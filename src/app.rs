@@ -296,7 +296,18 @@ impl App {
 
     /// What a new server would need to rebuild this workspace.
     fn snapshot(&self) -> Saved {
-        let mut agents: Vec<SavedAgent> = self
+        let mut agents = self.open_agents();
+        let focus = self.agents.get(self.focus).and_then(|f| agents.iter().position(|s| s.name == f.name)).unwrap_or(0);
+        if let Some(p) = &self.pending_restore {
+            agents.extend(p.agents.iter().cloned());
+        }
+        Saved::new(focus, agents)
+    }
+
+    /// The agents open now, as they'd be started again (saved workspace,
+    /// `trix layout save`).
+    pub fn open_agents(&self) -> Vec<SavedAgent> {
+        self
             .agents
             .iter()
             .filter(|a| a.state != State::Exited || self.parked.contains(&a.id))
@@ -311,12 +322,7 @@ impl App {
                     session: if matches!(a.kind, Kind::Claude | Kind::Codex) { a.session.clone() } else { None },
                 })
             })
-            .collect();
-        let focus = self.agents.get(self.focus).and_then(|f| agents.iter().position(|s| s.name == f.name)).unwrap_or(0);
-        if let Some(p) = &self.pending_restore {
-            agents.extend(p.agents.iter().cloned());
-        }
-        Saved::new(focus, agents)
+            .collect()
     }
 
     /// Save the workspace if it changed since last time.

@@ -109,6 +109,7 @@ impl Dimensions for TermSize {
     }
 }
 
+#[derive(Debug)]
 pub struct Spawn {
     pub kind: Kind,
     pub name: String,

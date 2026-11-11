@@ -29,6 +29,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
 - **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
 - **Agents can run agents.** `trix spawn`, `send`, `read`, `wait` and `close` let a script, or an agent in another pane, work the workspace the way you do. A "lead" Claude can start workers in their own worktrees, hand them tasks, wait for them and read what they did. It never answers a permission prompt for you, and the sidebar shows which agent it is driving. See [Agent control](#agent-control).
+- **Layouts on demand.** `trix layout save work` remembers the tabs you have open, with their folders. `trix layout open work` brings them back whenever you want, with fresh conversations, or the old ones with `--resume`. See [Layouts](#layouts).
 - **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
 - **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude and Codex resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`), and shells reopen in the folder they were in.
@@ -96,6 +97,33 @@ To make a manager, start a Claude pane and tell it what it's for. For example:
 > You're the lead for this repo. Don't edit code yourself. Split the task into independent pieces. For each piece, start a worker with `trix spawn claude --worktree --name <piece> --prompt "<brief>"`. Then loop: `trix wait <all workers> -t 280`, `trix read <worker>` to check its work, and `trix send` follow-ups. If a worker shows `needs-you`, tell me which one and why, and leave it alone. When they're all done, summarise each worktree's branch and diff (`trix ls --json`).
 
 Inside a pane, these commands act on that pane's session. Elsewhere, add `-s <name>` for a named session.
+
+### Layouts
+
+A layout is a named set of tabs you can open again whenever you like: the three repos you always work in, a shell per service, a dev server.
+
+```sh
+trix layout save work-layout          # the tabs open now: kind, name, folder, extra args
+trix layout open work-layout          # open them again, with fresh conversations
+trix layout open work-layout --resume # …or pick up the conversations they had when saved
+trix layout ls                        # saved layouts and their tabs
+trix layout rm work-layout
+```
+
+- Layouts live in `~/.config/trix/layouts/<name>.toml` (`$XDG_CONFIG_HOME` if set), one plain TOML file each, meant to be edited by hand or by an agent:
+  ```toml
+  [[agent]]
+  kind = "claude"            # claude, codex, shell or custom
+  name = "api"
+  cwd = "~/code/api"
+  args = "--model opus"      # optional: extra arguments (for custom, the command)
+  session = "0a955a0a-…"     # optional: what --resume picks up
+  ```
+- `save` records where each shell is now, even if you `cd`'d since. It won't overwrite an existing layout without `--force`.
+- `open` adds to the workspace you're in and skips tabs that are already open under the same name, so opening twice is harmless. New tabs never steal focus. A tab whose folder is gone is reported and skipped.
+- From a terminal outside trix, `open` starts the workspace if needed and attaches to it. From inside a pane, it just adds the tabs, so an agent can run it too: "open my work layout".
+- `--resume` only applies to Claude and Codex tabs that have a saved `session`. Everything else starts fresh either way.
+- How this differs from [Restore](#restore): restore brings back whatever was open after a crash or restart, and it's per session and one-shot. A layout stays until you remove it, and you can open it into any session, any number of times.
 
 ### Viewers
 
@@ -195,6 +223,7 @@ Codex shows a startup warning that `-c` overrides run it "without the shared bac
 src/main.rs    CLI, attach client, frame-paced server loop
 src/session.rs detach/attach and viewers: control socket, framing, remote ratatui backend
 src/search.rs  search across agent scrollbacks
+src/layout.rs  saved layouts: save / open / ls / rm, TOML files
 src/control.rs agent control: spawn / send / read / wait / close, ls --json, guard rails
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications

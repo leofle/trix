@@ -55,6 +55,10 @@ pub enum Request {
     Wait { targets: Vec<String>, all: bool, timeout_secs: u64 },
     Spawn { kind: String, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool },
     Close { target: String, force: bool },
+    /// The agents open now, as JSON `SavedAgent`s (`trix layout save`).
+    Layout,
+    /// Start a saved layout's agents (`trix layout open`).
+    Open { name: String, agents: Vec<crate::layout::LayoutAgent>, resume: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
@@ -65,7 +69,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn ok(out: impl Into<String>) -> Reply {
+    pub fn ok(out: impl Into<String>) -> Reply {
         Reply { code: 0, out: out.into(), err: String::new() }
     }
     fn fail(err: impl Into<String>) -> Reply {
@@ -170,7 +174,7 @@ fn absolute(p: PathBuf, cwd: &std::path::Path) -> PathBuf {
 }
 
 /// The pane this process runs in, when it is one of this session's.
-fn caller() -> Option<u32> {
+pub fn caller() -> Option<u32> {
     if std::env::var("TRIX_SESSION").ok()? != session::name() {
         return None;
     }
@@ -229,6 +233,8 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Read { target, lines } => read(app, &target, lines),
         Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree),
         Request::Close { target, force } => close(app, from, &target, force),
+        Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
+        Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
         Request::Wait { .. } => unreachable!(),
     };
     reply(&mut stream, &r);

@@ -3,6 +3,7 @@ mod app;
 mod control;
 mod hooks;
 mod input;
+mod layout;
 mod platform;
 mod search;
 mod session;
@@ -52,6 +53,16 @@ agent control (for scripts, and for agents managing other agents):
   trix close <agent> [--force]
                             close it; --force if it is working or needs you
   <agent> is a name, or its number in `trix ls`.
+
+layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
+  trix layout save <name> [--force]
+                            save the tabs open now: kind, name, folder, args
+  trix layout open <name> [--resume]
+                            open them again (fresh conversations; --resume
+                            picks up the saved ones). Tabs already open are
+                            skipped. From outside trix, starts it and attaches
+  trix layout ls            list saved layouts
+  trix layout rm <name>     remove one
 
   trix hook <source>        (internal) agent lifecycle reporter
   trix server               (internal) the background workspace
@@ -131,6 +142,23 @@ fn main() -> anyhow::Result<()> {
         }
         Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--json") => {
             control::run(control::Request::List { json: true });
+        }
+        Some("layout") => {
+            let cmd = match layout::parse(&args[1..]) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("trix: {e}");
+                    std::process::exit(2);
+                }
+            };
+            match layout::run(cmd) {
+                Ok(true) => return client(Mode::Control(Vec::new()), false),
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    eprintln!("trix: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Some(cmd) if control::COMMANDS.contains(&cmd) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
