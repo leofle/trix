@@ -193,3 +193,7 @@ Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=
 ## Next
 
 Nothing queued. Ideas and requests welcome.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
