@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod control;
 mod hooks;
 mod input;
 mod search;
@@ -31,9 +32,26 @@ usage:
   trix claude codex shell   open, and start these agents in the current folder
   trix attach               attach to the running workspace, never start one
   trix view                 watch the running workspace read-only (q leaves)
-  trix ls                   list agents and their state without attaching
+  trix ls [--json]          list agents and their state without attaching
   trix kill                 stop the workspace and every agent in it
   trix kill --all           stop every running session
+
+agent control (for scripts, and for agents managing other agents):
+  trix spawn <kind> [--name N] [--cwd DIR] [--worktree] [--prompt P] [--args A]
+                            start claude, codex, shell or custom; prints its name
+  trix send <agent> <prompt…>
+                            type a prompt into an agent and submit it (prompt
+                            from stdin when omitted). Refuses agents that need
+                            you, shells and starting agents unless --force
+  trix read <agent> [-n N]  the last N lines of its screen and scrollback (60)
+  trix wait <agent>… [--all] [-t SECS]
+                            block until one (or --all) stops working: done,
+                            idle, needs-you or exited. Exits 124 after -t
+                            seconds (300; 0 waits forever)
+  trix close <agent> [--force]
+                            close it; --force if it is working or needs you
+  <agent> is a name, or its number in `trix ls`.
+
   trix hook <source>        (internal) agent lifecycle reporter
   trix server               (internal) the background workspace
 
@@ -109,6 +127,19 @@ fn main() -> anyhow::Result<()> {
         Some("-V" | "--version") => {
             println!("trix {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--json") => {
+            control::run(control::Request::List { json: true });
+        }
+        Some(cmd) if control::COMMANDS.contains(&cmd) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            match control::parse(&args, cwd) {
+                Ok(req) => control::run(req),
+                Err(e) => {
+                    eprintln!("trix: {e}\n\n{HELP}");
+                    std::process::exit(2);
+                }
+            }
         }
         Some("ls" | "list") => {
             let names = if explicit { vec![session::name().to_string()] } else { session::candidates() };
@@ -323,6 +354,7 @@ fn server() -> anyhow::Result<()> {
         if now >= last_tick + TICK {
             last_tick = now;
             app.tick();
+            control::poll(&mut app);
             if now >= last_slow + Duration::from_secs(1) {
                 last_slow = now;
                 app.slow_tick();
@@ -348,6 +380,7 @@ fn server() -> anyhow::Result<()> {
 
     // Save before stopping: the agents' exits must not read as "closed".
     app.persist();
+    control::stop_all(&mut app, "the workspace stopped");
     app.shutdown_all();
     let _ = std::fs::remove_file(&control);
     let _ = std::fs::remove_file(&socket);
@@ -426,6 +459,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
         SessionEvent::List(mut stream) => {
             let _ = session::write_frame(&mut stream, session::TEXT, app.listing().as_bytes());
         }
+        SessionEvent::Control { stream, from, req } => control::handle(app, stream, from, req),
         SessionEvent::Kill => *killed = true,
     }
 }

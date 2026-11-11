@@ -305,6 +305,9 @@ fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, t: &Theme) {
     if a.unseen && a.state != State::Blocked {
         line1.push(Span::styled(" •", Style::new().fg(sc).add_modifier(Modifier::BOLD)));
     }
+    if let Some(by) = &a.managed_by {
+        line1.push(Span::styled(format!(" ‹{by}"), Style::new().fg(t.muted)));
+    }
     let row1 = Rect { height: 1, ..r };
     f.render_widget(Paragraph::new(TLine::from(line1)), row1);
     let tstyle = if matches!(a.state, State::Working | State::Blocked) { Style::new().fg(mix(sc, t.dim, 0.3)) } else { Style::new().fg(t.muted) };

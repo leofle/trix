@@ -84,6 +84,25 @@ fn logical_ending_at<T>(term: &Term<T>, last: i32) -> (Logical, i32) {
     (l, first)
 }
 
+/// The last `n` logical lines of a terminal (scrollback and screen), oldest
+/// first, without the blank rows below the last output.
+pub fn tail<T>(term: &Term<T>, n: usize) -> Vec<String> {
+    let grid = term.grid();
+    let top = -(grid.history_size() as i32);
+    let mut last = grid.screen_lines() as i32 - 1;
+    let mut out = Vec::new();
+    while last >= top && out.len() < n {
+        let (line, first) = logical_ending_at(term, last);
+        let text = line.text();
+        if !(out.is_empty() && text.is_empty()) {
+            out.push(text);
+        }
+        last = first - 1;
+    }
+    out.reverse();
+    out
+}
+
 /// Every matching line in one terminal, newest first, at most `limit`.
 pub fn search_term<T>(term: &Term<T>, agent: u32, query: &str, limit: usize) -> Vec<Hit> {
     let needle: Vec<char> = query.chars().collect();
@@ -194,6 +213,16 @@ mod tests {
     fn feed(t: &mut Term<VoidListener>, output: &str) {
         let mut p: Processor = Processor::new();
         p.advance(t, output.replace('\n', "\r\n").as_bytes());
+    }
+
+    #[test]
+    fn tail_reads_back_through_scrollback() {
+        let out: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let t = term(20, 5, &out);
+        assert_eq!(tail(&t, 3), ["line 28", "line 29", "line 30"], "blank rows below the output are skipped");
+        assert_eq!(tail(&t, 100).len(), 30);
+        let t = term(10, 5, "0123456789abcdef\nend\n");
+        assert_eq!(tail(&t, 2), ["0123456789abcdef", "end"], "wrapped rows come back as one line");
     }
     fn texts(hits: &[Hit]) -> Vec<&str> {
         hits.iter().map(|h| h.text.as_str()).collect()
