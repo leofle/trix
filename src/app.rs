@@ -204,6 +204,7 @@ pub struct App {
     /// Kept in every save until then, so detaching first loses nothing.
     pub pending_restore: Option<Saved>,
     last_saved: Option<Saved>,
+    last_completion_sound: Option<Instant>,
     /// Restored custom commands, shown exited until the human starts them.
     parked: HashSet<u32>,
 }
@@ -246,6 +247,7 @@ impl App {
             out,
             pending_restore: state::load(),
             last_saved: None,
+            last_completion_sound: None,
             parked: HashSet::new(),
         }
     }
@@ -751,6 +753,13 @@ impl App {
         let title = if crate::session::is_default() { title } else { format!("{title} · {}", crate::session::name()) };
         if !looking {
             desktop_notify(&title, &body, urgent);
+            if a.state == State::Done && std::env::var_os("TRIX_NO_SOUND").is_none() {
+                let now = Instant::now();
+                if completion_sound_due(self.last_completion_sound, now) {
+                    self.last_completion_sound = Some(now);
+                    play_completion_sound();
+                }
+            }
             if !self.term_focused {
                 // Bell → compositor urgency hint on the terminal window.
                 self.out.send_all(b"\x07");
@@ -1323,6 +1332,31 @@ fn reap(mut child: std::process::Child) {
     });
 }
 
+/// A burst of completions gets one chime, without delaying the workspace.
+fn completion_sound_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2))
+}
+
+fn play_completion_sound() {
+    // Embed the approved chime so installed binaries need no asset directory.
+    const CHIME: &[u8] = include_bytes!("../assets/task-complete.wav");
+    std::thread::spawn(|| {
+        let Ok(mut child) = Command::new("pw-play")
+            .args(["--media-role", "Notification", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(CHIME);
+        }
+        let _ = child.wait();
+    });
+}
+
 fn desktop_notify(title: &str, body: &str, urgent: bool) {
     if std::env::var_os("TRIX_NO_NOTIFY").is_some() {
         return;
@@ -1369,6 +1403,15 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_chime_groups_a_burst_without_extending_the_cooldown() {
+        let first = Instant::now();
+        assert!(completion_sound_due(None, first));
+        assert!(!completion_sound_due(Some(first), first));
+        assert!(!completion_sound_due(Some(first), first + Duration::from_millis(1999)));
+        assert!(completion_sound_due(Some(first), first + Duration::from_secs(2)));
+    }
 
     fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, m)
