@@ -7,6 +7,10 @@
 //! only ends the client; agents keep running, and their state changes still
 //! reach you as desktop notifications.
 //!
+//! Besides the one controlling terminal, any number of read-only viewers can
+//! attach (`trix view`). They get a copy of the controller's frames, cropped
+//! or padded to their own size, and their keys never reach the workspace.
+//!
 //! Wire format, both directions: `[kind: u8][len: u32 le][payload]`.
 //! Client → server payloads are JSON `ClientMsg`s. Server → client frames are
 //! raw terminal bytes (`OUT`), a goodbye with a message to print (`BYE`), or a
@@ -14,8 +18,11 @@
 
 use crossterm::event::Event;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
-use ratatui::layout::{Position, Size};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Position, Rect, Size};
+use ratatui::style::Style;
+use unicode_width::UnicodeWidthStr;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
@@ -50,12 +57,19 @@ pub enum ClientMsg {
     Event(Event),
     List,
     Kill,
+    /// Watch read-only. A new variant rather than a Hello flag, so an older
+    /// server rejects it instead of handing the viewer control.
+    View { protocol: u32, cols: u16, rows: u16 },
 }
 
 /// Session-level events, delivered to the server's main loop.
 pub enum SessionEvent {
     Attach { id: u64, stream: UnixStream, cols: u16, rows: u16, cwd: PathBuf, spawn: Vec<String> },
     Resize(u64, u16, u16),
+    View { id: u64, stream: UnixStream, cols: u16, rows: u16 },
+    ViewResize(u64, u16, u16),
+    /// A viewer pressed a key that means "stop watching".
+    Unview(u64),
     Detached(u64),
     List(UnixStream),
     Kill,
@@ -181,7 +195,18 @@ fn send_msg(w: &mut impl Write, msg: &ClientMsg) -> io::Result<()> {
 struct Link {
     client: Option<(u64, UnixStream)>,
     buf: Vec<u8>,
+    /// The controller's size, kept after it leaves: viewers keep seeing the
+    /// layout it had, and agents keep their terminal size.
     size: (u16, u16),
+    viewers: Vec<Viewer>,
+}
+
+struct Viewer {
+    id: u64,
+    stream: UnixStream,
+    size: (u16, u16),
+    /// What this viewer's screen shows now; `None` repaints from scratch.
+    shown: Option<Buffer>,
 }
 
 /// The currently attached client, shared by the renderer and the app (for
@@ -192,7 +217,7 @@ pub struct Out(Arc<Mutex<Link>>);
 
 impl Default for Out {
     fn default() -> Self {
-        Out(Arc::new(Mutex::new(Link { client: None, buf: Vec::new(), size: (80, 24) })))
+        Out(Arc::new(Mutex::new(Link { client: None, buf: Vec::new(), size: (80, 24), viewers: Vec::new() })))
     }
 }
 
@@ -214,6 +239,17 @@ impl Link {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
     }
+
+    /// Send to every viewer, dropping the ones that are gone or stalled.
+    fn send_viewers(&mut self, kind: u8, payload: &[u8]) {
+        self.viewers.retain_mut(|v| {
+            let ok = write_frame(&mut v.stream, kind, payload).is_ok();
+            if !ok {
+                let _ = v.stream.shutdown(std::net::Shutdown::Both);
+            }
+            ok
+        });
+    }
 }
 
 impl Out {
@@ -221,13 +257,72 @@ impl Out {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Terminal bytes outside the frame (title, bell, clipboard).
+    /// Terminal bytes for the controller only (clipboard).
     pub fn send(&self, bytes: &[u8]) {
         self.link().frame(OUT, bytes);
     }
 
+    /// Terminal bytes for everyone watching (title, bell).
+    pub fn send_all(&self, bytes: &[u8]) {
+        let mut l = self.link();
+        l.frame(OUT, bytes);
+        l.send_viewers(OUT, bytes);
+    }
+
+    /// Anyone to draw for: the controller or a viewer.
     pub fn attached(&self) -> bool {
+        let l = self.link();
+        l.client.is_some() || !l.viewers.is_empty()
+    }
+
+    /// A terminal is in control (keys, focus, "seen").
+    pub fn controlled(&self) -> bool {
         self.link().client.is_some()
+    }
+
+    pub fn viewers(&self) -> usize {
+        self.link().viewers.len()
+    }
+
+    pub fn add_viewer(&self, id: u64, stream: UnixStream, size: (u16, u16)) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        self.link().viewers.push(Viewer { id, stream, size: (size.0.max(1), size.1.max(1)), shown: None });
+    }
+
+    pub fn resize_viewer(&self, id: u64, cols: u16, rows: u16) {
+        if let Some(v) = self.link().viewers.iter_mut().find(|v| v.id == id) {
+            v.size = (cols.max(1), rows.max(1));
+            v.shown = None;
+        }
+    }
+
+    /// Say goodbye to one viewer. Returns true when it was one.
+    pub fn bye_viewer(&self, id: u64, message: &str) -> bool {
+        let mut l = self.link();
+        let Some(i) = l.viewers.iter().position(|v| v.id == id) else { return false };
+        let mut v = l.viewers.remove(i);
+        let _ = write_frame(&mut v.stream, BYE, message.as_bytes());
+        let _ = v.stream.shutdown(std::net::Shutdown::Both);
+        true
+    }
+
+    /// Copy a finished frame to every viewer, as a diff against what each one
+    /// shows already.
+    pub fn mirror(&self, frame: &Buffer, badge: Style) {
+        let mut l = self.link();
+        if l.viewers.is_empty() {
+            return;
+        }
+        l.viewers.retain_mut(|v| {
+            let next = viewer_frame(frame, v.size, badge);
+            let bytes = paint(v.shown.as_ref(), &next);
+            if write_frame(&mut v.stream, OUT, &bytes).is_err() {
+                let _ = v.stream.shutdown(std::net::Shutdown::Both);
+                return false;
+            }
+            v.shown = Some(next);
+            true
+        });
     }
 
     /// Make `stream` the client. A previously attached one is told why and
@@ -236,7 +331,7 @@ impl Out {
         let mut l = self.link();
         let kicked = l.client.is_some();
         if kicked {
-            l.bye("[trix attached from another terminal]");
+            l.bye("[trix attached from another terminal · `trix view` watches without taking over]");
         }
         let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
         l.client = Some((id, stream));
@@ -245,16 +340,31 @@ impl Out {
         kicked
     }
 
+    /// The controller is done (detach, or kicked).
     pub fn bye(&self, message: &str) {
         self.link().bye(message);
     }
 
-    /// The client with this id went away on its own.
-    pub fn lost(&self, id: u64) {
+    /// The workspace is going away: everyone is done.
+    pub fn bye_all(&self, message: &str) {
         let mut l = self.link();
+        l.bye(message);
+        l.send_viewers(BYE, message.as_bytes());
+        for v in l.viewers.drain(..) {
+            let _ = v.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// The client with this id went away on its own. Returns true when it
+    /// was the controller.
+    pub fn lost(&self, id: u64) -> bool {
+        let mut l = self.link();
+        l.viewers.retain(|v| v.id != id);
         if l.client.as_ref().is_some_and(|(c, _)| *c == id) {
             l.client = None;
+            return true;
         }
+        false
     }
 
     pub fn resize(&self, id: u64, cols: u16, rows: u16) -> bool {
@@ -269,6 +379,64 @@ impl Out {
     fn size(&self) -> (u16, u16) {
         self.link().size
     }
+}
+
+const BADGE: &str = " ◉ view only · q leaves ";
+
+/// The controller's frame as one viewer sees it: cropped or padded to the
+/// viewer's size, with a badge so nobody mistakes it for the real thing.
+fn viewer_frame(frame: &Buffer, (cols, rows): (u16, u16), badge: Style) -> Buffer {
+    let mut out = Buffer::empty(Rect::new(0, 0, cols, rows));
+    let src = frame.area;
+    let (w, h) = (cols.min(src.width), rows.min(src.height));
+    for y in 0..h {
+        for x in 0..w {
+            let cell = &frame[(src.x + x, src.y + y)];
+            // Half of a wide character would spill past the crop.
+            if x + 1 == w && w < src.width && cell.symbol().width() > 1 {
+                continue;
+            }
+            out[(x, y)] = cell.clone();
+        }
+    }
+    // At the right end of the controller's top bar, over its clock.
+    let bw = BADGE.width() as u16;
+    if w >= bw {
+        out.set_string(w - bw, 0, BADGE, badge);
+    }
+    out
+}
+
+/// Escape codes that turn `shown` into `next` (everything, from a cleared
+/// screen, when the viewer has nothing yet).
+fn paint(shown: Option<&Buffer>, next: &Buffer) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut be = CrosstermBackend::new(&mut bytes);
+    let blank;
+    let from = match shown {
+        Some(b) if b.area == next.area => b,
+        _ => {
+            let _ = be.clear();
+            blank = Buffer::empty(next.area);
+            &blank
+        }
+    };
+    let _ = be.draw(from.diff(next).into_iter());
+    let _ = be.hide_cursor();
+    let _ = Backend::flush(&mut be);
+    bytes
+}
+
+/// Keys a viewer presses to stop watching. Everything else is ignored.
+fn leaves(k: &KeyEvent) -> bool {
+    if k.kind == KeyEventKind::Release {
+        return false;
+    }
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    matches!(k.code, KeyCode::Char('q' | 'Q') | KeyCode::Esc)
+        || (ctrl && matches!(k.code, KeyCode::Char('c' | 'd')))
+        || (alt && k.code == KeyCode::Char('d'))
 }
 
 /// Buffers a frame's escape codes and ships them as one `OUT` on flush.
@@ -406,6 +574,29 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
             }
             send(SessionEvent::Detached(id));
         }
+        Ok(ClientMsg::View { protocol, cols, rows }) => {
+            if protocol != PROTOCOL {
+                let msg = "trix: the running workspace is from a different trix build — `trix kill` it (stops its agents) and start again";
+                let _ = write_frame(&mut s, BYE, msg.as_bytes());
+                return;
+            }
+            let Ok(w) = s.try_clone() else { return };
+            if !send(SessionEvent::View { id, stream: w, cols, rows }) {
+                return;
+            }
+            let mut r = BufReader::new(s);
+            while let Ok((MSG, p)) = read_frame(&mut r) {
+                let ev = match serde_json::from_slice::<ClientMsg>(&p) {
+                    Ok(ClientMsg::Event(Event::Key(k))) if leaves(&k) => SessionEvent::Unview(id),
+                    Ok(ClientMsg::Event(Event::Resize(c, r))) => SessionEvent::ViewResize(id, c, r),
+                    _ => continue,
+                };
+                if !send(ev) {
+                    return;
+                }
+            }
+            send(SessionEvent::Detached(id));
+        }
         Ok(ClientMsg::List) => {
             send(SessionEvent::List(s));
         }
@@ -485,13 +676,30 @@ pub fn send_once(session: &str, msg: &ClientMsg) -> bool {
 pub enum Ended {
     Bye(String),
     Lost,
+    /// The server hung up without a word: a build that predates this kind
+    /// of client.
+    Refused,
+}
+
+/// How a terminal attaches.
+pub enum Mode {
+    /// In control, starting these agent kinds in the current folder.
+    Control(Vec<String>),
+    /// Read-only.
+    View,
 }
 
 /// Run the client on an already-prepared terminal until the server says bye
 /// or goes away.
-pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, spawn: Vec<String>) -> io::Result<Ended> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    send_msg(&mut s, &ClientMsg::Hello { protocol: PROTOCOL, cols, rows, cwd, spawn })?;
+pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Result<Ended> {
+    let hello = match mode {
+        Mode::Control(spawn) => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            ClientMsg::Hello { protocol: PROTOCOL, cols, rows, cwd, spawn }
+        }
+        Mode::View => ClientMsg::View { protocol: PROTOCOL, cols, rows },
+    };
+    send_msg(&mut s, &hello)?;
     let mut w = s.try_clone()?;
     std::thread::Builder::new().name("trix-input".into()).spawn(move || {
         while let Ok(ev) = crossterm::event::read() {
@@ -502,8 +710,14 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, spawn: Vec<String>) -
     })?;
     let mut r = BufReader::with_capacity(1 << 16, s);
     let mut out = io::stdout().lock();
+    let mut heard = false;
     loop {
-        match read_frame(&mut r) {
+        let frame = read_frame(&mut r);
+        if frame.is_err() && !heard {
+            return Ok(Ended::Refused);
+        }
+        heard = true;
+        match frame {
             Ok((OUT, p)) => {
                 out.write_all(&p)?;
                 out.flush()?;
@@ -574,6 +788,86 @@ mod tests {
         huge.extend_from_slice(&((MAX_FRAME as u32) + 1).to_le_bytes());
         let err = read_frame(&mut Cursor::new(huge)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn frame_of(lines: &[&str]) -> Buffer {
+        let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+        let mut b = Buffer::empty(Rect::new(0, 0, w, lines.len() as u16));
+        for (y, l) in lines.iter().enumerate() {
+            b.set_string(0, y as u16, l, Style::new());
+        }
+        b
+    }
+    fn row(b: &Buffer, y: u16) -> String {
+        (0..b.area.width).map(|x| b[(x, y)].symbol().to_string()).collect()
+    }
+
+    #[test]
+    fn viewer_frame_crops_pads_and_badges() {
+        let f = frame_of(&["0123456789".repeat(4).as_str(), "second row", "third"]);
+        // Smaller viewer: cropped, with the badge over the top right.
+        let v = viewer_frame(&f, (30, 2), Style::new());
+        assert_eq!(v.area, Rect::new(0, 0, 30, 2));
+        assert_eq!(row(&v, 0), format!("012345{BADGE}"));
+        assert_eq!(row(&v, 1), format!("{:<30}", "second row"));
+        // Bigger viewer: padded with blanks, badge still on the frame's edge.
+        let v = viewer_frame(&f, (50, 5), Style::new());
+        assert_eq!(row(&v, 0), format!("{}{BADGE}{}", &"0123456789".repeat(4)[..16], " ".repeat(10)));
+        assert_eq!(row(&v, 2), format!("{:<50}", "third"));
+        assert_eq!(row(&v, 4), " ".repeat(50));
+        // Too narrow for the badge: just the frame.
+        let v = viewer_frame(&f, (8, 1), Style::new());
+        assert_eq!(row(&v, 0), "01234567");
+    }
+
+    #[test]
+    fn viewer_frame_never_cuts_a_wide_char_in_half() {
+        let f = frame_of(&["ab日本"]);
+        let v = viewer_frame(&f, (3, 1), Style::new());
+        assert_eq!(v[(2, 0)].symbol(), " ", "the half that fits is left blank");
+        assert_eq!(viewer_frame(&f, (4, 1), Style::new())[(2, 0)].symbol(), "日");
+    }
+
+    #[test]
+    fn paint_from_scratch_then_diffs() {
+        let a = frame_of(&["hello", "world"]);
+        let first = String::from_utf8(paint(None, &a)).unwrap();
+        assert!(first.contains("\x1b[2J"), "first paint clears the screen");
+        assert!(first.contains("hello") && first.contains("world"));
+        let same = String::from_utf8(paint(Some(&a), &a)).unwrap();
+        assert!(!same.contains("hello") && !same.contains("world"), "no change, no text: {same:?}");
+        let b = frame_of(&["hello", "wOrld"]);
+        let delta = String::from_utf8(paint(Some(&a), &b)).unwrap();
+        assert!(delta.contains('O') && !delta.contains("hello") && !delta.contains("\x1b[2J"));
+        // A resized viewer starts over.
+        let c = frame_of(&["hello!"]);
+        assert!(String::from_utf8(paint(Some(&a), &c)).unwrap().contains("\x1b[2J"));
+    }
+
+    #[test]
+    fn only_leave_keys_leave() {
+        let k = |code, m| KeyEvent::new(code, m);
+        for key in [
+            k(KeyCode::Char('q'), KeyModifiers::NONE),
+            k(KeyCode::Esc, KeyModifiers::NONE),
+            k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            k(KeyCode::Char('d'), KeyModifiers::ALT),
+            // alt+q quits trix for the controller; for a viewer it only leaves.
+            k(KeyCode::Char('q'), KeyModifiers::ALT),
+        ] {
+            assert!(leaves(&key), "{key:?}");
+        }
+        for key in [
+            k(KeyCode::Enter, KeyModifiers::NONE),
+            k(KeyCode::Char('y'), KeyModifiers::NONE),
+            k(KeyCode::Char('a'), KeyModifiers::ALT),
+            k(KeyCode::Char('n'), KeyModifiers::ALT),
+        ] {
+            assert!(!leaves(&key), "{key:?}");
+        }
+        let mut release = k(KeyCode::Char('q'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(!leaves(&release));
     }
 
     #[test]

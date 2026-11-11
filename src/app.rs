@@ -194,8 +194,10 @@ pub struct App {
     pub start_dir: PathBuf,
     drag: Option<Drag>,
     git_targets: Arc<Mutex<Vec<(u32, PathBuf)>>>,
-    last_title: String,
+    pub last_title: String,
     pub pane_size: (u16, u16),
+    /// Read-only terminals watching (`trix view`).
+    pub viewers: usize,
     /// The attached client's terminal (title, bell, clipboard passthrough).
     out: Out,
     /// Saved workspace awaiting the human's restore / start-fresh answer.
@@ -240,6 +242,7 @@ impl App {
             git_targets,
             last_title: String::new(),
             pane_size: (80, 24),
+            viewers: 0,
             out,
             pending_restore: state::load(),
             last_saved: None,
@@ -385,6 +388,9 @@ impl App {
             count(State::Working),
             count(State::Done),
         );
+        if self.viewers > 0 {
+            out.insert_str(out.len() - 1, &format!(" · {} watching", self.viewers));
+        }
         let w = self.agents.iter().map(|a| a.name.chars().count()).max().unwrap_or(0);
         for (i, a) in self.agents.iter().enumerate() {
             let since = crate::ui::fmt_dur(a.state_since.elapsed());
@@ -747,7 +753,7 @@ impl App {
             desktop_notify(&title, &body, urgent);
             if !self.term_focused {
                 // Bell → compositor urgency hint on the terminal window.
-                self.out.send(b"\x07");
+                self.out.send_all(b"\x07");
             }
         }
     }
@@ -762,7 +768,7 @@ impl App {
             (b, _) => format!("{base} · {b} need{} you", if b == 1 { "s" } else { "" }),
         };
         if title != self.last_title {
-            self.out.send(format!("\x1b]0;{title}\x07").as_bytes());
+            self.out.send_all(format!("\x1b]0;{title}\x07").as_bytes());
             self.last_title = title;
         }
     }

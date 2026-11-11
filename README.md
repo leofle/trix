@@ -27,6 +27,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
 - **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
+- **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
 - **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude and Codex resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`), and shells reopen in the folder they were in.
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
@@ -39,6 +40,7 @@ cargo install --path .
 trix                      # open the workspace (or attach to the running one)
 trix claude codex shell   # …and start these agents in the current folder
 trix attach               # attach only; fails if nothing is running
+trix view                 # watch read-only from another terminal (q leaves)
 trix ls                   # agents, states and activity, without attaching
 trix kill                 # stop the workspace and every agent in it
 
@@ -46,7 +48,16 @@ trix -s work              # the same, for a named session (works with every comm
 trix kill --all           # stop every running session
 ```
 
-`trix` starts a background server on first use (`$XDG_RUNTIME_DIR/trix/session.sock`, log in `server.log` next to it) and attaches to it. Only one terminal is attached at a time: attaching from a second one takes over from the first. The server keeps the environment of the terminal that started it, so agents launched later inherit that `PATH`.
+`trix` starts a background server on first use (`$XDG_RUNTIME_DIR/trix/session.sock`, log in `server.log` next to it) and attaches to it. One terminal is in control at a time: attaching from a second one takes over from the first. To look without taking over, use `trix view`. The server keeps the environment of the terminal that started it, so agents launched later inherit that `PATH`.
+
+### Viewers
+
+`trix view` (or `trix -s work view`) watches a running session read-only. Any number of viewers can watch at once, and the controlling terminal's top bar shows how many (`◉ 2 watching`), as does `trix ls`.
+
+- Viewers see the controller's screen. A smaller viewer sees it cropped, a bigger one sees it with blank space around it. A "view only" badge covers the clock. The layout, and the agents' terminal size, always follow the controller, so watching never changes anything.
+- Keys go nowhere, except `q`, `esc`, `ctrl+c` or `alt+d`, which stop watching. Mouse selection uses the viewer's own terminal.
+- Viewers stay when the controller detaches, and keep seeing live output. When the workspace quits or is killed, they're told and let go.
+- Viewers don't mark anything as seen, and they don't receive clipboard copies made in the controller.
 
 ### Sessions
 
@@ -111,6 +122,5 @@ Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_THEME=pat
 
 ## Next
 
-- Read-only extra viewers, so more than one terminal can watch a session.
 - Codex lifecycle hooks once trusting them can be scripted, for tool-level detail from Codex too.
 - Search across all agent scrollbacks.
