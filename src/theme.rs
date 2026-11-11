@@ -127,3 +127,45 @@ fn from_toml(text: &str) -> Theme {
     t
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_colors() {
+        assert_eq!(parse_hex("#1a1b26"), Some(Color::Rgb(0x1a, 0x1b, 0x26)));
+        assert_eq!(parse_hex("  1A1B26ff "), Some(Color::Rgb(0x1a, 0x1b, 0x26)));
+        assert_eq!(parse_hex("#fff"), None);
+        assert_eq!(parse_hex("zzzzzz"), None);
+    }
+
+    #[test]
+    fn mixing() {
+        let (black, white) = (Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255));
+        assert_eq!(mix(black, white, 0.0), black);
+        assert_eq!(mix(black, white, 1.0), white);
+        assert_eq!(mix(black, white, 0.5), Color::Rgb(128, 128, 128));
+        assert_eq!(mix(Color::Reset, white, 0.5), Color::Reset);
+    }
+
+    #[test]
+    fn omarchy_colors_toml() {
+        let t = from_toml("background = \"#101010\"\nforeground = \"#e0e0e0\"\nblue = \"#3366ff\"\nred = \"#ff0000\"\n");
+        assert_eq!(t.bg, Color::Rgb(0x10, 0x10, 0x10));
+        assert_eq!(t.fg, Color::Rgb(0xe0, 0xe0, 0xe0));
+        assert_eq!(t.fg_bright, t.fg, "falls back to foreground");
+        assert_eq!(t.accent, Color::Rgb(0x33, 0x66, 0xff), "no accent: blue");
+        assert_eq!(t.red, Color::Rgb(0xff, 0, 0));
+        assert_eq!(t.green, Theme::default().green, "missing keys keep the default");
+
+        let t = from_toml("accent = \"#00ff00\"\nblue = \"#3366ff\"");
+        assert_eq!(t.accent, Color::Rgb(0, 0xff, 0), "accent wins over blue");
+    }
+
+    #[test]
+    fn broken_toml_is_the_default_theme() {
+        assert_eq!(from_toml("this is = not [toml").bg, Theme::default().bg);
+        assert_eq!(from_toml("background = \"nope\"").bg, Theme::default().bg);
+    }
+}

@@ -194,3 +194,106 @@ pub fn one_line(s: &str, max: usize) -> String {
         flat
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn c(v: Value) -> HookMsg {
+        condense(7, "claude", &v)
+    }
+
+    #[test]
+    fn bash_command_is_flattened() {
+        let m = c(json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "cargo   test\n  --release"}, "session_id": "s1"}));
+        assert_eq!((m.agent, m.source.as_str(), m.event.as_str()), (7, "claude", "PreToolUse"));
+        assert_eq!(m.tool.as_deref(), Some("Bash"));
+        assert_eq!(m.detail.as_deref(), Some("cargo test --release"));
+        assert_eq!(m.session.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn file_tools_show_the_file_name() {
+        let m = c(json!({"hook_event_name": "PermissionRequest", "tool_name": "Edit", "tool_input": {"file_path": "/home/x/src/app.rs"}}));
+        assert_eq!(m.detail.as_deref(), Some("app.rs"));
+        let m = c(json!({"hook_event_name": "PreToolUse", "tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/n/a.ipynb"}}));
+        assert_eq!(m.detail.as_deref(), Some("a.ipynb"));
+    }
+
+    #[test]
+    fn question_detail_is_the_first_question() {
+        let m = c(json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Which db?"}, {"question": "ignored"}]}}));
+        assert_eq!(m.detail.as_deref(), Some("Which db?"));
+    }
+
+    #[test]
+    fn unknown_tool_has_no_detail() {
+        let m = c(json!({"hook_event_name": "PreToolUse", "tool_name": "Mystery", "tool_input": {"x": 1}}));
+        assert_eq!(m.tool.as_deref(), Some("Mystery"));
+        assert_eq!(m.detail, None);
+    }
+
+    #[test]
+    fn notification_and_prompt() {
+        let m = c(json!({"hook_event_name": "Notification", "message": "Claude needs your permission"}));
+        assert_eq!(m.detail.as_deref(), Some("Claude needs your permission"));
+        let long = "word ".repeat(40);
+        let m = c(json!({"hook_event_name": "UserPromptSubmit", "prompt": long}));
+        let d = m.detail.unwrap();
+        assert_eq!(d.chars().count(), 80);
+        assert!(d.ends_with('…'));
+    }
+
+    #[test]
+    fn codex_turn_complete() {
+        let m = condense(2, "codex", &json!({"type": "agent-turn-complete", "thread-id": "t-9", "last-assistant-message": "All tests pass."}));
+        assert_eq!(m.event, "agent-turn-complete");
+        assert_eq!(m.detail.as_deref(), Some("All tests pass."));
+        assert_eq!(m.session.as_deref(), Some("t-9"));
+    }
+
+    #[test]
+    fn empty_session_id_is_ignored() {
+        assert_eq!(c(json!({"hook_event_name": "Stop", "session_id": ""})).session, None);
+    }
+
+    #[test]
+    fn garbage_payload_still_reports() {
+        let m = c(Value::Null);
+        assert_eq!(m.event, "unknown");
+        assert_eq!((m.tool, m.detail, m.session), (None, None, None));
+    }
+
+    #[test]
+    fn hook_msg_wire_roundtrip_with_missing_fields() {
+        let m: HookMsg = serde_json::from_str(r#"{"agent":3,"source":"custom","event":"Stop"}"#).unwrap();
+        assert_eq!((m.agent, m.event.as_str()), (3, "Stop"));
+        assert_eq!(m.session, None);
+    }
+
+    #[test]
+    fn one_line_collapses_and_truncates() {
+        assert_eq!(one_line("  a \n\t b  c ", 50), "a b c");
+        assert_eq!(one_line("abcdef", 6), "abcdef");
+        assert_eq!(one_line("abcdefg", 6), "abcde…");
+        assert_eq!(one_line("日本語テキスト", 4), "日本語…");
+        assert_eq!(one_line("abc", 0), "…");
+    }
+
+    #[test]
+    fn claude_settings_hook_every_event() {
+        // The exe path is shell-quoted, so one with a quote in it still runs.
+        let exe = Path::new("/opt/it's/trix");
+        let path = write_claude_settings(exe).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let hooks = v["hooks"].as_object().unwrap();
+        for ev in ["PreToolUse", "PostToolUse", "PermissionRequest", "SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"] {
+            let cmd = hooks[ev][0]["hooks"][0]["command"].as_str().unwrap();
+            assert_eq!(cmd, r"'/opt/it'\''s/trix' hook claude", "{ev}");
+        }
+        assert_eq!(hooks["PreToolUse"][0]["matcher"], "*");
+    }
+}

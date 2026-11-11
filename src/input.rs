@@ -127,3 +127,99 @@ pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, m: KeyModifiers) -> Vec<u8> {
+        encode_key(&KeyEvent::new(code, m), TermMode::empty())
+    }
+    const NONE: KeyModifiers = KeyModifiers::NONE;
+    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+    const ALT: KeyModifiers = KeyModifiers::ALT;
+    const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+
+    #[test]
+    fn plain_and_unicode_chars() {
+        assert_eq!(key(KeyCode::Char('a'), NONE), b"a");
+        assert_eq!(key(KeyCode::Char('é'), NONE), "é".as_bytes());
+    }
+
+    #[test]
+    fn ctrl_chars_map_to_c0() {
+        assert_eq!(key(KeyCode::Char('a'), CTRL), [0x01]);
+        assert_eq!(key(KeyCode::Char('C'), CTRL), [0x03]);
+        assert_eq!(key(KeyCode::Char(' '), CTRL), [0x00]);
+        assert_eq!(key(KeyCode::Char('['), CTRL), [0x1b]);
+        assert_eq!(key(KeyCode::Char('/'), CTRL), [0x1f]);
+        assert_eq!(key(KeyCode::Char('?'), CTRL), [0x7f]);
+    }
+
+    #[test]
+    fn alt_prefixes_escape() {
+        assert_eq!(key(KeyCode::Char('x'), ALT), b"\x1bx");
+        assert_eq!(key(KeyCode::Char('c'), ALT | CTRL), [0x1b, 0x03]);
+        assert_eq!(key(KeyCode::Backspace, ALT), b"\x1b\x7f");
+        assert_eq!(key(KeyCode::Tab, ALT), b"\x1b\t");
+        // Already an escape: not doubled.
+        assert_eq!(key(KeyCode::Esc, ALT), b"\x1b");
+    }
+
+    #[test]
+    fn enter_variants() {
+        assert_eq!(key(KeyCode::Enter, NONE), b"\r");
+        assert_eq!(key(KeyCode::Enter, SHIFT), b"\x1b\r", "newline in the Claude / Codex composer");
+        assert_eq!(key(KeyCode::Enter, ALT), b"\x1b\r");
+        assert_eq!(key(KeyCode::Enter, CTRL), b"\n");
+    }
+
+    #[test]
+    fn editing_keys() {
+        assert_eq!(key(KeyCode::Tab, NONE), b"\t");
+        assert_eq!(key(KeyCode::BackTab, SHIFT), b"\x1b[Z");
+        assert_eq!(key(KeyCode::Backspace, NONE), [0x7f]);
+        assert_eq!(key(KeyCode::Backspace, CTRL), [0x08]);
+        assert_eq!(key(KeyCode::Esc, NONE), [0x1b]);
+        assert_eq!(key(KeyCode::Insert, NONE), b"\x1b[2~");
+        assert_eq!(key(KeyCode::Delete, NONE), b"\x1b[3~");
+        assert_eq!(key(KeyCode::Delete, CTRL), b"\x1b[3;5~");
+        assert_eq!(key(KeyCode::PageUp, NONE), b"\x1b[5~");
+        assert_eq!(key(KeyCode::PageDown, SHIFT), b"\x1b[6;2~");
+    }
+
+    #[test]
+    fn cursor_keys_follow_mode_and_modifiers() {
+        assert_eq!(key(KeyCode::Up, NONE), b"\x1b[A");
+        assert_eq!(key(KeyCode::Left, NONE), b"\x1b[D");
+        assert_eq!(key(KeyCode::Home, NONE), b"\x1b[H");
+        assert_eq!(key(KeyCode::End, NONE), b"\x1b[F");
+        assert_eq!(encode_key(&KeyEvent::new(KeyCode::Up, NONE), TermMode::APP_CURSOR), b"\x1bOA");
+        // Modifiers win over application mode.
+        assert_eq!(encode_key(&KeyEvent::new(KeyCode::Up, CTRL), TermMode::APP_CURSOR), b"\x1b[1;5A");
+        assert_eq!(key(KeyCode::Right, SHIFT), b"\x1b[1;2C");
+        assert_eq!(key(KeyCode::Down, ALT), b"\x1b[1;3B");
+        assert_eq!(key(KeyCode::Down, CTRL | SHIFT), b"\x1b[1;6B");
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(key(KeyCode::F(1), NONE), b"\x1bOP");
+        assert_eq!(key(KeyCode::F(4), NONE), b"\x1bOS");
+        assert_eq!(key(KeyCode::F(1), SHIFT), b"\x1b[1;2P");
+        assert_eq!(key(KeyCode::F(5), NONE), b"\x1b[15~");
+        assert_eq!(key(KeyCode::F(10), NONE), b"\x1b[21~");
+        assert_eq!(key(KeyCode::F(12), CTRL), b"\x1b[24;5~");
+        assert!(key(KeyCode::F(13), NONE).is_empty());
+    }
+
+    #[test]
+    fn paste_bracketed_and_plain() {
+        let bracketed = encode_paste("ls\n", TermMode::BRACKETED_PASTE);
+        assert_eq!(bracketed, b"\x1b[200~ls\n\x1b[201~");
+        // A pasted end marker must not be able to end the paste early.
+        let sneaky = encode_paste("a\x1b[201~rm -rf /\n", TermMode::BRACKETED_PASTE);
+        assert_eq!(sneaky, b"\x1b[200~arm -rf /\n\x1b[201~");
+        assert_eq!(encode_paste("a\r\nb\nc", TermMode::empty()), b"a\rb\rc");
+    }
+}

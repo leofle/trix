@@ -125,12 +125,18 @@ pub fn log_path() -> PathBuf {
 /// Sessions that have a control socket, default first. A socket can outlive a
 /// server that died hard, so callers still have to connect to know.
 pub fn candidates() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(runtime_dir())
+    let files = std::fs::read_dir(runtime_dir())
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| {
-            let file = e.file_name().to_string_lossy().into_owned();
+        .map(|e| e.file_name().to_string_lossy().into_owned());
+    session_names(files)
+}
+
+/// Session names from runtime-dir file names, default first, then by name.
+fn session_names(files: impl Iterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = files
+        .filter_map(|file| {
             let stem = file.strip_suffix(".sock")?;
             if stem == "session" {
                 return Some(DEFAULT.to_string());
@@ -506,5 +512,88 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, spawn: Vec<String>) -
             Ok(_) => {}
             Err(_) => return Ok(Ended::Lost),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn session_names_are_checked() {
+        for ok in ["work", "a", "9", "my-proj_2", &"x".repeat(32)] {
+            assert!(check_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "-x", "_x", ".x", "a/b", "a b", "a.b", "é", "../up", &"x".repeat(33)] {
+            assert!(check_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn default_session_keeps_the_old_file_names() {
+        let name = |p: PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name(file_for(DEFAULT, "session", "sock")), "session.sock");
+        assert_eq!(name(file_for(DEFAULT, "server", "log")), "server.log");
+        assert_eq!(name(file_for("work", "session", "sock")), "session-work.sock");
+        assert_eq!(name(file_for("work", "server", "log")), "server-work.log");
+    }
+
+    #[test]
+    fn running_sessions_from_socket_files() {
+        let files = [
+            "session-work.sock", "session.lock", "session-work.lock", "server-work.log", "session.sock",
+            "trix-123.sock", "claude-settings-123.json", "session-a.sock", "session-.sock", "session-bad name.sock",
+        ];
+        let names = session_names(files.iter().map(|s| s.to_string()));
+        assert_eq!(names, ["default", "a", "work"]);
+        assert!(session_names(std::iter::empty()).is_empty());
+        assert_eq!(session_names(["session-b.sock".to_string(), "session-a.sock".to_string()].into_iter()), ["a", "b"]);
+    }
+
+    #[test]
+    fn frames_roundtrip_in_sequence() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, OUT, b"hello").unwrap();
+        write_frame(&mut buf, BYE, b"").unwrap();
+        assert_eq!(&buf[..5], &[OUT, 5, 0, 0, 0]);
+        let mut r = Cursor::new(buf);
+        assert_eq!(read_frame(&mut r).unwrap(), (OUT, b"hello".to_vec()));
+        assert_eq!(read_frame(&mut r).unwrap(), (BYE, Vec::new()));
+        assert!(read_frame(&mut r).is_err(), "end of stream");
+    }
+
+    #[test]
+    fn truncated_and_oversized_frames_fail() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, TEXT, b"abcdef").unwrap();
+        buf.truncate(8);
+        assert!(read_frame(&mut Cursor::new(buf)).is_err());
+
+        let mut huge = vec![OUT];
+        huge.extend_from_slice(&((MAX_FRAME as u32) + 1).to_le_bytes());
+        let err = read_frame(&mut Cursor::new(huge)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn client_messages_roundtrip() {
+        let mut buf = Vec::new();
+        let hello = ClientMsg::Hello { protocol: PROTOCOL, cols: 120, rows: 40, cwd: "/tmp/x".into(), spawn: vec!["claude".into()] };
+        send_msg(&mut buf, &hello).unwrap();
+        send_msg(&mut buf, &ClientMsg::Event(Event::Paste("hi".into()))).unwrap();
+        let mut r = Cursor::new(buf);
+        let (kind, p) = read_frame(&mut r).unwrap();
+        assert_eq!(kind, MSG);
+        match serde_json::from_slice::<ClientMsg>(&p).unwrap() {
+            ClientMsg::Hello { protocol, cols, rows, cwd, spawn } => {
+                assert_eq!((protocol, cols, rows), (PROTOCOL, 120, 40));
+                assert_eq!(cwd, PathBuf::from("/tmp/x"));
+                assert_eq!(spawn, ["claude"]);
+            }
+            _ => panic!("expected Hello"),
+        }
+        let (_, p) = read_frame(&mut r).unwrap();
+        assert!(matches!(serde_json::from_slice::<ClientMsg>(&p).unwrap(), ClientMsg::Event(Event::Paste(s)) if s == "hi"));
     }
 }

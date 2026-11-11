@@ -1196,19 +1196,22 @@ fn clone_spec(s: &Spawn) -> Spawn {
 pub fn tilde(p: &Path) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let s = p.display().to_string();
-    if !home.is_empty() && s.starts_with(&home) {
-        format!("~{}", &s[home.len()..])
-    } else {
-        s
+    let home = home.trim_end_matches('/');
+    match s.strip_prefix(home) {
+        // Only a whole path component: `/home/al` must not turn `/home/alex` into `~ex`.
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+        _ => s,
     }
 }
 
+/// `~` and `~/…` are home; `~user` is left alone rather than guessed at.
 pub fn expand(s: &str) -> PathBuf {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix('~') {
-        PathBuf::from(format!("{}{}", std::env::var("HOME").unwrap_or_default(), rest))
-    } else {
-        PathBuf::from(s)
+    match s.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            PathBuf::from(format!("{}{}", std::env::var("HOME").unwrap_or_default(), rest))
+        }
+        _ => PathBuf::from(s),
     }
 }
 
@@ -1355,4 +1358,126 @@ fn base64(data: &[u8]) -> String {
         out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, m)
+    }
+    fn press(inp: &mut TextInput, code: KeyCode) -> bool {
+        inp.key(&key(code, KeyModifiers::NONE))
+    }
+    fn ctrl(inp: &mut TextInput, c: char) -> bool {
+        inp.key(&key(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn text_input_typing_and_cursor() {
+        let mut t = TextInput::new("héllo");
+        assert_eq!(t.cursor, 5);
+        press(&mut t, KeyCode::Left);
+        press(&mut t, KeyCode::Left);
+        press(&mut t, KeyCode::Char('X'));
+        assert_eq!((t.text.as_str(), t.cursor), ("hélXlo", 4));
+        press(&mut t, KeyCode::Home);
+        press(&mut t, KeyCode::Delete);
+        assert_eq!(t.text, "élXlo");
+        press(&mut t, KeyCode::Right);
+        press(&mut t, KeyCode::Backspace);
+        assert_eq!((t.text.as_str(), t.cursor), ("lXlo", 0));
+        assert!(!press(&mut t, KeyCode::Backspace), "nothing to delete");
+        press(&mut t, KeyCode::End);
+        assert!(!press(&mut t, KeyCode::Delete), "nothing after the cursor");
+        press(&mut t, KeyCode::Right);
+        assert_eq!(t.cursor, 4, "cursor stays in bounds");
+        assert!(!press(&mut t, KeyCode::F(2)), "unhandled keys are not consumed");
+    }
+
+    #[test]
+    fn text_input_ctrl_editing() {
+        let mut t = TextInput::new("git commit  -m");
+        ctrl(&mut t, 'w');
+        assert_eq!(t.text, "git commit  ");
+        ctrl(&mut t, 'w');
+        assert_eq!(t.text, "git ");
+        ctrl(&mut t, 'a');
+        assert_eq!(t.cursor, 0);
+        ctrl(&mut t, 'e');
+        assert_eq!(t.cursor, 4);
+        t.cursor = 2;
+        ctrl(&mut t, 'u');
+        assert_eq!((t.text.as_str(), t.cursor), ("t ", 0));
+        assert!(!ctrl(&mut t, 'x'), "ctrl+letter doesn't type the letter");
+        assert_eq!(t.text, "t ");
+    }
+
+    #[test]
+    fn pasted_control_chars_are_dropped() {
+        let mut t = TextInput::new("");
+        t.insert("a\nb\tc\x1b[2J");
+        assert_eq!((t.text.as_str(), t.cursor), ("abc[2J", 6));
+    }
+
+    #[test]
+    fn slugs() {
+        assert_eq!(slug("My Feature!!"), "my-feature");
+        assert_eq!(slug("fix/login  bug"), "fix-login-bug");
+        assert_eq!(slug("v1.2_rc"), "v1.2_rc");
+        assert_eq!(slug("  "), "agent");
+        assert_eq!(slug("Ärger"), "rger");
+    }
+
+    #[test]
+    fn home_paths() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(tilde(Path::new(&home)), "~");
+        assert_eq!(tilde(&Path::new(&home).join("code/x")), "~/code/x");
+        assert_eq!(tilde(Path::new(&format!("{home}2/x"))), format!("{home}2/x"), "a sibling of home is not home");
+        assert_eq!(tilde(Path::new("/etc")), "/etc");
+        assert_eq!(expand("~"), PathBuf::from(&home));
+        assert_eq!(expand(" ~/code "), Path::new(&home).join("code"));
+        assert_eq!(expand("~bob/x"), PathBuf::from("~bob/x"));
+        assert_eq!(expand("/abs"), PathBuf::from("/abs"));
+    }
+
+    #[test]
+    fn git_shortstat() {
+        assert_eq!(parse_shortstat(" 3 files changed, 10 insertions(+), 2 deletions(-)"), (3, 10, 2));
+        assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+)"), (1, 1, 0));
+        assert_eq!(parse_shortstat(" 1 file changed, 4 deletions(-)"), (1, 0, 4));
+        assert_eq!(parse_shortstat(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn base64_vectors() {
+        for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64(i.as_bytes()), o);
+        }
+        assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    #[test]
+    fn broadcast_never_answers_a_prompt() {
+        use crate::agent::test_agent;
+        let mut a = test_agent(Kind::Claude);
+        let cases = [
+            (State::Starting, false, false),
+            (State::Idle, true, true),
+            (State::Working, true, false),
+            (State::Blocked, false, false),
+            (State::Done, true, true),
+            (State::Exited, false, false),
+        ];
+        for (s, all, waiting) in cases {
+            a.set_state(s, true);
+            assert_eq!(broadcast_reaches(&a, BroadcastTarget::All), all, "{s:?} all");
+            assert_eq!(broadcast_reaches(&a, BroadcastTarget::Waiting), waiting, "{s:?} waiting");
+        }
+        let mut sh = test_agent(Kind::Shell);
+        sh.set_state(State::Idle, true);
+        assert!(!broadcast_reaches(&sh, BroadcastTarget::All), "shells are skipped");
+    }
 }

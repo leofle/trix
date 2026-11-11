@@ -367,3 +367,44 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
         SessionEvent::Kill => *killed = true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::take_session;
+
+    fn run(args: &[&str]) -> (Result<Option<String>, String>, Vec<String>) {
+        let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let r = take_session(&mut v);
+        (r, v)
+    }
+
+    #[test]
+    fn session_flag_anywhere() {
+        assert_eq!(run(&["-s", "work", "ls"]), (Ok(Some("work".into())), vec!["ls".into()]));
+        assert_eq!(run(&["ls", "-s", "work"]), (Ok(Some("work".into())), vec!["ls".into()]));
+        assert_eq!(run(&["attach", "--session", "w2"]), (Ok(Some("w2".into())), vec!["attach".into()]));
+        assert_eq!(run(&["--session=w3", "claude", "codex"]), (Ok(Some("w3".into())), vec!["claude".into(), "codex".into()]));
+    }
+
+    #[test]
+    fn no_flag_leaves_args_alone() {
+        assert_eq!(run(&["claude", "shell"]), (Ok(None), vec!["claude".into(), "shell".into()]));
+        assert_eq!(run(&[]), (Ok(None), vec![]));
+    }
+
+    #[test]
+    fn repeating_the_same_session_is_fine() {
+        assert_eq!(run(&["-s", "a", "ls", "--session=a"]).0, Ok(Some("a".into())));
+    }
+
+    #[test]
+    fn bad_flags_are_errors() {
+        assert!(run(&["-s"]).0.is_err());
+        assert!(run(&["ls", "--session"]).0.is_err());
+        assert!(run(&["-s", "a", "-s", "b"]).0.is_err());
+        assert!(run(&["-s", "a/b"]).0.is_err());
+        assert!(run(&["--session="]).0.is_err());
+        // A missing name must not swallow the next flag as one.
+        assert!(run(&["-s", "--session=x"]).0.is_err());
+    }
+}
