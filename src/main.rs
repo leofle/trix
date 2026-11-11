@@ -3,6 +3,7 @@ mod app;
 mod hooks;
 mod input;
 mod session;
+mod state;
 mod theme;
 mod ui;
 
@@ -251,6 +252,8 @@ fn server() -> anyhow::Result<()> {
         }
     }
 
+    // Save before stopping: the agents' exits must not read as "closed".
+    app.persist();
     app.shutdown_all();
     let _ = std::fs::remove_file(&control);
     let _ = std::fs::remove_file(&socket);
@@ -281,8 +284,8 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
                 app.toast("took over from another terminal", app::ToastKind::Info);
             }
             for label in spawn {
-                let Some(kind) = Kind::ALL.into_iter().find(|k| k.label() == label) else { continue };
-                let spec = Spawn { kind, name: app.unique_name(kind.label()), cwd: cwd.clone(), command: None, prompt: None, branch_note: None };
+                let Some(kind) = Kind::from_label(&label) else { continue };
+                let spec = Spawn { kind, name: app.unique_name(kind.label()), cwd: cwd.clone(), command: None, prompt: None, branch_note: None, resume: None };
                 if let Err(e) = app.spawn(spec) {
                     app.toast(format!("could not start {}: {e}", kind.label()), app::ToastKind::Bad);
                 }

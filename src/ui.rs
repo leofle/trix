@@ -937,7 +937,35 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped. alt+d detaches instead.", if live == 1 { " is" } else { "s are" }));
         }
         Modal::Help => help(f, area, t),
+        Modal::Restore => {
+            let summary = app.pending_restore.as_ref().map(|p| p.summary()).unwrap_or_default();
+            restore_prompt(f, area, t, &summary);
+        }
     }
+}
+
+fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str) {
+    let r = centered(area, (text.width() as u16 + 8).max(52), 7);
+    f.render_widget(Clear, r);
+    let block = modal_block("Pick up where you left off?", t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    f.render_widget(
+        Paragraph::new(Span::styled(text.to_string(), Style::new().fg(t.fg))).alignment(Alignment::Center),
+        Rect { y: inner.y + 1, height: 1, ..inner },
+    );
+    f.render_widget(
+        Paragraph::new(TLine::from(vec![
+            Span::styled(" y ", Style::new().fg(t.bg).bg(t.green).add_modifier(Modifier::BOLD)),
+            Span::styled(" restore     ", Style::new().fg(t.fg)),
+            Span::styled(" n ", Style::new().fg(t.fg_bright).bg(t.surface_hi)),
+            Span::styled(" start fresh     ", Style::new().fg(t.fg)),
+            Span::styled(" esc ", Style::new().fg(t.fg_bright).bg(t.surface_hi)),
+            Span::styled(" later", Style::new().fg(t.fg)),
+        ]))
+        .alignment(Alignment::Center),
+        Rect { y: inner.y + 3, height: 1, ..inner },
+    );
 }
 
 fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str) {

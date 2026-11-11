@@ -25,6 +25,9 @@ pub struct HookMsg {
     pub tool: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
+    /// Conversation id (Claude `session_id`, Codex `thread-id`), for resume.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 pub fn runtime_dir() -> PathBuf {
@@ -154,7 +157,8 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         "agent-turn-complete" => s("last-assistant-message").map(|p| one_line(&p, 80)),
         _ => None,
     };
-    HookMsg { agent, source: source.into(), event, tool, detail }
+    let session = s("session_id").or_else(|| s("thread-id")).filter(|id| !id.is_empty());
+    HookMsg { agent, source: source.into(), event, tool, detail, session }
 }
 
 fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
