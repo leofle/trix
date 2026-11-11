@@ -122,6 +122,8 @@ The layout (kind, name, folder, extra args, and the conversation id Claude and C
 
 Scrollback isn't restored, and closed or exited agents aren't saved.
 
+The sidebar size you pick with `alt+m` is kept separately, in `prefs.json` in the same folder. It applies to every session and survives restarts whether or not you restore.
+
 | key | action |
 | --- | --- |
 | `alt+n` | new agent (claude · codex · shell · custom command, folder, first prompt, worktree) |
@@ -133,7 +135,7 @@ Scrollback isn't restored, and closed or exited agents aren't saved.
 | `alt+r` / `alt+w` | rename / close |
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
-| `alt+m` | mini sidebar: one line per agent, half the width |
+| `alt+m` | mini sidebar: one line per agent, half the width (remembered) |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
 | `alt+?` | all keys |

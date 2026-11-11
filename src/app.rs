@@ -235,13 +235,14 @@ impl App {
         let themed = polled.is_some();
         let git_targets = Arc::new(Mutex::new(Vec::new()));
         spawn_git_watcher(git_targets.clone(), tx.clone());
+        let prefs = state::load_prefs();
         App {
             agents: Vec::new(),
             specs: HashMap::new(),
             focus: 0,
             view: View::Focus,
             sidebar: true,
-            sidebar_mini: false,
+            sidebar_mini: prefs.sidebar_mini,
             modal: None,
             theme: polled.unwrap_or_default(),
             theme_watch,
@@ -871,6 +872,9 @@ impl App {
                     // From hidden, alt+m brings the sidebar back small.
                     self.sidebar_mini = !self.sidebar || !self.sidebar_mini;
                     self.sidebar = true;
+                    if let Err(e) = state::store_prefs(&state::Prefs { sidebar_mini: self.sidebar_mini }) {
+                        self.toast(format!("couldn't remember the sidebar size: {e}"), ToastKind::Bad);
+                    }
                     true
                 }
                 KeyCode::Char('f') => {

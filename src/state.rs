@@ -96,6 +96,41 @@ fn store_at(path: &Path, saved: &Saved) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// How you like trix to look, whatever the session or workspace. Kept apart
+/// from the saved workspace, which is per session, only read when you
+/// restore, and gone when the workspace is empty.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Prefs {
+    /// alt+m: the narrow sidebar.
+    #[serde(default)]
+    pub sidebar_mini: bool,
+}
+
+fn prefs_path() -> PathBuf {
+    dir().join("prefs.json")
+}
+
+pub fn load_prefs() -> Prefs {
+    load_prefs_from(&prefs_path())
+}
+
+fn load_prefs_from(path: &Path) -> Prefs {
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+pub fn store_prefs(prefs: &Prefs) -> std::io::Result<()> {
+    store_prefs_at(&prefs_path(), prefs)
+}
+
+fn store_prefs_at(path: &Path, prefs: &Prefs) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(prefs)?)?;
+    std::fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +200,24 @@ mod tests {
         assert_eq!(load_from(&path), None, "other version");
         std::fs::write(&path, r#"{"version":1,"agents":[]}"#).unwrap();
         assert_eq!(load_from(&path), None, "no agents");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prefs_round_trip_and_default() {
+        let dir = tmp();
+        let path = dir.join("prefs.json");
+        assert_eq!(load_prefs_from(&path), Prefs::default(), "no file yet: full sidebar");
+        store_prefs_at(&path, &Prefs { sidebar_mini: true }).unwrap();
+        assert!(load_prefs_from(&path).sidebar_mini);
+        store_prefs_at(&path, &Prefs { sidebar_mini: false }).unwrap();
+        assert!(!load_prefs_from(&path).sidebar_mini);
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(load_prefs_from(&path), Prefs::default(), "older file without the field");
+        std::fs::write(&path, r#"{"sidebar_mini":true,"from_a_newer_trix":1}"#).unwrap();
+        assert!(load_prefs_from(&path).sidebar_mini, "unknown fields don't throw the rest away");
+        std::fs::write(&path, "garbage").unwrap();
+        assert_eq!(load_prefs_from(&path), Prefs::default());
         let _ = std::fs::remove_dir_all(dir);
     }
 
