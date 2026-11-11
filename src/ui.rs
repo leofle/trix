@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
-use crate::app::{App, BroadcastTarget, Modal, NEW_FIELDS, TextInput, ToastKind, View, tilde};
+use crate::app::{App, BroadcastTarget, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
 use crate::theme::{Theme, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -793,6 +793,7 @@ fn input_spans(inp: &TextInput, active: bool, placeholder: &str, t: &Theme, max:
 fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let Some(m) = &app.modal else { return };
     match m {
+        Modal::Search(s) => search_box(f, app, s, area, t),
         Modal::New(form) => {
             let r = centered(area, 72, 16);
             f.render_widget(Clear, r);
@@ -1005,6 +1006,109 @@ fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str) {
     );
 }
 
+/// "↑340", "↑12k", or "on screen" for a hit on the live screen.
+fn hit_place(h: &crate::search::Hit) -> String {
+    match h.from_bottom {
+        _ if h.start.line.0 >= 0 => "on screen".into(),
+        n if n >= 10_000 => format!("↑{}k", n / 1000),
+        n if n >= 1000 => format!("↑{:.1}k", n as f32 / 1000.0),
+        n => format!("↑{n}"),
+    }
+}
+
+fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
+    let r = centered(area, 110, area.height.saturating_sub(4).clamp(9, 26));
+    f.render_widget(Clear, r);
+    let block = modal_block("Search every agent", t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(1) };
+    if inner.height < 4 || inner.width < 20 {
+        return;
+    }
+
+    // Query, and the count on the right.
+    let count = match (s.input.text.trim().is_empty(), s.hits.len()) {
+        (true, _) => String::new(),
+        (false, 0) => "no matches".into(),
+        (false, n) => {
+            let more = if s.capped { "+" } else { "" };
+            format!("{n}{more} line{} · {} agent{}", if n == 1 { "" } else { "s" }, s.agents, if s.agents == 1 { "" } else { "s" })
+        }
+    };
+    let room = (inner.width as usize).saturating_sub(count.width() + 4);
+    let (spans, cur) = input_spans(&s.input, true, "search all scrollback…", t, room);
+    let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
+    line.extend(spans);
+    f.render_widget(Paragraph::new(TLine::from(line)), Rect { height: 1, ..inner });
+    f.render_widget(
+        Paragraph::new(Span::styled(count, Style::new().fg(t.dim))).alignment(Alignment::Right),
+        Rect { height: 1, ..inner },
+    );
+    if let Some(cx) = cur {
+        f.set_cursor_position((inner.x + 2 + cx, inner.y));
+    }
+
+    let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(4), ..inner };
+    if s.hits.is_empty() {
+        let note = if s.input.text.trim().is_empty() {
+            "lowercase ignores case · any capital matches exactly"
+        } else {
+            "nothing in any agent's scrollback matches"
+        };
+        f.render_widget(Paragraph::new(Span::styled(note, Style::new().fg(t.muted))), Rect { height: 1, ..list });
+    } else {
+        let names: std::collections::HashMap<u32, &Agent> = app.agents.iter().map(|a| (a.id, a)).collect();
+        let name_w = s.hits.iter().filter_map(|h| names.get(&h.agent)).map(|a| a.name.width()).max().unwrap_or(4).min(16);
+        let rows = list.height as usize;
+        let top = if s.sel >= rows { s.sel + 1 - rows } else { 0 };
+        for (i, h) in s.hits.iter().enumerate().skip(top).take(rows) {
+            let y = list.y + (i - top) as u16;
+            let selected = i == s.sel;
+            let row = Rect { y, height: 1, ..list };
+            if selected {
+                f.buffer_mut().set_style(row, Style::new().bg(t.surface_hi));
+            }
+            let (name, color) = match names.get(&h.agent) {
+                Some(a) => (trunc(&a.name, name_w), kind_color(t, a.kind)),
+                None => ("gone".into(), t.muted),
+            };
+            let place = hit_place(h);
+            let fixed = 2 + name_w + 2 + 10 + 1;
+            let width = (list.width as usize).saturating_sub(fixed);
+            let (text, at) = crate::search::snippet(&h.text, h.at, h.len, width);
+            let chars: Vec<char> = text.chars().collect();
+            let end = (at + h.len).min(chars.len());
+            let (before, hit, after): (String, String, String) =
+                (chars[..at].iter().collect(), chars[at..end].iter().collect(), chars[end..].iter().collect());
+            let base = Style::new().fg(if selected { t.fg_bright } else { t.fg });
+            let spans = vec![
+                Span::styled(if selected { "▸ " } else { "  " }, Style::new().fg(t.accent)),
+                Span::styled(format!("{name:<name_w$}  "), Style::new().fg(color)),
+                Span::styled(format!("{place:>9} "), Style::new().fg(t.dim)),
+                Span::raw(" "),
+                Span::styled(before, base),
+                Span::styled(hit, Style::new().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(after, base),
+            ];
+            f.render_widget(Paragraph::new(TLine::from(spans)), row);
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(TLine::from(vec![
+            Span::styled("↑↓", Style::new().fg(t.fg)),
+            Span::styled(" select   ", Style::new().fg(t.dim)),
+            Span::styled("enter", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" jump   ", Style::new().fg(t.dim)),
+            Span::styled("esc", Style::new().fg(t.fg)),
+            Span::styled(" close", Style::new().fg(t.dim)),
+        ]))
+        .alignment(Alignment::Right),
+        Rect { y: r.bottom() - 2, height: 1, ..inner },
+    );
+}
+
 fn help(f: &mut Frame, area: Rect, t: &Theme) {
     let r = centered(area, 78, 19);
     f.render_widget(Clear, r);
@@ -1018,6 +1122,7 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
         ("alt+j / k", "next / previous"),
         ("alt+a", "next one that needs you"),
         ("alt+b", "broadcast a prompt"),
+        ("alt+f", "search all scrollback"),
         ("alt+r", "rename"),
         ("alt+w", "close"),
         ("enter", "restart an exited agent"),

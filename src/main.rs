@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod hooks;
 mod input;
+mod search;
 mod session;
 mod state;
 mod theme;
