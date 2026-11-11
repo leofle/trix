@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use agent::{Kind, Spawn};
 use app::{App, AppEvent};
-use session::{ClientMsg, Ended, Out, RemoteBackend, SessionEvent};
+use session::{ClientMsg, Ended, Mode, Out, RemoteBackend, SessionEvent};
 
 const HELP: &str = "\
 trix — a workspace where coding agents live
@@ -29,6 +29,7 @@ usage:
   trix                      open the workspace (attaches if it is already running)
   trix claude codex shell   open, and start these agents in the current folder
   trix attach               attach to the running workspace, never start one
+  trix view                 watch the running workspace read-only (q leaves)
   trix ls                   list agents and their state without attaching
   trix kill                 stop the workspace and every agent in it
   trix kill --all           stop every running session
@@ -39,7 +40,8 @@ usage:
                             one, e.g. `trix -s work`, `trix ls -s work`
 
 Agents live in a background server: closing the terminal or pressing alt+d
-detaches, and they keep working. alt+q quits and stops them. Each named
+detaches, and they keep working. alt+q quits and stops them. One terminal
+is in control at a time; `trix view` lets any number of others watch. Each named
 session is its own workspace, with its own agents and saved layout. Without
 -s, `trix ls` shows every running session.
 
@@ -143,7 +145,14 @@ fn main() -> anyhow::Result<()> {
             eprintln!("trix: attach takes no arguments\n\n{HELP}");
             std::process::exit(2);
         }
-        return client(Vec::new(), false);
+        return client(Mode::Control(Vec::new()), false);
+    }
+    if matches!(args.first().map(String::as_str), Some("view" | "watch")) {
+        if args.len() > 1 {
+            eprintln!("trix: view takes no arguments\n\n{HELP}");
+            std::process::exit(2);
+        }
+        return client(Mode::View, false);
     }
     let mut initial = Vec::new();
     for a in &args {
@@ -158,7 +167,7 @@ fn main() -> anyhow::Result<()> {
         };
         initial.push(kind.label().to_string());
     }
-    client(initial, true)
+    client(Mode::Control(initial), true)
 }
 
 fn restore() {
@@ -175,9 +184,17 @@ fn restore() {
     let _ = disable_raw_mode();
 }
 
+/// A viewer only needs raw keys and the alternate screen: no mouse capture,
+/// so text can still be selected the terminal's own way.
+fn restore_view() {
+    let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = disable_raw_mode();
+}
+
 /// The terminal side: connect (starting the server if allowed), take over the
 /// terminal, and relay until detached.
-fn client(spawn: Vec<String>, start: bool) -> anyhow::Result<()> {
+fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
+    let view = matches!(mode, Mode::View);
     let stream = match session::connect() {
         Some(s) => s,
         None if start => session::start_server()?,
@@ -188,23 +205,28 @@ fn client(spawn: Vec<String>, start: bool) -> anyhow::Result<()> {
         }
     };
 
+    let reset = if view { restore_view } else { restore };
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore();
+        reset();
         prev_hook(info);
     }));
 
     enable_raw_mode()?;
     let mut out = stdout();
-    queue!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+    if view {
+        queue!(out, EnterAlternateScreen)?;
+    } else {
+        queue!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+            queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+        }
     }
     out.flush()?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    let ended = session::run_client(stream, cols, rows, spawn);
-    restore();
+    let ended = session::run_client(stream, cols, rows, mode);
+    reset();
     match ended? {
         Ended::Bye(msg) => {
             if !msg.is_empty() {
@@ -214,6 +236,14 @@ fn client(spawn: Vec<String>, start: bool) -> anyhow::Result<()> {
         }
         Ended::Lost => {
             eprintln!("trix: lost the workspace server (log: {})", session::log_path().display());
+            std::process::exit(1);
+        }
+        Ended::Refused if view => {
+            eprintln!("trix: the running workspace was started by an older trix that can't be watched — restart it (alt+q, then `{}`) to use `trix view`", session::command());
+            std::process::exit(1);
+        }
+        Ended::Refused => {
+            eprintln!("trix: the workspace server hung up (log: {})", session::log_path().display());
             std::process::exit(1);
         }
     }
@@ -275,11 +305,12 @@ fn server() -> anyhow::Result<()> {
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if killed {
-            out.bye("[trix stopped by `trix kill`]");
+            out.bye_all("[trix stopped by `trix kill`]");
             break;
         }
         if app.quit {
             out.bye("");
+            out.bye_all("[trix quit]");
             break;
         }
         if app.detach {
@@ -307,7 +338,10 @@ fn server() -> anyhow::Result<()> {
             app.dirty = false;
             last_draw = now;
             // Output errors only ever mean the client left; `Out` handles it.
-            let _ = terminal.draw(|f| ui::draw(f, &mut app));
+            if let Ok(frame) = terminal.draw(|f| ui::draw(f, &mut app)) {
+                let t = &app.theme;
+                out.mirror(frame.buffer, ratatui::style::Style::new().fg(t.bg).bg(t.accent));
+            }
         }
     }
 
@@ -320,6 +354,18 @@ fn server() -> anyhow::Result<()> {
         let _ = std::fs::remove_file(p);
     }
     Ok(())
+}
+
+fn viewers_changed(app: &mut App, out: &Out, what: &str) {
+    app.viewers = out.viewers();
+    // Newcomers need the title too, not just the next change of it.
+    app.last_title.clear();
+    if out.controlled() {
+        let n = app.viewers;
+        let count = if n == 0 { String::new() } else { format!(" · {n} watching") };
+        app.toast(format!("{what}{count}"), app::ToastKind::Info);
+    }
+    app.dirty = true;
 }
 
 fn dispatch(ev: AppEvent, app: &mut App, terminal: &mut Terminal<RemoteBackend>, out: &Out, killed: &mut bool) {
@@ -355,10 +401,25 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
                 app.handle(AppEvent::Resize);
             }
         }
+        SessionEvent::View { id, stream, cols, rows } => {
+            out.add_viewer(id, stream, (cols, rows));
+            viewers_changed(app, out, "someone started watching");
+        }
+        SessionEvent::ViewResize(id, cols, rows) => {
+            out.resize_viewer(id, cols, rows);
+            app.dirty = true;
+        }
+        SessionEvent::Unview(id) => {
+            if out.bye_viewer(id, "[stopped watching trix]") {
+                viewers_changed(app, out, "a viewer left");
+            }
+        }
         SessionEvent::Detached(id) => {
-            out.lost(id);
-            if !out.attached() {
+            let had = out.viewers();
+            if out.lost(id) {
                 app.on_detach();
+            } else if out.viewers() < had {
+                viewers_changed(app, out, "a viewer left");
             }
         }
         SessionEvent::List(mut stream) => {

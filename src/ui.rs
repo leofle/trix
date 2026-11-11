@@ -149,12 +149,19 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         View::Focus => "focus",
         View::Grid => "grid",
     };
-    let right = TLine::from(vec![
+    let mut right = Vec::new();
+    if app.viewers > 0 {
+        right.push(Span::styled("◉ ", Style::new().fg(t.accent)));
+        right.push(Span::styled(format!("{} watching", app.viewers), Style::new().fg(t.fg)));
+        right.push(Span::styled("  ·  ", Style::new().fg(t.muted)));
+    }
+    right.extend([
         Span::styled(view, Style::new().fg(t.dim)),
         Span::styled("  ·  ", Style::new().fg(t.muted)),
         Span::styled(now, Style::new().fg(t.fg)),
         Span::raw(" "),
     ]);
+    let right = TLine::from(right);
     f.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
 }
 
