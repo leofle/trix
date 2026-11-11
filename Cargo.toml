@@ -1,0 +1,22 @@
+[package]
+name = "trix"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+libc = "0.2.191"
+ratatui = "0.30.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.2.1"
+unicode-width = "0.2.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
