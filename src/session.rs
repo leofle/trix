@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::app::AppEvent;
@@ -61,16 +61,87 @@ pub enum SessionEvent {
     Kill,
 }
 
+// ───────────────────────────── naming ─────────────────────────────
+
+/// The session everyone gets without `-s`. Its files keep their original,
+/// unsuffixed names, so a server started by an older build is still found.
+pub const DEFAULT: &str = "default";
+
+static NAME: OnceLock<String> = OnceLock::new();
+
+/// Pick the session this process works with. Set once, before any path below
+/// is used; the server inherits it through `TRIX_SESSION`.
+pub fn set_name(name: String) {
+    let _ = NAME.set(name);
+}
+
+pub fn name() -> &'static str {
+    NAME.get().map(String::as_str).unwrap_or(DEFAULT)
+}
+
+pub fn is_default() -> bool {
+    name() == DEFAULT
+}
+
+/// Names end up in file names and on the command line: keep them boring.
+pub fn check_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 32
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok { Ok(()) } else { Err(format!("bad session name '{name}': use up to 32 letters, digits, - or _, starting with a letter or digit")) }
+}
+
+/// `trix`, or `trix -s work`: what to type to reach this session again.
+pub fn command() -> String {
+    if is_default() { "trix".into() } else { format!("trix -s {}", name()) }
+}
+
+/// `<stem>.<ext>` for the default session, `<stem>-<name>.<ext>` otherwise.
+fn file_for(session: &str, stem: &str, ext: &str) -> PathBuf {
+    if session == DEFAULT {
+        runtime_dir().join(format!("{stem}.{ext}"))
+    } else {
+        runtime_dir().join(format!("{stem}-{session}.{ext}"))
+    }
+}
+
+fn control_path_for(session: &str) -> PathBuf {
+    file_for(session, "session", "sock")
+}
+
 pub fn control_path() -> PathBuf {
-    runtime_dir().join("session.sock")
+    control_path_for(name())
 }
 
 fn lock_path() -> PathBuf {
-    runtime_dir().join("session.lock")
+    file_for(name(), "session", "lock")
 }
 
 pub fn log_path() -> PathBuf {
-    runtime_dir().join("server.log")
+    file_for(name(), "server", "log")
+}
+
+/// Sessions that have a control socket, default first. A socket can outlive a
+/// server that died hard, so callers still have to connect to know.
+pub fn candidates() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(runtime_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let stem = file.strip_suffix(".sock")?;
+            if stem == "session" {
+                return Some(DEFAULT.to_string());
+            }
+            let n = stem.strip_prefix("session-")?;
+            check_name(n).is_ok().then(|| n.to_string())
+        })
+        .collect();
+    names.sort_by(|a, b| (a != DEFAULT, a).cmp(&(b != DEFAULT, b)));
+    names.dedup();
+    names
 }
 
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -345,12 +416,16 @@ pub fn connect() -> Option<UnixStream> {
     UnixStream::connect(control_path()).ok()
 }
 
+fn connect_to(session: &str) -> Option<UnixStream> {
+    UnixStream::connect(control_path_for(session)).ok()
+}
+
 /// Start a detached server and wait for it to accept connections.
 pub fn start_server() -> anyhow::Result<UnixStream> {
     let exe = std::env::current_exe()?;
     let log = File::create(log_path())?;
     let mut cmd = Command::new(exe);
-    cmd.arg("server").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+    cmd.arg("server").env("TRIX_SESSION", name()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // New session: no controlling terminal, so closing this one can't SIGHUP it.
     unsafe {
         cmd.pre_exec(|| {
@@ -375,9 +450,10 @@ pub fn start_server() -> anyhow::Result<UnixStream> {
     }
 }
 
-/// Ask the server something that has a plain-text answer.
-pub fn query(msg: &ClientMsg) -> Option<String> {
-    let mut s = connect()?;
+/// Ask a session's server something that has a plain-text answer. `None`
+/// when that session isn't running.
+pub fn query(session: &str, msg: &ClientMsg) -> Option<String> {
+    let mut s = connect_to(session)?;
     send_msg(&mut s, msg).ok()?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
     match read_frame(&mut s) {
@@ -386,8 +462,8 @@ pub fn query(msg: &ClientMsg) -> Option<String> {
     }
 }
 
-pub fn send_once(msg: &ClientMsg) -> bool {
-    match connect() {
+pub fn send_once(session: &str, msg: &ClientMsg) -> bool {
+    match connect_to(session) {
         Some(mut s) => {
             let ok = send_msg(&mut s, msg).is_ok();
             // Wait for the server to hang up, so `trix kill && trix` is safe.

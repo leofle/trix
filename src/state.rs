@@ -56,8 +56,13 @@ fn dir() -> PathBuf {
     base.join("trix")
 }
 
+/// One file per session; the default one keeps the original name.
 pub fn path() -> PathBuf {
-    dir().join("workspace.json")
+    if crate::session::is_default() {
+        dir().join("workspace.json")
+    } else {
+        dir().join(format!("workspace-{}.json", crate::session::name()))
+    }
 }
 
 pub fn load() -> Option<Saved> {
@@ -76,7 +81,7 @@ pub fn store(saved: &Saved) -> std::io::Result<()> {
         };
     }
     std::fs::create_dir_all(dir())?;
-    let tmp = dir().join(format!("workspace.json.{}", std::process::id()));
+    let tmp = path().with_extension(format!("json.{}", std::process::id()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(saved)?)?;
     std::fs::rename(&tmp, path())
 }

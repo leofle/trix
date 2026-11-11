@@ -31,23 +31,73 @@ usage:
   trix attach               attach to the running workspace, never start one
   trix ls                   list agents and their state without attaching
   trix kill                 stop the workspace and every agent in it
+  trix kill --all           stop every running session
   trix hook <source>        (internal) agent lifecycle reporter
   trix server               (internal) the background workspace
 
+  -s, --session <name>      work with a named session instead of the default
+                            one, e.g. `trix -s work`, `trix ls -s work`
+
 Agents live in a background server: closing the terminal or pressing alt+d
-detaches, and they keep working. alt+q quits and stops them.
+detaches, and they keep working. alt+q quits and stops them. Each named
+session is its own workspace, with its own agents and saved layout. Without
+-s, `trix ls` shows every running session.
 
 keys inside trix: alt+n new agent · alt+a who needs you · alt+g grid · alt+d detach · alt+? all keys
 ";
 
-fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("hook") => {
-            let source = args.get(1).cloned().unwrap_or_else(|| "custom".into());
-            hooks::run_client(&source, args.get(2).cloned());
-            return Ok(());
+/// Pull `-s <name>` / `--session <name>` / `--session=<name>` out of `args`.
+fn take_session(args: &mut Vec<String>) -> Result<Option<String>, String> {
+    let mut found = None;
+    let mut i = 0;
+    while i < args.len() {
+        let value = if args[i] == "-s" || args[i] == "--session" {
+            if i + 1 >= args.len() {
+                return Err(format!("{} needs a session name", args[i]));
+            }
+            let v = args.remove(i + 1);
+            args.remove(i);
+            v
+        } else if let Some(v) = args[i].strip_prefix("--session=") {
+            let v = v.to_string();
+            args.remove(i);
+            v
+        } else {
+            i += 1;
+            continue;
+        };
+        session::check_name(&value)?;
+        if found.as_ref().is_some_and(|f| f != &value) {
+            return Err("more than one session given".into());
         }
+        found = Some(value);
+    }
+    Ok(found)
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("hook") {
+        let source = args.get(1).cloned().unwrap_or_else(|| "custom".into());
+        hooks::run_client(&source, args.get(2).cloned());
+        return Ok(());
+    }
+    let flag = match take_session(&mut args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("trix: {e}");
+            std::process::exit(2);
+        }
+    };
+    // Inside a pane, `trix ls` and friends mean the session the pane is in.
+    let from_env = std::env::var("TRIX_SESSION").ok().filter(|n| session::check_name(n).is_ok());
+    let explicit = flag.is_some() || from_env.is_some();
+    session::set_name(flag.or(from_env).unwrap_or_else(|| session::DEFAULT.into()));
+    let missing = || {
+        if session::is_default() { "trix: no workspace running".to_string() } else { format!("trix: no session '{}' running", session::name()) }
+    };
+
+    match args.first().map(String::as_str) {
         Some("server") => return server(),
         Some("-h" | "--help" | "help") => {
             print!("{HELP}");
@@ -57,19 +107,27 @@ fn main() -> anyhow::Result<()> {
             println!("trix {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Some("ls" | "list") => match session::query(&ClientMsg::List) {
-            Some(text) => {
-                print!("{text}");
-                return Ok(());
-            }
-            None => {
-                eprintln!("trix: no workspace running");
+        Some("ls" | "list") => {
+            let names = if explicit { vec![session::name().to_string()] } else { session::candidates() };
+            let texts: Vec<String> = names.iter().filter_map(|n| session::query(n, &ClientMsg::List)).collect();
+            if texts.is_empty() {
+                eprintln!("{}", missing());
                 std::process::exit(1);
             }
-        },
+            print!("{}", texts.join("\n"));
+            return Ok(());
+        }
         Some("kill") => {
-            if !session::send_once(&ClientMsg::Kill) {
-                eprintln!("trix: no workspace running");
+            if matches!(args.get(1).map(String::as_str), Some("-a" | "--all")) {
+                let killed = session::candidates().iter().filter(|n| session::send_once(n, &ClientMsg::Kill)).count();
+                if killed == 0 {
+                    eprintln!("trix: no workspace running");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            if !session::send_once(session::name(), &ClientMsg::Kill) {
+                eprintln!("{}", missing());
                 std::process::exit(1);
             }
             return Ok(());
@@ -124,7 +182,8 @@ fn client(spawn: Vec<String>, start: bool) -> anyhow::Result<()> {
         Some(s) => s,
         None if start => session::start_server()?,
         None => {
-            eprintln!("trix: no workspace running — start one with `trix`");
+            let what = if session::is_default() { "no workspace running".to_string() } else { format!("no session '{}' running", session::name()) };
+            eprintln!("trix: {what} — start it with `{}`", session::command());
             std::process::exit(1);
         }
     };
@@ -225,7 +284,7 @@ fn server() -> anyhow::Result<()> {
         }
         if app.detach {
             app.detach = false;
-            out.bye("[detached from trix · run `trix` to come back]");
+            out.bye(&format!("[detached from trix · run `{}` to come back]", session::command()));
             app.on_detach();
         }
         let now = Instant::now();

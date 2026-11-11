@@ -191,6 +191,7 @@ impl Agent {
         env.insert("TRIX_SOCKET".into(), socket.display().to_string());
         env.insert("TRIX_AGENT_ID".into(), id.to_string());
         env.insert("TRIX_AGENT_NAME".into(), spec.name.clone());
+        env.insert("TRIX_SESSION".into(), crate::session::name().into());
         if spec.kind == Kind::Codex {
             if let Some(chain) = codex_user_notify() {
                 env.insert("TRIX_CODEX_NOTIFY".into(), chain);

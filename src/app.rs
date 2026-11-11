@@ -375,8 +375,9 @@ impl App {
     /// Plain-text status for `trix ls`.
     pub fn listing(&self) -> String {
         let count = |s: State| self.agents.iter().filter(|a| a.state == s).count();
+        let session = if crate::session::is_default() { String::new() } else { format!("{} · ", crate::session::name()) };
         let mut out = format!(
-            "trix · {} agent{} · {} need{} you · {} working · {} done\n",
+            "trix · {session}{} agent{} · {} need{} you · {} working · {} done\n",
             self.agents.len(),
             if self.agents.len() == 1 { "" } else { "s" },
             count(State::Blocked),
@@ -741,6 +742,7 @@ impl App {
             }
             _ => return,
         };
+        let title = if crate::session::is_default() { title } else { format!("{title} · {}", crate::session::name()) };
         if !looking {
             desktop_notify(&title, &body, urgent);
             if !self.term_focused {
@@ -753,10 +755,11 @@ impl App {
     fn update_title(&mut self) {
         let blocked = self.agents.iter().filter(|a| a.state == State::Blocked).count();
         let working = self.agents.iter().filter(|a| a.state == State::Working).count();
+        let base = if crate::session::is_default() { "trix".to_string() } else { format!("trix · {}", crate::session::name()) };
         let title = match (blocked, working) {
-            (0, 0) => "trix".to_string(),
-            (0, w) => format!("trix · {w} working"),
-            (b, _) => format!("trix · {b} need{} you", if b == 1 { "s" } else { "" }),
+            (0, 0) => base,
+            (0, w) => format!("{base} · {w} working"),
+            (b, _) => format!("{base} · {b} need{} you", if b == 1 { "s" } else { "" }),
         };
         if title != self.last_title {
             self.out.send(format!("\x1b]0;{title}\x07").as_bytes());
