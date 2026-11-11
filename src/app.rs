@@ -1,5 +1,5 @@
 use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::agent::{Agent, Kind, Spawn, State};
 use crate::hooks::HookMsg;
 use crate::input;
+use crate::search::{self, Hit};
 use crate::session::{Out, SessionEvent};
 use crate::state::{self, Saved, SavedAgent};
 use crate::theme::{Theme, ThemeWatcher};
@@ -130,8 +131,21 @@ pub enum BroadcastTarget {
     Waiting,
 }
 
+/// The alt+f search box.
+#[derive(Default)]
+pub struct Search {
+    pub input: TextInput,
+    pub hits: Vec<Hit>,
+    pub sel: usize,
+    /// How many agents have at least one hit.
+    pub agents: usize,
+    /// Some agent had more hits than are kept.
+    pub capped: bool,
+}
+
 pub enum Modal {
     New(NewForm),
+    Search(Search),
     Broadcast(TextInput, BroadcastTarget),
     Rename(u32, TextInput),
     ConfirmClose(u32),
@@ -823,6 +837,14 @@ impl App {
                     self.sidebar = !self.sidebar;
                     true
                 }
+                KeyCode::Char('f') => {
+                    if self.agents.is_empty() {
+                        self.toast("no agents to search yet", ToastKind::Info);
+                    } else {
+                        self.modal = Some(Modal::Search(Search::default()));
+                    }
+                    true
+                }
                 KeyCode::Char('b') => {
                     if self.agents.is_empty() {
                         self.toast("no agents to talk to yet", ToastKind::Info);
@@ -921,6 +943,10 @@ impl App {
                     }
                 }
                 Modal::Broadcast(t, _) | Modal::Rename(_, t) => t.insert(&s.replace('\n', " ")),
+                Modal::Search(q) => {
+                    q.input.insert(s.lines().next().unwrap_or(""));
+                    self.refresh_search();
+                }
                 _ => {}
             }
             self.dirty = true;
@@ -940,6 +966,32 @@ impl App {
         }
         match modal {
             Modal::Help => self.modal = None,
+            Modal::Search(s) => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let last = s.hits.len().saturating_sub(1);
+                match k.code {
+                    KeyCode::Up | KeyCode::BackTab => s.sel = s.sel.saturating_sub(1),
+                    KeyCode::Char('p') if ctrl => s.sel = s.sel.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Tab => s.sel = (s.sel + 1).min(last),
+                    KeyCode::Char('n') if ctrl => s.sel = (s.sel + 1).min(last),
+                    KeyCode::PageUp => s.sel = s.sel.saturating_sub(10),
+                    KeyCode::PageDown => s.sel = (s.sel + 10).min(last),
+                    KeyCode::Enter => {
+                        if let Some(hit) = s.hits.get(s.sel).cloned() {
+                            let query = s.input.text.clone();
+                            self.modal = None;
+                            self.jump_to(&hit, &query);
+                        }
+                    }
+                    _ => {
+                        let before = s.input.text.clone();
+                        s.input.key(&k);
+                        if s.input.text != before {
+                            self.refresh_search();
+                        }
+                    }
+                }
+            }
             Modal::Restore => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.modal = None;
@@ -1050,6 +1102,57 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Re-run the open search over every agent's scrollback.
+    fn refresh_search(&mut self) {
+        let Some(Modal::Search(s)) = &self.modal else { return };
+        let query = s.input.text.clone();
+        let mut hits = Vec::new();
+        let (mut agents, mut capped) = (0, false);
+        for a in &self.agents {
+            let found = search::search_term(&a.term.lock(), a.id, &query, search::PER_AGENT);
+            agents += usize::from(!found.is_empty());
+            capped |= found.len() >= search::PER_AGENT;
+            hits.extend(found);
+        }
+        if let Some(Modal::Search(s)) = &mut self.modal {
+            s.hits = hits;
+            s.sel = 0;
+            s.agents = agents;
+            s.capped = capped;
+        }
+        self.dirty = true;
+    }
+
+    /// Focus the hit's agent, scroll the line into view and select the match.
+    fn jump_to(&mut self, hit: &Hit, query: &str) {
+        let Some(idx) = self.index_of(hit.agent) else {
+            self.toast("that agent is gone", ToastKind::Info);
+            return;
+        };
+        self.set_focus(idx);
+        self.view = View::Focus;
+        let found = {
+            let mut t = self.agents[idx].term.lock();
+            match search::relocate(&t, hit, query) {
+                Some(now) => {
+                    let (screen, history) = (t.grid().screen_lines(), t.grid().history_size());
+                    let want = search::offset_for(now.start.line.0, screen, history) as i32;
+                    let delta = want - t.grid().display_offset() as i32;
+                    t.scroll_display(Scroll::Delta(delta));
+                    let mut sel = Selection::new(SelectionType::Simple, now.start, Side::Left);
+                    sel.update(now.end, Side::Right);
+                    t.selection = Some(sel);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !found {
+            self.toast("that line has scrolled out of the scrollback", ToastKind::Info);
+        }
+        self.dirty = true;
     }
 
     fn broadcast(&mut self, text: &str, target: BroadcastTarget) {

@@ -25,6 +25,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
+- **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
 - **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
 - **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
@@ -49,6 +50,17 @@ trix kill --all           # stop every running session
 ```
 
 `trix` starts a background server on first use (`$XDG_RUNTIME_DIR/trix/session.sock`, log in `server.log` next to it) and attaches to it. One terminal is in control at a time: attaching from a second one takes over from the first. To look without taking over, use `trix view`. The server keeps the environment of the terminal that started it, so agents launched later inherit that `PATH`.
+
+### Search
+
+`alt+f` opens a search over every agent's scrollback, including exited ones. The last 10,000 lines of each are kept.
+
+- Results update as you type, one row per matching line, newest first. They're grouped by agent, in sidebar order. Each row shows how far back the line is (`↑340`, `↑2.1k`, `on screen`). An agent shows at most 200 lines; a `+` after the count means some were left out.
+- Smart case: a lowercase query ignores case, and any capital makes the match exact.
+- Lines that wrapped on screen are searched as one line, so a match that wraps across rows is still found.
+- `↑` `↓` (or `tab`, `ctrl+n` `ctrl+p`) select a result, `pgup` `pgdn` move by ten, `enter` jumps, `esc` closes.
+- Jumping focuses the agent, scrolls the line into view and selects the match. New output since the search is accounted for. If the line has already fallen off the scrollback, you're told so. Typing into the agent returns it to the live view.
+- Full-screen programs (vim, htop) only have their current screen to search.
 
 ### Viewers
 
@@ -82,6 +94,7 @@ Scrollback isn't restored, and closed or exited agents aren't saved.
 | `alt+a` | next agent that needs you |
 | `alt+g` | grid ⇄ focus |
 | `alt+b` | broadcast a prompt |
+| `alt+f` | search every agent's scrollback |
 | `alt+r` / `alt+w` | rename / close |
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
@@ -106,7 +119,8 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 
 ```
 src/main.rs    CLI, attach client, frame-paced server loop
-src/session.rs detach/attach: control socket, framing, remote ratatui backend
+src/session.rs detach/attach and viewers: control socket, framing, remote ratatui backend
+src/search.rs  search across agent scrollbacks
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
@@ -116,11 +130,10 @@ src/input.rs   key → xterm byte encoding
 src/theme.rs   Omarchy theme loading / live reload
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
+`cargo test` runs the unit tests, which take well under a second. They cover scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
 
 Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes completion chimes independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
 ## Next
 
 - Codex lifecycle hooks once trusting them can be scripted, for tool-level detail from Codex too.
-- Search across all agent scrollbacks.
