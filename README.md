@@ -27,6 +27,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
 - **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
+- **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude and Codex resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`), and shells reopen in the folder they were in.
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
 - **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own ANSI palette. Without Omarchy it falls back to Tokyo Night, or you can point `TRIX_THEME` at a colors.toml.
 
@@ -42,6 +43,16 @@ trix kill                 # stop the workspace and every agent in it
 ```
 
 `trix` starts a background server on first use (`$XDG_RUNTIME_DIR/trix/session.sock`, log in `server.log` next to it) and attaches to it. Only one terminal is attached at a time: attaching from a second one takes over from the first. The server keeps the environment of the terminal that started it, so agents launched later inherit that `PATH`.
+
+### Restore
+
+The layout (kind, name, folder, extra args, and the conversation id Claude and Codex report through their hooks) is saved to `$XDG_STATE_HOME/trix/workspace.json` (default `~/.local/state/trix/`) whenever it changes. When a fresh server finds it, you're asked once:
+
+- `y` restores. Claude and Codex resume their conversation, or start fresh if they never reported one. Shells reopen where they were. Custom commands come back **stopped** (they could do anything when re-run); press enter on one to start it. Agents whose folder is gone, such as a deleted worktree, are skipped.
+- `n` starts fresh and forgets the saved workspace.
+- `esc` decides later. Nothing is lost, and the question comes back on the next attach.
+
+Scrollback isn't restored, and closed or exited agents aren't saved.
 
 | key | action |
 | --- | --- |
@@ -75,6 +86,7 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 ```
 src/main.rs    CLI, attach client, frame-paced server loop
 src/session.rs detach/attach: control socket, framing, remote ratatui backend
+src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
 src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay
@@ -89,5 +101,4 @@ Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_THEME=pat
 
 - Named sessions (`trix -s work`) and read-only extra viewers.
 - Codex lifecycle hooks once trusting them can be scripted, for tool-level detail from Codex too.
-- Session restore (resume Claude/Codex conversations on relaunch).
 - Search across all agent scrollbacks.

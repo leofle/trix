@@ -5,7 +5,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,6 +17,7 @@ use crate::agent::{Agent, Kind, Spawn, State};
 use crate::hooks::HookMsg;
 use crate::input;
 use crate::session::{Out, SessionEvent};
+use crate::state::{self, Saved, SavedAgent};
 use crate::theme::{Theme, ThemeWatcher};
 
 pub enum AppEvent {
@@ -135,6 +136,8 @@ pub enum Modal {
     Rename(u32, TextInput),
     ConfirmClose(u32),
     ConfirmQuit,
+    /// A fresh server found a saved workspace: bring it back?
+    Restore,
     Help,
 }
 
@@ -195,6 +198,12 @@ pub struct App {
     pub pane_size: (u16, u16),
     /// The attached client's terminal (title, bell, clipboard passthrough).
     out: Out,
+    /// Saved workspace awaiting the human's restore / start-fresh answer.
+    /// Kept in every save until then, so detaching first loses nothing.
+    pub pending_restore: Option<Saved>,
+    last_saved: Option<Saved>,
+    /// Restored custom commands, shown exited until the human starts them.
+    parked: HashSet<u32>,
 }
 
 impl App {
@@ -232,6 +241,9 @@ impl App {
             last_title: String::new(),
             pane_size: (80, 24),
             out,
+            pending_restore: state::load(),
+            last_saved: None,
+            parked: HashSet::new(),
         }
     }
 
@@ -246,7 +258,111 @@ impl App {
         }
         self.last_title.clear();
         self.update_title();
+        if self.pending_restore.is_some() && self.modal.is_none() {
+            self.modal = Some(Modal::Restore);
+        }
         self.dirty = true;
+    }
+
+    // ───────────────────────────── restore ─────────────────────────────
+
+    /// What a new server would need to rebuild this workspace.
+    fn snapshot(&self) -> Saved {
+        let mut agents: Vec<SavedAgent> = self
+            .agents
+            .iter()
+            .filter(|a| a.state != State::Exited || self.parked.contains(&a.id))
+            .filter_map(|a| {
+                let spec = self.specs.get(&a.id)?;
+                Some(SavedAgent {
+                    kind: a.kind.label().into(),
+                    name: a.name.clone(),
+                    // A shell may have cd'd since; agents stay where they started.
+                    cwd: if a.kind == Kind::Shell { a.live_cwd() } else { spec.cwd.clone() },
+                    command: spec.command.clone(),
+                    session: if matches!(a.kind, Kind::Claude | Kind::Codex) { a.session.clone() } else { None },
+                })
+            })
+            .collect();
+        let focus = self.agents.get(self.focus).and_then(|f| agents.iter().position(|s| s.name == f.name)).unwrap_or(0);
+        if let Some(p) = &self.pending_restore {
+            agents.extend(p.agents.iter().cloned());
+        }
+        Saved::new(focus, agents)
+    }
+
+    /// Save the workspace if it changed since last time.
+    pub fn persist(&mut self) {
+        let snap = self.snapshot();
+        if self.last_saved.as_ref() == Some(&snap) {
+            return;
+        }
+        match state::store(&snap) {
+            Ok(()) => self.last_saved = Some(snap),
+            Err(e) => eprintln!("trix: could not save workspace to {}: {e}", state::path().display()),
+        }
+    }
+
+    /// Relaunch the saved agents: Claude and Codex back in their conversation,
+    /// shells in their folder. Custom commands could do anything when re-run,
+    /// so they come back stopped and wait for an Enter.
+    fn restore_saved(&mut self) {
+        let Some(saved) = self.pending_restore.take() else { return };
+        let (mut restored, mut resumed, mut skipped) = (0, 0, Vec::new());
+        let mut focus = None;
+        for (i, s) in saved.agents.into_iter().enumerate() {
+            let Some(kind) = Kind::from_label(&s.kind) else { continue };
+            if !s.cwd.is_dir() {
+                skipped.push(s.name);
+                continue;
+            }
+            let resume = s.session.clone().filter(|_| matches!(kind, Kind::Claude | Kind::Codex));
+            let spec = Spawn {
+                kind,
+                name: self.unique_name(&s.name),
+                cwd: s.cwd,
+                command: s.command,
+                prompt: None,
+                branch_note: Some(if resume.is_some() { "resuming conversation" } else { "restored" }.into()),
+                resume,
+            };
+            let res = if kind == Kind::Custom {
+                let cmd = spec.command.clone().unwrap_or_default();
+                let note = shell_words::quote(&format!("  was running: {cmd}")).into_owned();
+                let shown = Spawn {
+                    command: Some(format!("printf '%s\\n' '' '  restored from your last session' {note} '  press enter to start it again'")),
+                    ..clone_spec(&spec)
+                };
+                self.spawn_as(shown, spec).map(|id| {
+                    self.parked.insert(id);
+                })
+            } else {
+                if spec.resume.is_some() {
+                    resumed += 1;
+                }
+                self.spawn(spec)
+            };
+            match res {
+                Ok(()) => {
+                    restored += 1;
+                    if i == saved.focus || focus.is_none() {
+                        focus = Some(self.agents.len() - 1);
+                    }
+                }
+                Err(e) => self.toast(format!("could not restore: {e}"), ToastKind::Bad),
+            }
+        }
+        if let Some(f) = focus {
+            self.set_focus(f);
+        }
+        let mut msg = format!("restored {restored} agent{}", if restored == 1 { "" } else { "s" });
+        if resumed > 0 {
+            msg.push_str(&format!(" · {resumed} conversation{} resumed", if resumed == 1 { "" } else { "s" }));
+        }
+        if !skipped.is_empty() {
+            msg.push_str(&format!(" · skipped {} (folder gone)", skipped.join(", ")));
+        }
+        self.toast(msg, if skipped.is_empty() { ToastKind::Good } else { ToastKind::Info });
     }
 
     /// Nobody is looking any more: every state change becomes a notification.
@@ -339,22 +455,19 @@ impl App {
     }
 
     pub fn spawn(&mut self, spec: Spawn) -> anyhow::Result<()> {
+        self.spawn_as(clone_spec(&spec), spec).map(|_| ())
+    }
+
+    /// Run `run`, but remember `keep` as what Enter-to-restart launches.
+    fn spawn_as(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
-        let agent = Agent::spawn(
-            id,
-            clone_spec(&spec),
-            self.pane_size,
-            self.tx.clone(),
-            &self.socket,
-            self.claude_settings.as_deref(),
-            &self.exe,
-        )?;
-        self.specs.insert(id, spec);
+        let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe)?;
+        self.specs.insert(id, keep);
         self.agents.push(agent);
         self.set_focus(self.agents.len() - 1);
         self.sync_git_targets();
-        Ok(())
+        Ok(id)
     }
 
     fn launch_form(&mut self) {
@@ -396,6 +509,7 @@ impl App {
             command: Some(f.args.text.clone()).filter(|s| !s.trim().is_empty()),
             prompt: Some(f.prompt.text.clone()).filter(|s| !s.trim().is_empty()),
             branch_note: note,
+            resume: None,
         };
         self.modal = None;
         if let Err(e) = self.spawn(spec) {
@@ -407,6 +521,8 @@ impl App {
         let old_id = self.agents[idx].id;
         let Some(mut spec) = self.specs.remove(&old_id) else { return };
         spec.prompt = None;
+        spec.resume = None;
+        self.parked.remove(&old_id);
         // A fresh id, so late hook / exit events from the old process can't
         // land on the new one.
         let id = self.next_id;
@@ -432,6 +548,7 @@ impl App {
             let a = self.agents.remove(i);
             a.shutdown();
             self.specs.remove(&id);
+            self.parked.remove(&id);
             if self.focus >= self.agents.len() {
                 self.focus = self.agents.len().saturating_sub(1);
             }
@@ -558,6 +675,11 @@ impl App {
                     };
                     a.set_state(State::Exited, focused);
                     a.unseen = !focused;
+                    if self.parked.contains(&id) {
+                        // Not news: it was restored stopped on purpose.
+                        a.activity = "restored · enter to start".into();
+                        a.unseen = false;
+                    }
                     self.dirty = true;
                 }
             }
@@ -605,6 +727,7 @@ impl App {
             self.dirty = true;
         }
         self.sync_git_targets();
+        self.persist();
         self.dirty = true; // clocks & elapsed timers
     }
 
@@ -799,6 +922,18 @@ impl App {
         }
         match modal {
             Modal::Help => self.modal = None,
+            Modal::Restore => match k.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.modal = None;
+                    self.restore_saved();
+                }
+                KeyCode::Char('n') => {
+                    self.modal = None;
+                    self.pending_restore = None;
+                    self.toast("starting fresh", ToastKind::Info);
+                }
+                _ => {}
+            },
             Modal::ConfirmQuit => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.quit = true,
                 _ => self.modal = None,
@@ -1051,6 +1186,7 @@ fn clone_spec(s: &Spawn) -> Spawn {
         command: s.command.clone(),
         prompt: s.prompt.clone(),
         branch_note: s.branch_note.clone(),
+        resume: s.resume.clone(),
     }
 }
 

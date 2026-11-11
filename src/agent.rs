@@ -36,6 +36,9 @@ impl Kind {
             Kind::Custom => "custom",
         }
     }
+    pub fn from_label(s: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.label() == s)
+    }
     pub fn is_agent(self) -> bool {
         !matches!(self, Kind::Shell)
     }
@@ -113,6 +116,8 @@ pub struct Spawn {
     pub command: Option<String>,
     pub prompt: Option<String>,
     pub branch_note: Option<String>,
+    /// Conversation to resume (Claude / Codex) instead of starting a new one.
+    pub resume: Option<String>,
 }
 
 pub struct Agent {
@@ -142,6 +147,8 @@ pub struct Agent {
     last_resize: Instant,
     pub activity: String,
     pub last_prompt: Option<String>,
+    /// The conversation this agent is in, as its hooks last reported it.
+    pub session: Option<String>,
     pub title: Option<String>,
     pub exit_code: Option<i32>,
 
@@ -231,6 +238,7 @@ impl Agent {
             last_resize: now,
             activity: spec.branch_note.unwrap_or_else(|| "launching".into()),
             last_prompt: spec.prompt,
+            session: spec.resume,
             title: None,
             exit_code: None,
             last_output: now,
@@ -338,6 +346,10 @@ impl Agent {
         // dead pane: Enter-to-restart only works while it reads as exited.
         if self.state == State::Exited {
             return None;
+        }
+        // `/clear` and friends start a new conversation: always track the latest.
+        if let Some(id) = &msg.session {
+            self.session = Some(id.clone());
         }
         match msg.source.as_str() {
             "claude" => self.hooked = true,
@@ -610,6 +622,10 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
                 args.push("--settings".into());
                 args.push(s.display().to_string());
             }
+            if let Some(id) = &spec.resume {
+                args.push("--resume".into());
+                args.push(id.clone());
+            }
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
                 args.extend(split_args(extra));
             }
@@ -619,6 +635,9 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
             ("claude".into(), args)
         }
         Kind::Codex => {
+            if spec.resume.is_some() {
+                args.push("resume".into());
+            }
             args.push("-c".into());
             // A JSON string array is a valid TOML inline array, with escaping.
             let notify = serde_json::to_string(&[exe.display().to_string(), "hook".into(), "codex".into()]).unwrap_or_default();
@@ -626,7 +645,9 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
                 args.extend(split_args(extra));
             }
-            if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
+            if let Some(id) = &spec.resume {
+                args.push(id.clone());
+            } else if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
                 args.push(p.into());
             }
             ("codex".into(), args)
