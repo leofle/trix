@@ -37,7 +37,10 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 
 ## Use
 
+Install from a clone with [Rust](https://rustup.rs) (on a Mac, see [macOS](#macos) first):
+
 ```sh
+git clone https://github.com/leofle/trix.git && cd trix
 cargo install --path .
 trix                      # open the workspace (or attach to the running one)
 trix claude codex shell   # …and start these agents in the current folder
@@ -139,7 +142,21 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 
 ## macOS
 
-trix runs on Linux and macOS. On a Mac:
+trix runs on Linux and macOS. macOS support is new: if something doesn't work, please [open an issue](https://github.com/leofle/trix/issues) and include `$TMPDIR/trix/server.log`.
+
+### Install
+
+```sh
+xcode-select --install          # Apple's compiler and linker (skip it if git already works)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env             # or open a new terminal
+git clone https://github.com/leofle/trix.git && cd trix
+cargo install --path .          # installs ~/.cargo/bin/trix
+```
+
+Then set your terminal's Option key to send Alt (below), and run `trix claude` in a project folder. trix starts [Claude Code](https://claude.com/claude-code) and Codex but doesn't install them, so have them installed and logged in first.
+
+### Differences
 
 - **Make Option send Alt.** Every trix key is `alt+…`, and macOS terminals type `˜` for Option-N unless told otherwise. In Ghostty, set `macos-option-as-alt = true`. In iTerm2, go to Settings › Profiles › Keys and set Left Option to `Esc+`. In Terminal.app, go to Settings › Profiles › Keyboard and turn on "Use Option as Meta key". In kitty, set `macos_option_as_alt yes`.
 - **Notifications** go through `osascript`. They appear as coming from Script Editor; allow it once in System Settings › Notifications.
