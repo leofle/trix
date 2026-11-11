@@ -26,6 +26,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
+- **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
 - **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own ANSI palette. Without Omarchy it falls back to Tokyo Night, or you can point `TRIX_THEME` at a colors.toml.
 
@@ -33,9 +34,14 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 
 ```sh
 cargo install --path .
-trix                      # empty workspace — press enter to spawn
-trix claude codex shell   # start with agents in the current folder
+trix                      # open the workspace (or attach to the running one)
+trix claude codex shell   # …and start these agents in the current folder
+trix attach               # attach only; fails if nothing is running
+trix ls                   # agents, states and activity, without attaching
+trix kill                 # stop the workspace and every agent in it
 ```
+
+`trix` starts a background server on first use (`$XDG_RUNTIME_DIR/trix/session.sock`, log in `server.log` next to it) and attaches to it. Only one terminal is attached at a time: attaching from a second one takes over from the first. The server keeps the environment of the terminal that started it, so agents launched later inherit that `PATH`.
 
 | key | action |
 | --- | --- |
@@ -45,11 +51,12 @@ trix claude codex shell   # start with agents in the current folder
 | `alt+g` | grid ⇄ focus |
 | `alt+b` | broadcast a prompt |
 | `alt+r` / `alt+w` | rename / close |
+| `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52 + wl-copy) |
 | `alt+?` | all keys |
-| `alt+q` | quit |
+| `alt+q` | quit (stops every agent) |
 
 Every other key goes straight to the focused agent, including `shift+enter` for a newline in the Claude and Codex composers.
 
@@ -66,7 +73,8 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 ## Layout
 
 ```
-src/main.rs    terminal setup, frame-paced event loop
+src/main.rs    CLI, attach client, frame-paced server loop
+src/session.rs detach/attach: control socket, framing, remote ratatui backend
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
 src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay
@@ -79,7 +87,7 @@ Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_THEME=pat
 
 ## Next
 
-- Detach/attach: run agents in a background server so they survive closing the terminal, as herdr does.
+- Named sessions (`trix -s work`) and read-only extra viewers.
 - Codex lifecycle hooks once trusting them can be scripted, for tool-level detail from Codex too.
 - Session restore (resume Claude/Codex conversations on relaunch).
 - Search across all agent scrollbacks.
