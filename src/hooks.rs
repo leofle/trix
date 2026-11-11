@@ -161,11 +161,41 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
     HookMsg { agent, source: source.into(), event, tool, detail, session }
 }
 
+/// A shell command as a string: Claude sends one; Codex may send an argv,
+/// often `["bash", "-lc", "<script>"]`, where the script is what matters.
+fn shell_command(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => {
+            let parts: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+            match parts.as_slice() {
+                [_, flag, script] if flag.starts_with('-') && flag.ends_with('c') => Some(script.to_string()),
+                [] => None,
+                _ => Some(parts.join(" ")),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The files a Codex `apply_patch` touches, by name.
+fn patch_files(patch: &str) -> Option<String> {
+    let files: Vec<String> = patch
+        .lines()
+        .filter_map(|l| ["*** Add File: ", "*** Update File: ", "*** Delete File: "].iter().find_map(|p| l.strip_prefix(p)))
+        .map(|p| Path::new(p.trim()).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.trim().into()))
+        .collect();
+    (!files.is_empty()).then(|| one_line(&files.join(", "), 60))
+}
+
 fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
     let g = |k: &str| input.get(k).and_then(Value::as_str);
     let base = |p: &str| Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.into());
     let d = match tool.unwrap_or("") {
-        "Bash" => g("command").map(|c| one_line(c, 60)),
+        "Bash" | "exec_command" | "shell" | "local_shell" => {
+            shell_command(input.get("command").or_else(|| input.get("cmd"))).map(|c| one_line(&c, 60))
+        }
+        "apply_patch" => g("command").or(g("input")).or(g("patch")).and_then(patch_files),
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             g("file_path").or(g("notebook_path")).map(base)
         }
@@ -181,7 +211,8 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
             .map(|q| one_line(q, 60)),
         _ => None,
     };
-    d
+    // Codex approvals carry their own one-line explanation.
+    d.or_else(|| g("description").map(|s| one_line(s, 60)))
 }
 
 pub fn one_line(s: &str, max: usize) -> String {
@@ -252,6 +283,33 @@ mod tests {
         assert_eq!(m.event, "agent-turn-complete");
         assert_eq!(m.detail.as_deref(), Some("All tests pass."));
         assert_eq!(m.session.as_deref(), Some("t-9"));
+    }
+
+    #[test]
+    fn codex_shell_commands() {
+        let m = condense(2, "codex", &json!({"hook_event_name": "PreToolUse", "tool_name": "exec_command", "session_id": "thr_1",
+            "tool_input": {"cmd": ["bash", "-lc", "cargo   test --release"]}}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref(), m.session.as_deref()), ("PreToolUse", Some("cargo test --release"), Some("thr_1")));
+        let m = condense(2, "codex", &json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": ["git", "status"]}}));
+        assert_eq!(m.detail.as_deref(), Some("git status"));
+        let m = condense(2, "codex", &json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls -la"}}));
+        assert_eq!(m.detail.as_deref(), Some("ls -la"));
+    }
+
+    #[test]
+    fn codex_patches_show_their_files() {
+        let patch = "*** Begin Patch\n*** Update File: src/app.rs\n@@\n-a\n+b\n*** Add File: docs/new.md\n+hi\n*** End Patch";
+        let m = condense(2, "codex", &json!({"hook_event_name": "PreToolUse", "tool_name": "apply_patch", "tool_input": {"command": patch}}));
+        assert_eq!(m.detail.as_deref(), Some("app.rs, new.md"));
+        let m = condense(2, "codex", &json!({"hook_event_name": "PreToolUse", "tool_name": "apply_patch", "tool_input": {"command": "garbage"}}));
+        assert_eq!(m.detail, None);
+    }
+
+    #[test]
+    fn codex_approval_falls_back_to_its_description() {
+        let m = condense(2, "codex", &json!({"hook_event_name": "PermissionRequest", "tool_name": "mcp__fs__write",
+            "tool_input": {"path": "/x", "description": "Write the config file"}}));
+        assert_eq!(m.detail.as_deref(), Some("Write the config file"));
     }
 
     #[test]
