@@ -20,7 +20,7 @@ A workspace where coding agents live. Run Claude Code, Codex, shells, or any CLI
 
 Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and Rex added agent awareness, but they still treat the agent as just another pane. In trix, the agent comes first:
 
-- **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>` and Codex with `-c notify=…`, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished. Your own agent configs are never touched. Agents without hooks fall back to output cadence and screen heuristics.
+- **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>` and Codex with `-c` hook overrides, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex).) Agents without hooks fall back to output cadence and screen heuristics.
 - **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (requires `pw-play` from PipeWire). Completions within two seconds share one chime. The terminal title tracks the count too.
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
@@ -105,6 +105,19 @@ Scrollback isn't restored, and closed or exited agents aren't saved.
 
 Every other key goes straight to the focused agent, including `shift+enter` for a newline in the Claude and Codex composers.
 
+## Codex
+
+Codex runs a hook only after you've trusted it in its `/hooks` screen. trix passes its hooks the same way on every launch (`-c hooks=…`, one hook per event, all running `trix hook codex`), so trusting them once covers every Codex pane trix ever opens:
+
+1. Open a Codex pane in trix (`alt+n`, codex).
+2. Type `/hooks`, and trust the eight trix hooks.
+
+From then on, Codex panes show live detail like Claude's: `exec_command cargo test`, `apply_patch app.rs, new.md`, `approve exec_command rm -rf dist`, and `interrupted` when you press esc.
+
+Until the hooks are trusted, Codex skips them and trix falls back to Codex's `notify`, which only reports finished turns. Screen heuristics cover the rest, and the first finished turn shows a one-time reminder. Codex records trust against the hook's exact definition, which includes the path to trix. If you run trix from another path, such as `target/release/trix` while developing, Codex asks you to trust its hooks again.
+
+Codex shows a startup warning that `-c` overrides run it "without the shared background server". That's been true of every Codex pane in trix, because trix has always passed `-c notify=…`.
+
 ## States
 
 | glyph | state | source |
@@ -112,7 +125,7 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 | `⠹` | working | `UserPromptSubmit` / `PreToolUse` hooks, or sustained output |
 | `▲` | needs you | `PermissionRequest`, `AskUserQuestion`, or an approval prompt seen on screen |
 | `✓` | done | `Stop` hook / Codex `agent-turn-complete`, or work that went quiet |
-| `○` | idle | at the prompt |
+| `○` | idle | at the prompt, or `Interrupt` (Codex) |
 | `•` | unseen | it finished or asked something while you were elsewhere |
 
 ## Layout
@@ -124,7 +137,7 @@ src/search.rs  search across agent scrollbacks
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
-src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay
+src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay + Codex payloads
 src/ui.rs      all rendering
 src/input.rs   key → xterm byte encoding
 src/theme.rs   Omarchy theme loading / live reload
@@ -136,4 +149,4 @@ Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=
 
 ## Next
 
-- Codex lifecycle hooks once trusting them can be scripted, for tool-level detail from Codex too.
+Nothing queued. Ideas and requests welcome.

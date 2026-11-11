@@ -10,9 +10,7 @@ use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -139,7 +137,8 @@ pub struct Agent {
     pub created: Instant,
     /// Unseen completion / question — cleared when the human looks at it.
     pub unseen: bool,
-    /// Claude lifecycle hooks are reporting (spinner-aware heuristics apply).
+    /// Lifecycle hooks are reporting: Claude's, or Codex's once trusted
+    /// (spinner-aware heuristics apply).
     pub hooked: bool,
     /// A custom tool reports its own state via `trix hook <source>`; trust it
     /// and skip the output heuristics entirely.
@@ -356,7 +355,10 @@ impl Agent {
         }
         match msg.source.as_str() {
             "claude" => self.hooked = true,
-            "codex" => {} // notify only covers turn completion; keep heuristics
+            // `notify` only covers finished turns. Anything else is one of
+            // Codex's lifecycle hooks, which it runs once they're trusted.
+            "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
+            "codex" => {}
             _ => self.reported = true,
         }
         let tool = msg.tool.clone().unwrap_or_default();
@@ -418,6 +420,10 @@ impl Agent {
                     }
                 }
                 self.set_state(State::Done, focused)
+            }
+            "Interrupt" => {
+                self.activity = "interrupted".into();
+                self.set_state(State::Idle, focused)
             }
             "SessionEnd" => self.set_state(State::Idle, focused),
             _ => None,
@@ -621,6 +627,25 @@ fn codex_user_notify() -> Option<String> {
     (!argv.is_empty() && !is_trix).then(|| serde_json::to_string(&argv).ok()).flatten()
 }
 
+/// Codex lifecycle hooks, passed with `-c`. Codex only runs a hook once the
+/// user has trusted it in its `/hooks` screen, and it records that trust
+/// against a hash of this exact definition, one hook per event, by position.
+/// Changing a byte here (or running trix from another path) asks for review
+/// again; until then Codex skips them and `notify` still reports finished
+/// turns.
+pub const CODEX_HOOK_EVENTS: [&str; 8] =
+    ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "Stop", "Interrupt", "SessionEnd"];
+
+fn codex_hooks(exe: &Path) -> String {
+    let exe = exe.display().to_string();
+    let command = format!("{} hook codex", shell_words::quote(&exe));
+    // A JSON string is a valid TOML basic string, with escaping.
+    let command = serde_json::to_string(&command).unwrap_or_default();
+    let handler = format!("[{{hooks=[{{type=\"command\",command={command},timeout=3}}]}}]");
+    let events: Vec<String> = CODEX_HOOK_EVENTS.iter().map(|e| format!("{e}={handler}")).collect();
+    format!("hooks={{{}}}", events.join(","))
+}
+
 fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &std::path::Path) -> (String, Vec<String>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut args = Vec::new();
@@ -650,6 +675,8 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
             // A JSON string array is a valid TOML inline array, with escaping.
             let notify = serde_json::to_string(&[exe.display().to_string(), "hook".into(), "codex".into()]).unwrap_or_default();
             args.push(format!("notify={notify}"));
+            args.push("-c".into());
+            args.push(codex_hooks(exe));
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
                 args.extend(split_args(extra));
             }
@@ -971,16 +998,55 @@ mod tests {
     #[test]
     fn codex_command_line() {
         let notify = r#"notify=["/bin/trix","hook","codex"]"#;
+        let hooks = codex_hooks(Path::new("/bin/trix"));
         let mut s = spec(Kind::Codex);
         s.prompt = Some("hi".into());
         let (prog, args) = command_for(&s, None, Path::new("/bin/trix"));
         assert_eq!(prog, "codex");
-        assert_eq!(args, ["-c", notify, "hi"]);
+        assert_eq!(args, ["-c", notify, "-c", &hooks, "hi"]);
 
         // Resuming: the id goes last and a first prompt makes no sense.
         s.resume = Some("t-1".into());
         s.command = Some("--full-auto".into());
-        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1, ["resume", "-c", notify, "--full-auto", "t-1"]);
+        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1, ["resume", "-c", notify, "-c", &hooks, "--full-auto", "t-1"]);
+    }
+
+    #[test]
+    fn codex_hooks_match_what_was_trusted() {
+        // Codex trusts a hook by a hash of its exact definition. This is the
+        // string trusted with `/hooks` on 2026-11-11; if it changes, every
+        // user has to review trix's hooks again.
+        let h = r#"{hooks=[{type="command",command="/home/fleo/.cargo/bin/trix hook codex",timeout=3}]}"#;
+        let want = format!(
+            "hooks={{SessionStart=[{h}],UserPromptSubmit=[{h}],PreToolUse=[{h}],PermissionRequest=[{h}],PostToolUse=[{h}],Stop=[{h}],Interrupt=[{h}],SessionEnd=[{h}]}}"
+        );
+        assert_eq!(codex_hooks(Path::new("/home/fleo/.cargo/bin/trix")), want);
+    }
+
+    #[test]
+    fn codex_hooks_quote_odd_paths() {
+        let h = codex_hooks(Path::new("/opt/my tools/trix"));
+        assert!(h.contains(r#"command="'/opt/my tools/trix' hook codex""#), "{h}");
+        let parsed: toml::Table = h.parse().expect("valid TOML");
+        let first = &parsed["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(first["command"].as_str(), Some("'/opt/my tools/trix' hook codex"));
+        assert_eq!(first["timeout"].as_integer(), Some(3));
+    }
+
+    #[test]
+    fn codex_hooks_take_over_from_heuristics() {
+        let mut a = test_agent(Kind::Codex);
+        a.on_hook(&hook("codex", "agent-turn-complete", None, None), true);
+        assert!(!a.hooked, "notify alone isn't a lifecycle hook");
+        a.on_hook(&hook("codex", "SessionStart", None, None), true);
+        assert!(a.hooked && !a.reported);
+        a.on_hook(&hook("codex", "UserPromptSubmit", None, Some("fix it")), true);
+        a.on_hook(&hook("codex", "PermissionRequest", Some("exec_command"), Some("cargo test")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "approve exec_command cargo test"));
+        a.on_hook(&hook("codex", "PostToolUse", Some("exec_command"), None), false);
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&hook("codex", "Interrupt", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
     }
 
     #[test]

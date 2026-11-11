@@ -212,6 +212,8 @@ pub struct App {
     pub pane_size: (u16, u16),
     /// Read-only terminals watching (`trix view`).
     pub viewers: usize,
+    /// Told the human once that Codex isn't sending its hooks.
+    codex_hint: bool,
     /// The attached client's terminal (title, bell, clipboard passthrough).
     out: Out,
     /// Saved workspace awaiting the human's restore / start-fresh answer.
@@ -258,6 +260,7 @@ impl App {
             last_title: String::new(),
             pane_size: (80, 24),
             viewers: 0,
+            codex_hint: false,
             out,
             pending_restore: state::load(),
             last_saved: None,
@@ -712,6 +715,12 @@ impl App {
                     let focused = i == self.focus && self.term_focused;
                     if let Some(prev) = self.agents[i].on_hook(&msg, focused) {
                         self.transitioned(i, prev);
+                    }
+                    // A finished turn through `notify` but never a lifecycle
+                    // hook: Codex has them, they just aren't trusted yet.
+                    if msg.event == "agent-turn-complete" && !self.agents[i].hooked && !self.codex_hint {
+                        self.codex_hint = true;
+                        self.toast("for live Codex detail, trust trix's hooks once in Codex: /hooks", ToastKind::Info);
                     }
                     self.dirty = true;
                 }
