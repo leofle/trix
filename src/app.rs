@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crate::agent::{Agent, Kind, Spawn, State};
 use crate::hooks::HookMsg;
 use crate::input;
+use crate::session::{Out, SessionEvent};
 use crate::theme::{Theme, ThemeWatcher};
 
 pub enum AppEvent {
@@ -34,6 +35,8 @@ pub enum AppEvent {
     Clipboard(String),
     Hook(HookMsg),
     Git(u32, Option<String>, Option<(u32, u32, u32)>),
+    /// Attach / detach / control traffic; handled by the server loop.
+    Session(SessionEvent),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -181,6 +184,8 @@ pub struct App {
     pub toast: Option<Toast>,
     pub hits: HitMap,
     pub quit: bool,
+    /// alt+d: let the client go, keep everything running.
+    pub detach: bool,
     pub dirty: bool,
     pub started: Instant,
     pub start_dir: PathBuf,
@@ -188,10 +193,12 @@ pub struct App {
     git_targets: Arc<Mutex<Vec<(u32, PathBuf)>>>,
     last_title: String,
     pub pane_size: (u16, u16),
+    /// The attached client's terminal (title, bell, clipboard passthrough).
+    out: Out,
 }
 
 impl App {
-    pub fn new(tx: Sender<AppEvent>, socket: PathBuf, claude_settings: Option<PathBuf>, exe: PathBuf) -> App {
+    pub fn new(tx: Sender<AppEvent>, socket: PathBuf, claude_settings: Option<PathBuf>, exe: PathBuf, out: Out) -> App {
         let mut theme_watch = ThemeWatcher::new();
         let polled = theme_watch.poll();
         let themed = polled.is_some();
@@ -216,6 +223,7 @@ impl App {
             toast: None,
             hits: HitMap::default(),
             quit: false,
+            detach: false,
             dirty: true,
             started: Instant::now(),
             start_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
@@ -223,7 +231,59 @@ impl App {
             git_targets,
             last_title: String::new(),
             pane_size: (80, 24),
+            out,
         }
+    }
+
+    /// A terminal attached: it starts from a blank screen and its own folder.
+    pub fn on_attach(&mut self, cwd: PathBuf) {
+        if cwd.is_dir() {
+            self.start_dir = cwd;
+        }
+        self.term_focused = true;
+        if let Some(a) = self.agents.get_mut(self.focus) {
+            a.unseen = false;
+        }
+        self.last_title.clear();
+        self.update_title();
+        self.dirty = true;
+    }
+
+    /// Nobody is looking any more: every state change becomes a notification.
+    pub fn on_detach(&mut self) {
+        self.term_focused = false;
+        self.drag = None;
+        self.modal = None;
+    }
+
+    /// Plain-text status for `trix ls`.
+    pub fn listing(&self) -> String {
+        let count = |s: State| self.agents.iter().filter(|a| a.state == s).count();
+        let mut out = format!(
+            "trix · {} agent{} · {} need{} you · {} working · {} done\n",
+            self.agents.len(),
+            if self.agents.len() == 1 { "" } else { "s" },
+            count(State::Blocked),
+            if count(State::Blocked) == 1 { "s" } else { "" },
+            count(State::Working),
+            count(State::Done),
+        );
+        let w = self.agents.iter().map(|a| a.name.chars().count()).max().unwrap_or(0);
+        for (i, a) in self.agents.iter().enumerate() {
+            let since = crate::ui::fmt_dur(a.state_since.elapsed());
+            let mark = if a.unseen { "•" } else { " " };
+            let name = format!("{:<w$}", a.name);
+            out.push_str(&format!(
+                "{:>2} {mark} {name}  {:<6}  {:<9} {:>6}  {}  {}\n",
+                i + 1,
+                a.kind.label(),
+                a.state.label(),
+                since,
+                crate::hooks::one_line(&a.activity, 50),
+                tilde(&a.cwd),
+            ));
+        }
+        out
     }
 
     pub fn focused(&self) -> Option<&Agent> {
@@ -268,9 +328,12 @@ impl App {
 
     fn suggest_name(&self, dir: &Path) -> String {
         let base = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "agent".into());
-        let base = slug(&base);
+        self.unique_name(&slug(&base))
+    }
+
+    pub fn unique_name(&self, base: &str) -> String {
         if !self.agents.iter().any(|a| a.name == base) {
-            return base;
+            return base.to_string();
         }
         (2..).map(|n| format!("{base}-{n}")).find(|n| !self.agents.iter().any(|a| &a.name == n)).unwrap()
     }
@@ -498,7 +561,7 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppEvent::Clipboard(s) => copy_to_clipboard(&s),
+            AppEvent::Clipboard(s) => copy_to_clipboard(&self.out, &s),
             AppEvent::Hook(msg) => {
                 if let Some(i) = self.index_of(msg.agent) {
                     let focused = i == self.focus && self.term_focused;
@@ -508,6 +571,7 @@ impl App {
                     self.dirty = true;
                 }
             }
+            AppEvent::Session(_) => {}
             AppEvent::Git(id, branch, diff) => {
                 if let Some(i) = self.index_of(id) {
                     self.agents[i].branch = branch;
@@ -558,7 +622,7 @@ impl App {
             desktop_notify(&title, &body, urgent);
             if !self.term_focused {
                 // Bell → compositor urgency hint on the terminal window.
-                let _ = std::io::stdout().write_all(b"\x07");
+                self.out.send(b"\x07");
             }
         }
     }
@@ -572,7 +636,7 @@ impl App {
             (b, _) => format!("trix · {b} need{} you", if b == 1 { "s" } else { "" }),
         };
         if title != self.last_title {
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&title));
+            self.out.send(format!("\x1b]0;{title}\x07").as_bytes());
             self.last_title = title;
         }
     }
@@ -641,6 +705,10 @@ impl App {
                             self.modal = Some(Modal::ConfirmClose(a.id));
                         }
                     }
+                    true
+                }
+                KeyCode::Char('d') => {
+                    self.detach = true;
                     true
                 }
                 KeyCode::Char('/') | KeyCode::Char('?') => {
@@ -904,7 +972,7 @@ impl App {
                         if d.moved {
                             if let Some(text) = t.selection_to_string().filter(|s| !s.trim().is_empty()) {
                                 drop(t);
-                                copy_to_clipboard(&text);
+                                copy_to_clipboard(&self.out, &text);
                                 let lines = text.lines().count();
                                 self.toast(format!("copied {} line{}", lines, if lines == 1 { "" } else { "s" }), ToastKind::Good);
                                 return;
@@ -1121,11 +1189,10 @@ fn desktop_notify(title: &str, body: &str, urgent: bool) {
     }
 }
 
-pub fn copy_to_clipboard(text: &str) {
-    // OSC 52 reaches the outer terminal (works over SSH too)…
+pub fn copy_to_clipboard(out: &Out, text: &str) {
+    // OSC 52 reaches the attached terminal (works over SSH too)…
     let b64 = base64(text.as_bytes());
-    let _ = std::io::stdout().write_all(format!("\x1b]52;c;{b64}\x07").as_bytes());
-    let _ = std::io::stdout().flush();
+    out.send(format!("\x1b]52;c;{b64}\x07").as_bytes());
     // …and wl-copy covers terminals that ignore it.
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if let Ok(mut c) = Command::new("wl-copy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {

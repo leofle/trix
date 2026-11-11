@@ -934,7 +934,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
         Modal::ConfirmQuit => {
             let live = app.agents.iter().filter(|a| a.state != State::Exited).count();
-            confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped.", if live == 1 { " is" } else { "s are" }));
+            confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped. alt+d detaches instead.", if live == 1 { " is" } else { "s are" }));
         }
         Modal::Help => help(f, area, t),
     }
@@ -987,8 +987,8 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
         ("wheel", "scroll · click focus"),
         ("drag", "select & copy"),
         ("shift+enter", "newline to agent"),
-        ("alt+q", "quit"),
-        ("", ""),
+        ("alt+d", "detach · keeps running"),
+        ("alt+q", "quit · stops agents"),
     ];
     let cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(1) });
     for (col, items) in cols.iter().zip([left, right]) {
