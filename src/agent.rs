@@ -164,9 +164,14 @@ pub struct Agent {
 
     pub branch: Option<String>,
     pub diff: Option<(u32, u32, u32)>,
-    /// When `trix send` last typed a prompt in, so `trix wait` doesn't take
-    /// the end of the previous turn for the end of this one.
+    /// A prompt is on its way in (`trix send`, or a first prompt at launch)
+    /// and no turn has visibly started since. `trix wait` treats that as
+    /// work, so the end of the previous turn, or `SessionStart`, isn't taken
+    /// for the end of this one.
     pub prompted: Option<Instant>,
+    /// A hook has reported a turn. Until then a hooked agent can still be on
+    /// a startup dialog (trust this folder?) that no hook reports.
+    pub turn_seen: bool,
     /// The agent that started or last prompted this one through `trix`.
     pub managed_by: Option<String>,
 }
@@ -184,6 +189,7 @@ impl Agent {
         exe: &std::path::Path,
     ) -> anyhow::Result<Agent> {
         let (program, args) = command_for(&spec, claude_settings, exe);
+        let first_prompt = spec.kind.is_agent() && spec.prompt.as_deref().is_some_and(|p| !p.trim().is_empty());
         let command_line = std::iter::once(program.clone())
             .chain(args.iter().map(|a| if a.contains(' ') { format!("{a:?}") } else { a.clone() }))
             .collect::<Vec<_>>()
@@ -257,7 +263,8 @@ impl Agent {
             tools_used: 0,
             branch: None,
             diff: None,
-            prompted: None,
+            prompted: first_prompt.then(Instant::now),
+            turn_seen: false,
             managed_by: None,
         })
     }
@@ -304,6 +311,11 @@ impl Agent {
         let prev = self.state;
         self.state = s;
         self.state_since = Instant::now();
+        // The turn a prompt was sent for has visibly begun (or ended, or it
+        // is waiting on the human): idle alone isn't evidence of any of that.
+        if s != State::Idle {
+            self.prompted = None;
+        }
         match s {
             State::Working => {
                 if self.work_started.is_none() {
@@ -379,6 +391,7 @@ impl Agent {
                 self.set_state(State::Idle, focused)
             }
             "UserPromptSubmit" => {
+                self.turn_seen = true;
                 if let Some(p) = &msg.detail {
                     self.last_prompt = Some(p.clone());
                 }
@@ -387,6 +400,7 @@ impl Agent {
                 self.set_state(State::Working, focused)
             }
             "PreToolUse" => {
+                self.turn_seen = true;
                 self.tools_used += 1;
                 if tool == "AskUserQuestion" {
                     self.activity = msg.detail.clone().unwrap_or_else(|| "has a question".into());
@@ -470,6 +484,19 @@ impl Agent {
         let screen_question = || self.screen_needs_input();
 
         if self.hooked {
+            // `SessionStart` comes before the trust-this-folder dialog, and no
+            // hook reports the dialog. Before the first turn, the screen is
+            // the only way to know; after it, prompts come through hooks, and
+            // the agent's own prose ("would you like to…") mustn't count.
+            if self.state == State::Idle
+                && !self.turn_seen
+                && quiet > Duration::from_millis(800)
+                && self.state_since.elapsed() > Duration::from_secs(1)
+                && screen_question()
+            {
+                self.activity = "waiting for an answer".into();
+                return self.set_state(State::Blocked, focused);
+            }
             // Claude redraws its spinner every second while working. A long
             // silence means the turn was interrupted without a Stop hook.
             if self.state == State::Working && quiet > Duration::from_secs(6) {
@@ -541,12 +568,18 @@ impl Agent {
         }
     }
 
-    /// Look at the bottom of the live screen for approval / question UI.
+    /// Look at the bottom of what's on the live screen for approval /
+    /// question UI. Inline TUIs draw from the top of a fresh terminal, so
+    /// that's the last rows with anything on them, not the last rows.
     pub fn screen_needs_input(&self) -> bool {
         let term = self.term.lock();
         let grid = term.grid();
-        let lines = grid.screen_lines() as i32;
         let cols = grid.columns();
+        let blank = |l: i32| (0..cols).all(|c| matches!(grid[Line(l)][Column(c)].c, ' ' | '\0'));
+        let mut lines = grid.screen_lines() as i32;
+        while lines > 0 && blank(lines - 1) {
+            lines -= 1;
+        }
         let mut text = String::new();
         for l in (lines - 14).max(0)..lines {
             let row = &grid[Line(l)];
@@ -933,6 +966,54 @@ mod tests {
         a.dismissed_at = Some(ago(Duration::from_secs(3)));
         a.heuristics(true);
         assert_eq!((a.state, a.activity.as_str()), (State::Idle, "dismissed"));
+    }
+
+    fn show(a: &Agent, text: &str) {
+        let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        p.advance(&mut *a.term.lock(), text.replace('\n', "\r\n").as_bytes());
+    }
+
+    #[test]
+    fn trust_dialog_after_session_start_needs_you() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("SessionStart", None, None), false);
+        assert_eq!(a.state, State::Idle);
+        show(&a, " Quick safety check: Is this a project you trust?\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n");
+        a.state_since = ago(Duration::from_secs(2));
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "waiting for an answer"));
+        a.shutdown();
+    }
+
+    #[test]
+    fn prose_after_a_turn_is_not_a_question() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("SessionStart", None, None), false);
+        a.on_hook(&claude("UserPromptSubmit", None, None), false);
+        a.on_hook(&claude("Interrupt", None, None), false);
+        assert_eq!(a.state, State::Idle);
+        show(&a, "Would you like to add tests too? (yes/no)\n");
+        a.state_since = ago(Duration::from_secs(2));
+        a.last_output = ago(Duration::from_secs(1));
+        assert_eq!(a.heuristics(false), None, "hooks report this agent's prompts");
+        a.shutdown();
+    }
+
+    #[test]
+    fn a_first_prompt_is_pending_until_its_turn_shows() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut s = spec(Kind::Custom);
+        s.command = Some("exec sleep 60".into());
+        s.prompt = Some("go".into());
+        s.cwd = std::env::temp_dir();
+        let mut a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), None, Path::new("/bin/true")).unwrap();
+        assert!(a.prompted.is_some());
+        a.set_state(State::Idle, false);
+        assert!(a.prompted.is_some(), "SessionStart's idle is not the turn");
+        a.set_state(State::Working, false);
+        assert!(a.prompted.is_none());
+        a.shutdown();
     }
 
     #[test]

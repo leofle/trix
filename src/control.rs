@@ -355,9 +355,6 @@ pub fn settled(a: &Agent, now: Instant) -> bool {
         return since.is_none_or(|s| s > Duration::from_millis(500)) && !a.running_command();
     }
     let Some(since) = since else { return true };
-    if a.prompted.is_some_and(|t| a.state_since > t) {
-        return true;
-    }
     if a.hooked || a.reported {
         // It will say when its turn starts.
         return since > SEND_GRACE;
@@ -486,8 +483,8 @@ fn close(app: &mut App, from: Option<u32>, target: &str, force: bool) -> Reply {
         return Reply::fail(e);
     }
     if !force && matches!(a.state, State::Working | State::Blocked | State::Starting) {
-        let what = if a.state == State::Blocked { "needs you" } else { a.state.label() };
-        return Reply::fail(format!("'{}' is {what} — --force to stop it anyway", a.name));
+        let what = if a.state == State::Blocked { "needs you" } else { &format!("is {}", a.state.label()) };
+        return Reply::fail(format!("'{}' {what} — --force to stop it anyway", a.name));
     }
     let (id, name) = (a.id, a.name.clone());
     app.close(id);
@@ -658,6 +655,8 @@ mod tests {
         a.prompted = Some(now);
         assert!(!settled(&a, now), "still Done from the last turn");
         assert!(settled(&a, now + SEND_GRACE + Duration::from_secs(1)), "never started: don't hang");
+        a.set_state(State::Idle, true);
+        assert!(!settled(&a, now), "idle (SessionStart) is not the turn");
         a.set_state(State::Working, true);
         assert!(!settled(&a, Instant::now()));
         a.set_state(State::Blocked, true);
