@@ -14,7 +14,8 @@
 //! Wire format, both directions: `[kind: u8][len: u32 le][payload]`.
 //! Client → server payloads are JSON `ClientMsg`s. Server → client frames are
 //! raw terminal bytes (`OUT`), a goodbye with a message to print (`BYE`), or a
-//! plain-text reply (`TEXT`, for `trix ls`).
+//! plain-text reply (`TEXT`, for `trix ls`; a JSON `control::Reply` for the
+//! agent-control commands).
 
 use crossterm::event::Event;
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
@@ -60,6 +61,9 @@ pub enum ClientMsg {
     /// Watch read-only. A new variant rather than a Hello flag, so an older
     /// server rejects it instead of handing the viewer control.
     View { protocol: u32, cols: u16, rows: u16 },
+    /// `trix send/read/wait/spawn/close`, `trix ls --json`. `from` is the
+    /// pane asking, when it is one of this session's.
+    Control { protocol: u32, from: Option<u32>, req: crate::control::Request },
 }
 
 /// Session-level events, delivered to the server's main loop.
@@ -72,6 +76,7 @@ pub enum SessionEvent {
     Unview(u64),
     Detached(u64),
     List(UnixStream),
+    Control { stream: UnixStream, from: Option<u32>, req: crate::control::Request },
     Kill,
 }
 
@@ -603,6 +608,14 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
         Ok(ClientMsg::Kill) => {
             send(SessionEvent::Kill);
         }
+        Ok(ClientMsg::Control { protocol, from, req }) => {
+            if protocol != crate::control::CONTROL {
+                let r = crate::control::Reply { code: 1, err: "the running workspace is from a different trix build — restart it to use this".into(), ..Default::default() };
+                crate::control::reply(&mut s, &r);
+                return;
+            }
+            send(SessionEvent::Control { stream: s, from, req });
+        }
         _ => {}
     }
 }
@@ -656,6 +669,29 @@ pub fn query(session: &str, msg: &ClientMsg) -> Option<String> {
     match read_frame(&mut s) {
         Ok((TEXT, p)) => Some(String::from_utf8_lossy(&p).into_owned()),
         _ => Some(String::new()),
+    }
+}
+
+/// Send a control request to this session and wait for its reply: up to
+/// `wait` seconds more than usual for `trix wait` (`Some(0)`: forever).
+pub fn control(msg: &ClientMsg, wait: Option<u64>) -> Result<crate::control::Reply, String> {
+    let Some(mut s) = connect() else {
+        return Err(if is_default() { "no workspace running".into() } else { format!("no session '{}' running", name()) });
+    };
+    send_msg(&mut s, msg).map_err(|e| format!("talking to the workspace: {e}"))?;
+    let timeout = match wait {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs + 10)),
+        None => Some(Duration::from_secs(15)),
+    };
+    let _ = s.set_read_timeout(timeout);
+    match read_frame(&mut s) {
+        Ok((TEXT, p)) => serde_json::from_slice(&p).map_err(|e| format!("bad reply from the workspace: {e}")),
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Err("the workspace didn't answer in time".into()),
+        _ => Err(format!(
+            "the running workspace was started by an older trix without agent control — restart it (alt+q, then `{}`) to use this",
+            command()
+        )),
     }
 }
 

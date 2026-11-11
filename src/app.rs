@@ -223,6 +223,8 @@ pub struct App {
     last_completion_sound: Option<Instant>,
     /// Restored custom commands, shown exited until the human starts them.
     parked: HashSet<u32>,
+    /// `trix wait`s still waiting.
+    pub waiters: Vec<crate::control::Waiter>,
 }
 
 impl App {
@@ -266,6 +268,7 @@ impl App {
             last_saved: None,
             last_completion_sound: None,
             parked: HashSet::new(),
+            waiters: Vec::new(),
         }
     }
 
@@ -484,14 +487,30 @@ impl App {
         self.spawn_as(clone_spec(&spec), spec).map(|_| ())
     }
 
+    /// Start an agent without taking the human's focus off what they're
+    /// looking at (`trix spawn`).
+    pub fn spawn_quiet(&mut self, spec: Spawn) -> anyhow::Result<u32> {
+        let id = self.start(clone_spec(&spec), spec)?;
+        if self.agents.len() == 1 {
+            self.set_focus(0);
+        }
+        self.dirty = true;
+        Ok(id)
+    }
+
     /// Run `run`, but remember `keep` as what Enter-to-restart launches.
     fn spawn_as(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
+        let id = self.start(run, keep)?;
+        self.set_focus(self.agents.len() - 1);
+        Ok(id)
+    }
+
+    fn start(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
         let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe)?;
         self.specs.insert(id, keep);
         self.agents.push(agent);
-        self.set_focus(self.agents.len() - 1);
         self.sync_git_targets();
         Ok(id)
     }
@@ -569,7 +588,7 @@ impl App {
         }
     }
 
-    fn close(&mut self, id: u32) {
+    pub fn close(&mut self, id: u32) {
         if let Some(i) = self.index_of(id) {
             let a = self.agents.remove(i);
             a.shutdown();
@@ -1362,7 +1381,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
 /// is true when an existing worktree (e.g. from an earlier session) was reused.
-fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
+pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
     let top = git(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
     let top = PathBuf::from(top);
     let common = git(&top, &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| ".git".into());

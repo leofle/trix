@@ -164,6 +164,11 @@ pub struct Agent {
 
     pub branch: Option<String>,
     pub diff: Option<(u32, u32, u32)>,
+    /// When `trix send` last typed a prompt in, so `trix wait` doesn't take
+    /// the end of the previous turn for the end of this one.
+    pub prompted: Option<Instant>,
+    /// The agent that started or last prompted this one through `trix`.
+    pub managed_by: Option<String>,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -252,6 +257,8 @@ impl Agent {
             tools_used: 0,
             branch: None,
             diff: None,
+            prompted: None,
+            managed_by: None,
         })
     }
 
@@ -566,6 +573,14 @@ impl Agent {
         out
     }
 
+    /// Is a shell running a command, rather than sitting at its prompt? The
+    /// terminal's foreground process group says: the shell's own while at the
+    /// prompt, the command's while one runs.
+    pub fn running_command(&self) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else { return false };
+        foreground_group(&stat).is_some_and(|g| g > 0 && g != self.pid as i32)
+    }
+
     pub fn live_cwd(&self) -> PathBuf {
         std::fs::read_link(format!("/proc/{}/cwd", self.pid)).unwrap_or_else(|_| self.cwd.clone())
     }
@@ -574,6 +589,12 @@ impl Agent {
     pub fn cursor_point(&self) -> Point {
         self.term.lock().grid().cursor.point
     }
+}
+
+/// The terminal's foreground process group (`tpgid`) from a /proc stat line.
+/// The command name can hold spaces and parens, so count from its last ')'.
+fn foreground_group(stat: &str) -> Option<i32> {
+    stat.rsplit_once(')')?.1.split_whitespace().nth(5)?.parse().ok()
 }
 
 /// Does this screen text show an approval prompt or a question?
@@ -737,6 +758,16 @@ mod tests {
     }
     fn spec(kind: Kind) -> Spawn {
         Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None }
+    }
+
+    #[test]
+    fn foreground_group_from_stat() {
+        assert_eq!(foreground_group("4242 (zsh) S 1 4242 4242 34817 4300 4194560 0"), Some(4300));
+        assert_eq!(foreground_group("7 (a b) c)) S 1 7 7 0 -1 0"), Some(-1));
+        assert_eq!(foreground_group("garbage"), None);
+        let a = test_agent(Kind::Shell);
+        assert!(!a.running_command(), "sleep leads its own foreground group");
+        a.shutdown();
     }
 
     // ── state transitions ──

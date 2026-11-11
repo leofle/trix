@@ -28,6 +28,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
 - **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
+- **Agents can run agents.** `trix spawn`, `send`, `read`, `wait` and `close` let a script, or an agent in another pane, work the workspace the way you do. A "lead" Claude can start workers in their own worktrees, hand them tasks, wait for them and read what they did. It never answers a permission prompt for you, and the sidebar shows which agent it is driving. See [Agent control](#agent-control).
 - **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
 - **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude and Codex resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`), and shells reopen in the folder they were in.
@@ -43,6 +44,7 @@ trix claude codex shell   # …and start these agents in the current folder
 trix attach               # attach only; fails if nothing is running
 trix view                 # watch read-only from another terminal (q leaves)
 trix ls                   # agents, states and activity, without attaching
+trix ls --json            # the same, for scripts and agents
 trix kill                 # stop the workspace and every agent in it
 
 trix -s work              # the same, for a named session (works with every command)
@@ -61,6 +63,36 @@ trix kill --all           # stop every running session
 - `↑` `↓` (or `tab`, `ctrl+n` `ctrl+p`) select a result, `pgup` `pgdn` move by ten, `enter` jumps, `esc` closes.
 - Jumping focuses the agent, scrolls the line into view and selects the match. New output since the search is accounted for. If the line has already fallen off the scrollback, you're told so. Typing into the agent returns it to the live view.
 - Full-screen programs (vim, htop) only have their current screen to search.
+
+### Agent control
+
+Six commands drive a running workspace from any shell. They're meant for scripts and for agents managing other agents:
+
+```sh
+trix spawn claude --name api --worktree --prompt "add rate limiting to /login"
+trix send api "also cover it with a test"     # or pipe the prompt in on stdin
+trix wait api                                 # blocks until api stops working
+trix read api -n 80                           # the last 80 lines of its screen and scrollback
+trix ls --json                                # every agent: state, activity, branch, diff, last prompt…
+trix close api
+```
+
+- `<agent>` is an agent's name, or its number in `trix ls`. Names are safer, because numbers shift when an agent closes. `spawn` prints the new agent's name and folder. It refuses a name that's already taken, and it never steals focus from the agent you're looking at.
+- `wait` takes one or more agents and returns when one of them stops working (`--all`: when every one has). It prints one `name<TAB>state<TAB>activity` line per agent, where the state is `done`, `idle`, `needs-you` or `exited`. A prompt just sent with `send` counts as work until the agent's turn starts, so `send` followed by `wait` waits for that turn. After `-t` seconds (default 300, `0` waits forever) it exits with 124, and you can simply run it again. A shell counts as done when it's back at its prompt. Builtins and shell functions run inside the shell itself, so `wait` can't see them.
+- Exit codes: 0 ok, 1 refused or failed (the reason goes to stderr), 2 bad usage, 124 `wait` timed out.
+
+Guard rails, enforced by the server:
+
+- `send` refuses an agent that **needs you**, because its Enter would answer that prompt, for example approve a `rm -rf`. It also refuses a **shell** (the prompt would run as a command) and an agent still **starting** (it may be on a trust dialog). `--force` overrides the first two. Answering prompts is left to you on purpose.
+- An agent can't `send` to, `wait` for or `close` itself. trix knows which pane is asking from its `TRIX_AGENT_ID`.
+- `close` won't stop an agent that is working or needs you without `--force`.
+- Every `send` shows a toast (`lead → api: also cover it…`). Agents that another agent started or prompted show `‹lead` next to their name in the sidebar.
+
+To make a manager, start a Claude pane and tell it what it's for. For example:
+
+> You're the lead for this repo. Don't edit code yourself. Split the task into independent pieces. For each piece, start a worker with `trix spawn claude --worktree --name <piece> --prompt "<brief>"`. Then loop: `trix wait <all workers> -t 280`, `trix read <worker>` to check its work, and `trix send` follow-ups. If a worker shows `needs-you`, tell me which one and why, and leave it alone. When they're all done, summarise each worktree's branch and diff (`trix ls --json`).
+
+Inside a pane, these commands act on that pane's session. Elsewhere, add `-s <name>` for a named session.
 
 ### Viewers
 
@@ -134,6 +166,7 @@ Codex shows a startup warning that `-c` overrides run it "without the shared bac
 src/main.rs    CLI, attach client, frame-paced server loop
 src/session.rs detach/attach and viewers: control socket, framing, remote ratatui backend
 src/search.rs  search across agent scrollbacks
+src/control.rs agent control: spawn / send / read / wait / close, ls --json, guard rails
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
@@ -143,7 +176,7 @@ src/input.rs   key → xterm byte encoding
 src/theme.rs   Omarchy theme loading / live reload
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
+`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
 
 Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes completion chimes independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
