@@ -187,6 +187,8 @@ pub struct App {
     pub focus: usize,
     pub view: View,
     pub sidebar: bool,
+    /// alt+m: a narrow sidebar, one line per agent.
+    pub sidebar_mini: bool,
     pub modal: Option<Modal>,
     pub theme: Theme,
     theme_watch: ThemeWatcher,
@@ -239,6 +241,7 @@ impl App {
             focus: 0,
             view: View::Focus,
             sidebar: true,
+            sidebar_mini: false,
             modal: None,
             theme: polled.unwrap_or_default(),
             theme_watch,
@@ -862,6 +865,12 @@ impl App {
                 }
                 KeyCode::Char('s') => {
                     self.sidebar = !self.sidebar;
+                    true
+                }
+                KeyCode::Char('m') => {
+                    // From hidden, alt+m brings the sidebar back small.
+                    self.sidebar_mini = !self.sidebar || !self.sidebar_mini;
+                    self.sidebar = true;
                     true
                 }
                 KeyCode::Char('f') => {

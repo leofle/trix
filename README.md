@@ -133,6 +133,7 @@ Scrollback isn't restored, and closed or exited agents aren't saved.
 | `alt+r` / `alt+w` | rename / close |
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
+| `alt+m` | mini sidebar: one line per agent, half the width |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
 | `alt+?` | all keys |

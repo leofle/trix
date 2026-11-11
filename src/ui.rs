@@ -17,6 +17,8 @@ use crate::theme::{Theme, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SIDEBAR_W: u16 = 36;
+/// alt+m: number, state, name and the unseen dot.
+const SIDEBAR_MINI_W: u16 = 18;
 
 pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
@@ -73,9 +75,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Default::default();
 
     let [top, body, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let show_sidebar = app.sidebar && body.width >= 70;
+    let side_w = if app.sidebar_mini { SIDEBAR_MINI_W } else { SIDEBAR_W };
+    let show_sidebar = app.sidebar && body.width >= side_w + 34;
     let (side, main) = if show_sidebar {
-        let [s, m] = Layout::horizontal([Constraint::Length(SIDEBAR_W), Constraint::Min(20)]).areas(body);
+        let [s, m] = Layout::horizontal([Constraint::Length(side_w), Constraint::Min(20)]).areas(body);
         (Some(s), m)
     } else {
         (None, body)
@@ -230,7 +233,8 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
 
     let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), ..inner };
     let n = app.agents.len() as u16;
-    let compact = n * 4 > list.height;
+    let mini = app.sidebar_mini;
+    let compact = mini || n * 4 > list.height;
     let per = if compact { 1 } else { 4 };
     let mut y = list.y;
     for i in 0..app.agents.len() {
@@ -238,7 +242,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             break;
         }
         let r = Rect { x: list.x, y, width: list.width, height: if compact { 1 } else { 3 } };
-        card(f, app, i, r, compact, t);
+        card(f, app, i, r, compact, mini, t);
         app.hits.cards.push((r, app.agents[i].id));
         y += per;
     }
@@ -248,29 +252,31 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let btn = Rect { x: inner.x, y: by, width: inner.width, height: 1 };
     let line = TLine::from(vec![
         Span::styled(" + ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-        Span::styled("new agent", Style::new().fg(t.fg)),
+        Span::styled(if mini { "new" } else { "new agent" }, Style::new().fg(t.fg)),
     ]);
     f.render_widget(Paragraph::new(line), btn);
-    f.render_widget(
-        Paragraph::new(Span::styled("alt+n ", Style::new().fg(t.muted))).alignment(Alignment::Right),
-        btn,
-    );
+    if !mini {
+        f.render_widget(
+            Paragraph::new(Span::styled("alt+n ", Style::new().fg(t.muted))).alignment(Alignment::Right),
+            btn,
+        );
+    }
     app.hits.new_button = Some(btn);
 }
 
-fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, t: &Theme) {
+fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, t: &Theme) {
     let a = &app.agents[i];
     let selected = i == app.focus;
-    let sc = state_color(t, a.state);
     let bg = if selected { t.surface_hi } else { t.surface };
     f.buffer_mut().set_style(r, Style::new().bg(bg));
-
+    card_text(f, app, i, r, compact, mini, t);
+    // Last, so the text's leading spaces don't paint over it.
     let bar_color = if a.state == State::Blocked {
         Some(t.red)
     } else if selected {
         Some(t.accent)
     } else if a.unseen {
-        Some(sc)
+        Some(state_color(t, a.state))
     } else {
         None
     };
@@ -281,6 +287,13 @@ fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, t: &Theme) {
             }
         }
     }
+}
+
+fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, t: &Theme) {
+    let a = &app.agents[i];
+    let selected = i == app.focus;
+    let sc = state_color(t, a.state);
+    let bg = if selected { t.surface_hi } else { t.surface };
 
     let (g, gs) = glyph(app, a.state);
     let idx = if i < 9 { format!("{}", i + 1) } else { " ".into() };
@@ -291,6 +304,24 @@ fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, t: &Theme) {
     } else {
         Style::new().fg(t.fg)
     };
+    if mini {
+        // " 1 ⠹ name •": everything that tells agents apart and says who needs you.
+        let dot = a.unseen && a.state != State::Blocked;
+        let name_max = (r.width as usize).saturating_sub(5 + if dot { 2 } else { 0 });
+        let mut line = vec![
+            Span::raw(" "),
+            Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
+            Span::raw(" "),
+            Span::styled(g, gs),
+            Span::raw(" "),
+            Span::styled(trunc(&a.name, name_max), name_style),
+        ];
+        if dot {
+            line.push(Span::styled(" •", Style::new().fg(sc).add_modifier(Modifier::BOLD)));
+        }
+        f.render_widget(Paragraph::new(TLine::from(line)), Rect { height: 1, ..r });
+        return;
+    }
     let time = fmt_dur(elapsed(a));
     let w = r.width as usize;
     let name_max = w.saturating_sub(7 + time.len() + 2);
@@ -1134,6 +1165,7 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
         ("", "VIEW"),
         ("alt+g", "grid ⇄ focus"),
         ("alt+s", "toggle sidebar"),
+        ("alt+m", "mini sidebar"),
         ("shift+pgup", "scroll back"),
         ("wheel", "scroll · click focus"),
         ("drag", "select & copy"),
@@ -1171,6 +1203,75 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole screen, drawn into a test terminal: four agents, the second
+    /// one needing you, the third with unseen finished work.
+    fn screen(mini: bool, width: u16) -> (String, App) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None; // never offer (or save over) the real workspace
+        app.sidebar_mini = mini;
+        for (name, state, unseen) in [("web", State::Working, false), ("api-gateway-v2", State::Blocked, true), ("docs", State::Done, true), ("sh", State::Idle, false)] {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.name = name.into();
+            a.set_state(state, false);
+            a.unseen = unseen;
+            a.activity = "Edit src/app.rs".into();
+            app.agents.push(a);
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 18)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, app)
+    }
+
+    #[test]
+    fn mini_sidebar_is_one_narrow_line_per_agent() {
+        let (full, app) = screen(false, 100);
+        assert!(full.lines().any(|l| l.starts_with(" ▌ 2")), "the full sidebar shows the bar too:\n{full}");
+        let full_w = app.hits.cards[0].0.width;
+        assert!(full.contains("new agent") && full.contains("alt+n"));
+        for a in &app.agents {
+            a.shutdown();
+        }
+        let (mini, app) = screen(true, 100);
+        println!("{mini}");
+        let cards = &app.hits.cards;
+        assert_eq!(cards.len(), 4);
+        assert!(cards.iter().all(|(r, _)| r.height == 1 && r.width == SIDEBAR_MINI_W - 2));
+        assert!(cards[0].0.width * 2 <= full_w + 2, "about half as wide");
+        assert!(cards.windows(2).all(|w| w[1].0.y == w[0].0.y + 1), "one row each, no gaps");
+        let row = |i: usize| mini.lines().nth(cards[i].0.y as usize).unwrap().to_string();
+        assert!(row(0).starts_with(" ▌1"), "focused: accent bar: {}", row(0));
+        assert!(row(1).starts_with(" ▌2"), "needs you: red bar: {}", row(1));
+        assert!(row(3).starts_with("  4"), "nothing to say: no bar: {}", row(3));
+        assert!(row(0).contains("1 ") && row(0).contains("web"));
+        assert!(row(1).contains("api-gate") && row(1).contains('…'), "long names are cut: {}", row(1));
+        assert!(row(2).contains("docs •"), "unseen work keeps its dot: {}", row(2));
+        assert!(!mini.contains("Edit src/app.rs") || mini.lines().all(|l| !l.starts_with("       Edit")), "no activity rows");
+        assert!(mini.contains("+ new") && !mini.contains("new agent"));
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn mini_sidebar_fits_narrower_terminals() {
+        let (full, app) = screen(false, 60);
+        assert!(app.hits.cards.is_empty(), "60 columns is too narrow for the full sidebar:\n{full}");
+        for a in &app.agents {
+            a.shutdown();
+        }
+        let (_, app) = screen(true, 60);
+        assert_eq!(app.hits.cards.len(), 4, "but the mini one fits");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
 
     #[test]
     fn durations() {
