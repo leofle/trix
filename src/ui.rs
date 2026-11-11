@@ -113,8 +113,12 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let mut spans = vec![
         Span::styled(" ◆ ", Style::new().fg(t.accent)),
         Span::styled("trix", Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
-        Span::styled("   ", Style::new()),
     ];
+    if !crate::session::is_default() {
+        spans.push(Span::styled(" · ", Style::new().fg(t.muted)));
+        spans.push(Span::styled(crate::session::name(), Style::new().fg(t.accent).add_modifier(Modifier::BOLD)));
+    }
+    spans.push(Span::styled("   ", Style::new()));
     let pills = [
         (State::Blocked, "needs you"),
         (State::Working, "working"),
