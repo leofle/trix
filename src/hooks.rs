@@ -50,10 +50,8 @@ pub fn sweep_stale() {
             .split('.')
             .next()
             .and_then(|p| p.parse::<u32>().ok());
-        if let Some(pid) = pid {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
-                let _ = std::fs::remove_file(e.path());
-            }
+        if pid.is_some_and(|pid| !crate::platform::alive(pid)) {
+            let _ = std::fs::remove_file(e.path());
         }
     }
 }
