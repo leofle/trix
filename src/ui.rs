@@ -375,12 +375,16 @@ fn trunc(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
     }
+    // Leave a column for the ellipsis, and never split a wide character.
     let mut out = String::new();
+    let mut w = 0;
     for ch in s.chars() {
-        if out.width() + 2 > max {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw + 1 > max {
             break;
         }
         out.push(ch);
+        w += cw;
     }
     out.push('…');
     out
@@ -1047,4 +1051,33 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
     ]);
     f.render_widget(Paragraph::new(legend).alignment(Alignment::Center), Rect { y: r.bottom() - 2, height: 1, x: r.x, width: r.width });
     let _ = Instant::now();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations() {
+        let s = Duration::from_secs;
+        assert_eq!(fmt_dur(s(0)), "0s");
+        assert_eq!(fmt_dur(s(59)), "59s");
+        assert_eq!(fmt_dur(s(60)), "1m00s");
+        assert_eq!(fmt_dur(s(134)), "2m14s");
+        assert_eq!(fmt_dur(s(3599)), "59m59s");
+        assert_eq!(fmt_dur(s(3600)), "1h00m");
+        assert_eq!(fmt_dur(s(3725)), "1h02m");
+    }
+
+    #[test]
+    fn trunc_fits_the_width() {
+        assert_eq!(trunc("hello", 5), "hello");
+        assert_eq!(trunc("hello world", 6), "hello…");
+        assert_eq!(trunc("日本語テキスト", 6), "日本…");
+        for max in 1..12 {
+            for s in ["hello world", "日本語テキスト", "a日b本c語"] {
+                assert!(trunc(s, max).width() <= max.max(1), "{s:?} at {max}: {:?}", trunc(s, max));
+            }
+        }
+    }
 }

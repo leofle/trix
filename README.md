@@ -105,6 +105,8 @@ src/input.rs   key → xterm byte encoding
 src/theme.rs   Omarchy theme loading / live reload
 ```
 
+`cargo test` runs the unit tests, which take well under a second. They cover the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
+
 Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_THEME=path/to/colors.toml` overrides the theme. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
 ## Next

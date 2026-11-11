@@ -11,6 +11,8 @@ use alacritty_terminal::tty;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -540,25 +542,7 @@ impl Agent {
             }
             text.push('\n');
         }
-        let t = text.to_lowercase();
-        // Only phrasings of actual prompts — a bare word like "approve" shows
-        // up in ordinary agent prose and code.
-        const PATTERNS: [&str; 13] = [
-            "enter to confirm",
-            "trust this folder",
-            "(yes/no)",
-            "do you want to",
-            "would you like to",
-            "allow command",
-            "allow this",
-            "(y/n)",
-            "[y/n]",
-            "yes, and don't ask",
-            "yes, proceed",
-            "press enter to confirm",
-            "❯ 1. yes",
-        ];
-        PATTERNS.iter().any(|p| t.contains(p))
+        needs_input(&text)
     }
 
     /// Plain-text dump of the visible screen (used for broadcast previews & copy).
@@ -584,6 +568,29 @@ impl Agent {
     pub fn cursor_point(&self) -> Point {
         self.term.lock().grid().cursor.point
     }
+}
+
+/// Does this screen text show an approval prompt or a question?
+fn needs_input(screen: &str) -> bool {
+    let t = screen.to_lowercase();
+    // Only phrasings of actual prompts — a bare word like "approve" shows
+    // up in ordinary agent prose and code.
+    const PATTERNS: [&str; 13] = [
+        "enter to confirm",
+        "trust this folder",
+        "(yes/no)",
+        "do you want to",
+        "would you like to",
+        "allow command",
+        "allow this",
+        "(y/n)",
+        "[y/n]",
+        "yes, and don't ask",
+        "yes, proceed",
+        "press enter to confirm",
+        "❯ 1. yes",
+    ];
+    PATTERNS.iter().any(|p| t.contains(p))
 }
 
 fn window_size((cols, lines): (u16, u16)) -> WindowSize {
@@ -658,5 +665,345 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
             let cmd = spec.command.clone().unwrap_or_default();
             (shell, vec!["-lc".into(), cmd])
         }
+    }
+}
+
+/// A real agent around `sleep`: a live PTY and emulator, but nothing on screen
+/// and no output, so the state machine only sees what a test feeds it.
+#[cfg(test)]
+pub(crate) fn test_agent(kind: Kind) -> Agent {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let spec = Spawn {
+        kind: Kind::Custom,
+        name: "t".into(),
+        cwd: std::env::temp_dir(),
+        command: Some("exec sleep 60".into()),
+        prompt: None,
+        branch_note: None,
+        resume: None,
+    };
+    let sock = std::env::temp_dir().join("trix-test.sock");
+    let mut a = Agent::spawn(1, spec, (80, 24), tx, &sock, None, std::path::Path::new("/bin/true")).unwrap();
+    a.kind = kind;
+    a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hook(source: &str, event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        HookMsg {
+            agent: 1,
+            source: source.into(),
+            event: event.into(),
+            tool: tool.map(Into::into),
+            detail: detail.map(Into::into),
+            session: None,
+        }
+    }
+    fn claude(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        hook("claude", event, tool, detail)
+    }
+    fn ago(d: Duration) -> Instant {
+        Instant::now().checked_sub(d).expect("uptime")
+    }
+    fn spec(kind: Kind) -> Spawn {
+        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None }
+    }
+
+    // ── state transitions ──
+
+    #[test]
+    fn set_state_reports_changes_only() {
+        let mut a = test_agent(Kind::Claude);
+        assert_eq!(a.set_state(State::Working, true), Some(State::Starting));
+        assert!(a.work_started.is_some());
+        assert_eq!(a.set_state(State::Working, true), None);
+        a.set_state(State::Blocked, true);
+        assert!(a.work_started.is_some(), "blocked keeps the work timer");
+        a.set_state(State::Idle, true);
+        assert!(a.work_started.is_none());
+    }
+
+    #[test]
+    fn unseen_only_when_not_looking() {
+        let mut a = test_agent(Kind::Claude);
+        a.set_state(State::Done, false);
+        assert!(a.unseen);
+        a.set_state(State::Working, false);
+        a.set_state(State::Done, true);
+        assert!(!a.unseen);
+        a.set_state(State::Blocked, false);
+        assert!(a.unseen);
+    }
+
+    // ── hooks ──
+
+    #[test]
+    fn a_full_claude_turn() {
+        let mut a = test_agent(Kind::Claude);
+        assert_eq!(a.on_hook(&claude("SessionStart", None, None), false), Some(State::Starting));
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "ready"));
+        assert!(a.hooked);
+
+        a.on_hook(&claude("UserPromptSubmit", None, Some("fix the tests")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "thinking"));
+        assert_eq!(a.last_prompt.as_deref(), Some("fix the tests"));
+
+        a.on_hook(&claude("PreToolUse", Some("Bash"), Some("cargo test")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.tools_used), (State::Working, "Bash cargo test", 1));
+
+        a.on_hook(&claude("PermissionRequest", Some("Bash"), Some("rm -rf dist")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "approve Bash rm -rf dist"));
+        assert!(a.unseen);
+
+        a.on_hook(&claude("PostToolUse", Some("Bash"), None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "Bash ✓"));
+
+        a.on_hook(&claude("PreToolUse", Some("Read"), None), false);
+        assert_eq!(a.activity, "Read", "no detail: just the tool");
+
+        a.on_hook(&claude("Stop", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 2 tools"));
+    }
+
+    #[test]
+    fn a_reply_without_tools() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("UserPromptSubmit", None, None), true);
+        a.on_hook(&claude("Stop", None, None), true);
+        assert_eq!(a.activity, "replied");
+        a.on_hook(&claude("UserPromptSubmit", None, None), true);
+        a.on_hook(&claude("PreToolUse", Some("Edit"), Some("app.rs")), true);
+        a.on_hook(&claude("Stop", None, None), true);
+        assert_eq!(a.activity, "finished · 1 tool", "the count restarts each prompt");
+    }
+
+    #[test]
+    fn questions_block() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("PreToolUse", Some("AskUserQuestion"), Some("Which db?")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which db?"));
+        let mut b = test_agent(Kind::Claude);
+        b.on_hook(&claude("PreToolUse", Some("AskUserQuestion"), None), false);
+        assert_eq!(b.activity, "has a question");
+    }
+
+    #[test]
+    fn only_permission_notifications_block() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("UserPromptSubmit", None, None), true);
+        assert_eq!(a.on_hook(&claude("Notification", None, Some("Claude is waiting for your input")), true), None);
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&claude("Notification", None, Some("Claude needs your permission to use Bash")), true);
+        assert_eq!(a.state, State::Blocked);
+    }
+
+    #[test]
+    fn codex_turn_complete_uses_its_message() {
+        let mut a = test_agent(Kind::Codex);
+        a.set_state(State::Working, true);
+        a.on_hook(&hook("codex", "agent-turn-complete", None, Some("All green")), true);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "All green"));
+        assert!(!a.hooked && !a.reported, "codex keeps the heuristics");
+    }
+
+    #[test]
+    fn latest_session_id_wins() {
+        let mut a = test_agent(Kind::Claude);
+        let mut m = claude("SessionStart", None, None);
+        m.session = Some("first".into());
+        a.on_hook(&m, true);
+        let mut m = claude("Stop", None, None);
+        a.on_hook(&m, true);
+        assert_eq!(a.session.as_deref(), Some("first"), "a report without an id keeps the old one");
+        m.session = Some("after-clear".into());
+        a.on_hook(&m, true);
+        assert_eq!(a.session.as_deref(), Some("after-clear"));
+    }
+
+    #[test]
+    fn exited_agents_ignore_late_hooks() {
+        let mut a = test_agent(Kind::Claude);
+        a.set_state(State::Exited, true);
+        assert_eq!(a.on_hook(&claude("SessionEnd", None, None), true), None);
+        assert_eq!(a.state, State::Exited);
+        assert_eq!(a.heuristics(true), None);
+    }
+
+    #[test]
+    fn unknown_events_change_nothing() {
+        let mut a = test_agent(Kind::Claude);
+        a.set_state(State::Idle, true);
+        assert_eq!(a.on_hook(&claude("SomethingNew", None, None), true), None);
+        assert_eq!(a.state, State::Idle);
+    }
+
+    // ── heuristics ──
+
+    #[test]
+    fn starting_settles_to_idle() {
+        let mut a = test_agent(Kind::Shell);
+        assert_eq!(a.heuristics(true), None, "too early");
+        a.created = ago(Duration::from_secs(2));
+        a.last_output = ago(Duration::from_secs(1));
+        assert_eq!(a.heuristics(true), Some(State::Starting));
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "ready"));
+    }
+
+    #[test]
+    fn hooked_turn_that_went_silent_was_interrupted() {
+        let mut a = test_agent(Kind::Claude);
+        a.hooked = true;
+        a.set_state(State::Working, true);
+        a.last_output = ago(Duration::from_secs(3));
+        assert_eq!(a.heuristics(true), None, "spinner pauses happen");
+        a.last_output = ago(Duration::from_secs(7));
+        a.heuristics(true);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+    }
+
+    #[test]
+    fn dismissed_prompt_stops_blocking() {
+        let mut a = test_agent(Kind::Claude);
+        a.hooked = true;
+        a.set_state(State::Blocked, true);
+        a.state_since = ago(Duration::from_secs(5));
+        a.last_output = ago(Duration::from_secs(3));
+        assert_eq!(a.heuristics(true), None, "nobody pressed anything");
+        a.dismissed_at = Some(ago(Duration::from_secs(3)));
+        a.heuristics(true);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "dismissed"));
+    }
+
+    #[test]
+    fn unhooked_long_work_is_done_short_work_is_idle() {
+        let mut a = test_agent(Kind::Claude);
+        a.set_state(State::Working, true);
+        a.work_started = Some(ago(Duration::from_secs(10)));
+        a.last_output = ago(Duration::from_secs(2));
+        a.heuristics(true);
+        assert_eq!(a.state, State::Done);
+        assert!(a.activity.starts_with("finished after"), "{}", a.activity);
+
+        let mut b = test_agent(Kind::Claude);
+        b.set_state(State::Working, true);
+        b.work_started = Some(ago(Duration::from_secs(1)));
+        b.last_output = ago(Duration::from_secs(2));
+        b.heuristics(true);
+        assert_eq!(b.state, State::Idle);
+    }
+
+    #[test]
+    fn sustained_output_means_working() {
+        let mut a = test_agent(Kind::Shell);
+        a.set_state(State::Idle, true);
+        for _ in 0..5 {
+            a.burst.push_back(Instant::now());
+        }
+        assert_eq!(a.heuristics(true), None, "a few bursts are not work yet");
+        a.burst.push_back(Instant::now());
+        a.last_output = Instant::now();
+        a.heuristics(true);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "working"));
+    }
+
+    #[test]
+    fn self_reporting_tools_skip_heuristics() {
+        let mut a = test_agent(Kind::Custom);
+        a.on_hook(&hook("mytool", "UserPromptSubmit", None, None), true);
+        assert!(a.reported);
+        a.last_output = ago(Duration::from_secs(60));
+        a.work_started = Some(ago(Duration::from_secs(60)));
+        assert_eq!(a.heuristics(true), None);
+        assert_eq!(a.state, State::Working);
+    }
+
+    #[test]
+    fn keystroke_echo_is_not_activity() {
+        let mut a = test_agent(Kind::Shell);
+        a.last_input = Instant::now();
+        a.last_resize = ago(Duration::from_secs(10));
+        a.on_output();
+        assert!(a.burst.is_empty());
+        a.last_input = ago(Duration::from_secs(10));
+        a.on_output();
+        assert_eq!(a.burst.len(), 1);
+        assert_eq!(*a.spark.back().unwrap(), 2, "both still count for the sparkline");
+    }
+
+    // ── screen prompts ──
+
+    #[test]
+    fn prompts_on_screen_need_input() {
+        assert!(needs_input("Do you want to proceed?\n ❯ 1. Yes\n   2. No"));
+        assert!(needs_input("Allow command `rm -rf dist`? (y/N)"));
+        assert!(needs_input("DO YOU TRUST THIS FOLDER?"));
+        assert!(needs_input("Press Enter to confirm"));
+    }
+
+    #[test]
+    fn ordinary_prose_does_not() {
+        assert!(!needs_input(""));
+        assert!(!needs_input("I'd approve of this approach; the yes branch is fine."));
+        assert!(!needs_input("$ cargo test\n test result: ok"));
+    }
+
+    // ── command lines ──
+
+    #[test]
+    fn claude_command_line() {
+        let mut s = spec(Kind::Claude);
+        s.resume = Some("abc".into());
+        s.command = Some(r#"--model opus --append-system-prompt "be terse""#.into());
+        s.prompt = Some("fix it".into());
+        let (prog, args) = command_for(&s, Some(Path::new("/run/s.json")), Path::new("/bin/trix"));
+        assert_eq!(prog, "claude");
+        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--model", "opus", "--append-system-prompt", "be terse", "fix it"]);
+
+        let mut s = spec(Kind::Claude);
+        s.command = Some("   ".into());
+        s.prompt = Some(String::new());
+        assert!(command_for(&s, None, Path::new("/bin/trix")).1.is_empty());
+    }
+
+    #[test]
+    fn codex_command_line() {
+        let notify = r#"notify=["/bin/trix","hook","codex"]"#;
+        let mut s = spec(Kind::Codex);
+        s.prompt = Some("hi".into());
+        let (prog, args) = command_for(&s, None, Path::new("/bin/trix"));
+        assert_eq!(prog, "codex");
+        assert_eq!(args, ["-c", notify, "hi"]);
+
+        // Resuming: the id goes last and a first prompt makes no sense.
+        s.resume = Some("t-1".into());
+        s.command = Some("--full-auto".into());
+        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1, ["resume", "-c", notify, "--full-auto", "t-1"]);
+    }
+
+    #[test]
+    fn shell_and_custom_command_lines() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        assert_eq!(command_for(&spec(Kind::Shell), None, Path::new("/bin/trix")), (shell.clone(), vec![]));
+        let mut s = spec(Kind::Custom);
+        s.command = Some("npm run dev".into());
+        assert_eq!(command_for(&s, None, Path::new("/bin/trix")), (shell, vec!["-lc".into(), "npm run dev".into()]));
+    }
+
+    #[test]
+    fn unbalanced_quotes_fall_back_to_words() {
+        assert_eq!(split_args(r#"--a "b c""#), ["--a", "b c"]);
+        assert_eq!(split_args(r#"--a "b"#), ["--a", "\"b"]);
+    }
+
+    #[test]
+    fn kind_labels_roundtrip() {
+        for k in Kind::ALL {
+            assert_eq!(Kind::from_label(k.label()), Some(k));
+        }
+        assert_eq!(Kind::from_label("vim"), None);
+        assert!(!Kind::Shell.is_agent() && Kind::Custom.is_agent());
     }
 }
