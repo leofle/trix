@@ -6,7 +6,6 @@ use alacritty_terminal::term::TermMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -1457,12 +1456,6 @@ fn parse_shortstat(s: &str) -> (u32, u32, u32) {
     r
 }
 
-fn reap(mut child: std::process::Child) {
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-}
-
 /// A burst of completions gets one chime, without delaying the workspace.
 fn completion_sound_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2))
@@ -1471,50 +1464,22 @@ fn completion_sound_due(last: Option<Instant>, now: Instant) -> bool {
 fn play_completion_sound() {
     // Embed the approved chime so installed binaries need no asset directory.
     const CHIME: &[u8] = include_bytes!("../assets/task-complete.wav");
-    std::thread::spawn(|| {
-        let Ok(mut child) = Command::new("pw-play")
-            .args(["--media-role", "Notification", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            return;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(CHIME);
-        }
-        let _ = child.wait();
-    });
+    crate::platform::play(CHIME);
 }
 
 fn desktop_notify(title: &str, body: &str, urgent: bool) {
     if std::env::var_os("TRIX_NO_NOTIFY").is_some() {
         return;
     }
-    let res = Command::new("notify-send")
-        .args(["-a", "trix", "-u", if urgent { "critical" } else { "normal" }, title, body])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Ok(c) = res {
-        reap(c);
-    }
+    crate::platform::notify(title, body, urgent);
 }
 
 pub fn copy_to_clipboard(out: &Out, text: &str) {
     // OSC 52 reaches the attached terminal (works over SSH too)…
     let b64 = base64(text.as_bytes());
     out.send(format!("\x1b]52;c;{b64}\x07").as_bytes());
-    // …and wl-copy covers terminals that ignore it.
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Ok(mut c) = Command::new("wl-copy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            if let Some(mut stdin) = c.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            reap(c);
-        }
-    }
+    // …and the system clipboard covers terminals that ignore it.
+    crate::platform::copy(text);
 }
 
 fn base64(data: &[u8]) -> String {

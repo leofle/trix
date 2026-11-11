@@ -3,6 +3,7 @@ mod app;
 mod control;
 mod hooks;
 mod input;
+mod platform;
 mod search;
 mod session;
 mod state;

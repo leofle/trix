@@ -129,6 +129,9 @@ pub struct Agent {
     pub command_line: String,
     pub term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
+    /// Our own handle on the PTY's master side, to ask the terminal which
+    /// process group is in the foreground.
+    pty: std::fs::File,
     pub pid: u32,
     pub size: (u16, u16),
 
@@ -219,6 +222,7 @@ impl Agent {
         let ws = window_size(size);
         let pty = tty::new(&opts, ws, id as u64)?;
         let pid = pty.child().id();
+        let master = pty.file().try_clone()?;
 
         let listener = Listener { id, tx };
         let config = Config { scrolling_history: 10_000, ..Config::default() };
@@ -239,6 +243,7 @@ impl Agent {
             command_line,
             term,
             sender,
+            pty: master,
             pid,
             size,
             state: State::Starting,
@@ -610,24 +615,17 @@ impl Agent {
     /// terminal's foreground process group says: the shell's own while at the
     /// prompt, the command's while one runs.
     pub fn running_command(&self) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else { return false };
-        foreground_group(&stat).is_some_and(|g| g > 0 && g != self.pid as i32)
+        crate::platform::foreground_group(&self.pty).is_some_and(|g| g != self.pid as i32)
     }
 
     pub fn live_cwd(&self) -> PathBuf {
-        std::fs::read_link(format!("/proc/{}/cwd", self.pid)).unwrap_or_else(|_| self.cwd.clone())
+        crate::platform::cwd_of(self.pid).unwrap_or_else(|| self.cwd.clone())
     }
 
     #[allow(dead_code)]
     pub fn cursor_point(&self) -> Point {
         self.term.lock().grid().cursor.point
     }
-}
-
-/// The terminal's foreground process group (`tpgid`) from a /proc stat line.
-/// The command name can hold spaces and parens, so count from its last ')'.
-fn foreground_group(stat: &str) -> Option<i32> {
-    stat.rsplit_once(')')?.1.split_whitespace().nth(5)?.parse().ok()
 }
 
 /// Does this screen text show an approval prompt or a question?
@@ -794,12 +792,29 @@ mod tests {
     }
 
     #[test]
-    fn foreground_group_from_stat() {
-        assert_eq!(foreground_group("4242 (zsh) S 1 4242 4242 34817 4300 4194560 0"), Some(4300));
-        assert_eq!(foreground_group("7 (a b) c)) S 1 7 7 0 -1 0"), Some(-1));
-        assert_eq!(foreground_group("garbage"), None);
+    fn foreground_job_from_the_terminal() {
         let a = test_agent(Kind::Shell);
         assert!(!a.running_command(), "sleep leads its own foreground group");
+        a.shutdown();
+        // A shell with job control hands the terminal to the command it runs.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut s = spec(Kind::Custom);
+        s.command = Some("exec sh -mc 'sleep 5; true'".into());
+        s.cwd = std::env::temp_dir();
+        let a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), None, Path::new("/bin/true")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !a.running_command() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.running_command(), "sleep is in the foreground, not the shell");
+        a.shutdown();
+    }
+
+    #[test]
+    fn live_cwd_follows_the_process() {
+        let a = test_agent(Kind::Shell);
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap();
+        assert_eq!(real(&a.live_cwd()), real(&std::env::temp_dir()));
         a.shutdown();
     }
 

@@ -21,7 +21,7 @@ A workspace where coding agents live. Run Claude Code, Codex, shells, or any CLI
 Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and Rex added agent awareness, but they still treat the agent as just another pane. In trix, the agent comes first:
 
 - **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>` and Codex with `-c` hook overrides, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex).) Agents without hooks fall back to output cadence and screen heuristics.
-- **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (requires `pw-play` from PipeWire). Completions within two seconds share one chime. The terminal title tracks the count too.
+- **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too.
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
@@ -131,11 +131,20 @@ Scrollback isn't restored, and closed or exited agents aren't saved.
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
 | `shift+pgup/pgdn`, wheel | scrollback |
-| drag | select & copy (OSC 52 + wl-copy) |
+| drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
 | `alt+?` | all keys |
 | `alt+q` | quit (stops every agent) |
 
 Every other key goes straight to the focused agent, including `shift+enter` for a newline in the Claude and Codex composers.
+
+## macOS
+
+trix runs on Linux and macOS. On a Mac:
+
+- **Make Option send Alt.** Every trix key is `alt+…`, and macOS terminals type `˜` for Option-N unless told otherwise. In Ghostty, set `macos-option-as-alt = true`. In iTerm2, go to Settings › Profiles › Keys and set Left Option to `Esc+`. In Terminal.app, go to Settings › Profiles › Keyboard and turn on "Use Option as Meta key". In kitty, set `macos_option_as_alt yes`.
+- **Notifications** go through `osascript`. They appear as coming from Script Editor; allow it once in System Settings › Notifications.
+- **The chime** plays through `afplay`. **Copying** goes through OSC 52, plus `pbcopy` for terminals that ignore it (Terminal.app).
+- **Files:** sockets and logs live under `$TMPDIR/trix` (there's no `XDG_RUNTIME_DIR`). The saved workspace lives in `~/.local/state/trix`. Without Omarchy, the theme is Tokyo Night, or whatever `TRIX_THEME` points at.
 
 ## Codex
 
@@ -174,6 +183,7 @@ src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay + Co
 src/ui.rs      all rendering
 src/input.rs   key → xterm byte encoding
 src/theme.rs   Omarchy theme loading / live reload
+src/platform.rs Linux / macOS differences: process liveness and folders, foreground job, notifications, sound, clipboard
 ```
 
 `cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
