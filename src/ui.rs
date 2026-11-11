@@ -867,12 +867,8 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let inner = block.inner(r);
             f.render_widget(block, r);
             let inner = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height };
-            let n = app
-                .agents
-                .iter()
-                .filter(|a| a.state != State::Exited)
-                .filter(|a| *target == BroadcastTarget::All || a.kind.is_agent() && matches!(a.state, State::Idle | State::Done))
-                .count();
+            let n = app.agents.iter().filter(|a| crate::app::broadcast_reaches(a, *target)).count();
+            let held = app.agents.iter().filter(|a| a.kind.is_agent() && matches!(a.state, State::Blocked | State::Starting)).count();
             let pill = |on: bool, s: &'static str| {
                 if on {
                     Span::styled(format!(" {s} "), Style::new().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD))
@@ -890,6 +886,15 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 ])),
                 Rect { height: 1, ..inner },
             );
+            if held > 0 {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        format!("skipping {held} on a prompt — answer {} first", if held == 1 { "it" } else { "them" }),
+                        Style::new().fg(t.dim),
+                    )),
+                    Rect { y: inner.y + 4, height: 1, ..inner },
+                );
+            }
             let (spans, cur) = input_spans(inp, true, "message to send…", t, inner.width as usize - 2);
             let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
             line.extend(spans);

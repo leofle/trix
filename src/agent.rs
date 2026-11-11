@@ -132,7 +132,14 @@ pub struct Agent {
     pub created: Instant,
     /// Unseen completion / question — cleared when the human looks at it.
     pub unseen: bool,
+    /// Claude lifecycle hooks are reporting (spinner-aware heuristics apply).
     pub hooked: bool,
+    /// A custom tool reports its own state via `trix hook <source>`; trust it
+    /// and skip the output heuristics entirely.
+    pub reported: bool,
+    /// Last Esc/Enter the human pressed while this agent was blocked.
+    pub dismissed_at: Option<Instant>,
+    last_resize: Instant,
     pub activity: String,
     pub last_prompt: Option<String>,
     pub title: Option<String>,
@@ -177,6 +184,11 @@ impl Agent {
         env.insert("TRIX_SOCKET".into(), socket.display().to_string());
         env.insert("TRIX_AGENT_ID".into(), id.to_string());
         env.insert("TRIX_AGENT_NAME".into(), spec.name.clone());
+        if spec.kind == Kind::Codex {
+            if let Some(chain) = codex_user_notify() {
+                env.insert("TRIX_CODEX_NOTIFY".into(), chain);
+            }
+        }
 
         let opts = tty::Options {
             shell: Some(tty::Shell::new(program, args)),
@@ -214,6 +226,9 @@ impl Agent {
             created: now,
             unseen: false,
             hooked: false,
+            reported: false,
+            dismissed_at: None,
+            last_resize: now,
             activity: spec.branch_note.unwrap_or_else(|| "launching".into()),
             last_prompt: spec.prompt,
             title: None,
@@ -256,6 +271,7 @@ impl Agent {
             return;
         }
         self.size = (cols, lines);
+        self.last_resize = Instant::now();
         let _ = self.sender.send(Msg::Resize(window_size((cols, lines))));
         self.term.lock().resize(TermSize { cols: cols as usize, lines: lines as usize });
     }
@@ -296,8 +312,11 @@ impl Agent {
         if let Some(b) = self.spark.back_mut() {
             *b += 1;
         }
-        // Ignore output that is just the echo of keystrokes.
-        if now.duration_since(self.last_input) > Duration::from_millis(350) {
+        // Ignore output that is just the echo of keystrokes, or the redraw a
+        // resize provokes (sidebar / grid / attention banner toggles).
+        if now.duration_since(self.last_input) > Duration::from_millis(350)
+            && now.duration_since(self.last_resize) > Duration::from_millis(400)
+        {
             self.burst.push_back(now);
         }
         while self.burst.front().is_some_and(|t| now.duration_since(*t) > Duration::from_millis(2500)) {
@@ -315,7 +334,16 @@ impl Agent {
 
     /// Apply a hook report. Returns the previous state when it changed.
     pub fn on_hook(&mut self, msg: &HookMsg, focused: bool) -> Option<State> {
-        self.hooked |= msg.source == "claude";
+        // A late report (e.g. SessionEnd racing ChildExit) must not revive a
+        // dead pane: Enter-to-restart only works while it reads as exited.
+        if self.state == State::Exited {
+            return None;
+        }
+        match msg.source.as_str() {
+            "claude" => self.hooked = true,
+            "codex" => {} // notify only covers turn completion; keep heuristics
+            _ => self.reported = true,
+        }
         let tool = msg.tool.clone().unwrap_or_default();
         let described = |d: &Option<String>| match d {
             Some(d) if !d.is_empty() => format!("{tool} {d}"),
@@ -407,6 +435,10 @@ impl Agent {
             return None;
         }
 
+        if self.reported {
+            return None;
+        }
+
         let screen_question = || self.screen_needs_input();
 
         if self.hooked {
@@ -422,6 +454,18 @@ impl Agent {
             }
             if self.state == State::Blocked && busy && !screen_question() {
                 return self.set_state(State::Working, focused);
+            }
+            // Denied / cancelled a prompt: no PostToolUse or Stop follows, and
+            // the redraw lands inside the keystroke-echo window. If the human
+            // pressed Esc/Enter, things went quiet and the prompt is gone, it
+            // no longer needs them.
+            if self.state == State::Blocked
+                && self.dismissed_at.is_some_and(|t| t > self.state_since && t.elapsed() > Duration::from_secs(2))
+                && quiet > Duration::from_secs(2)
+                && !screen_question()
+            {
+                self.activity = "dismissed".into();
+                return self.set_state(State::Idle, focused);
             }
             return None;
         }
@@ -446,6 +490,12 @@ impl Agent {
             State::Blocked if busy && !screen_question() => {
                 self.activity = "working".into();
                 self.set_state(State::Working, focused)
+            }
+            // Unhooked agents only become blocked from what the screen shows,
+            // so once the prompt is gone and output settles, they're not.
+            State::Blocked if quiet > Duration::from_secs(2) && !screen_question() => {
+                self.activity = "idle".into();
+                self.set_state(State::Idle, focused)
             }
             State::Idle | State::Done if busy => {
                 self.activity = self.title.clone().unwrap_or_else(|| "working".into());
@@ -478,6 +528,8 @@ impl Agent {
             text.push('\n');
         }
         let t = text.to_lowercase();
+        // Only phrasings of actual prompts — a bare word like "approve" shows
+        // up in ordinary agent prose and code.
         const PATTERNS: [&str; 13] = [
             "enter to confirm",
             "trust this folder",
@@ -489,7 +541,7 @@ impl Agent {
             "(y/n)",
             "[y/n]",
             "yes, and don't ask",
-            "approve",
+            "yes, proceed",
             "press enter to confirm",
             "❯ 1. yes",
         ];
@@ -525,6 +577,30 @@ fn window_size((cols, lines): (u16, u16)) -> WindowSize {
     WindowSize { num_cols: cols, num_lines: lines, cell_width: 9, cell_height: 18 }
 }
 
+/// Split user-typed extra flags the way a shell would, so quoted values like
+/// `--append-system-prompt "be terse"` stay one argument.
+fn split_args(s: &str) -> Vec<String> {
+    shell_words::split(s).unwrap_or_else(|_| s.split_whitespace().map(String::from).collect())
+}
+
+/// The user's own Codex `notify` command (JSON array), so `trix hook codex`
+/// can call it after reporting — our `-c notify=` would otherwise replace it.
+fn codex_user_notify() -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
+    let text = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    let table: toml::Table = text.parse().ok()?;
+    let argv: Vec<String> = table
+        .get("notify")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    let is_trix = argv.first().is_some_and(|p| p.rsplit('/').next() == Some("trix")) && argv.get(1).map(String::as_str) == Some("hook");
+    (!argv.is_empty() && !is_trix).then(|| serde_json::to_string(&argv).ok()).flatten()
+}
+
 fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &std::path::Path) -> (String, Vec<String>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut args = Vec::new();
@@ -535,7 +611,7 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
                 args.push(s.display().to_string());
             }
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
-                args.extend(extra.split_whitespace().map(String::from));
+                args.extend(split_args(extra));
             }
             if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
                 args.push(p.into());
@@ -544,9 +620,11 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
         }
         Kind::Codex => {
             args.push("-c".into());
-            args.push(format!("notify=[\"{}\",\"hook\",\"codex\"]", exe.display()));
+            // A JSON string array is a valid TOML inline array, with escaping.
+            let notify = serde_json::to_string(&[exe.display().to_string(), "hook".into(), "codex".into()]).unwrap_or_default();
+            args.push(format!("notify={notify}"));
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
-                args.extend(extra.split_whitespace().map(String::from));
+                args.extend(split_args(extra));
             }
             if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
                 args.push(p.into());

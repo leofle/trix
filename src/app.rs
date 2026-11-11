@@ -311,9 +311,14 @@ impl App {
         let mut note = None;
         if f.worktree {
             match make_worktree(&cwd, &slug(&name)) {
-                Ok((path, branch)) => {
+                Ok((path, branch, reused)) => {
+                    if let Some(other) = self.agents.iter().find(|a| a.cwd == path) {
+                        f.error = Some(format!("{branch} is already {}'s worktree — pick another name", other.name));
+                        f.field = 2;
+                        return;
+                    }
                     cwd = path;
-                    note = Some(format!("worktree on {branch}"));
+                    note = Some(format!("{} worktree on {branch}", if reused { "reusing" } else { "new" }));
                 }
                 Err(e) => {
                     f.error = Some(e.to_string());
@@ -336,18 +341,26 @@ impl App {
     }
 
     fn restart(&mut self, idx: usize) {
-        let id = self.agents[idx].id;
-        let Some(spec) = self.specs.get(&id) else { return };
-        let mut spec = clone_spec(spec);
+        let old_id = self.agents[idx].id;
+        let Some(mut spec) = self.specs.remove(&old_id) else { return };
         spec.prompt = None;
+        // A fresh id, so late hook / exit events from the old process can't
+        // land on the new one.
+        let id = self.next_id;
+        self.next_id += 1;
         let size = self.agents[idx].size;
         match Agent::spawn(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe) {
             Ok(a) => {
                 self.agents[idx].shutdown();
                 self.agents[idx] = a;
                 self.toast(format!("restarted {}", spec.name), ToastKind::Good);
+                self.specs.insert(id, spec);
+                self.sync_git_targets();
             }
-            Err(e) => self.toast(format!("restart failed: {e}"), ToastKind::Bad),
+            Err(e) => {
+                self.specs.insert(old_id, spec);
+                self.toast(format!("restart failed: {e}"), ToastKind::Bad);
+            }
         }
     }
 
@@ -673,6 +686,9 @@ impl App {
             return;
         }
 
+        if a.state == State::Blocked && matches!(k.code, KeyCode::Esc | KeyCode::Enter) {
+            a.dismissed_at = Some(Instant::now());
+        }
         let bytes = {
             let mut t = a.term.lock();
             t.scroll_display(Scroll::Bottom);
@@ -821,10 +837,7 @@ impl App {
         }
         let mut n = 0;
         for a in self.agents.iter_mut() {
-            if a.state == State::Exited || !a.kind.is_agent() && target == BroadcastTarget::Waiting {
-                continue;
-            }
-            if target == BroadcastTarget::Waiting && !matches!(a.state, State::Idle | State::Done) {
+            if !broadcast_reaches(a, target) {
                 continue;
             }
             let mode = *a.term.lock().mode();
@@ -941,6 +954,20 @@ impl App {
     }
 }
 
+/// Whether a broadcast should be typed into this agent. Never shells (the
+/// prompt would run as a command), and never an agent sitting on a prompt:
+/// the trailing Enter would answer it — e.g. approve a pending `rm -rf`.
+/// Starting agents may be on a "trust this folder?" dialog, so skip those too.
+pub fn broadcast_reaches(a: &Agent, target: BroadcastTarget) -> bool {
+    if !a.kind.is_agent() {
+        return false;
+    }
+    match target {
+        BroadcastTarget::All => matches!(a.state, State::Idle | State::Working | State::Done),
+        BroadcastTarget::Waiting => matches!(a.state, State::Idle | State::Done),
+    }
+}
+
 fn viewport_point<T>(t: &alacritty_terminal::term::Term<T>, r: Rect, x: u16, y: u16) -> Point {
     let col = x.saturating_sub(r.x).min(r.width.saturating_sub(1)) as usize;
     let row = y.saturating_sub(r.y).min(r.height.saturating_sub(1)) as i32;
@@ -996,12 +1023,20 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`.
-fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String)> {
-    let root = git(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
-    let root = PathBuf::from(root);
-    let common = git(&root, &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| ".git".into());
-    let common = if Path::new(&common).is_absolute() { PathBuf::from(common) } else { root.join(common) };
+/// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
+/// is true when an existing worktree (e.g. from an earlier session) was reused.
+fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
+    let top = git(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
+    let top = PathBuf::from(top);
+    let common = git(&top, &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| ".git".into());
+    let common = if Path::new(&common).is_absolute() { PathBuf::from(common) } else { top.join(common) };
+    // Anchor at the main checkout even when launched from inside a worktree
+    // (the form defaults to the focused agent's folder), so worktrees never
+    // nest inside each other.
+    let root = match common.file_name() {
+        Some(n) if n == ".git" => common.parent().map(Path::to_path_buf).unwrap_or(top),
+        _ => top,
+    };
     let exclude = common.join("info/exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
     if !existing.lines().any(|l| l.trim() == ".trix/") {
@@ -1011,7 +1046,7 @@ fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String)> {
     let path = root.join(".trix/worktrees").join(name);
     let branch = format!("trix/{name}");
     if path.exists() {
-        return Ok((path, branch));
+        return Ok((path, branch, true));
     }
     let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_some();
     let p = path.display().to_string();
@@ -1025,7 +1060,7 @@ fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String)> {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("worktree: {}", err.lines().last().unwrap_or("failed"));
     }
-    Ok((path, branch))
+    Ok((path, branch, false))
 }
 
 fn spawn_git_watcher(targets: Arc<Mutex<Vec<(u32, PathBuf)>>>, tx: Sender<AppEvent>) {

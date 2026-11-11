@@ -81,7 +81,8 @@ pub fn serve(path: &Path, tx: Sender<AppEvent>) -> anyhow::Result<()> {
 
 /// Claude Code settings overlay, passed with `claude --settings <file>`.
 pub fn write_claude_settings(exe: &Path) -> anyhow::Result<PathBuf> {
-    let cmd = format!("'{}' hook claude", exe.display());
+    let quoted = exe.display().to_string().replace('\'', r"'\''");
+    let cmd = format!("'{quoted}' hook claude");
     let handler = serde_json::json!([{ "type": "command", "command": cmd, "timeout": 5 }]);
     let mut hooks = serde_json::Map::new();
     for ev in ["PreToolUse", "PostToolUse", "PermissionRequest"] {
@@ -103,6 +104,23 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
         return;
     };
     let Ok(agent) = id.parse::<u32>() else { return };
+    // Codex: hand the payload on to the user's own notify, which our
+    // `-c notify=` replaced. Fire-and-forget, like Codex itself does.
+    if source == "codex" {
+        if let (Some(p), Ok(chain)) = (&arg_payload, std::env::var("TRIX_CODEX_NOTIFY")) {
+            if let Ok(argv) = serde_json::from_str::<Vec<String>>(&chain) {
+                if let Some((prog, rest)) = argv.split_first() {
+                    let _ = std::process::Command::new(prog)
+                        .args(rest)
+                        .arg(p)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
+        }
+    }
     let raw = match arg_payload {
         Some(p) => p,
         None => {
