@@ -540,6 +540,11 @@ impl Agent {
                 }
                 self.set_state(State::Working, focused)
             }
+            // Grok's permission prompt carries a message, not a tool: show it as is.
+            "PermissionRequest" if msg.source == "grok" && msg.detail.as_deref().is_some_and(|d| !d.is_empty()) => {
+                self.activity = hooks::one_line(msg.detail.as_deref().unwrap_or_default(), 60);
+                self.set_state(State::Blocked, focused)
+            }
             "PermissionRequest" => {
                 self.activity = format!("approve {}", described(&msg.detail));
                 self.set_state(State::Blocked, focused)
@@ -641,10 +646,15 @@ impl Agent {
         }
 
         // Grok and Cursor have no hook for their approval prompts: the
-        // prompt on screen is the sign, read only from their own wording.
-        // OpenCode's TUI may keep redrawing under its prompt, so no quiet
-        // spell is asked for: the wording alone is specific enough.
-        if self.kind.reads_prompts_on_screen() && self.state == State::Working && self.screen_kind_prompt() {
+        // prompt on screen is the sign, read only from their own wording,
+        // once the screen has been still for half a second. OpenCode's TUI
+        // may keep redrawing under its prompt, so it gets no quiet spell:
+        // the wording alone is specific enough.
+        if self.kind.reads_prompts_on_screen()
+            && self.state == State::Working
+            && (self.kind == Kind::OpenCode || quiet > Duration::from_millis(500))
+            && self.screen_kind_prompt()
+        {
             self.activity = "needs your approval".into();
             return self.set_state(State::Blocked, focused);
         }
@@ -1840,6 +1850,9 @@ mod tests {
         show(&a, "Run this command?\n → Run (once) (y)\n   Skip (esc or n)\n");
         a.on_output();
         a.heuristics(false);
+        assert_eq!(a.state, State::Working, "not while the screen is still drawing");
+        a.last_output = ago(Duration::from_millis(700));
+        a.heuristics(false);
         assert_eq!(a.state, State::Blocked);
         // Approved: the prompt is gone, the agent's question is still on screen.
         show(&a, "\x1b[2J\x1b[HWould you like to add tests too?\n  running…\n");
@@ -1909,5 +1922,21 @@ mod tests {
         a.on_hook(&hook("grok", "Stop", None, None), false);
         assert_eq!(a.state, State::Done);
         a.shutdown();
+    }
+
+    #[test]
+    fn grok_permission_hook_shows_its_message() {
+        let mut a = test_agent(Kind::Grok);
+        a.set_state(State::Idle, false);
+        a.on_hook(&hook("grok", "UserPromptSubmit", None, Some("go")), false);
+        a.on_hook(&hook("grok", "PermissionRequest", Some("permission"), Some("Grok needs your permission")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Grok needs your permission"));
+        let mut b = test_agent(Kind::Grok);
+        b.set_state(State::Idle, false);
+        b.on_hook(&hook("grok", "UserPromptSubmit", None, Some("go")), false);
+        b.on_hook(&hook("grok", "PermissionRequest", Some("permission"), None), false);
+        assert_eq!((b.state, b.activity.as_str()), (State::Blocked, "approve permission"));
+        a.shutdown();
+        b.shutdown();
     }
 }

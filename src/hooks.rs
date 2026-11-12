@@ -515,6 +515,8 @@ fn condense_grok(agent: u32, v: &Value) -> HookMsg {
         "PreToolUse" => input.and_then(|i| tool_detail(m.tool.as_deref(), i)),
         "UserPromptSubmit" => text(v, "prompt").map(|p| one_line(&p, 80)),
         "Notification" => text(v, "message").or_else(|| text(v, "notificationType")).or_else(|| text(v, "notification_type")),
+        // Grok's own words for what waits, such as "Grok needs your permission".
+        "PermissionRequest" => text(v, "message").map(|m| one_line(&m, 80)),
         _ => None,
     };
     if event == "PermissionRequest" && m.tool.is_none() {
@@ -779,7 +781,7 @@ mod tests {
         assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Notification", Some("task_complete")));
         assert_eq!(g(json!({"hook_event_name":"PermissionDenied"})).event, "unknown");
         let m = g(json!({"hook_event_name":"Notification","notificationType":"permission_prompt","notification_type":"permission_prompt","message":"Grok needs your permission"}));
-        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail), ("PermissionRequest", Some("permission"), None));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail), ("PermissionRequest", Some("permission"), Some("Grok needs your permission".into())));
         assert_eq!(g(json!({"hook_event_name":"Notification","notification_type":"permission_prompt"})).event, "PermissionRequest");
         assert_eq!(g(json!({"hook_event_name":"Notification","notificationType":"idle_prompt"})).event, "Notification");
     }
