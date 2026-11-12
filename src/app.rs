@@ -452,6 +452,9 @@ impl App {
             .filter(|a| a.state != State::Exited || self.parked.contains(&a.id))
             .filter_map(|a| {
                 let spec = self.specs.get(&a.id)?;
+                // Claude names its conversation at start, but writes it only
+                // with the first message: until then `--resume` finds nothing.
+                let written = a.transcript.as_ref().is_none_or(|p| p.exists());
                 Some(SavedAgent {
                     kind: a.kind.label().into(),
                     name: a.name.clone(),
@@ -460,7 +463,7 @@ impl App {
                     command: spec.command.clone(),
                     // An id trix made up for Grok names no conversation until
                     // a turn; one it resumed does from the start.
-                    session: if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) { a.session.clone() } else { None },
+                    session: if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) && written { a.session.clone() } else { None },
                 })
             })
             .collect()
@@ -2336,6 +2339,28 @@ mod tests {
         assert_eq!(app.open_agents()[0].session, None, "no turn yet: nothing to resume");
         app.agents[0].turn_seen = true;
         assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"));
+        app.agents[0].shutdown();
+    }
+
+    #[test]
+    fn a_claude_session_is_saved_once_its_conversation_is_written() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.id = 4;
+        let log = std::env::temp_dir().join(format!("trix-transcript-test-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        // SessionStart names the conversation and its log, before any message.
+        a.session = Some("1edd8d96-d5b4-47b7-98a2-3b9a0daa56b2".into());
+        a.transcript = Some(log.clone());
+        app.specs.insert(4, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
+        app.agents.push(a);
+        assert_eq!(app.open_agents()[0].session, None, "no message yet: --resume would find nothing");
+        std::fs::write(&log, "{}\n").unwrap();
+        assert_eq!(app.open_agents()[0].session.as_deref(), Some("1edd8d96-d5b4-47b7-98a2-3b9a0daa56b2"));
+        // No log reported at all (another agent): the id alone decides.
+        app.agents[0].transcript = None;
+        let _ = std::fs::remove_file(&log);
+        assert!(app.open_agents()[0].session.is_some());
         app.agents[0].shutdown();
     }
 
