@@ -328,6 +328,7 @@ fn server() -> anyhow::Result<()> {
         // Another server won the race; the client will connect to that one.
         return Ok(());
     };
+    platform::raise_fd_limit();
     let exe = std::env::current_exe()?;
     let (tx, rx) = mpsc::channel::<AppEvent>();
     hooks::sweep_stale();

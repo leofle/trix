@@ -18,6 +18,35 @@ pub fn alive(pid: u32) -> bool {
     ok || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Open files the server asks for at most. macOS refuses more than 10240
+/// (`OPEN_MAX`) however high the hard limit is, and that is about 2000 agents.
+const FD_WANTED: libc::rlim_t = 10240;
+
+/// The soft open-file limit to ask for: `FD_WANTED`, kept within the hard
+/// limit, and never lower than what is set now.
+fn fd_target(soft: libc::rlim_t, hard: libc::rlim_t) -> libc::rlim_t {
+    FD_WANTED.min(hard).max(soft)
+}
+
+/// Raise the soft limit on open files. Each agent needs about five (the
+/// terminal, its pipes, a socket and the log), and a shell inherits the
+/// usual macOS default of 256, which runs out at around 50 agents. Returns
+/// the limit now in force, or `None` if it can't be read.
+pub fn raise_fd_limit() -> Option<libc::rlim_t> {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
+    }
+    let want = fd_target(lim.rlim_cur, lim.rlim_max);
+    if want > lim.rlim_cur {
+        let raised = libc::rlimit { rlim_cur: want, rlim_max: lim.rlim_max };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return Some(want);
+        }
+    }
+    Some(lim.rlim_cur)
+}
+
 /// The process group in the foreground of the terminal behind `pty` (the
 /// master side), or `None` if it can't be told.
 pub fn foreground_group(pty: &impl AsRawFd) -> Option<i32> {
@@ -134,5 +163,24 @@ mod tests {
     #[test]
     fn own_working_folder() {
         assert_eq!(cwd_of(std::process::id()), std::env::current_dir().ok());
+    }
+
+    #[test]
+    fn fd_limit_target() {
+        assert_eq!(fd_target(256, libc::RLIM_INFINITY), FD_WANTED, "the macOS default is raised");
+        assert_eq!(fd_target(256, 1024), 1024, "never past the hard limit");
+        assert_eq!(fd_target(1_048_576, libc::RLIM_INFINITY), 1_048_576, "never lowered");
+        assert_eq!(fd_target(256, 256), 256);
+    }
+
+    #[test]
+    fn raising_the_fd_limit_sticks() {
+        let mut before = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) };
+        let now = raise_fd_limit().expect("readable");
+        assert!(now >= before.rlim_cur);
+        let mut after = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) };
+        assert_eq!(after.rlim_cur, now);
     }
 }
