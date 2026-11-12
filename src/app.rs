@@ -242,6 +242,8 @@ pub struct App {
     /// `~/.config/trix/config.toml`, and the write it was read from.
     pub config: crate::config::Config,
     config_stamp: Option<(std::time::SystemTime, u64)>,
+    /// The file had a mistake when it was last read.
+    config_failed: bool,
     last_needs_you_sound: Option<Instant>,
 }
 
@@ -306,6 +308,7 @@ impl App {
             published: HashMap::new(),
             config,
             config_stamp,
+            config_failed: config_error.is_some(),
             last_needs_you_sound: None,
         };
         if let Some(e) = config_error {
@@ -321,8 +324,18 @@ impl App {
             return;
         }
         self.config_stamp = stamp;
-        match crate::config::load() {
-            Ok(c) if c == self.config => {}
+        self.apply_config(crate::config::load());
+    }
+
+    fn apply_config(&mut self, loaded: Result<crate::config::Config, String>) {
+        let failed = std::mem::replace(&mut self.config_failed, loaded.is_err());
+        match loaded {
+            // A fix that lands back on the settings in use still deserves a word.
+            Ok(c) if c == self.config => {
+                if failed {
+                    self.toast("config OK again", ToastKind::Good);
+                }
+            }
             Ok(c) => {
                 self.config = c;
                 self.toast("config reloaded", ToastKind::Good);
@@ -1789,6 +1802,25 @@ mod tests {
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
+    }
+
+    #[test]
+    fn config_reloads_say_what_happened() {
+        let mut app = test_app();
+        let read = |text: &str| crate::config::parse(text, std::path::Path::new("/"));
+        let toast = |app: &mut App| app.toast.take().map(|t| t.text);
+        app.apply_config(read("[keys]\nnew = \"alt+t\"\n"));
+        assert_eq!(toast(&mut app).as_deref(), Some("config reloaded"));
+        app.apply_config(read("[keys]\nnew = \"t\"\n"));
+        let t = toast(&mut app).unwrap_or_default();
+        assert!(t.contains("alone would catch") && t.ends_with("kept the previous settings"), "{t}");
+        assert_eq!(app.key(crate::config::Action::New), "alt+t");
+        // Fixed, back to the settings in use: say so all the same.
+        app.apply_config(read("[keys]\nnew = \"alt+t\"\n"));
+        assert_eq!(toast(&mut app).as_deref(), Some("config OK again"));
+        // Saved again, unchanged: nothing to say.
+        app.apply_config(read("[keys]\nnew = \"alt+t\"\n"));
+        assert_eq!(toast(&mut app), None);
     }
 
     #[test]

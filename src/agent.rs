@@ -437,8 +437,12 @@ impl Agent {
                     self.work_started = Some(Instant::now());
                 }
             }
-            State::Done | State::Blocked => {
+            State::Done => self.unseen = !focused,
+            State::Blocked => {
                 self.unseen = !focused;
+                // Output from before it asked (a spinner, streamed text) is
+                // not the agent going on: only what comes after may count.
+                self.burst.clear();
             }
             _ => {}
         }
@@ -552,6 +556,12 @@ impl Agent {
             // Grok's permission prompt carries a message, not a tool: show it as is.
             "PermissionRequest" if msg.source == "grok" && msg.detail.as_deref().is_some_and(|d| !d.is_empty()) => {
                 self.activity = hooks::one_line(msg.detail.as_deref().unwrap_or_default(), 60);
+                self.set_state(State::Blocked, focused)
+            }
+            // Claude asks permission to show its own question: the question
+            // is what you're being asked.
+            "PermissionRequest" if tool == "AskUserQuestion" => {
+                self.activity = msg.detail.clone().unwrap_or_else(|| "has a question".into());
                 self.set_state(State::Blocked, focused)
             }
             "PermissionRequest" => {
@@ -931,7 +941,7 @@ fn needs_input(screen: &str) -> bool {
     let t = screen.to_lowercase();
     // Only phrasings of actual prompts — a bare word like "approve" shows
     // up in ordinary agent prose and code.
-    const PATTERNS: [&str; 13] = [
+    const PATTERNS: [&str; 14] = [
         "enter to confirm",
         "trust this folder",
         "(yes/no)",
@@ -945,6 +955,8 @@ fn needs_input(screen: &str) -> bool {
         "yes, proceed",
         "press enter to confirm",
         "❯ 1. yes",
+        // Claude Code's question dialog (AskUserQuestion).
+        "enter to select",
     ];
     PATTERNS.iter().any(|p| t.contains(p))
 }
@@ -1342,6 +1354,29 @@ mod tests {
         let mut b = test_agent(Kind::Claude);
         b.on_hook(&claude("PreToolUse", Some("AskUserQuestion"), None), false);
         assert_eq!(b.activity, "has a question");
+    }
+
+    #[test]
+    fn a_question_stays_asked_while_claude_draws_it() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("UserPromptSubmit", None, None), false);
+        redraw(&mut a); // its spinner, while it thinks
+        a.on_hook(&claude("PreToolUse", Some("AskUserQuestion"), Some("Tea or coffee?")), false);
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Tea or coffee?"), "output from before it asked isn't the turn going on");
+        // It draws the dialog, in many writes, as Claude Code 2.x does.
+        show(&a, "Tea or coffee?\n❯ 1. Tea\n  2. Coffee\n  3. Type something.\nEnter to select · ↑/↓ to navigate · Esc to cancel\n");
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked, "its dialog is on screen");
+        // Then it asks to show it and says it needs you: still the one question.
+        assert_eq!(a.on_hook(&claude("PermissionRequest", Some("AskUserQuestion"), Some("Tea or coffee?")), false), None);
+        assert_eq!(a.on_hook(&claude("Notification", None, Some("Claude needs your permission to use AskUserQuestion")), false), None);
+        assert_eq!(a.activity, "Tea or coffee?");
+        // Answered.
+        a.on_hook(&claude("PostToolUse", Some("AskUserQuestion"), None), false);
+        assert_eq!(a.state, State::Working);
+        a.shutdown();
     }
 
     #[test]
