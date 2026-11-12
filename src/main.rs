@@ -5,6 +5,7 @@ mod control;
 mod events;
 mod hooks;
 mod input;
+mod install;
 mod layout;
 mod platform;
 mod search;
@@ -77,6 +78,8 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
                             notifications); trix reloads it on every save
 
   trix hook <source>        (internal) agent lifecycle reporter
+  trix install <kind> -- <command…>
+                            (internal) install a missing agent in its pane, then run it
   trix server               (internal) the background workspace
 
   -s, --session <name>      work with a named session instead of the default
@@ -135,6 +138,10 @@ fn main() -> anyhow::Result<()> {
         let source = args.get(1).cloned().unwrap_or_else(|| "custom".into());
         hooks::run_client(&source, args.get(2).cloned());
         return Ok(());
+    }
+    // Before the session flags: everything after `--` is the agent's.
+    if args.first().map(String::as_str) == Some("install") {
+        std::process::exit(install::run(&args[1..]));
     }
     let flag = match take_session(&mut args) {
         Ok(f) => f,

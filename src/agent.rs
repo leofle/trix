@@ -250,6 +250,10 @@ pub struct Agent {
     /// `session` is an id trix made up for a new Grok conversation, not one
     /// it resumed: no conversation exists under it until a turn.
     pub session_named_by_trix: bool,
+    /// The agent wasn't installed, and its pane is installing it ("installing
+    /// grok (npm)"). It stays starting until the installer says it's done:
+    /// install output isn't the agent at work. See `install`.
+    pub installing: Option<String>,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -288,6 +292,15 @@ impl Agent {
             .chain(args.iter().map(|a| if a.contains(' ') { format!("{a:?}") } else { a.clone() }))
             .collect::<Vec<_>>()
             .join(" ");
+        // An agent that isn't installed installs in its pane first, then runs.
+        let installing = if spec.kind.takes_prompts() && crate::install::missing(&program) {
+            let via = crate::install::pick(spec.kind, std::env::var_os("PATH").as_deref())
+                .ok_or_else(|| anyhow::anyhow!("{program} isn't installed, and installing it needs {}", crate::install::needs(spec.kind)))?;
+            Some(format!("installing {program} ({})", via.label()))
+        } else {
+            None
+        };
+        let (program, args) = if installing.is_some() { crate::install::wrap(exe, spec.kind, program, args) } else { (program, args) };
 
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -356,7 +369,7 @@ impl Agent {
             reported: false,
             dismissed_at: None,
             last_resize: now,
-            activity: spec.branch_note.unwrap_or_else(|| "launching".into()),
+            activity: installing.clone().or(spec.branch_note).unwrap_or_else(|| "launching".into()),
             last_prompt: spec.prompt,
             session_named_by_trix: fresh.is_some(),
             session: spec.resume.or(fresh),
@@ -379,6 +392,7 @@ impl Agent {
             last_hook_seq: 0,
             title_attention: None,
             changes: Vec::new(),
+            installing,
         })
     }
 
@@ -492,6 +506,15 @@ impl Agent {
         }
     }
 
+    /// Its install is over and the agent itself is starting: it gets the
+    /// usual start-up time from now.
+    fn installed(&mut self) {
+        if self.installing.take().is_some() {
+            self.created = Instant::now();
+            self.activity = "launching".into();
+        }
+    }
+
     /// Apply a hook report. Returns the previous state when it changed.
     pub fn on_hook(&mut self, msg: &HookMsg, focused: bool) -> Option<State> {
         // A late report (e.g. SessionEnd racing ChildExit) must not revive a
@@ -499,6 +522,15 @@ impl Agent {
         if self.state == State::Exited {
             return None;
         }
+        // trix's own installer is done: the agent starts now.
+        if msg.source == "trix" {
+            if msg.event == "Installed" {
+                self.installed();
+            }
+            return None;
+        }
+        // The agent reporting at all means it is installed and running.
+        self.installed();
         // Hooks are separate processes read on separate threads, so a
         // PostToolUse can land after the Stop that followed it and flip a
         // finished agent back to Working.
@@ -658,6 +690,9 @@ impl Agent {
         let busy = self.burst.len() >= 6 && quiet < Duration::from_millis(1200);
 
         if self.state == State::Starting {
+            if self.installing.is_some() {
+                return None;
+            }
             if self.created.elapsed() > Duration::from_millis(1500) && quiet > Duration::from_millis(600) {
                 if self.kind.is_agent() && self.screen_needs_input() {
                     self.activity = "waiting for an answer".into();
@@ -1489,6 +1524,34 @@ mod tests {
         a.last_output = ago(Duration::from_secs(1));
         assert_eq!(a.heuristics(true), Some(State::Starting));
         assert_eq!((a.state, a.activity.as_str()), (State::Idle, "ready"));
+    }
+
+    #[test]
+    fn installing_stays_starting_until_the_installer_is_done() {
+        let mut a = test_agent(Kind::Grok);
+        a.installing = Some("installing grok (npm)".into());
+        a.created = ago(Duration::from_secs(60));
+        a.last_output = ago(Duration::from_secs(5));
+        assert_eq!(a.heuristics(true), None, "a quiet download isn't a ready agent");
+        assert_eq!(a.state, State::Starting);
+        // Not the user's own tool reporting: nothing becomes `reported`.
+        assert_eq!(a.on_hook(&hook("trix", "Installed", None, None), true), None);
+        assert!(a.installing.is_none() && !a.reported && !a.hooked);
+        assert_eq!(a.activity, "launching");
+        // The agent gets its own start-up time from here.
+        assert_eq!(a.heuristics(true), None, "just started");
+        a.created = ago(Duration::from_secs(2));
+        assert_eq!(a.heuristics(true), Some(State::Starting));
+        assert_eq!(a.state, State::Idle);
+    }
+
+    #[test]
+    fn the_agents_own_report_ends_installing_too() {
+        let mut a = test_agent(Kind::OpenCode);
+        a.installing = Some("installing opencode (brew)".into());
+        a.on_hook(&hook("opencode", "Busy", None, None), true);
+        assert!(a.installing.is_none());
+        assert_eq!(a.state, State::Working);
     }
 
     #[test]

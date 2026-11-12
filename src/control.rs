@@ -309,7 +309,10 @@ pub fn send_refusal(a: &Agent) -> Option<String> {
             a.name,
             crate::hooks::one_line(&a.activity, 60)
         )),
-        State::Starting => Some(format!("'{}' is still starting (it may be on a trust dialog) — `trix wait` for it first", a.name)),
+        State::Starting => Some(match &a.installing {
+            Some(what) => format!("'{}' is still {what} — `trix wait` for it first", a.name),
+            None => format!("'{}' is still starting (it may be on a trust dialog) — `trix wait` for it first", a.name),
+        }),
         State::Exited => Some(format!("'{}' has exited", a.name)),
     }
 }
