@@ -120,6 +120,9 @@ pub struct Prefs {
     /// alt+m: the narrow sidebar.
     #[serde(default)]
     pub sidebar_mini: bool,
+    /// Claude context windows learned per model (see usage.rs).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub context_windows: std::collections::BTreeMap<String, u64>,
 }
 
 fn prefs_path() -> PathBuf {
@@ -236,14 +239,20 @@ mod tests {
         let dir = tmp();
         let path = dir.join("prefs.json");
         assert_eq!(load_prefs_from(&path), Prefs::default(), "no file yet: full sidebar");
-        store_prefs_at(&path, &Prefs { sidebar_mini: true }).unwrap();
+        store_prefs_at(&path, &Prefs { sidebar_mini: true, ..Prefs::default() }).unwrap();
         assert!(load_prefs_from(&path).sidebar_mini);
-        store_prefs_at(&path, &Prefs { sidebar_mini: false }).unwrap();
+        store_prefs_at(&path, &Prefs { sidebar_mini: false, ..Prefs::default() }).unwrap();
         assert!(!load_prefs_from(&path).sidebar_mini);
         std::fs::write(&path, "{}").unwrap();
         assert_eq!(load_prefs_from(&path), Prefs::default(), "older file without the field");
         std::fs::write(&path, r#"{"sidebar_mini":true,"from_a_newer_trix":1}"#).unwrap();
         assert!(load_prefs_from(&path).sidebar_mini, "unknown fields don't throw the rest away");
+        let mut learned = Prefs::default();
+        learned.context_windows.insert("claude-opus-5-5".into(), 1_000_000);
+        store_prefs_at(&path, &learned).unwrap();
+        assert_eq!(load_prefs_from(&path), learned, "learned context windows are kept");
+        store_prefs_at(&path, &Prefs::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("context_windows"), "and left out when there are none");
         std::fs::write(&path, "garbage").unwrap();
         assert_eq!(load_prefs_from(&path), Prefs::default());
         let _ = std::fs::remove_dir_all(dir);

@@ -175,6 +175,10 @@ pub struct Agent {
 
     pub branch: Option<String>,
     pub diff: Option<(u32, u32, u32)>,
+    /// Its conversation log (Claude reports it in every hook).
+    pub transcript: Option<PathBuf>,
+    /// How full its context window is, from that log.
+    pub context: Option<crate::usage::Context>,
     /// A prompt is on its way in (`trix send`, or a first prompt at launch)
     /// and no turn has visibly started since. `trix wait` treats that as
     /// work, so the end of the previous turn, or `SessionStart`, isn't taken
@@ -295,6 +299,8 @@ impl Agent {
             tools_used: 0,
             branch: None,
             diff: None,
+            transcript: None,
+            context: None,
             prompted: first_prompt.then(Instant::now),
             turn_seen: false,
             managed_by: None,
@@ -412,6 +418,9 @@ impl Agent {
         // `/clear` and friends start a new conversation: always track the latest.
         if let Some(id) = &msg.session {
             self.session = Some(id.clone());
+        }
+        if let Some(p) = &msg.transcript {
+            self.transcript = Some(PathBuf::from(p));
         }
         match msg.source.as_str() {
             "claude" => self.hooked = true,
@@ -839,6 +848,7 @@ mod tests {
             tool: tool.map(Into::into),
             detail: detail.map(Into::into),
             session: None,
+            transcript: None,
         }
     }
     fn claude(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {

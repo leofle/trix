@@ -36,6 +36,8 @@ pub enum AppEvent {
     Clipboard(String),
     Hook(HookMsg),
     Git(u32, Option<String>, Option<(u32, u32, u32)>),
+    /// An agent's context use changed (`None`: a fresh conversation, nothing yet).
+    Context(u32, Option<crate::usage::Context>),
     /// Attach / detach / control traffic; handled by the server loop.
     Session(SessionEvent),
 }
@@ -216,6 +218,7 @@ pub struct App {
     pub start_dir: PathBuf,
     drag: Option<Drag>,
     git_targets: Arc<Mutex<GitTargets>>,
+    usage_targets: crate::usage::Targets,
     pub last_title: String,
     pub pane_size: (u16, u16),
     /// Read-only terminals watching (`trix view`).
@@ -242,6 +245,8 @@ impl App {
         let themed = polled.is_some();
         let git_targets = Arc::new(Mutex::new(GitTargets::default()));
         spawn_git_watcher(git_targets.clone(), tx.clone());
+        let usage_targets = crate::usage::Targets::default();
+        crate::usage::spawn_watcher(usage_targets.clone(), tx.clone());
         let prefs = state::load_prefs();
         App {
             agents: Vec::new(),
@@ -273,6 +278,7 @@ impl App {
             start_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             drag: None,
             git_targets,
+            usage_targets,
             last_title: String::new(),
             pane_size: (80, 24),
             viewers: 0,
@@ -684,6 +690,15 @@ impl App {
         let mut t = self.git_targets.lock().unwrap();
         t.agents = agents;
         t.watched = watched;
+        drop(t);
+        // Nor its context: it keeps the last reading.
+        let usage = self
+            .agents
+            .iter()
+            .filter(|a| a.state != State::Exited)
+            .map(|a| crate::usage::Target { id: a.id, kind: a.kind, transcript: a.transcript.clone(), session: a.session.clone() })
+            .collect();
+        *self.usage_targets.lock().unwrap() = usage;
     }
 
     pub fn set_focus(&mut self, idx: usize) {
@@ -824,6 +839,12 @@ impl App {
                 }
             }
             AppEvent::Session(_) => {}
+            AppEvent::Context(id, ctx) => {
+                if let Some(i) = self.index_of(id) {
+                    self.agents[i].context = ctx;
+                    self.dirty = true;
+                }
+            }
             AppEvent::Git(id, branch, diff) => {
                 if let Some(i) = self.index_of(id) {
                     self.agents[i].branch = branch;

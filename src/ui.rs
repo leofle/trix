@@ -369,15 +369,20 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     let line2 = TLine::from(vec![Span::raw("       "), Span::styled(trunc(&a.activity, w.saturating_sub(8)), act_style)]);
     f.render_widget(Paragraph::new(line2), Rect { y: r.y + 1, height: 1, ..r });
 
-    // Row 3: kind · output sparkline · git.
+    // Row 3: kind · context · output sparkline · git.
     let kind = a.kind.label();
-    let spark_w = spark_width(10usize.min(w.saturating_sub(16)));
+    let gauge = a.context.map(|c| (format!("{}{}% ", pie(c.used_frac()), c.used_percent()), context_color(t, c.used_frac())));
+    let gauge_w = gauge.as_ref().map(|(g, _)| g.width()).unwrap_or(0);
+    let spark_w = spark_width(10usize.min(w.saturating_sub(16 + gauge_w)));
     let mut spans = vec![
         Span::raw("       "),
         Span::styled(format!("{kind:<7}"), Style::new().fg(mix(kind_color(t, a.kind), bg, 0.25))),
     ];
+    if let Some((g, c)) = gauge {
+        spans.push(Span::styled(g, Style::new().fg(c.unwrap_or(mix(t.dim, bg, 0.2)))));
+    }
     spans.extend(sparkline(a, spark_w, if a.state == State::Idle || a.state == State::Exited { t.dim } else { sc }, mix(t.muted, bg, 0.4)));
-    let used = 7 + 7 + spark_w;
+    let used = 7 + 7 + gauge_w + spark_w;
     let mut git = String::new();
     let mut diff = None;
     if let Some((files, add, del)) = a.diff.filter(|d| d.0 > 0) {
@@ -394,6 +399,27 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
         spans.push(Span::styled(de, Style::new().fg(mix(t.red, t.dim, 0.2))));
     }
     f.render_widget(Paragraph::new(TLine::from(spans)), Rect { y: r.y + 2, height: 1, ..r });
+}
+
+/// A one-cell pie of how full the context is: ○ ◔ ◑ ◕ ●.
+fn pie(used: f32) -> &'static str {
+    ["○", "◔", "◑", "◕", "●"][((used * 4.0).round() as usize).min(4)]
+}
+
+/// Yellow from 70% used, red from 85%; otherwise nothing to say.
+fn context_color(t: &Theme, used: f32) -> Option<Color> {
+    if used >= 0.85 {
+        Some(t.red)
+    } else if used >= 0.70 {
+        Some(t.yellow)
+    } else {
+        None
+    }
+}
+
+/// "context 31% · ~691k left": for the pane's bottom border.
+fn context_label(c: &crate::usage::Context) -> String {
+    format!("context {}% · {}{} left", c.used_percent(), if c.exact { "" } else { "~" }, crate::usage::tokens(c.left()))
 }
 
 fn kind_color(t: &Theme, k: Kind) -> Color {
@@ -492,10 +518,15 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme)
         }
     }
     right.push(Span::raw(" "));
-    let status = TLine::from(vec![
-        Span::styled(format!(" {} ", a.state.label()), Style::new().fg(sc)),
-        Span::styled(format!("{} ", fmt_dur(elapsed(a))), Style::new().fg(t.dim)),
-    ]);
+    let mut status = vec![];
+    if let Some(c) = a.context.filter(|_| !compact) {
+        let color = context_color(t, c.used_frac()).unwrap_or(t.dim);
+        status.push(Span::styled(format!(" {} ", context_label(&c)), Style::new().fg(color)));
+        status.push(Span::styled("·", Style::new().fg(t.muted)));
+    }
+    status.push(Span::styled(format!(" {} ", a.state.label()), Style::new().fg(sc)));
+    status.push(Span::styled(format!("{} ", fmt_dur(elapsed(a))), Style::new().fg(t.dim)));
+    let status = TLine::from(status);
     Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1255,6 +1286,59 @@ mod tests {
 
     /// The whole screen, drawn into a test terminal: four agents, the second
     /// one needing you, the third with unseen finished work.
+    #[test]
+    fn context_gauge_in_sidebar_and_pane() {
+        use crate::usage::Context;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.sidebar_mini = false;
+        for (name, ctx) in [
+            ("roomy", Some(Context { used: 309_460, window: 1_000_000, exact: false })),
+            ("tight", Some(Context { used: 230_000, window: 258_400, exact: true })),
+            ("plain", None),
+        ] {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.name = name.into();
+            a.set_state(State::Idle, false);
+            a.context = ctx;
+            app.agents.push(a);
+        }
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        narrow.draw(|f| draw(f, &mut app)).unwrap();
+        let nb = narrow.backend().buffer();
+        let bottom: String = (0..nb.area.height).map(|y| (0..nb.area.width).map(|x| nb[(x, y)].symbol().to_string()).collect::<String>()).find(|l| l.contains('╰')).unwrap();
+        assert!(bottom.contains("context 31% · ~691k left · idle"), "fits an 80-column terminal: {bottom}");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: Vec<String> = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect();
+        let row3 = |name: &str| {
+            let card = app.hits.cards[app.agents.iter().position(|a| a.name == name).unwrap()].0;
+            text[card.y as usize + 2].clone()
+        };
+        assert!(row3("roomy").contains("claude ◔31%"), "{}", row3("roomy"));
+        assert!(row3("tight").contains("claude ●89%"), "{}", row3("tight"));
+        assert!(!row3("plain").contains('%'), "no reading, no gauge: {}", row3("plain"));
+        let bottom = text.iter().find(|l| l.contains('╰')).unwrap();
+        assert!(bottom.contains("context 31% · ~691k left"), "estimated window: {bottom}");
+        // The tight one is red: 89% used.
+        let x = row3("tight").find('●').map(|b| row3("tight")[..b].chars().count()).unwrap() as u16;
+        let card = app.hits.cards[1].0;
+        assert_eq!(buf[(x, card.y + 2)].fg, app.theme.red);
+        app.focus = 1;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let bottom: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .find(|l| l.contains('╰'))
+            .unwrap();
+        assert!(bottom.contains("context 89% · 28k left"), "exact window, no ~: {bottom}");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
     fn screen(mini: bool, width: u16) -> (String, App) {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());

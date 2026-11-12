@@ -10,6 +10,7 @@ mod session;
 mod state;
 mod theme;
 mod ui;
+mod usage;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,

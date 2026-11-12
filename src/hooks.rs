@@ -28,6 +28,9 @@ pub struct HookMsg {
     /// Conversation id (Claude `session_id`, Codex `thread-id`), for resume.
     #[serde(default)]
     pub session: Option<String>,
+    /// Claude's `transcript_path`: the conversation log the context gauge reads.
+    #[serde(default)]
+    pub transcript: Option<String>,
 }
 
 pub fn runtime_dir() -> PathBuf {
@@ -161,7 +164,8 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         _ => None,
     };
     let session = s("session_id").or_else(|| s("thread-id")).filter(|id| !id.is_empty());
-    HookMsg { agent, source: source.into(), event, tool, detail, session }
+    let transcript = s("transcript_path").filter(|p| !p.is_empty());
+    HookMsg { agent, source: source.into(), event, tool, detail, session, transcript }
 }
 
 /// A shell command as a string: Claude sends one; Codex may send an argv,

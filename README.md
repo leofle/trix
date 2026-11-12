@@ -22,6 +22,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 
 - **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>` and Codex with `-c` hook overrides, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex).) Agents without hooks fall back to output cadence and screen heuristics.
 - **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too.
+- **Context at a glance.** Each Claude and Codex agent shows how full its context window is: a pie and a percentage in the sidebar (`◔31%`, yellow from 70%, red from 85%), and `context 31% · ~691k left` on its pane. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
@@ -125,6 +126,14 @@ trix layout rm work-layout
 - `--resume` only applies to Claude and Codex tabs that have a saved `session`. Everything else starts fresh either way.
 - How this differs from [Restore](#restore): restore brings back whatever was open after a crash or restart, and it's per session and one-shot. A layout stays until you remove it, and you can open it into any session, any number of times.
 
+### Context gauge
+
+trix follows each Claude and Codex agent's conversation log (Claude's `~/.claude/projects/…/<session>.jsonl`, Codex's `~/.codex/sessions/…/rollout-…-<thread>.jsonl`). It reads only what was added since its last look, at most every two seconds, in a background thread. The figure is the context as of the agent's last turn.
+
+- **Codex** logs its window size, so its gauge is exact.
+- **Claude** doesn't log it. trix starts from 200K, and once any conversation of a model goes past 200K without being compacted, it knows that model has 1M. It remembers that per model in `prefs.json`. Until then a 1M model reads fuller than it is, which is why its pane says `~` before the number left. To set it outright, start trix with `TRIX_CLAUDE_CONTEXT=1000000`. The `[1m]` model variants are recognised as 1M.
+- In `trix ls --json`, each agent gets `"context": {"used", "window", "left", "used_percent", "window_exact"}`, or `null` before its first turn.
+
 ### Viewers
 
 `trix view` (or `trix -s work view`) watches a running session read-only. Any number of viewers can watch at once, and the controlling terminal's top bar shows how many (`◉ 2 watching`), as does `trix ls`.
@@ -224,6 +233,7 @@ src/main.rs    CLI, attach client, frame-paced server loop
 src/session.rs detach/attach and viewers: control socket, framing, remote ratatui backend
 src/search.rs  search across agent scrollbacks
 src/layout.rs  saved layouts: save / open / ls / rm, TOML files
+src/usage.rs   context gauge: follows Claude / Codex conversation logs
 src/control.rs agent control: spawn / send / read / wait / close, ls --json, guard rails
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
@@ -237,7 +247,7 @@ src/platform.rs Linux / macOS differences: process liveness and folders, foregro
 
 `cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
 
-Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes completion chimes independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
+Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes completion chimes independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
 ## Next
 

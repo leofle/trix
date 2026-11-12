@@ -523,6 +523,19 @@ struct JsonAgent<'a> {
     last_prompt: Option<&'a str>,
     exit_code: Option<i32>,
     managed_by: Option<&'a str>,
+    /// How full its context window is (Claude and Codex), when known.
+    context: Option<JsonContext>,
+}
+
+#[derive(Serialize)]
+struct JsonContext {
+    used: u64,
+    window: u64,
+    left: u64,
+    used_percent: u8,
+    /// The window size came from the agent (Codex) or TRIX_CLAUDE_CONTEXT,
+    /// rather than being inferred.
+    window_exact: bool,
 }
 
 #[derive(Serialize)]
@@ -564,6 +577,7 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
             last_prompt: a.last_prompt.as_deref(),
             exit_code: a.exit_code,
             managed_by: a.managed_by.as_deref(),
+            context: a.context.map(|c| JsonContext { used: c.used, window: c.window, left: c.left(), used_percent: c.used_percent(), window_exact: c.exact }),
         })
         .collect();
     let mut s = serde_json::to_string_pretty(&JsonList { session: session::name(), viewers: app.viewers, agents }).unwrap_or_default();
