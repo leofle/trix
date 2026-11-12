@@ -68,12 +68,24 @@ pub fn to_toml(name: &str, agents: &[LayoutAgent]) -> String {
     format!(
         "# trix layout '{name}' · `trix layout open {name}` opens these tabs again\n\
          # kind: claude, codex, shell or custom · args: extra arguments (for custom, the command)\n\
+         # cwd: the folder; a relative one starts from your home folder\n\
          # session: the conversation `--resume` picks up; delete the line to always start fresh\n\n{body}"
     )
 }
 
 pub fn from_toml(text: &str) -> Result<Vec<LayoutAgent>, String> {
-    toml::from_str::<LayoutFile>(text).map(|f| f.agents).map_err(|e| e.message().to_string())
+    let mut agents = toml::from_str::<LayoutFile>(text).map(|f| f.agents).map_err(|e| e.message().to_string())?;
+    for i in 0..agents.len() {
+        let name = agents[i].name.trim().to_string();
+        if name.is_empty() {
+            return Err(format!("agent {} has an empty name", i + 1));
+        }
+        if agents[..i].iter().any(|a| a.name == name) {
+            return Err(format!("two agents are named '{name}'"));
+        }
+        agents[i].name = name;
+    }
+    Ok(agents)
 }
 
 fn load_from(dir: &Path, name: &str) -> Result<Vec<LayoutAgent>, String> {
@@ -207,9 +219,12 @@ pub fn run(cmd: Cmd) -> Result<bool, String> {
             if agents.is_empty() {
                 return Err(format!("layout '{name}' has no agents"));
             }
-            let inside = std::env::var_os("TRIX").is_some();
+            // From a pane, never attach: that would nest trix. Only a pane of
+            // the session this targets can't start it, since it's in it.
+            let in_pane = std::env::var_os("TRIX").is_some();
+            let own_session = in_pane && std::env::var("TRIX_SESSION").is_ok_and(|s| s == session::name());
             if session::connect().is_none() {
-                if inside {
+                if own_session {
                     return Err("this pane's workspace isn't running".into());
                 }
                 session::start_server().map_err(|e| format!("starting the workspace: {e}"))?;
@@ -219,14 +234,20 @@ pub fn run(cmd: Cmd) -> Result<bool, String> {
             if !reply.err.is_empty() {
                 eprintln!("trix: {}", reply.err);
             }
+            let hint = || match (in_pane, own_session) {
+                (false, _) => eprintln!("trix: `{}` attaches to the workspace", session::command()),
+                (true, false) => eprintln!("trix: session '{}' · `{}` from outside trix attaches to it", session::name(), session::command()),
+                (true, true) => {}
+            };
             if reply.code != 0 {
                 // Attaching would cover what failed and why with the TUI.
-                if !inside {
-                    eprintln!("trix: `{}` attaches to the workspace", session::command());
-                }
+                hint();
                 std::process::exit(reply.code);
             }
-            Ok(!inside)
+            if in_pane {
+                hint();
+            }
+            Ok(!in_pane)
         }
     }
 }
@@ -240,7 +261,7 @@ fn reply_or_err(r: Reply) -> Result<String, String> {
 /// What starting this layout entry runs, or why it can't.
 pub fn spec_for(a: &LayoutAgent, resume: bool) -> Result<Spawn, String> {
     let kind = Kind::from_label(&a.kind).ok_or_else(|| format!("unknown kind '{}'", a.kind))?;
-    let cwd = app::expand(&a.cwd);
+    let cwd = home_relative(&a.cwd);
     if !cwd.is_dir() {
         return Err(format!("folder not found: {}", a.cwd));
     }
@@ -250,6 +271,16 @@ pub fn spec_for(a: &LayoutAgent, resume: bool) -> Result<Spawn, String> {
     }
     let resume = a.session.clone().filter(|_| resume && matches!(kind, Kind::Claude | Kind::Codex));
     Ok(Spawn { kind, name: a.name.clone(), cwd, command, prompt: None, branch_note: None, resume })
+}
+
+/// A layout's folder: `~` expanded, and a relative one taken from the home
+/// folder, not from wherever the workspace happened to be started.
+fn home_relative(cwd: &str) -> PathBuf {
+    let p = app::expand(cwd);
+    if p.is_absolute() {
+        return p;
+    }
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(p)
 }
 
 /// `trix layout open`: start every entry that isn't open already.
@@ -368,6 +399,11 @@ mod tests {
         assert_eq!(from_toml(""), Ok(vec![]));
         assert!(from_toml("[[agent]]\nkind = \"shell\"\n").unwrap_err().contains("name"), "says what's missing");
         assert!(from_toml("not toml at all [").is_err());
+        let a = from_toml("[[agent]]\nkind = \"shell\"\nname = \" api \"\ncwd = \"/tmp\"\n").unwrap();
+        assert_eq!(a[0].name, "api", "names are trimmed");
+        assert!(from_toml("[[agent]]\nkind = \"shell\"\nname = \"  \"\ncwd = \"/tmp\"\n").unwrap_err().contains("agent 1 has an empty name"));
+        let twice = "[[agent]]\nkind = \"shell\"\nname = \"a\"\ncwd = \"/tmp\"\n\n[[agent]]\nkind = \"shell\"\nname = \"a \"\ncwd = \"/tmp\"\n";
+        assert!(from_toml(twice).unwrap_err().contains("two agents are named 'a'"));
     }
 
     #[test]
@@ -403,7 +439,9 @@ mod tests {
         assert!(spec_for(&entry("bard", "x", "/tmp"), false).unwrap_err().contains("unknown kind"));
         assert!(spec_for(&entry("custom", "x", "/tmp"), false).unwrap_err().contains("command"));
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(spec_for(&entry("shell", "h", "~"), false).unwrap().cwd, PathBuf::from(home), "~ expands");
+        assert_eq!(spec_for(&entry("shell", "h", "~"), false).unwrap().cwd, PathBuf::from(&home), "~ expands");
+        assert_eq!(home_relative("Projects/x"), PathBuf::from(&home).join("Projects/x"), "relative means from home");
+        assert_eq!(home_relative("/srv/x"), PathBuf::from("/srv/x"));
     }
 
     #[test]

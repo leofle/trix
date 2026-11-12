@@ -115,13 +115,13 @@ trix layout rm work-layout
   [[agent]]
   kind = "claude"            # claude, codex, shell or custom
   name = "api"
-  cwd = "~/code/api"
+  cwd = "~/code/api"         # a relative folder starts from your home folder
   args = "--model opus"      # optional: extra arguments (for custom, the command)
   session = "0a955a0a-…"     # optional: what --resume picks up
   ```
 - `save` records where each shell is now, even if you `cd`'d since. It won't overwrite an existing layout without `--force`.
 - `open` adds to the workspace you're in and skips tabs that are already open under the same name, so opening twice is harmless. New tabs never steal focus. A tab whose folder is gone is reported and skipped.
-- From a terminal outside trix, `open` starts the workspace if needed and attaches to it. From inside a pane, it just adds the tabs, so an agent can run it too: "open my work layout".
+- From a terminal outside trix, `open` starts the workspace if needed and attaches to it, unless a tab failed to start: then it reports why and leaves attaching to you. From inside a pane, it just adds the tabs, so an agent can run it too: "open my work layout". `trix -s <name> layout open …` from a pane starts that session if needed and opens the tabs there.
 - `--resume` only applies to Claude and Codex tabs that have a saved `session`. Everything else starts fresh either way.
 - How this differs from [Restore](#restore): restore brings back whatever was open after a crash or restart, and it's per session and one-shot. A layout stays until you remove it, and you can open it into any session, any number of times.
 
