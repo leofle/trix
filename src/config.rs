@@ -218,13 +218,14 @@ pub enum Action {
     Broadcast,
     Rename,
     Close,
+    Menu,
     Detach,
     Help,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 16] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -237,6 +238,7 @@ impl Action {
         Action::Broadcast,
         Action::Rename,
         Action::Close,
+        Action::Menu,
         Action::Detach,
         Action::Help,
         Action::Quit,
@@ -256,6 +258,7 @@ impl Action {
             Action::Broadcast => "broadcast",
             Action::Rename => "rename",
             Action::Close => "close",
+            Action::Menu => "menu",
             Action::Detach => "detach",
             Action::Help => "help",
             Action::Quit => "quit",
@@ -276,6 +279,7 @@ impl Action {
             Action::Broadcast => &["alt+b"],
             Action::Rename => &["alt+r"],
             Action::Close => &["alt+w"],
+            Action::Menu => &["alt+o"],
             Action::Detach => &["alt+d"],
             Action::Help => &["alt+?", "alt+/"],
             Action::Quit => &["alt+q"],
@@ -515,6 +519,7 @@ mod tests {
         assert_eq!(k.lookup(&key(KeyCode::Char('n'), ALT)), Some((Action::New, 0)));
         assert_eq!(k.lookup(&key(KeyCode::Char('3'), ALT)), Some((Action::Jump, 2)));
         assert_eq!(k.lookup(&key(KeyCode::Down, ALT)), Some((Action::Next, 0)));
+        assert_eq!(k.lookup(&key(KeyCode::Char('o'), ALT)), Some((Action::Menu, 0)));
         // `?` comes with shift; it's the character that counts.
         assert_eq!(k.lookup(&key(KeyCode::Char('?'), ALT | KeyModifiers::SHIFT)), Some((Action::Help, 0)));
         assert_eq!(k.lookup(&key(KeyCode::Char('n'), KeyModifiers::NONE)), None, "plain n is typing");

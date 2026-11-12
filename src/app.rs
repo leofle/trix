@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::agent::{Agent, Kind, Spawn, State};
+use crate::config::Action;
 use crate::hooks::HookMsg;
 use crate::input;
 use crate::search::{self, Hit};
@@ -154,7 +155,58 @@ pub enum Modal {
     /// A fresh server found a saved workspace: bring it back?
     Restore,
     Help,
+    Menu(Menu),
 }
+
+/// One agent's menu: right-click it, or the menu key for the focused one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Menu {
+    pub agent: u32,
+    /// The cell it was opened from (a click); `None` centres it.
+    pub at: Option<(u16, u16)>,
+    pub sel: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuItem {
+    Rename,
+    Restart,
+    CopyPath,
+    Close,
+}
+
+impl MenuItem {
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuItem::Rename => "Rename",
+            MenuItem::Restart => "Restart",
+            MenuItem::CopyPath => "Copy folder path",
+            MenuItem::Close => "Close",
+        }
+    }
+
+    /// The letter that picks it, underlined in its label.
+    pub fn letter(self) -> char {
+        match self {
+            MenuItem::Rename => 'r',
+            MenuItem::Restart => 's',
+            MenuItem::CopyPath => 'f',
+            MenuItem::Close => 'c',
+        }
+    }
+
+    /// The workspace key that does the same, shown beside it.
+    pub fn action(self) -> Option<Action> {
+        match self {
+            MenuItem::Rename => Some(Action::Rename),
+            MenuItem::Close => Some(Action::Close),
+            MenuItem::Restart | MenuItem::CopyPath => None,
+        }
+    }
+}
+
+/// Two clicks on one agent's card or title within this are a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -174,7 +226,12 @@ pub struct Toast {
 pub struct HitMap {
     pub cards: Vec<(Rect, u32)>,
     pub panes: Vec<(Rect, u32)>,
+    /// Each pane's title row: its top border, where its name is.
+    pub titles: Vec<(Rect, u32)>,
     pub new_button: Option<Rect>,
+    /// An open menu: all of it, and the row of each item.
+    pub menu: Option<Rect>,
+    pub menu_items: Vec<(Rect, MenuItem)>,
 }
 
 struct Drag {
@@ -245,6 +302,8 @@ pub struct App {
     /// The file had a mistake when it was last read.
     config_failed: bool,
     last_needs_you_sound: Option<Instant>,
+    /// The last left click on a card or title: when, which agent, which row.
+    last_click: Option<(Instant, u32, u16)>,
 }
 
 impl App {
@@ -310,6 +369,7 @@ impl App {
             config_stamp,
             config_failed: config_error.is_some(),
             last_needs_you_sound: None,
+            last_click: None,
         };
         if let Some(e) = config_error {
             app.toast(format!("config: {e} — using the defaults (`trix config` checks it)"), ToastKind::Bad);
@@ -542,6 +602,136 @@ impl App {
         self.agents.iter().position(|a| a.id == id)
     }
 
+    /// What an agent's menu offers, in order. Nothing once it's gone.
+    pub fn menu_items(&self, id: u32) -> Vec<MenuItem> {
+        let Some(a) = self.agents.iter().find(|a| a.id == id) else { return Vec::new() };
+        let mut items = vec![MenuItem::Rename];
+        if a.state == State::Exited {
+            items.push(MenuItem::Restart);
+        }
+        items.extend([MenuItem::CopyPath, MenuItem::Close]);
+        items
+    }
+
+    pub fn open_menu(&mut self, id: u32, at: Option<(u16, u16)>) {
+        if self.index_of(id).is_some() {
+            self.modal = Some(Modal::Menu(Menu { agent: id, at, sel: 0 }));
+            self.dirty = true;
+        }
+    }
+
+    /// The menu key: the focused agent's menu, by its name on screen.
+    fn open_focused_menu(&mut self) {
+        let Some(id) = self.focused().map(|a| a.id) else { return };
+        let on = |hits: &[(Rect, u32)]| hits.iter().find(|(_, i)| *i == id).map(|(r, _)| (r.x + 2, r.y + 1));
+        let at = on(&self.hits.titles).or_else(|| on(&self.hits.cards));
+        self.open_menu(id, at);
+    }
+
+    fn run_menu(&mut self, id: u32, item: MenuItem) {
+        self.modal = None;
+        self.dirty = true;
+        let Some(i) = self.index_of(id) else { return };
+        match item {
+            MenuItem::Rename => self.start_rename(id),
+            MenuItem::Restart => self.restart(i),
+            MenuItem::CopyPath => {
+                // Where it is now: a shell may have moved since it started.
+                let cwd = self.agents[i].live_cwd();
+                copy_to_clipboard(&self.out, &cwd.display().to_string());
+                self.toast(format!("copied {}", tilde(&cwd)), ToastKind::Good);
+            }
+            MenuItem::Close => self.ask_close(id),
+        }
+    }
+
+    fn start_rename(&mut self, id: u32) {
+        if let Some(i) = self.index_of(id) {
+            self.modal = Some(Modal::Rename(id, TextInput::new(&self.agents[i].name)));
+            self.dirty = true;
+        }
+    }
+
+    /// Close an exited agent; ask first about one that still runs.
+    fn ask_close(&mut self, id: u32) {
+        match self.index_of(id).map(|i| self.agents[i].state) {
+            Some(State::Exited) => self.close(id),
+            Some(_) => self.modal = Some(Modal::ConfirmClose(id)),
+            None => {}
+        }
+    }
+
+    fn menu_key(&mut self, m: Menu, k: KeyEvent) {
+        let items = self.menu_items(m.agent);
+        if items.is_empty() {
+            self.modal = None;
+            return;
+        }
+        let last = items.len() - 1;
+        // An item's own key works here too, and the menu key closes it.
+        if let Some((action, _)) = self.config.keys.lookup(&k) {
+            if action == Action::Menu {
+                self.modal = None;
+            } else if let Some(&item) = items.iter().find(|i| i.action() == Some(action)) {
+                self.run_menu(m.agent, item);
+            }
+            return;
+        }
+        let sel = match k.code {
+            KeyCode::Esc => {
+                self.modal = None;
+                return;
+            }
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => m.sel.checked_sub(1).unwrap_or(last),
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => if m.sel >= last { 0 } else { m.sel + 1 },
+            KeyCode::Home => 0,
+            KeyCode::End => last,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.run_menu(m.agent, items[m.sel.min(last)]);
+                return;
+            }
+            KeyCode::Char(c) => {
+                if let Some(&item) = items.iter().find(|i| i.letter() == c.to_ascii_lowercase()) {
+                    self.run_menu(m.agent, item);
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.modal = Some(Modal::Menu(Menu { sel, ..m }));
+    }
+
+    /// The mouse while a menu is open: pick, point, or click away.
+    fn menu_mouse(&mut self, m: Menu, e: MouseEvent) {
+        let (x, y) = (e.column, e.row);
+        let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        let under = self.hits.menu_items.iter().position(|(r, _)| inside(r));
+        match e.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(i) = under {
+                    let item = self.hits.menu_items[i].1;
+                    self.run_menu(m.agent, item);
+                } else if !self.hits.menu.is_some_and(|r| inside(&r)) {
+                    self.modal = None;
+                    self.dirty = true;
+                }
+            }
+            // Right-click elsewhere: that agent's menu there, or none.
+            MouseEventKind::Down(MouseButton::Right) if !self.hits.menu.is_some_and(|r| inside(&r)) => {
+                self.modal = None;
+                self.dirty = true;
+                self.on_mouse(e);
+            }
+            MouseEventKind::Moved => {
+                if let Some(sel) = under.filter(|&i| i != m.sel) {
+                    self.modal = Some(Modal::Menu(Menu { sel, ..m }));
+                    self.dirty = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         self.toast = Some(Toast { text: text.into(), kind, at: Instant::now() });
         self.dirty = true;
@@ -735,6 +925,10 @@ impl App {
         if let Some(i) = self.index_of(id) {
             let a = self.agents.remove(i);
             a.shutdown();
+            // A menu or dialog about it has nothing left to act on.
+            if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent)) if agent == id) {
+                self.modal = None;
+            }
             self.specs.remove(&id);
             self.parked.remove(&id);
             let was_focused = i == self.focus;
@@ -1042,7 +1236,6 @@ impl App {
             return;
         }
         if let Some((action, n)) = self.config.keys.lookup(&k) {
-            use crate::config::Action;
             match action {
                 Action::New => self.open_new(),
                 Action::Jump => self.set_focus(n),
@@ -1085,20 +1278,16 @@ impl App {
                     }
                 }
                 Action::Rename => {
-                    if let Some(a) = self.focused() {
-                        self.modal = Some(Modal::Rename(a.id, TextInput::new(&a.name)));
+                    if let Some(id) = self.focused().map(|a| a.id) {
+                        self.start_rename(id);
                     }
                 }
                 Action::Close => {
-                    if let Some(a) = self.focused() {
-                        if a.state == State::Exited {
-                            let id = a.id;
-                            self.close(id);
-                        } else {
-                            self.modal = Some(Modal::ConfirmClose(a.id));
-                        }
+                    if let Some(id) = self.focused().map(|a| a.id) {
+                        self.ask_close(id);
                     }
                 }
+                Action::Menu => self.open_focused_menu(),
                 Action::Detach => self.detach = true,
                 Action::Help => self.modal = Some(Modal::Help),
                 Action::Quit => {
@@ -1182,12 +1371,18 @@ impl App {
         if k.code == KeyCode::Enter && self.search_due.is_some() && matches!(self.modal, Some(Modal::Search(_))) {
             self.refresh_search();
         }
+        if let Some(Modal::Menu(m)) = self.modal {
+            self.menu_key(m, k);
+            return;
+        }
         let Some(modal) = &mut self.modal else { return };
         if k.code == KeyCode::Esc {
             self.modal = None;
             return;
         }
         match modal {
+            // Handled above.
+            Modal::Menu(_) => {}
             Modal::Help => self.modal = None,
             Modal::Search(s) => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1426,12 +1621,23 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if let Some(Modal::Menu(menu)) = self.modal {
+            self.menu_mouse(menu, m);
+            return;
+        }
         if self.modal.is_some() {
             return;
         }
         let (x, y) = (m.column, m.row);
         let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        // An agent's name: its card in the sidebar, or its pane's title.
+        let named = self.hits.cards.iter().chain(&self.hits.titles).find(|(r, _)| inside(r)).map(|&(_, id)| id);
         match m.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                if let Some(id) = named.or_else(|| self.hits.panes.iter().find(|(r, _)| inside(r)).map(|&(_, id)| id)) {
+                    self.open_menu(id, Some((x, y)));
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(r) = self.hits.new_button {
                     if inside(&r) {
@@ -1440,8 +1646,13 @@ impl App {
                         return;
                     }
                 }
-                if let Some(&(_, id)) = self.hits.cards.iter().find(|(r, _)| inside(r)) {
-                    if let Some(i) = self.index_of(id) {
+                if let Some(id) = named {
+                    let now = Instant::now();
+                    let double = self.last_click.is_some_and(|(at, prev, row)| prev == id && row == y && now.duration_since(at) < DOUBLE_CLICK);
+                    self.last_click = if double { None } else { Some((now, id, y)) };
+                    if double {
+                        self.start_rename(id);
+                    } else if let Some(i) = self.index_of(id) {
                         self.set_focus(i);
                     }
                     return;
@@ -1821,6 +2032,161 @@ mod tests {
         // Saved again, unchanged: nothing to say.
         app.apply_config(read("[keys]\nnew = \"alt+t\"\n"));
         assert_eq!(toast(&mut app), None);
+    }
+
+    /// Two agents, `a` (id 1, focused) and `b` (id 2), with sidebar cards
+    /// and pane titles where a frame would have put them.
+    fn menu_app() -> App {
+        let mut app = test_app();
+        for (id, name) in [(1, "a"), (2, "b")] {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        app.hits.cards = vec![(Rect::new(0, 2, 20, 3), 1), (Rect::new(0, 5, 20, 3), 2)];
+        app.hits.titles = vec![(Rect::new(22, 1, 60, 1), 1)];
+        app
+    }
+    fn click(app: &mut App, button: MouseButton, x: u16, y: u16) {
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(button), column: x, row: y, modifiers: KeyModifiers::NONE });
+    }
+    fn hit(app: &mut App, code: KeyCode, m: KeyModifiers) {
+        app.on_key(KeyEvent::new(code, m));
+    }
+    fn menu_of(app: &App) -> Option<Menu> {
+        match app.modal {
+            Some(Modal::Menu(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn right_click_opens_that_agents_menu() {
+        let mut app = menu_app();
+        click(&mut app, MouseButton::Right, 3, 6);
+        assert_eq!(menu_of(&app), Some(Menu { agent: 2, at: Some((3, 6)), sel: 0 }));
+        assert_eq!(app.focus, 0, "a menu doesn't move the focus");
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::CopyPath, MenuItem::Close]);
+        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(2));
+        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(0), "it wraps");
+        hit(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(2));
+        hit(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(matches!(&app.modal, Some(Modal::Rename(2, t)) if t.text == "b"), "its letter");
+        // Right-click on a pane title, and on the pane itself.
+        app.modal = None;
+        click(&mut app, MouseButton::Right, 40, 1);
+        assert_eq!(menu_of(&app).map(|m| m.agent), Some(1));
+        app.modal = None;
+        app.hits.panes = vec![(Rect::new(23, 2, 58, 20), 1)];
+        click(&mut app, MouseButton::Right, 40, 10);
+        assert_eq!(menu_of(&app).map(|m| m.agent), Some(1));
+        app.modal = None;
+        click(&mut app, MouseButton::Right, 90, 30);
+        assert!(app.modal.is_none(), "nothing there, no menu");
+    }
+
+    #[test]
+    fn the_menu_does_what_it_offers() {
+        let mut app = menu_app();
+        let alt = KeyModifiers::ALT;
+        // The menu key opens the focused agent's, by its pane's title.
+        hit(&mut app, KeyCode::Char('o'), alt);
+        assert_eq!(menu_of(&app), Some(Menu { agent: 1, at: Some((24, 2)), sel: 0 }));
+        hit(&mut app, KeyCode::Char('o'), alt);
+        assert!(app.modal.is_none(), "and closes it");
+        // An item's own key works inside it.
+        hit(&mut app, KeyCode::Char('o'), alt);
+        hit(&mut app, KeyCode::Char('r'), alt);
+        assert!(matches!(app.modal, Some(Modal::Rename(1, _))));
+        app.modal = None;
+        // Copy its folder.
+        app.open_menu(1, None);
+        hit(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(app.modal.is_none());
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.starts_with("copied ")), "{:?}", app.toast.as_ref().map(|t| &t.text));
+        // Close asks first while it runs.
+        app.open_menu(2, None);
+        hit(&mut app, KeyCode::End, KeyModifiers::NONE);
+        hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2))));
+        app.modal = None;
+        // An exited agent can be restarted, and closes without asking.
+        app.agents[1].set_state(State::Exited, false);
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Close]);
+        app.open_menu(2, None);
+        hit(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.agents.len(), 1);
+        assert!(app.modal.is_none());
+        // Esc, and keys that mean nothing here.
+        app.open_menu(1, None);
+        hit(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert!(menu_of(&app).is_some());
+        hit(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn the_menu_follows_the_mouse() {
+        let mut app = menu_app();
+        click(&mut app, MouseButton::Right, 3, 3);
+        // Where the frame drew it.
+        app.hits.menu = Some(Rect::new(3, 3, 24, 5));
+        app.hits.menu_items = vec![(Rect::new(4, 4, 22, 1), MenuItem::Rename), (Rect::new(4, 5, 22, 1), MenuItem::CopyPath), (Rect::new(4, 6, 22, 1), MenuItem::Close)];
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Moved, column: 10, row: 6, modifiers: KeyModifiers::NONE });
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(2), "pointing picks");
+        click(&mut app, MouseButton::Left, 3, 3);
+        assert!(menu_of(&app).is_some(), "its border is part of it");
+        click(&mut app, MouseButton::Left, 10, 4);
+        assert!(matches!(app.modal, Some(Modal::Rename(1, _))), "clicking an item runs it");
+        // Clicking elsewhere closes it; right-clicking elsewhere moves it.
+        app.open_menu(1, Some((3, 3)));
+        click(&mut app, MouseButton::Right, 10, 6);
+        assert_eq!(menu_of(&app).map(|m| m.agent), Some(1), "inside the menu, a right-click does nothing");
+        click(&mut app, MouseButton::Right, 1, 6);
+        assert_eq!(menu_of(&app).map(|m| (m.agent, m.at)), Some((2, Some((1, 6)))));
+        click(&mut app, MouseButton::Left, 70, 20);
+        assert!(app.modal.is_none());
+        assert_eq!(app.focus, 0, "the click that closed it did nothing else");
+    }
+
+    #[test]
+    fn double_click_on_a_name_renames() {
+        let mut app = menu_app();
+        click(&mut app, MouseButton::Left, 3, 6);
+        assert_eq!((app.focus, app.modal.is_none()), (1, true), "one click focuses");
+        click(&mut app, MouseButton::Left, 4, 6);
+        assert!(matches!(&app.modal, Some(Modal::Rename(2, t)) if t.text == "b"));
+        app.modal = None;
+        // Too slow, or on another agent, is two clicks.
+        app.last_click = Some((Instant::now().checked_sub(Duration::from_secs(1)).unwrap(), 2, 6));
+        click(&mut app, MouseButton::Left, 3, 6);
+        assert!(app.modal.is_none());
+        click(&mut app, MouseButton::Left, 3, 3);
+        assert!(app.modal.is_none());
+        assert_eq!(app.focus, 0);
+        // A pane's title too.
+        click(&mut app, MouseButton::Left, 40, 1);
+        click(&mut app, MouseButton::Left, 41, 1);
+        assert!(matches!(app.modal, Some(Modal::Rename(1, _))));
+    }
+
+    #[test]
+    fn closing_an_agent_takes_its_menu_with_it() {
+        let mut app = menu_app();
+        app.open_menu(2, None);
+        app.close(2);
+        assert!(app.modal.is_none());
+        app.open_menu(1, None);
+        let other = app.agents.iter().find(|a| a.id == 1).map(|a| a.id);
+        assert_eq!(other, Some(1));
+        app.open_menu(7, None);
+        assert_eq!(menu_of(&app).map(|m| m.agent), Some(1), "no menu for an agent that isn't there");
     }
 
     #[test]

@@ -152,7 +152,7 @@ needs_you = "~/sounds/knock.ogg"  # off by default
 mute = ["codex", "scratch"]       # agent kinds or names that never make a sound
 ```
 
-- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `search`, `broadcast`, `rename`, `close`, `detach`, `help` and `quit`. Naming an action replaces its keys, and the actions you leave out keep theirs. A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents. The exception is an F-key, which may stand alone. `super`/`cmd` is refused, because terminals don't pass it on. A key bound to two actions is an error. The footer, the help (`alt+?`) and the other hints show the keys you chose.
+- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `search`, `broadcast`, `rename`, `close`, `menu`, `detach`, `help` and `quit`. Naming an action replaces its keys, and the actions you leave out keep theirs. A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents. The exception is an F-key, which may stand alone. `super`/`cmd` is refused, because terminals don't pass it on. A key bound to two actions is an error. The footer, the help (`alt+?`) and the other hints show the keys you chose.
 - **Notifications** cover agents you're not looking at, as before. `on` picks the events; `desktop`, `bell` and `command` pick where they go. `command` runs without a shell (as an argv, or a string split like one; `~` works in the program), from your home folder, with the event's JSON on stdin (the same object as `trix events --json`). It also gets `TRIX_NOTIFY_EVENT` (`needs-you` or `done`), `TRIX_NOTIFY_AGENT`, `TRIX_NOTIFY_TITLE`, `TRIX_NOTIFY_BODY` and `TRIX_NOTIFY_SESSION`. For example, `command = ['sh', '-c', 'curl -s -d "$TRIX_NOTIFY_TITLE" ntfy.sh/my-agents']` puts every notification on your phone through [ntfy](https://ntfy.sh).
 - **Sounds** follow their own settings, separate from `on`. A sound file can be anything `pw-play` (wav, flac, ogg) or `afplay` (also mp3, m4a) plays. A relative path is looked up next to `config.toml`. Sounds within two seconds of each other share one sound, done and needs-you separately.
 - `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
@@ -200,7 +200,8 @@ The sidebar size you pick with `alt+m` is kept separately, in `prefs.json` in th
 | `alt+g` | grid ⇄ focus |
 | `alt+b` | broadcast a prompt |
 | `alt+f` | search every agent's scrollback |
-| `alt+r` / `alt+w` | rename / close |
+| `alt+r` / `alt+w` | rename (or double-click its name) / close |
+| `alt+o`, right-click | an agent's menu: rename, restart, copy folder path, close |
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
 | `alt+m` | mini sidebar: one line per agent, half the width (remembered) |

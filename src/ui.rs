@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
-use crate::app::{App, BroadcastTarget, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
+use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
 use crate::theme::{Theme, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -102,7 +102,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     bottom_bar(f, app, bottom, &t);
 
-    if app.modal.is_some() {
+    if let Some(Modal::Menu(m)) = app.modal {
+        // A menu floats over the workspace without dimming it.
+        agent_menu(f, app, m, area, &t);
+    } else if app.modal.is_some() {
         backdrop(f.buffer_mut(), area, &t);
         modal(f, app, area, &t);
     } else if let Some((x, y)) = cursor {
@@ -541,6 +544,7 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     let block = pane_block(app, &app.agents[app.focus], true, false, t);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.hits.titles.push((Rect { height: 1, ..area }, app.agents[app.focus].id));
     app.pane_size = (inner.width, inner.height);
     // Keep every agent sized to the main pane so switching is instant.
     for a in app.agents.iter_mut() {
@@ -607,6 +611,7 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
             let block = pane_block(app, &app.agents[i], focused, c.width < 70, t);
             let inner = block.inner(*c);
             f.render_widget(block, *c);
+            app.hits.titles.push((Rect { height: 1, ..*c }, app.agents[i].id));
             app.agents[i].resize(inner.width, inner.height);
             let a = &app.agents[i];
             app.hits.panes.push((inner, a.id));
@@ -891,6 +896,7 @@ fn input_spans(inp: &TextInput, active: bool, placeholder: &str, t: &Theme, max:
 fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let Some(m) = &app.modal else { return };
     match m {
+        Modal::Menu(_) => {}
         Modal::Search(s) => search_box(f, app, s, area, t),
         Modal::New(form) => {
             let r = centered(area, 86, 16);
@@ -1208,6 +1214,67 @@ fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
     );
 }
 
+/// The key shown beside a menu item: its workspace key, if it has one.
+fn menu_key(app: &App, item: MenuItem) -> String {
+    match item {
+        MenuItem::Restart => "enter".into(),
+        _ => item.action().and_then(|a| app.config.keys.label(a)).unwrap_or_default(),
+    }
+}
+
+/// Where a menu goes: from the click down and right, kept on screen
+/// (up or left when there's no room), or centred when opened by key.
+fn menu_rect(at: Option<(u16, u16)>, w: u16, h: u16, area: Rect) -> Rect {
+    let (w, h) = (w.min(area.width), h.min(area.height));
+    let Some((x, y)) = at else { return centered(area, w, h) };
+    let x = x.min(area.right().saturating_sub(w)).max(area.x);
+    let y = if y + h <= area.bottom() { y } else { (y + 1).saturating_sub(h).max(area.y) };
+    Rect { x, y, width: w, height: h }
+}
+
+fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: &Theme) {
+    let items = app.menu_items(m.agent);
+    let Some(a) = app.agents.iter().find(|a| a.id == m.agent) else { return };
+    let keys: Vec<String> = items.iter().map(|&i| menu_key(app, i)).collect();
+    let label_w = items.iter().map(|i| i.label().width()).max().unwrap_or(0);
+    let key_w = keys.iter().map(|k| k.width()).max().unwrap_or(0);
+    let name = trunc(&a.name, 24);
+    let w = (label_w + if key_w > 0 { key_w + 3 } else { 0 } + 4).max(name.width() + 7) as u16;
+    let r = menu_rect(m.at, w, items.len() as u16 + 2, area);
+    f.render_widget(Clear, r);
+    let block = modal_block(&name, t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    app.hits.menu = Some(r);
+    for (n, (&item, key)) in items.iter().zip(&keys).enumerate() {
+        let row = Rect { y: inner.y + n as u16, height: 1, ..inner };
+        if row.y >= inner.bottom() {
+            break;
+        }
+        let selected = n == m.sel.min(items.len() - 1);
+        let base = if selected { Style::new().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD) } else { Style::new().fg(t.fg) };
+        // The item's letter, underlined where it first appears.
+        let label = item.label();
+        let at = label.char_indices().find(|(_, c)| c.to_ascii_lowercase() == item.letter()).map(|(i, _)| i);
+        let mut spans = vec![Span::styled(" ", base)];
+        match at {
+            Some(i) => {
+                let end = i + label[i..].chars().next().map_or(0, char::len_utf8);
+                spans.push(Span::styled(&label[..i], base));
+                spans.push(Span::styled(&label[i..end], base.add_modifier(Modifier::UNDERLINED)));
+                spans.push(Span::styled(&label[end..], base));
+            }
+            None => spans.push(Span::styled(label, base)),
+        }
+        let gap = (row.width as usize).saturating_sub(label.width() + key.width() + 2);
+        spans.push(Span::styled(" ".repeat(gap), base));
+        spans.push(Span::styled(key.clone(), if selected { base } else { Style::new().fg(t.dim) }));
+        spans.push(Span::styled(" ", base));
+        f.render_widget(Paragraph::new(TLine::from(spans)), row);
+        app.hits.menu_items.push((row, item));
+    }
+}
+
 /// Two actions' keys as one label: `alt+j / k` when they share a prefix.
 fn key_pair(a: &str, b: &str) -> String {
     match (a.rsplit_once('+'), b.rsplit_once('+')) {
@@ -1231,8 +1298,9 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Attention), "next one that needs you"),
         (k(Action::Broadcast), "broadcast a prompt"),
         (k(Action::Search), "search all scrollback"),
-        (k(Action::Rename), "rename"),
+        (k(Action::Rename), "rename · double-click"),
         (k(Action::Close), "close"),
+        (k(Action::Menu), "menu · or right-click"),
         ("enter".into(), "restart an exited agent"),
     ];
     let right: Vec<(String, &str)> = vec![
@@ -1395,6 +1463,53 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (text, app)
+    }
+
+    #[test]
+    fn an_agents_menu_floats_where_it_was_opened() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        for (id, name) in [(1, "web"), (2, "api")] {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let mut frame = |app: &mut App| {
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>()
+        };
+        frame(&mut app);
+        assert!(app.hits.titles.iter().any(|(r, id)| *id == 1 && r.height == 1), "the focused pane's title is clickable");
+        app.open_menu(2, Some((10, 4)));
+        let rows = frame(&mut app);
+        println!("{}", rows.join("\n"));
+        let menu = app.hits.menu.expect("drawn");
+        assert_eq!((menu.x, menu.y), (10, 4), "from the click, down and right");
+        let row = |item| app.hits.menu_items.iter().find(|(_, i)| *i == item).map(|(r, _)| rows[r.y as usize].clone()).unwrap();
+        assert!(rows[4].contains("api"), "titled with its agent: {}", rows[4]);
+        assert!(row(MenuItem::Rename).contains("Rename") && row(MenuItem::Rename).contains("alt+r"), "{}", row(MenuItem::Rename));
+        assert!(row(MenuItem::Close).contains("Close") && row(MenuItem::Close).contains("alt+w"));
+        assert!(row(MenuItem::CopyPath).contains("Copy folder path"));
+        assert!(!rows.iter().any(|r| r.contains("Restart")), "only for an exited agent");
+        // In the corner it opens up and to the left, all of it on screen.
+        app.open_menu(2, Some((99, 23)));
+        frame(&mut app);
+        let menu = app.hits.menu.expect("drawn");
+        assert!(menu.right() <= 100 && menu.bottom() <= 24 && menu.bottom() == 24, "{menu:?}");
+        // From the keyboard, with nowhere to start from: centred.
+        app.open_menu(1, None);
+        frame(&mut app);
+        let menu = app.hits.menu.expect("drawn");
+        assert!(menu.x > 30 && menu.x < 50, "{menu:?}");
+        // The help lists it.
+        app.modal = Some(Modal::Help);
+        let help = frame(&mut app).join("\n");
+        assert!(help.contains("alt+o") && help.contains("right-click") && help.contains("double-click"), "{help}");
     }
 
     #[test]
