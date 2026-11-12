@@ -1,14 +1,17 @@
 //! `trix events`: what the agents do, live, one JSON object per line.
 //!
-//! The server compares every agent with what it last published once per
-//! turn of its loop, so every change shows, however it came about (a hook,
-//! the screen, an exit, a rename, `trix close`). Each subscriber has its own
-//! writer thread and a bounded queue: one that stops reading never stalls the
-//! workspace. It is dropped instead, and told it lost events.
+//! Once per turn of its loop, the server sends what changed: each agent's
+//! state changes as they happened (two in one turn both show), and how its
+//! name and the list of agents differ from what it last published, so every
+//! change shows, however it came about (a hook, the screen, an exit, a
+//! rename, `trix close`). Each subscriber has its own writer thread and a
+//! bounded queue: one that stops reading never stalls the workspace. It is
+//! dropped instead, once its queue is full, and told it lost events.
 //!
 //! Events: `present` (each agent there when you subscribe), `spawned`,
-//! `state`, `renamed`, `closed`, and `stopped` when the workspace stops, or
-//! `lost` if the subscriber fell behind.
+//! `state`, `renamed`, `restarted` (a new process, and id, in the same
+//! place: `prev_id` is the old one), `closed`, and `stopped` when the
+//! workspace stops, or `lost` if the subscriber fell behind.
 
 use std::io::IsTerminal;
 use std::os::unix::net::UnixStream;
@@ -43,6 +46,8 @@ pub struct Published {
     name: String,
     kind: &'static str,
     state: State,
+    /// Restarted under a new id since: the old one, to say so.
+    prev_id: Option<u32>,
 }
 
 /// The names `trix ls --json` uses.
@@ -102,8 +107,10 @@ pub fn subscribe(app: &mut App, mut stream: UnixStream, targets: &[String]) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<String>(QUEUE);
     let lost = Arc::new(AtomicBool::new(false));
     let lost_w = lost.clone();
+    // No write timeout: a reader that pauses (ctrl+z, a stalled pipe) gets
+    // everything once it reads again, and a cut-off frame never. Only a full
+    // queue drops it, and then it hears so, after what it was sent.
     let writer = std::thread::spawn(move || {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let ack = serde_json::to_vec(&Reply::ok("")).unwrap_or_default();
         if session::write_frame(&mut stream, TEXT, &ack).is_err() {
             return;
@@ -126,7 +133,23 @@ pub fn subscribe(app: &mut App, mut stream: UnixStream, targets: &[String]) {
 }
 
 fn published(a: &Agent) -> Published {
-    Published { name: a.name.clone(), kind: a.kind.label(), state: a.state }
+    Published { name: a.name.clone(), kind: a.kind.label(), state: a.state, prev_id: None }
+}
+
+/// `old` was restarted as `new`, in the same place: subscribers following
+/// it follow the new process, and hear `restarted`, not `closed`.
+pub fn restarted(app: &mut App, old: u32, new: u32) {
+    if let Some(mut p) = app.published.remove(&old) {
+        p.prev_id = Some(old);
+        app.published.insert(new, p);
+    }
+    for s in &mut app.subscribers {
+        if let Some(ids) = &mut s.only {
+            for id in ids.iter_mut().filter(|id| **id == old) {
+                *id = new;
+            }
+        }
+    }
 }
 
 /// Tell subscribers what changed since the last call. Cheap when nothing
@@ -134,14 +157,34 @@ fn published(a: &Agent) -> Published {
 pub fn publish(app: &mut App) {
     if app.subscribers.is_empty() {
         app.published.clear();
+        for a in &mut app.agents {
+            a.changes.clear();
+        }
         return;
     }
     let mut events: Vec<(u32, String)> = Vec::new();
-    for (i, a) in app.agents.iter().enumerate() {
+    // The ones gone first: a name closed and opened again in the same turn
+    // reads in that order.
+    let gone: Vec<u32> = app.published.keys().copied().filter(|id| !app.agents.iter().any(|a| a.id == *id)).collect();
+    for id in gone {
+        if let Some(p) = app.published.remove(&id) {
+            let v = json!({ "event": "closed", "at": now_ms(), "session": session::name(), "id": id, "name": p.name, "kind": p.kind, "state": state_label(p.state) });
+            events.push((id, v.to_string()));
+        }
+    }
+    for (i, a) in app.agents.iter_mut().enumerate() {
+        let changes = std::mem::take(&mut a.changes);
+        let a = &*a;
         match app.published.get_mut(&a.id) {
             None => {
                 events.push((a.id, agent_event("spawned", a, i + 1, None).to_string()));
                 app.published.insert(a.id, published(a));
+            }
+            Some(p) if p.prev_id.is_some() => {
+                let mut v = agent_event("restarted", a, i + 1, Some(p.state));
+                v["prev_id"] = json!(p.prev_id.take());
+                events.push((a.id, v.to_string()));
+                (p.name, p.state) = (a.name.clone(), a.state);
             }
             Some(p) => {
                 if p.name != a.name {
@@ -150,18 +193,22 @@ pub fn publish(app: &mut App) {
                     events.push((a.id, v.to_string()));
                     p.name = a.name.clone();
                 }
+                // Each change as it happened; the last with what it does now.
+                let n = changes.len();
+                for (k, (from, to, activity)) in changes.into_iter().enumerate() {
+                    let mut v = agent_event("state", a, i + 1, Some(from));
+                    v["state"] = json!(state_label(to));
+                    if k + 1 < n {
+                        v["activity"] = json!(activity);
+                    }
+                    events.push((a.id, v.to_string()));
+                    p.state = to;
+                }
                 if p.state != a.state {
                     events.push((a.id, agent_event("state", a, i + 1, Some(p.state)).to_string()));
                     p.state = a.state;
                 }
             }
-        }
-    }
-    let gone: Vec<u32> = app.published.keys().copied().filter(|id| !app.agents.iter().any(|a| a.id == *id)).collect();
-    for id in gone {
-        if let Some(p) = app.published.remove(&id) {
-            let v = json!({ "event": "closed", "at": now_ms(), "session": session::name(), "id": id, "name": p.name, "kind": p.kind, "state": state_label(p.state) });
-            events.push((id, v.to_string()));
         }
     }
     if events.is_empty() {
@@ -235,15 +282,28 @@ pub fn run(targets: Vec<String>, as_json: bool) -> ! {
         let Ok(v) = serde_json::from_slice::<Value>(&p) else { continue };
         let kind = v["event"].as_str().unwrap_or_default();
         if as_json {
-            println!("{v}");
+            print_line(&v.to_string());
         } else if let Some(line) = human(&v, color) {
-            println!("{line}");
+            print_line(&line);
         }
         match kind {
             "stopped" => std::process::exit(0),
             "lost" => fail("fell behind and missed events; run it again to start from where things are now", 1),
             _ => {}
         }
+    }
+}
+
+/// One line out. Whoever reads it gone (`trix events | head -1`) is how a
+/// pipe ends, not an error.
+fn print_line(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "{line}").and_then(|()| out.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        fail(&format!("writing out: {e}"), 1);
     }
 }
 
@@ -262,6 +322,7 @@ fn human(v: &Value, color: bool) -> Option<String> {
         "spawned" => format!("new {} · {}", s("kind"), s("state")),
         "state" => format!("{} → {}", s("prev"), s("state")),
         "renamed" => format!("renamed from {}", s("prev_name")),
+        "restarted" => format!("restarted · {}", s("state")),
         "closed" => "closed".into(),
         "stopped" => return Some(format!("{time}  the workspace stopped")),
         _ => return None,
@@ -404,6 +465,108 @@ mod tests {
             last = serde_json::from_slice(&p).unwrap();
         }
         assert_eq!(last["event"], "lost");
+        app.agents[0].shutdown();
+    }
+
+    #[test]
+    fn a_restart_reads_as_one_and_followers_keep_following() {
+        let mut app = app();
+        add(&mut app, Kind::Claude, 1, "web");
+        let mut all = listen(&mut app, &[]);
+        let mut web = listen(&mut app, &["web"]);
+        for c in [&mut all, &mut web] {
+            next(c);
+            next(c);
+        }
+        app.agents[0].set_state(State::Exited, false);
+        publish(&mut app);
+        // Restarted: a new process and id, in the same place.
+        let old = app.agents.remove(0);
+        old.shutdown();
+        add(&mut app, Kind::Claude, 2, "web");
+        restarted(&mut app, 1, 2);
+        publish(&mut app);
+        app.agents[0].set_state(State::Working, false);
+        publish(&mut app);
+        for c in [&mut all, &mut web] {
+            assert_eq!(next(c)["state"], "exited");
+            let v = next(c);
+            assert_eq!((v["event"].as_str(), v["id"].as_u64(), v["prev_id"].as_u64(), v["prev"].as_str()), (Some("restarted"), Some(2), Some(1), Some("exited")));
+            let v = next(c);
+            assert_eq!((v["event"].as_str(), v["id"].as_u64(), v["state"].as_str()), (Some("state"), Some(2), Some("working")), "following the new process");
+        }
+        let line = human(&json!({"event":"restarted","at":0,"name":"web","state":"starting","activity":""}), false).unwrap();
+        assert!(line.ends_with("web            restarted · starting"), "{line}");
+        app.agents[0].shutdown();
+    }
+
+    #[test]
+    fn closed_comes_before_a_new_agent_of_the_same_name() {
+        let mut app = app();
+        add(&mut app, Kind::Claude, 1, "web");
+        let mut c = listen(&mut app, &[]);
+        next(&mut c);
+        next(&mut c);
+        app.agents.remove(0).shutdown();
+        add(&mut app, Kind::Claude, 2, "web");
+        publish(&mut app);
+        assert_eq!((next(&mut c)["event"].as_str(), next(&mut c)["event"].as_str()), (Some("closed"), Some("spawned")));
+        app.agents[0].shutdown();
+    }
+
+    #[test]
+    fn every_change_shows_even_two_in_one_turn() {
+        let mut app = app();
+        add(&mut app, Kind::Claude, 1, "web");
+        app.agents[0].set_state(State::Working, false);
+        let mut c = listen(&mut app, &[]);
+        next(&mut c);
+        next(&mut c);
+        // Done and straight back to work, between two turns of the loop.
+        app.agents[0].activity = "finished after 12s".into();
+        app.agents[0].set_state(State::Done, false);
+        app.agents[0].activity = "Bash ls".into();
+        app.agents[0].set_state(State::Working, false);
+        publish(&mut app);
+        let v = next(&mut c);
+        assert_eq!((v["prev"].as_str(), v["state"].as_str(), v["activity"].as_str()), (Some("working"), Some("done"), Some("finished after 12s")));
+        let v = next(&mut c);
+        assert_eq!((v["prev"].as_str(), v["state"].as_str(), v["activity"].as_str()), (Some("done"), Some("working"), Some("Bash ls")));
+        // Without subscribers, nothing piles up.
+        drop(c);
+        std::thread::sleep(Duration::from_millis(50));
+        prune(&mut app);
+        for _ in 0..200 {
+            app.agents[0].set_state(State::Idle, false);
+            app.agents[0].set_state(State::Working, false);
+        }
+        assert!(app.agents[0].changes.len() <= 64);
+        publish(&mut app);
+        assert!(app.agents[0].changes.is_empty());
+        app.agents[0].shutdown();
+    }
+
+    #[test]
+    fn a_paused_reader_gets_everything_when_it_reads_again() {
+        let mut app = app();
+        add(&mut app, Kind::Claude, 1, "web");
+        let mut c = listen(&mut app, &[]);
+        // More than the socket holds, fewer than the queue: the writer waits.
+        for i in 0..300 {
+            app.agents[0].set_state(if i % 2 == 0 { State::Working } else { State::Idle }, false);
+            publish(&mut app);
+        }
+        assert_eq!(app.subscribers.len(), 1, "still subscribed");
+        std::thread::sleep(Duration::from_millis(200));
+        let mut n = 0;
+        let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
+        while let Ok((_, p)) = session::read_frame(&mut c) {
+            let v: Value = serde_json::from_slice(&p).unwrap();
+            if v["event"] == "state" {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 300, "none lost, none cut off");
         app.agents[0].shutdown();
     }
 

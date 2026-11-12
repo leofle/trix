@@ -195,11 +195,19 @@ function report(payload) {
   } catch {}
 }
 
+// At most 400 UTF-16 units, never half an emoji: a lone surrogate is
+// invalid in JSON, and the whole report would be dropped.
+function cut(s) {
+  let t = s.slice(0, 400);
+  if (/[\uD800-\uDBFF]$/.test(t)) t = t.slice(0, -1);
+  return typeof t.toWellFormed === "function" ? t.toWellFormed() : t;
+}
+
 function brief(args) {
   const out = {};
   for (const k of KEYS) {
     const v = args?.[k];
-    if (typeof v === "string") out[k] = v.slice(0, 400);
+    if (typeof v === "string") out[k] = cut(v);
   }
   return out;
 }
@@ -213,7 +221,7 @@ export const TrixPlugin = async () => {
         .filter((p) => p?.type === "text" && !p.synthetic && typeof p.text === "string")
         .map((p) => p.text)
         .join(" ");
-      report({ type: "chat.message", sessionID: input?.sessionID, prompt: text.slice(0, 400) });
+      report({ type: "chat.message", sessionID: input?.sessionID, prompt: cut(text) });
     },
     "tool.execute.before": async (input, output) => {
       report({ type: "tool.execute.before", sessionID: root(input?.sessionID), tool: input?.tool, args: brief(output?.args) });
@@ -825,6 +833,27 @@ mod tests {
         assert!(src.contains(r#"const TRIX = "/opt/it's \"trix\"";"#));
         assert!(!src.contains("__TRIX_EXE__"));
         assert!(src.contains(r#"spawn(TRIX, ["hook", "opencode""#) && !src.contains("shell:") && !src.contains("exec("));
+        // Text is cut without splitting an emoji, which JSON can't carry.
+        assert!(src.contains("out[k] = cut(v)") && src.contains("prompt: cut(text)"));
+        assert_eq!(src.matches("slice(0, 400)").count(), 1, "only inside cut()");
+    }
+
+    /// The plugin's `cut`, run by Node when it's installed.
+    #[test]
+    fn opencode_plugin_cut_keeps_emoji_whole() {
+        let src = OPENCODE_PLUGIN;
+        let Some(start) = src.find("function cut(") else { panic!("no cut()") };
+        let end = start + src[start..].find("\n}\n").unwrap() + 2;
+        let script = format!(
+            "{}\nconst r = cut(\"a\".repeat(399) + \"\\u{{1F600}}b\");\nprocess.stdout.write(JSON.stringify([r.length, cut(\"x\\uD83D\")]));",
+            &src[start..end]
+        );
+        let Ok(out) = std::process::Command::new("node").arg("-e").arg(&script).output() else { return };
+        if !out.status.success() {
+            return;
+        }
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v, serde_json::json!([399, "x"]));
     }
 
     #[test]
