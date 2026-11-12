@@ -994,10 +994,10 @@ impl App {
         }
         let prev = self.focus;
         if prev != idx {
-            if let Some(a) = self.agents.get(prev) {
-                if a.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
-                    a.write(&b"\x1b[O"[..]);
-                }
+            if let Some(a) = self.agents.get(prev)
+                && a.term.lock().mode().contains(TermMode::FOCUS_IN_OUT)
+            {
+                a.write(&b"\x1b[O"[..]);
             }
             let a = &self.agents[idx];
             if a.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
@@ -1083,11 +1083,11 @@ impl App {
                 }
             }
             AppEvent::Bell(id) => {
-                if let Some(i) = self.index_of(id) {
-                    if i != self.focus || !self.term_focused {
-                        self.agents[i].unseen = true;
-                        self.dirty = true;
-                    }
+                if let Some(i) = self.index_of(id)
+                    && (i != self.focus || !self.term_focused)
+                {
+                    self.agents[i].unseen = true;
+                    self.dirty = true;
                 }
             }
             AppEvent::Exit(id, code) => {
@@ -1463,12 +1463,12 @@ impl App {
                         self.toast(format!("there is already an agent named '{name}'"), ToastKind::Bad);
                         return;
                     }
-                    if let Some(i) = self.index_of(id) {
-                        if !name.is_empty() {
-                            self.agents[i].name = name.clone();
-                            if let Some(s) = self.specs.get_mut(&id) {
-                                s.name = name;
-                            }
+                    if let Some(i) = self.index_of(id)
+                        && !name.is_empty()
+                    {
+                        self.agents[i].name = name.clone();
+                        if let Some(s) = self.specs.get_mut(&id) {
+                            s.name = name;
                         }
                     }
                     self.modal = None;
@@ -1517,8 +1517,7 @@ impl App {
                         } else if f.dir.key(&k) && !f.name_touched {
                             let suggested = {
                                 let d = expand(&f.dir.text);
-                                let base = d.file_name().map(|s| slug(&s.to_string_lossy())).unwrap_or_default();
-                                base
+                                d.file_name().map(|s| slug(&s.to_string_lossy())).unwrap_or_default()
                             };
                             if !suggested.is_empty() {
                                 f.name = TextInput::new(&suggested);
@@ -1657,12 +1656,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(r) = self.hits.new_button {
-                    if inside(&r) {
-                        self.open_new();
-                        self.dirty = true;
-                        return;
-                    }
+                if let Some(r) = self.hits.new_button
+                    && inside(&r)
+                {
+                    self.open_new();
+                    self.dirty = true;
+                    return;
                 }
                 if let Some(id) = named {
                     let now = Instant::now();
@@ -1675,31 +1674,31 @@ impl App {
                     }
                     return;
                 }
-                if let Some(&(r, id)) = self.hits.panes.iter().find(|(r, _)| inside(r)) {
-                    if let Some(i) = self.index_of(id) {
-                        if i != self.focus {
-                            self.set_focus(i);
-                        }
-                        let a = &self.agents[i];
-                        let mut t = a.term.lock();
-                        let p = viewport_point(&t, r, x, y);
-                        t.selection = Some(Selection::new(SelectionType::Simple, p, Side::Left));
-                        self.drag = Some(Drag { agent: id, origin: r, moved: false });
-                        self.dirty = true;
+                if let Some(&(r, id)) = self.hits.panes.iter().find(|(r, _)| inside(r))
+                    && let Some(i) = self.index_of(id)
+                {
+                    if i != self.focus {
+                        self.set_focus(i);
                     }
+                    let a = &self.agents[i];
+                    let mut t = a.term.lock();
+                    let p = viewport_point(&t, r, x, y);
+                    t.selection = Some(Selection::new(SelectionType::Simple, p, Side::Left));
+                    self.drag = Some(Drag { agent: id, origin: r, moved: false });
+                    self.dirty = true;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(d) = &mut self.drag {
-                    if let Some(i) = self.agents.iter().position(|a| a.id == d.agent) {
-                        let mut t = self.agents[i].term.lock();
-                        let p = viewport_point(&t, d.origin, x, y);
-                        if let Some(sel) = &mut t.selection {
-                            sel.update(p, Side::Right);
-                        }
-                        d.moved = true;
-                        self.dirty = true;
+                if let Some(d) = &mut self.drag
+                    && let Some(i) = self.agents.iter().position(|a| a.id == d.agent)
+                {
+                    let mut t = self.agents[i].term.lock();
+                    let p = viewport_point(&t, d.origin, x, y);
+                    if let Some(sel) = &mut t.selection {
+                        sel.update(p, Side::Right);
                     }
+                    d.moved = true;
+                    self.dirty = true;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -1740,12 +1739,10 @@ impl App {
                         }
                         self.dirty = true;
                     }
-                } else if let Some(_) = self.hits.cards.iter().find(|(r, _)| inside(r)) {
-                    if !self.agents.is_empty() {
-                        let n = self.agents.len();
-                        let next = if up { (self.focus + n - 1) % n } else { (self.focus + 1) % n };
-                        self.set_focus(next);
-                    }
+                } else if self.hits.cards.iter().any(|(r, _)| inside(r)) && !self.agents.is_empty() {
+                    let n = self.agents.len();
+                    let next = if up { (self.focus + n - 1) % n } else { (self.focus + 1) % n };
+                    self.set_focus(next);
                 }
             }
             _ => {}

@@ -345,20 +345,18 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
     };
     // Codex: hand the payload on to the user's own notify, which our
     // `-c notify=` replaced. Fire-and-forget, like Codex itself does.
-    if source == "codex" {
-        if let (Some(p), Ok(chain)) = (&arg_payload, std::env::var("TRIX_CODEX_NOTIFY")) {
-            if let Ok(argv) = serde_json::from_str::<Vec<String>>(&chain) {
-                if let Some((prog, rest)) = argv.split_first() {
-                    let _ = std::process::Command::new(prog)
-                        .args(rest)
-                        .arg(p)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                }
-            }
-        }
+    if source == "codex"
+        && let (Some(p), Ok(chain)) = (&arg_payload, std::env::var("TRIX_CODEX_NOTIFY"))
+        && let Ok(argv) = serde_json::from_str::<Vec<String>>(&chain)
+        && let Some((prog, rest)) = argv.split_first()
+    {
+        let _ = std::process::Command::new(prog)
+            .args(rest)
+            .arg(p)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
     let seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let raw = match arg_payload {
