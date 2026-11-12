@@ -164,7 +164,9 @@ pub struct Menu {
     pub agent: u32,
     /// The cell it was opened from (a click); `None` centres it.
     pub at: Option<(u16, u16)>,
-    pub sel: usize,
+    /// The item highlighted, by what it is: the list can change under it
+    /// (Restart comes when the agent exits).
+    pub sel: MenuItem,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,7 +300,7 @@ pub struct App {
     pub published: HashMap<u32, crate::events::Published>,
     /// `~/.config/trix/config.toml`, and the write it was read from.
     pub config: crate::config::Config,
-    config_stamp: Option<(std::time::SystemTime, u64)>,
+    config_stamp: Option<crate::config::Stamp>,
     /// The file had a mistake when it was last read.
     config_failed: bool,
     last_needs_you_sound: Option<Instant>,
@@ -614,10 +616,11 @@ impl App {
     }
 
     pub fn open_menu(&mut self, id: u32, at: Option<(u16, u16)>) {
-        if self.index_of(id).is_some() {
-            self.modal = Some(Modal::Menu(Menu { agent: id, at, sel: 0 }));
-            self.dirty = true;
-        }
+        let Some(i) = self.index_of(id) else { return };
+        // On an exited agent, restarting it is what you most likely came for.
+        let sel = if self.agents[i].state == State::Exited { MenuItem::Restart } else { MenuItem::Rename };
+        self.modal = Some(Modal::Menu(Menu { agent: id, at, sel }));
+        self.dirty = true;
     }
 
     /// The menu key: the focused agent's menu, by its name on screen.
@@ -668,6 +671,7 @@ impl App {
             return;
         }
         let last = items.len() - 1;
+        let at = items.iter().position(|&i| i == m.sel).unwrap_or(0);
         // An item's own key works here too, and the menu key closes it.
         if let Some((action, _)) = self.config.keys.lookup(&k) {
             if action == Action::Menu {
@@ -677,20 +681,33 @@ impl App {
             }
             return;
         }
+        // Letters only as themselves: ctrl+c is "go away", not Close.
+        let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let sel = match k.code {
             KeyCode::Esc => {
                 self.modal = None;
                 return;
             }
-            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => m.sel.checked_sub(1).unwrap_or(last),
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => if m.sel >= last { 0 } else { m.sel + 1 },
-            KeyCode::Home => 0,
-            KeyCode::End => last,
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.run_menu(m.agent, items[m.sel.min(last)]);
+            KeyCode::Char('c' | 'g') if ctrl => {
+                self.modal = None;
                 return;
             }
-            KeyCode::Char(c) => {
+            KeyCode::Up | KeyCode::BackTab => at.checked_sub(1).unwrap_or(last),
+            KeyCode::Char('k') if plain => at.checked_sub(1).unwrap_or(last),
+            KeyCode::Down | KeyCode::Tab => if at >= last { 0 } else { at + 1 },
+            KeyCode::Char('j') if plain => if at >= last { 0 } else { at + 1 },
+            KeyCode::Home => 0,
+            KeyCode::End => last,
+            KeyCode::Enter => {
+                self.run_menu(m.agent, items[at]);
+                return;
+            }
+            KeyCode::Char(' ') if plain => {
+                self.run_menu(m.agent, items[at]);
+                return;
+            }
+            KeyCode::Char(c) if plain => {
                 if let Some(&item) = items.iter().find(|i| i.letter() == c.to_ascii_lowercase()) {
                     self.run_menu(m.agent, item);
                 }
@@ -698,7 +715,7 @@ impl App {
             }
             _ => return,
         };
-        self.modal = Some(Modal::Menu(Menu { sel, ..m }));
+        self.modal = Some(Modal::Menu(Menu { sel: items[sel], ..m }));
     }
 
     /// The mouse while a menu is open: pick, point, or click away.
@@ -723,7 +740,7 @@ impl App {
                 self.on_mouse(e);
             }
             MouseEventKind::Moved => {
-                if let Some(sel) = under.filter(|&i| i != m.sel) {
+                if let Some(sel) = under.map(|i| self.hits.menu_items[i].1).filter(|&i| i != m.sel) {
                     self.modal = Some(Modal::Menu(Menu { sel, ..m }));
                     self.dirty = true;
                 }
@@ -910,6 +927,7 @@ impl App {
             Ok(a) => {
                 self.agents[idx].shutdown();
                 self.agents[idx] = a;
+                crate::events::restarted(self, old_id, id);
                 self.toast(format!("restarted {}", spec.name), ToastKind::Good);
                 self.specs.insert(id, spec);
                 self.sync_git_targets();
@@ -2066,16 +2084,16 @@ mod tests {
     fn right_click_opens_that_agents_menu() {
         let mut app = menu_app();
         click(&mut app, MouseButton::Right, 3, 6);
-        assert_eq!(menu_of(&app), Some(Menu { agent: 2, at: Some((3, 6)), sel: 0 }));
+        assert_eq!(menu_of(&app), Some(Menu { agent: 2, at: Some((3, 6)), sel: MenuItem::Rename }));
         assert_eq!(app.focus, 0, "a menu doesn't move the focus");
         assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::CopyPath, MenuItem::Close]);
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(menu_of(&app).map(|m| m.sel), Some(2));
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close));
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(menu_of(&app).map(|m| m.sel), Some(0), "it wraps");
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Rename), "it wraps");
         hit(&mut app, KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(menu_of(&app).map(|m| m.sel), Some(2));
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close));
         hit(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
         assert!(matches!(&app.modal, Some(Modal::Rename(2, t)) if t.text == "b"), "its letter");
         // Right-click on a pane title, and on the pane itself.
@@ -2097,7 +2115,7 @@ mod tests {
         let alt = KeyModifiers::ALT;
         // The menu key opens the focused agent's, by its pane's title.
         hit(&mut app, KeyCode::Char('o'), alt);
-        assert_eq!(menu_of(&app), Some(Menu { agent: 1, at: Some((24, 2)), sel: 0 }));
+        assert_eq!(menu_of(&app), Some(Menu { agent: 1, at: Some((24, 2)), sel: MenuItem::Rename }));
         hit(&mut app, KeyCode::Char('o'), alt);
         assert!(app.modal.is_none(), "and closes it");
         // An item's own key works inside it.
@@ -2139,7 +2157,7 @@ mod tests {
         app.hits.menu = Some(Rect::new(3, 3, 24, 5));
         app.hits.menu_items = vec![(Rect::new(4, 4, 22, 1), MenuItem::Rename), (Rect::new(4, 5, 22, 1), MenuItem::CopyPath), (Rect::new(4, 6, 22, 1), MenuItem::Close)];
         app.on_mouse(MouseEvent { kind: MouseEventKind::Moved, column: 10, row: 6, modifiers: KeyModifiers::NONE });
-        assert_eq!(menu_of(&app).map(|m| m.sel), Some(2), "pointing picks");
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close), "pointing picks");
         click(&mut app, MouseButton::Left, 3, 3);
         assert!(menu_of(&app).is_some(), "its border is part of it");
         click(&mut app, MouseButton::Left, 10, 4);
@@ -2174,6 +2192,51 @@ mod tests {
         click(&mut app, MouseButton::Left, 40, 1);
         click(&mut app, MouseButton::Left, 41, 1);
         assert!(matches!(app.modal, Some(Modal::Rename(1, _))));
+    }
+
+    #[test]
+    fn ctrl_and_alt_letters_dont_pick_menu_items() {
+        let mut app = menu_app();
+        app.agents[1].set_state(State::Exited, false);
+        for (code, m) in [('c', KeyModifiers::CONTROL), ('c', KeyModifiers::ALT), ('s', KeyModifiers::CONTROL), ('f', KeyModifiers::CONTROL), ('k', KeyModifiers::ALT)] {
+            app.open_menu(2, None);
+            hit(&mut app, KeyCode::Char(code), m);
+            assert_eq!(app.agents.len(), 2, "{m:?}+{code} closed it");
+            assert!(!matches!(app.modal, Some(Modal::Rename(..) | Modal::ConfirmClose(_))), "{m:?}+{code} opened a dialog");
+        }
+        // ctrl+c is "go away".
+        app.open_menu(2, None);
+        hit(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.modal.is_none());
+        // Shift is still the letter.
+        app.open_menu(1, None);
+        hit(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert!(matches!(app.modal, Some(Modal::Rename(1, _))));
+    }
+
+    #[test]
+    fn an_exited_agents_menu_starts_on_restart() {
+        let mut app = menu_app();
+        app.agents[1].set_state(State::Exited, false);
+        app.open_menu(2, None);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Restart));
+        app.open_menu(1, None);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Rename));
+    }
+
+    #[test]
+    fn the_highlight_stays_on_its_item_when_the_list_changes() {
+        let mut app = menu_app();
+        app.open_menu(2, None);
+        hit(&mut app, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close));
+        // It exits while the menu is open: Restart comes in above Close.
+        app.agents[1].set_state(State::Exited, false);
+        hit(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::CopyPath), "one up from Close");
+        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.agents.len(), 1, "Enter ran Close, not what took its place");
     }
 
     #[test]

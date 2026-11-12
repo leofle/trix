@@ -171,6 +171,10 @@ pub fn run(argv: &[String], env: &[(&str, String)], input: Vec<u8>) -> std::io::
 
 /// Put text on the system clipboard, for terminals that ignore OSC 52.
 pub fn copy(text: &str) {
+    // Tests copy too: never over what the person running them copied.
+    if cfg!(test) {
+        return;
+    }
     if cfg!(target_os = "macos") {
         feed(&mut Command::new("pbcopy"), text.as_bytes().to_vec());
     } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {

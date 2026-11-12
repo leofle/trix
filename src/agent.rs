@@ -183,6 +183,8 @@ pub struct Agent {
     /// `screen_needs_input`'s last answer, and the (last output, last
     /// resize) it was for.
     screen_seen: std::cell::Cell<Option<ScreenSeen>>,
+    /// The folder its process was last seen in, for once it has exited.
+    last_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
     /// process group is in the foreground.
     pty: std::fs::File,
@@ -242,6 +244,9 @@ pub struct Agent {
     /// blinks while Grok thinks its terminal is unfocused, so it counts for
     /// a moment after it goes.
     title_attention: Option<Instant>,
+    /// State changes `trix events` hasn't told about yet: (from, to, the
+    /// activity then). Two in one turn of the server loop both show.
+    pub changes: Vec<(State, State, String)>,
     /// `session` is an id trix made up for a new Grok conversation, not one
     /// it resumed: no conversation exists under it until a turn.
     pub session_named_by_trix: bool,
@@ -339,6 +344,7 @@ impl Agent {
             later,
             submit_free: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             screen_seen: std::cell::Cell::new(None),
+            last_cwd: std::cell::RefCell::new(None),
             pty: master,
             pid,
             size,
@@ -372,6 +378,7 @@ impl Agent {
             managed_by: None,
             last_hook_seq: 0,
             title_attention: None,
+            changes: Vec::new(),
         })
     }
 
@@ -425,6 +432,11 @@ impl Agent {
         let prev = self.state;
         self.state = s;
         self.state_since = Instant::now();
+        // Bounded: without subscribers, nothing drains it but the server loop.
+        if self.changes.len() >= 64 {
+            self.changes.remove(0);
+        }
+        self.changes.push((prev, s, self.activity.clone()));
         // The turn a prompt was sent for has visibly begun (or it is waiting
         // on the human, or gone). Idle isn't evidence of that, and neither is
         // Done: a prompt sent mid-turn waits for that turn to end first.
@@ -665,8 +677,27 @@ impl Agent {
         // Right after a turn, Grok names the conversation and redraws, which
         // would otherwise read as a new turn and undo its Done.
         let mut title_idle = false;
+        if self.kind == Kind::Grok {
+            // Its own question or approval UI on screen outranks the title,
+            // which keeps spinning (so the screen is never quiet) while it
+            // waits. Answered, the UI goes, and the title takes over again.
+            if matches!(self.state, State::Working | State::Blocked) && self.screen_kind_prompt() {
+                if self.state == State::Blocked {
+                    return None;
+                }
+                self.activity = "needs your approval".into();
+                return self.set_state(State::Blocked, focused);
+            }
+        }
+        // A blink of the label that has gone counts only while it still
+        // waits, or if it came since the state last changed (the label
+        // blinked off before a tick saw it). Not once the approval is
+        // answered: that would turn it straight back to blocked.
+        let latched = self
+            .title_attention
+            .is_some_and(|t| t.elapsed() < GROK_BLINK && (self.state == State::Blocked || t > self.state_since));
         if self.kind == Kind::Grok
-            && let Some(sig) = grok_title(self.title.as_deref(), self.title_attention.is_some_and(|t| t.elapsed() < GROK_BLINK))
+            && let Some(sig) = grok_title(self.title.as_deref(), latched)
         {
             title_idle = sig == TitleSignal::Idle;
             if let Some(s) = self.apply_title(sig, quiet, focused) {
@@ -841,9 +872,12 @@ impl Agent {
             _ if self.state == State::Blocked
                 && self.title_attention.is_some_and(|t| self.state_since.checked_sub(Duration::from_secs(1)).is_none_or(|s| t >= s)) =>
             {
-                self.activity = "working".into();
-                let next = if matches!(sig, TitleSignal::Busy(_)) { State::Working } else { State::Idle };
-                Some(self.set_state(next, focused))
+                if matches!(sig, TitleSignal::Busy(_)) {
+                    self.activity = "working".into();
+                    return Some(self.set_state(State::Working, focused));
+                }
+                // Idle again: the turn ended with (or right after) the answer.
+                Some(self.end_turn(focused))
             }
             // The user's own Grok hooks report the turn: the title only adds
             // approvals.
@@ -859,18 +893,22 @@ impl Agent {
                 self.activity = what.unwrap_or_else(|| "working".into());
                 Some(self.set_state(State::Working, focused))
             }
-            TitleSignal::Idle if self.state == State::Working && quiet > Duration::from_millis(500) => {
-                let worked = self.work_started.map(|t| t.elapsed()).unwrap_or_default();
-                if worked > Duration::from_secs(3) {
-                    self.activity = format!("finished after {}", crate::ui::fmt_dur(worked));
-                    Some(self.set_state(State::Done, focused))
-                } else {
-                    self.activity = "idle".into();
-                    Some(self.set_state(State::Idle, focused))
-                }
-            }
+            TitleSignal::Idle if self.state == State::Working && quiet > Duration::from_millis(500) => Some(self.end_turn(focused)),
             // Idle: dialogs at start (trust this folder) are on screen only.
             TitleSignal::Idle => None,
+        }
+    }
+
+    /// Grok's title went idle after work: done if the turn was long enough
+    /// to be worth a look, idle if not.
+    fn end_turn(&mut self, focused: bool) -> Option<State> {
+        let worked = self.work_started.map(|t| t.elapsed()).unwrap_or_default();
+        if worked > Duration::from_secs(3) {
+            self.activity = format!("finished after {}", crate::ui::fmt_dur(worked));
+            self.set_state(State::Done, focused)
+        } else {
+            self.activity = "idle".into();
+            self.set_state(State::Idle, focused)
         }
     }
 
@@ -916,8 +954,20 @@ impl Agent {
         crate::platform::foreground_group(&self.pty).is_some_and(|g| g != self.pid as i32)
     }
 
+    /// Where its process is now. Once it has exited, its pid may be another
+    /// process's: where it was last seen, or where it started.
     pub fn live_cwd(&self) -> PathBuf {
-        crate::platform::cwd_of(self.pid).unwrap_or_else(|| self.cwd.clone())
+        let last = || self.last_cwd.borrow().clone().unwrap_or_else(|| self.cwd.clone());
+        if self.state == State::Exited {
+            return last();
+        }
+        match crate::platform::cwd_of(self.pid) {
+            Some(p) => {
+                *self.last_cwd.borrow_mut() = Some(p.clone());
+                p
+            }
+            None => last(),
+        }
     }
 
     #[allow(dead_code)]
@@ -2049,6 +2099,103 @@ mod tests {
         assert_eq!(a.state, State::Working);
         a.on_hook(&hook("grok", "Stop", None, None), false);
         assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    #[test]
+    fn grok_answered_stays_answered_while_the_label_fades() {
+        // With the user's hooks: approved, the tool runs and the turn ends,
+        // all within the blink window. Never back to "needs you".
+        let mut a = test_agent(Kind::Grok);
+        a.set_state(State::Idle, false);
+        a.on_hook(&hook("grok", "UserPromptSubmit", None, Some("go")), false);
+        a.on_title("⚠ Action Required - ⠙ - grok".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        std::thread::sleep(Duration::from_millis(5));
+        a.on_hook(&hook("grok", "PostToolUse", Some("edit"), Some("src/main.rs")), false);
+        assert_eq!(a.state, State::Working);
+        a.on_title("⠹ - Editing - grok".into());
+        assert_eq!(a.heuristics(false), None, "the label a moment ago was the answered one");
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&hook("grok", "Stop", None, None), false);
+        a.heuristics(false);
+        assert_eq!(a.state, State::Done, "the Done stays");
+
+        // Without hooks: the turn ends right after the answer.
+        let mut b = test_agent(Kind::Grok);
+        b.set_state(State::Idle, false);
+        b.on_title("⠋ - Thinking - grok".into());
+        b.heuristics(false);
+        b.work_started = Some(ago(Duration::from_secs(10)));
+        b.on_title("⚠ Action Required - ⠙ - grok".into());
+        b.heuristics(false);
+        assert_eq!(b.state, State::Blocked);
+        b.on_title("fix login - grok".into());
+        b.heuristics(false);
+        assert_eq!(b.state, State::Blocked, "the label blinks: still waiting");
+        b.state_since = ago(Duration::from_secs(3));
+        b.title_attention = Some(ago(Duration::from_secs(2)));
+        b.last_output = ago(Duration::from_secs(1));
+        b.heuristics(false);
+        assert_eq!(b.state, State::Done);
+        assert!(b.activity.starts_with("finished after"), "{}", b.activity);
+        a.shutdown();
+        b.shutdown();
+    }
+
+    #[test]
+    fn grok_label_seen_between_ticks_still_blocks() {
+        let mut a = test_agent(Kind::Grok);
+        a.set_state(State::Idle, false);
+        a.on_title("⠋ - Thinking - grok".into());
+        a.heuristics(false);
+        std::thread::sleep(Duration::from_millis(5));
+        // On and off again before the next tick.
+        a.on_title("⚠ Action Required - ⠙ - grok".into());
+        a.on_title("⠙ - Waiting - grok".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        a.shutdown();
+    }
+
+    #[test]
+    fn grok_question_mid_turn_reads_from_the_screen() {
+        for title in ["⠙ - Waiting - grok", "fix login - grok"] {
+            let mut a = test_agent(Kind::Grok);
+            a.set_state(State::Idle, false);
+            a.on_title("⠋ - Thinking - grok".into());
+            a.heuristics(false);
+            a.work_started = Some(ago(Duration::from_secs(10)));
+            assert_eq!(a.state, State::Working);
+            // Its question UI, while the title spins on: never quiet.
+            a.on_title(title.into());
+            show(&a, "Which database?\n (○) Postgres\n (○) SQLite\nTab:next answer  Enter:submit  x:dismiss\n");
+            redraw(&mut a);
+            a.heuristics(false);
+            assert_eq!(a.state, State::Blocked, "{title}: {}", a.activity);
+            redraw(&mut a);
+            a.heuristics(false);
+            assert_eq!(a.state, State::Blocked, "{title}: stays while the question is up");
+            // Answered: the UI goes and the title takes over.
+            show(&a, "\x1b[2J\x1b[HUsing Postgres.\n");
+            a.on_title("⠋ - Thinking - grok".into());
+            redraw(&mut a);
+            a.heuristics(false);
+            assert_eq!(a.state, State::Working, "{title}");
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn an_exited_agent_keeps_the_folder_it_was_last_in() {
+        let mut a = test_agent(Kind::Shell);
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let seen = a.live_cwd();
+        a.set_state(State::Exited, false);
+        // Its pid could be anyone's now: say, ours.
+        a.pid = std::process::id();
+        assert_eq!(real(&a.live_cwd()), real(&seen));
         a.shutdown();
     }
 

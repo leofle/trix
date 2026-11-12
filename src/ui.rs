@@ -380,13 +380,14 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
 
     // Row 3: kind · output sparkline · git.
     let kind = a.kind.label();
-    let spark_w = spark_width(10usize.min(w.saturating_sub(16)));
+    // The longest kind ("opencode") still gets a space before the sparkline.
+    let spark_w = spark_width(10usize.min(w.saturating_sub(17)));
     let mut spans = vec![
         Span::raw("       "),
-        Span::styled(format!("{kind:<8}"), Style::new().fg(mix(kind_color(t, a.kind), bg, 0.25))),
+        Span::styled(format!("{kind:<9}"), Style::new().fg(mix(kind_color(t, a.kind), bg, 0.25))),
     ];
     spans.extend(sparkline(a, spark_w, if a.state == State::Idle || a.state == State::Exited { t.dim } else { sc }, mix(t.muted, bg, 0.4)));
-    let used = 7 + 8 + spark_w;
+    let used = 7 + 9 + spark_w;
     let mut git = String::new();
     let mut diff = None;
     if let Some((files, add, del)) = a.diff.filter(|d| d.0 > 0) {
@@ -1214,12 +1215,11 @@ fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
     );
 }
 
-/// The key shown beside a menu item: its workspace key, if it has one.
+/// The key shown beside a menu item: its workspace key, if it has one and
+/// it works in the menu too. (Enter restarts an exited agent outside the
+/// menu, but in it Enter picks the highlighted item.)
 fn menu_key(app: &App, item: MenuItem) -> String {
-    match item {
-        MenuItem::Restart => "enter".into(),
-        _ => item.action().and_then(|a| app.config.keys.label(a)).unwrap_or_default(),
-    }
+    item.action().and_then(|a| app.config.keys.label(a)).unwrap_or_default()
 }
 
 /// Where a menu goes: from the click down and right, kept on screen
@@ -1228,7 +1228,9 @@ fn menu_rect(at: Option<(u16, u16)>, w: u16, h: u16, area: Rect) -> Rect {
     let (w, h) = (w.min(area.width), h.min(area.height));
     let Some((x, y)) = at else { return centered(area, w, h) };
     let x = x.min(area.right().saturating_sub(w)).max(area.x);
-    let y = if y + h <= area.bottom() { y } else { (y + 1).saturating_sub(h).max(area.y) };
+    // Up from the click when there's no room below. A click left below the
+    // screen by a resize since still lands it on screen.
+    let y = if y + h <= area.bottom() { y } else { (y + 1).min(area.bottom()).saturating_sub(h).max(area.y) };
     Rect { x, y, width: w, height: h }
 }
 
@@ -1251,7 +1253,7 @@ fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: 
         if row.y >= inner.bottom() {
             break;
         }
-        let selected = n == m.sel.min(items.len() - 1);
+        let selected = item == m.sel || (n == 0 && !items.contains(&m.sel));
         let base = if selected { Style::new().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD) } else { Style::new().fg(t.fg) };
         // The item's letter, underlined where it first appears.
         let label = item.label();
@@ -1359,6 +1361,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_menu_stays_on_screen() {
+        let area = Rect::new(0, 0, 100, 20);
+        // Below and right of the click when there's room, up when not.
+        assert_eq!(menu_rect(Some((10, 5)), 24, 6, area), Rect::new(10, 5, 24, 6));
+        assert_eq!(menu_rect(Some((10, 17)), 24, 6, area), Rect::new(10, 12, 24, 6));
+        // Opened at row 45 of a taller window that has since shrunk.
+        for at in [(10, 45), (500, 500), (99, 19)] {
+            let r = menu_rect(Some(at), 24, 6, area);
+            assert!(r.bottom() <= area.bottom() && r.right() <= area.right(), "{at:?}: {r:?}");
+        }
+        // Bigger than the screen: as much as fits.
+        assert_eq!(menu_rect(Some((10, 45)), 24, 30, area), Rect::new(10, 0, 24, 20));
+    }
 
     #[test]
     fn spark_width_divides_the_history() {

@@ -87,10 +87,21 @@ pub fn load() -> Result<Config, String> {
     }
 }
 
-/// When the file was last written, to notice edits. `None`: there is none.
-pub fn stamp() -> Option<(std::time::SystemTime, u64)> {
-    let m = std::fs::metadata(path()).ok()?;
-    Some((m.modified().ok()?, m.len()))
+/// Which file the config is and when it was written, to notice edits.
+pub type Stamp = [i64; 8];
+
+/// The file's `Stamp`. Not only its time and size: a symlink swapped to
+/// another file of the same size and time (Nix and home-manager set every
+/// store file's time to 1) is an edit too, seen by which file it points at.
+pub fn stamp() -> Option<Stamp> {
+    stamp_of(&path())
+}
+
+fn stamp_of(p: &Path) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).ok()?;
+    let link = std::fs::symlink_metadata(p).ok()?;
+    Some([m.mtime(), m.mtime_nsec(), m.size() as i64, m.dev() as i64, m.ino() as i64, m.ctime(), m.ctime_nsec(), link.ino() as i64])
 }
 
 #[derive(Deserialize, Default)]
@@ -512,6 +523,29 @@ mod tests {
         KeyEvent::new(code, mods)
     }
     const ALT: KeyModifiers = KeyModifiers::ALT;
+
+    #[test]
+    fn a_symlink_swapped_to_a_file_of_the_same_size_and_time_is_an_edit() {
+        let dir = std::env::temp_dir().join(format!("trix-stamp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The way Nix store files look: same length, time 1.
+        let one = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        for (name, text) in [("a.toml", "[keys]\nnew = \"alt+t\"\n"), ("b.toml", "[keys]\nnew = \"alt+y\"\n")] {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            std::io::Write::write_all(&mut &f, text.as_bytes()).unwrap();
+            f.set_modified(one).unwrap();
+        }
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(dir.join("a.toml"), &link).unwrap();
+        let before = stamp_of(&link).unwrap();
+        assert_eq!(stamp_of(&link), Some(before), "nothing changed, nothing to reload");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(dir.join("b.toml"), &link).unwrap();
+        assert_ne!(stamp_of(&link), Some(before));
+        assert_eq!(stamp_of(&dir.join("missing.toml")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn defaults_are_the_keys_trix_always_had() {
