@@ -1773,27 +1773,32 @@ mod tests {
         let mut app = test_app();
         // Echo off: what's on screen is only what cat received, line by line.
         // With echo on, how the terminal's echoes interleave with cat's
-        // output is up to the scheduler, and CI runners differ.
-        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; exec cat".into()), prompt: None, branch_note: None, resume: None };
+        // output is up to the scheduler, and CI runners differ. `ready` says
+        // echo is off: a login shell can take a while to get there.
+        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; echo ready; exec cat".into()), prompt: None, branch_note: None, resume: None };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        // What's on screen after `ready`, once it shows.
+        let after_ready = |app: &App| -> Option<Vec<String>> {
+            let tail = crate::search::tail(&app.agents[i].term.lock(), 20);
+            let lines: Vec<String> = tail.iter().map(|l| l.trim_end().to_string()).filter(|l| !l.is_empty()).collect();
+            let at = lines.iter().position(|l| l == "ready")?;
+            Some(lines[at + 1..].to_vec())
+        };
+        let wait_for = |app: &App, done: &dyn Fn(&[String]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !after_ready(app).is_some_and(|l| done(&l)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_for(&app, &|_| true);
+        assert!(after_ready(&app).is_some(), "the shell never turned echo off");
         app.agents[i].submit(b"one".to_vec());
         app.agents[i].submit(b"two".to_vec());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let lines = loop {
-            let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
-            let lines: Vec<String> = tail.iter().map(|l| l.trim_end().to_string()).filter(|l| !l.is_empty()).collect();
-            if lines.len() >= 2 || Instant::now() > deadline {
-                // A moment more, so an extra line would show.
-                std::thread::sleep(Duration::from_millis(200));
-                let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
-                break tail.iter().map(|l| l.trim_end().to_string()).collect::<Vec<_>>();
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        let text: Vec<&str> = lines.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
-        assert_eq!(text, ["one", "two"], "not 'onetwo' and an empty Enter");
+        wait_for(&app, &|l| l.len() >= 2);
+        // A moment more, so an extra line would show.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(after_ready(&app).unwrap_or_default(), ["one", "two"], "not 'onetwo' and an empty Enter");
         app.agents[i].shutdown();
     }
 

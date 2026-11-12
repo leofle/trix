@@ -898,6 +898,16 @@ impl Agent {
     }
 }
 
+/// An agent that goes away takes its process and terminal with it. The app
+/// shuts agents down before it drops them anyway; this covers the rest
+/// (tests above all), where the event loop would otherwise keep the PTY
+/// open until the program inside exits on its own.
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Does this screen text show an approval prompt or a question?
 fn needs_input(screen: &str) -> bool {
     let t = screen.to_lowercase();
