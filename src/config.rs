@@ -225,6 +225,7 @@ pub enum Action {
     Grid,
     Sidebar,
     MiniSidebar,
+    Compact,
     Search,
     Broadcast,
     Rename,
@@ -236,7 +237,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 16] = [
+    pub const ALL: [Action; 17] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -245,6 +246,7 @@ impl Action {
         Action::Grid,
         Action::Sidebar,
         Action::MiniSidebar,
+        Action::Compact,
         Action::Search,
         Action::Broadcast,
         Action::Rename,
@@ -265,6 +267,7 @@ impl Action {
             Action::Grid => "grid",
             Action::Sidebar => "sidebar",
             Action::MiniSidebar => "mini_sidebar",
+            Action::Compact => "compact",
             Action::Search => "search",
             Action::Broadcast => "broadcast",
             Action::Rename => "rename",
@@ -286,6 +289,7 @@ impl Action {
             Action::Grid => &["alt+g"],
             Action::Sidebar => &["alt+s"],
             Action::MiniSidebar => &["alt+m"],
+            Action::Compact => &["alt+c"],
             Action::Search => &["alt+f"],
             Action::Broadcast => &["alt+b"],
             Action::Rename => &["alt+r"],

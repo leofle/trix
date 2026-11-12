@@ -24,7 +24,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too. Which of these happen, and which sound plays, is up to you: see [Config](#config).
 - **Context at a glance.** Each Claude and Codex agent shows how full its context window is on its pane: `context 31% · ~691k left`, yellow from 70%, red from 85%. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
-- **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
+- **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little. Tiles keep a readable size: when they'd get too small, the grid shows a page at a time, the one with the focused agent, and `alt+c` fits them all on screen instead. The sidebar likewise keeps full cards and scrolls, or shows one-line cards after `alt+c`.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
@@ -152,7 +152,7 @@ needs_you = "~/sounds/knock.ogg"  # off by default
 mute = ["codex", "scratch"]       # agent kinds or names that never make a sound
 ```
 
-- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `search`, `broadcast`, `rename`, `close`, `menu`, `detach`, `help` and `quit`. Naming an action replaces its keys, and the actions you leave out keep theirs. A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents. The exception is an F-key, which may stand alone. `super`/`cmd` is refused, because terminals don't pass it on. A key bound to two actions is an error. The footer, the help (`alt+?`) and the other hints show the keys you chose.
+- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `compact`, `search`, `broadcast`, `rename`, `close`, `menu`, `detach`, `help` and `quit`. Naming an action replaces its keys, and the actions you leave out keep theirs. A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents. The exception is an F-key, which may stand alone. `super`/`cmd` is refused, because terminals don't pass it on. A key bound to two actions is an error. The footer, the help (`alt+?`) and the other hints show the keys you chose.
 - **Notifications** cover agents you're not looking at, as before. `on` picks the events; `desktop`, `bell` and `command` pick where they go. `command` runs without a shell (as an argv, or a string split like one; `~` works in the program), from your home folder, with the event's JSON on stdin (the same object as `trix events --json`). It also gets `TRIX_NOTIFY_EVENT` (`needs-you` or `done`), `TRIX_NOTIFY_AGENT`, `TRIX_NOTIFY_TITLE`, `TRIX_NOTIFY_BODY` and `TRIX_NOTIFY_SESSION`. For example, `command = ['sh', '-c', 'curl -s -d "$TRIX_NOTIFY_TITLE" ntfy.sh/my-agents']` puts every notification on your phone through [ntfy](https://ntfy.sh).
 - **Sounds** follow their own settings, separate from `on`. A sound file can be anything `pw-play` (wav, flac, ogg) or `afplay` (also mp3, m4a) plays. A relative path is looked up next to `config.toml`. Sounds within two seconds of each other share one sound, done and needs-you separately.
 - `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
@@ -190,7 +190,7 @@ The layout (kind, name, folder, extra args, and the conversation id each agent r
 
 Scrollback isn't restored, and closed or exited agents aren't saved.
 
-The sidebar size you pick with `alt+m` is kept separately, in `prefs.json` in the same folder. It applies to every session and survives restarts whether or not you restore.
+The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separately, in `prefs.json` in the same folder. It applies to every session and survives restarts whether or not you restore.
 
 | key | action |
 | --- | --- |
@@ -205,6 +205,7 @@ The sidebar size you pick with `alt+m` is kept separately, in `prefs.json` in th
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
 | `alt+m` | mini sidebar: one line per agent, half the width (remembered) |
+| `alt+c` | shrink to fit. In the sidebar: one-line cards instead of full ones that scroll. In the grid: every agent on screen instead of full-size tiles a page at a time (remembered) |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
 | `alt+?` | all keys |
