@@ -257,12 +257,9 @@ pub struct App {
     pub sidebar: bool,
     /// alt+m: a narrow sidebar, one line per agent.
     pub sidebar_mini: bool,
-    /// alt+c in focus view: one-line cards, so more fit. Otherwise cards
-    /// keep their size and the list scrolls.
+    /// alt+c: one-line cards, so more fit. Otherwise cards keep their size
+    /// and the list scrolls.
     pub sidebar_compact: bool,
-    /// alt+c in the grid: every agent on screen, however small. Otherwise
-    /// tiles keep a readable size, a page at a time.
-    pub grid_fit: bool,
     /// The first card the sidebar shows; it follows the focus.
     pub sidebar_scroll: usize,
     pub modal: Option<Modal>,
@@ -340,7 +337,6 @@ impl App {
             sidebar: true,
             sidebar_mini: prefs.sidebar_mini,
             sidebar_compact: prefs.sidebar_compact,
-            grid_fit: prefs.grid_fit,
             sidebar_scroll: 0,
             modal: None,
             theme: polled.unwrap_or_default(),
@@ -432,7 +428,6 @@ impl App {
         let prefs = state::load_prefs();
         self.sidebar_mini = prefs.sidebar_mini;
         self.sidebar_compact = prefs.sidebar_compact;
-        self.grid_fit = prefs.grid_fit;
         self.term_focused = true;
         if let Some(a) = self.agents.get_mut(self.focus) {
             a.unseen = false;
@@ -1299,27 +1294,11 @@ impl App {
                     }
                 }
                 Action::Compact => {
-                    // The view on screen is the one that changes.
-                    let (what, on) = if self.view == View::Grid {
-                        self.grid_fit = !self.grid_fit;
-                        ("grid", self.grid_fit)
-                    } else {
-                        self.sidebar_compact = !self.sidebar_compact;
-                        self.sidebar = true;
-                        ("sidebar", self.sidebar_compact)
-                    };
-                    self.toast(
-                        match (what, on) {
-                            ("grid", true) => "grid: every agent on screen",
-                            ("grid", false) => "grid: full-size tiles, a page at a time",
-                            (_, true) => "sidebar: compact cards",
-                            _ => "sidebar: full cards, scrolling",
-                        },
-                        ToastKind::Info,
-                    );
+                    self.sidebar_compact = !self.sidebar_compact;
+                    self.sidebar = true;
+                    self.toast(if self.sidebar_compact { "sidebar: compact cards" } else { "sidebar: full cards, scrolling" }, ToastKind::Info);
                     let mut prefs = state::load_prefs();
                     prefs.sidebar_compact = self.sidebar_compact;
-                    prefs.grid_fit = self.grid_fit;
                     if let Err(e) = state::store_prefs(&prefs) {
                         self.toast(format!("couldn't remember that: {e}"), ToastKind::Bad);
                     }

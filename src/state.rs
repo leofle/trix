@@ -123,12 +123,9 @@ pub struct Prefs {
     /// alt+m: the narrow sidebar.
     #[serde(default)]
     pub sidebar_mini: bool,
-    /// alt+c in focus view: one-line sidebar cards.
+    /// alt+c: one-line sidebar cards.
     #[serde(default)]
     pub sidebar_compact: bool,
-    /// alt+c in the grid: every agent on screen at once.
-    #[serde(default)]
-    pub grid_fit: bool,
     /// Claude context windows learned per model (see usage.rs).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context_windows: std::collections::BTreeMap<String, u64>,
