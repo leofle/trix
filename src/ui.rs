@@ -253,19 +253,33 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     f.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
 
     let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), ..inner };
-    let n = app.agents.len() as u16;
+    let n = app.agents.len();
     let mini = app.sidebar_mini;
-    let compact = mini || n * 4 > list.height;
+    // Cards keep their size (alt+c makes them one line); what doesn't fit
+    // scrolls, with the focused card always in view.
+    let compact = mini || app.sidebar_compact;
     let per = if compact { 1 } else { 4 };
-    let mut y = list.y;
-    for i in 0..app.agents.len() {
-        if y + per > list.bottom() + if compact { 0 } else { 1 } {
-            break;
-        }
+    // A full card is 3 rows and a gap; the last needs no gap.
+    let fit = if compact { list.height as usize } else { (list.height as usize + 1) / 4 };
+    let first = sidebar_window(app.sidebar_scroll, app.focus, n, fit);
+    app.sidebar_scroll = first;
+    let shown = fit.min(n - first.min(n));
+    for (k, i) in (first..first + shown).enumerate() {
+        let y = list.y + (k * per) as u16;
         let r = Rect { x: list.x, y, width: list.width, height: if compact { 1 } else { 3 } };
         card(f, app, i, r, compact, mini, t);
         app.hits.cards.push((r, app.agents[i].id));
-        y += per;
+    }
+    // What's out of view, in the free rows above and below the list.
+    let more = |k: usize, arrow: &str| if mini { format!(" {arrow} {k}") } else { format!("  {arrow} {k} more") };
+    if first > 0 {
+        f.render_widget(Paragraph::new(Span::styled(more(first, "↑"), Style::new().fg(t.muted))), Rect { y: inner.y + 1, height: 1, ..inner });
+    }
+    // Right under the last card shown: its gap row, or the next row.
+    let below = n - first.min(n) - shown;
+    let y = list.y + (shown.saturating_sub(1) * per) as u16 + if compact { 1 } else { 3 };
+    if below > 0 && shown > 0 && y < area.bottom().saturating_sub(2) {
+        f.render_widget(Paragraph::new(Span::styled(more(below, "↓"), Style::new().fg(t.muted))), Rect { y, height: 1, ..inner });
     }
 
     // "new agent" button pinned to the bottom of the rail.
@@ -283,6 +297,22 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         );
     }
     app.hits.new_button = Some(btn);
+}
+
+/// The first of `n` cards to show when `fit` fit: where the list was, moved
+/// just enough to show the focused card, and never past the end.
+fn sidebar_window(was: usize, focus: usize, n: usize, fit: usize) -> usize {
+    if fit == 0 || n <= fit {
+        return 0;
+    }
+    let first = was.min(n - fit);
+    if focus < first {
+        focus
+    } else if focus >= first + fit {
+        focus + 1 - fit
+    } else {
+        first
+    }
 }
 
 fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, t: &Theme) {
@@ -594,37 +624,75 @@ fn attention_banner(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Rect {
     Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area }
 }
 
-fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
-    let n = app.agents.len();
+/// The smallest a grid tile gets before the grid goes a page at a time
+/// (unless alt+c asked for every agent on screen).
+const TILE_MIN: (u16, u16) = (60, 15);
+
+/// Where each agent shown in the grid goes, and which page of how many
+/// this is (1 of 1 when every agent fits).
+fn grid_tiles(n: usize, focus: usize, area: Rect, fit_all: bool) -> (Vec<(usize, Rect)>, usize, usize) {
+    if n == 0 {
+        return (Vec::new(), 1, 1);
+    }
     let wide = area.width as f32 / (area.height as f32 * 2.2);
     let cols = ((n as f32 * wide).sqrt().ceil() as usize).clamp(1, n);
     let rows = n.div_ceil(cols);
-    let row_rects = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-    let mut cursor = None;
-    let mut idx = 0;
-    for (ri, rr) in row_rects.iter().enumerate() {
-        let in_row = if ri == rows - 1 { n - idx } else { cols };
-        let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row]).split(*rr);
-        for c in cells.iter() {
-            let i = idx;
-            idx += 1;
-            let focused = i == app.focus;
-            let block = pane_block(app, &app.agents[i], focused, c.width < 70, t);
-            let inner = block.inner(*c);
-            f.render_widget(block, *c);
-            app.hits.titles.push((Rect { height: 1, ..*c }, app.agents[i].id));
-            app.agents[i].resize(inner.width, inner.height);
-            let a = &app.agents[i];
-            app.hits.panes.push((inner, a.id));
-            let cur = render_term(f.buffer_mut(), inner, a, t, focused && app.term_focused);
-            if focused {
-                cursor = cur;
-            } else {
-                // Unfocused tiles recede a little.
-                fade(f.buffer_mut(), inner, t, 0.35);
-            }
-            pane_overlays(f, a, *c, inner, &app.key(Action::Close), t);
+    let roomy = area.width / cols as u16 >= TILE_MIN.0 && area.height / rows as u16 >= TILE_MIN.1;
+    let mut tiles = Vec::with_capacity(n);
+    if fit_all || roomy {
+        // Every agent, the last row's tiles sharing its whole width.
+        let row_rects = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
+        for (ri, rr) in row_rects.iter().enumerate() {
+            let start = ri * cols;
+            let in_row = (n - start).min(cols);
+            let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row]).split(*rr);
+            tiles.extend(cells.iter().enumerate().map(|(k, c)| (start + k, *c)));
         }
+        return (tiles, 1, 1);
+    }
+    // Full-size tiles, as many as fit, on the page with the focused agent.
+    // Every page has the same grid, so tiles keep their size page to page.
+    let cols = (area.width / TILE_MIN.0).max(1) as usize;
+    let rows = (area.height / TILE_MIN.1).max(1) as usize;
+    let per = cols * rows;
+    let page = focus.min(n - 1) / per;
+    let row_rects = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
+    for (k, i) in (page * per..((page + 1) * per).min(n)).enumerate() {
+        let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols]).split(row_rects[k / cols]);
+        tiles.push((i, cells[k % cols]));
+    }
+    (tiles, page + 1, n.div_ceil(per))
+}
+
+fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
+    let (tiles, page, pages) = grid_tiles(app.agents.len(), app.focus, area, app.grid_fit);
+    let mut cursor = None;
+    for (i, c) in tiles {
+        let focused = i == app.focus;
+        let block = pane_block(app, &app.agents[i], focused, c.width < 70, t);
+        let inner = block.inner(c);
+        f.render_widget(block, c);
+        app.hits.titles.push((Rect { height: 1, ..c }, app.agents[i].id));
+        app.agents[i].resize(inner.width, inner.height);
+        let a = &app.agents[i];
+        app.hits.panes.push((inner, a.id));
+        let cur = render_term(f.buffer_mut(), inner, a, t, focused && app.term_focused);
+        if focused {
+            cursor = cur;
+        } else {
+            // Unfocused tiles recede a little.
+            fade(f.buffer_mut(), inner, t, 0.35);
+        }
+        pane_overlays(f, a, c, inner, &app.key(Action::Close), t);
+    }
+    if pages > 1 {
+        // On the bottom border: which page, and how to get to the others.
+        let next = app.config.keys.label(Action::Next).unwrap_or_default();
+        let fit = app.config.keys.label(Action::Compact).map(|k| format!(" · {k} fit all")).unwrap_or_default();
+        let s = format!(" page {page}/{pages} · {next} next{fit} ");
+        let w = (s.chars().count() as u16).min(area.width);
+        let r = Rect { x: area.x + area.width.saturating_sub(w) / 2, y: area.bottom().saturating_sub(1), width: w, height: 1 };
+        f.render_widget(Paragraph::new(Span::styled(s, Style::new().fg(t.bg).bg(t.accent))), r);
     }
     cursor
 }
@@ -1310,6 +1378,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Grid), "grid ⇄ focus"),
         (k(Action::Sidebar), "toggle sidebar"),
         (k(Action::MiniSidebar), "mini sidebar"),
+        (k(Action::Compact), "compact cards · fit grid"),
         ("shift+pgup".into(), "scroll back"),
         ("wheel".into(), "scroll · click focus"),
         ("drag".into(), "select & copy"),
@@ -1554,6 +1623,92 @@ mod tests {
         assert!(row(2).contains("docs •"), "unseen work keeps its dot: {}", row(2));
         assert!(!mini.contains("Edit src/app.rs") || mini.lines().all(|l| !l.starts_with("       Edit")), "no activity rows");
         assert!(mini.contains("+ new") && !mini.contains("new agent"));
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn the_sidebar_window_follows_the_focus() {
+        // Everything fits: no scrolling, wherever it was.
+        assert_eq!(sidebar_window(5, 3, 4, 10), 0);
+        // Focus in view: the list stays put.
+        assert_eq!(sidebar_window(2, 4, 20, 5), 2);
+        // Focus below or above: just enough to show it.
+        assert_eq!(sidebar_window(2, 9, 20, 5), 5);
+        assert_eq!(sidebar_window(6, 1, 20, 5), 1);
+        // Agents closed since: never past the end.
+        assert_eq!(sidebar_window(18, 7, 8, 5), 3);
+        assert_eq!(sidebar_window(3, 0, 20, 0), 0, "no room at all");
+    }
+
+    #[test]
+    fn grid_tiles_keep_their_size_a_page_at_a_time() {
+        let area = Rect::new(0, 0, 180, 45);
+        // Few agents: every one, as large as they come.
+        let (tiles, page, pages) = grid_tiles(4, 0, area, false);
+        assert_eq!((tiles.len(), page, pages), (4, 1, 1));
+        assert!(tiles.iter().all(|(_, r)| r.width >= TILE_MIN.0 && r.height >= TILE_MIN.1));
+        // Many: full-size tiles, the page with the focus on it.
+        let (tiles, page, pages) = grid_tiles(24, 10, area, false);
+        assert_eq!((page, pages), (2, 3), "3×3 per page");
+        assert_eq!(tiles.iter().map(|(i, _)| *i).collect::<Vec<_>>(), (9..18).collect::<Vec<_>>());
+        assert!(tiles.iter().all(|(_, r)| r.width >= TILE_MIN.0 && r.height >= TILE_MIN.1), "{tiles:?}");
+        // The last page has the same grid, partly empty, not stretched.
+        let (last, page, _) = grid_tiles(24, 23, area, false);
+        assert_eq!((last.len(), page), (6, 3));
+        assert_eq!((last[0].1.width, last[0].1.height), (tiles[0].1.width, tiles[0].1.height));
+        // Fit all (alt+c): every agent on one screen, however small.
+        let (all, page, pages) = grid_tiles(24, 10, area, true);
+        assert_eq!((all.len(), page, pages), (24, 1, 1));
+        assert!(all.iter().any(|(_, r)| r.width < TILE_MIN.0 || r.height < TILE_MIN.1));
+        // A terminal smaller than one tile still shows the focused agent.
+        let (one, ..) = grid_tiles(3, 2, Rect::new(0, 0, 40, 10), false);
+        assert_eq!(one.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [2]);
+        assert_eq!(grid_tiles(0, 0, area, false).0.len(), 0);
+    }
+
+    #[test]
+    fn full_cards_scroll_and_compact_ones_fit() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.sidebar_mini = false;
+        app.sidebar_compact = false;
+        for k in 0..12 {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.id = k + 1;
+            a.name = format!("agent-{}", k + 1);
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let mut frame = |app: &mut App| {
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        let top = frame(&mut app);
+        let cards = app.hits.cards.clone();
+        assert!(cards.len() < 12 && cards.iter().all(|(r, _)| r.height == 3), "full cards, as many as fit: {cards:?}");
+        assert_eq!(cards[0].1, 1);
+        assert!(top.contains(&format!("↓ {} more", 12 - cards.len())) && !top.contains("↑"), "{top}");
+        // Focus the last: the list scrolls to it.
+        app.focus = 11;
+        let bottom = frame(&mut app);
+        let ids: Vec<u32> = app.hits.cards.iter().map(|(_, id)| *id).collect();
+        assert_eq!(ids.last(), Some(&12), "{bottom}");
+        assert!(bottom.contains(&format!("↑ {} more", 12 - ids.len())) && !bottom.contains("↓"), "{bottom}");
+        // Compact: one line each, and all twelve fit.
+        app.sidebar_compact = true;
+        let compact = frame(&mut app);
+        assert_eq!(app.hits.cards.len(), 12, "{compact}");
+        assert!(app.hits.cards.iter().all(|(r, _)| r.height == 1));
+        assert!(!compact.contains(" more"));
+        // The help names the key.
+        app.modal = Some(Modal::Help);
+        let help = frame(&mut app);
+        assert!(help.contains("alt+c") && help.contains("compact cards"), "{help}");
         for a in &app.agents {
             a.shutdown();
         }
