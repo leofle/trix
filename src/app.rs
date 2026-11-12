@@ -204,7 +204,7 @@ pub struct App {
     pub themed_by_omarchy: bool,
     tx: Sender<AppEvent>,
     socket: PathBuf,
-    claude_settings: Option<PathBuf>,
+    integrations: crate::hooks::Integrations,
     exe: PathBuf,
     pub term_focused: bool,
     next_id: u32,
@@ -239,7 +239,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(tx: Sender<AppEvent>, socket: PathBuf, claude_settings: Option<PathBuf>, exe: PathBuf, out: Out) -> App {
+    pub fn new(tx: Sender<AppEvent>, socket: PathBuf, integrations: crate::hooks::Integrations, exe: PathBuf, out: Out) -> App {
         let mut theme_watch = ThemeWatcher::new();
         let polled = theme_watch.poll();
         let themed = polled.is_some();
@@ -261,7 +261,7 @@ impl App {
             themed_by_omarchy: themed,
             tx,
             socket,
-            claude_settings,
+            integrations,
             exe,
             term_focused: true,
             next_id: 1,
@@ -338,7 +338,8 @@ impl App {
                     // A shell may have cd'd since; agents stay where they started.
                     cwd: if a.kind == Kind::Shell { a.live_cwd() } else { spec.cwd.clone() },
                     command: spec.command.clone(),
-                    session: if matches!(a.kind, Kind::Claude | Kind::Codex) { a.session.clone() } else { None },
+                    // A Grok id is trix's own until a turn makes it a conversation.
+                    session: if a.kind.resumes() && (a.kind != Kind::Grok || a.turn_seen) { a.session.clone() } else { None },
                 })
             })
             .collect()
@@ -384,7 +385,7 @@ impl App {
                 skipped.push(s.name);
                 continue;
             }
-            let resume = s.session.clone().filter(|_| matches!(kind, Kind::Claude | Kind::Codex));
+            let resume = s.session.clone().filter(|_| kind.resumes());
             let spec = Spawn {
                 kind,
                 name: self.unique_name(&s.name),
@@ -462,7 +463,7 @@ impl App {
             let mark = if a.unseen { "•" } else { " " };
             let name = format!("{:<w$}", a.name);
             out.push_str(&format!(
-                "{:>2} {mark} {name}  {:<6}  {:<9} {:>6}  {}  {}\n",
+                "{:>2} {mark} {name}  {:<8}  {:<9} {:>6}  {}  {}\n",
                 i + 1,
                 a.kind.label(),
                 a.state.label(),
@@ -569,7 +570,7 @@ impl App {
     fn start(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
-        let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe)?;
+        let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe)?;
         self.specs.insert(id, keep);
         self.agents.push(agent);
         self.sync_git_targets();
@@ -656,7 +657,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let size = self.agents[idx].size;
-        match Agent::spawn(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe) {
+        match Agent::spawn(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, &self.integrations, &self.exe) {
             Ok(a) => {
                 self.agents[idx].shutdown();
                 self.agents[idx] = a;
@@ -806,7 +807,7 @@ impl App {
             }
             AppEvent::Title(id, t) => {
                 if let Some(i) = self.index_of(id) {
-                    self.agents[i].title = Some(t);
+                    self.agents[i].on_title(t);
                     self.dirty = true;
                 }
             }
@@ -1738,7 +1739,7 @@ mod tests {
 
     fn test_app() -> App {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
     }

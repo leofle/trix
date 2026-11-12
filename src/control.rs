@@ -165,7 +165,7 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
             Request::Wait { targets: pos.clone(), all: has(&["--all"]), timeout_secs: number(&["--timeout", "-t"], WAIT_SECS)? }
         }
         "spawn" => {
-            let kind = one("agent kind (claude, codex, shell or custom)")?;
+            let kind = one("agent kind (claude, codex, grok, opencode, cursor, shell or custom)")?;
             let cwd = value(&["--cwd"]).map(|d| absolute(app::expand(&d), &cwd)).unwrap_or(cwd);
             Request::Spawn {
                 kind,
@@ -439,8 +439,12 @@ fn hung_up(s: &UnixStream) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool) -> Reply {
-    let Some(kind) = Kind::from_label(kind).or_else(|| (kind == "sh").then_some(Kind::Shell)) else {
-        return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, shell or custom)"));
+    let Some(kind) = Kind::from_label(kind).or(match kind {
+        "sh" => Some(Kind::Shell),
+        "cursor-agent" => Some(Kind::Cursor),
+        _ => None,
+    }) else {
+        return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, shell or custom)"));
     };
     if !cwd.is_dir() {
         return Reply::fail(format!("folder not found: {}", app::tilde(&cwd)));

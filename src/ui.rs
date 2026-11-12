@@ -416,6 +416,9 @@ fn kind_color(t: &Theme, k: Kind) -> Color {
     match k {
         Kind::Claude => t.orange,
         Kind::Codex => t.cyan,
+        Kind::Grok => t.fg_bright,
+        Kind::OpenCode => t.accent,
+        Kind::Cursor => mix(t.cyan, t.magenta, 0.5),
         Kind::Shell => t.dim,
         Kind::Custom => t.magenta,
     }
@@ -878,7 +881,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     match m {
         Modal::Search(s) => search_box(f, app, s, area, t),
         Modal::New(form) => {
-            let r = centered(area, 72, 16);
+            let r = centered(area, 86, 16);
             f.render_widget(Clear, r);
             let block = modal_block("New agent", t);
             let inner = block.inner(r);
@@ -1304,7 +1307,7 @@ mod tests {
     fn context_label_in_pane_only() {
         use crate::usage::Context;
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app.sidebar_mini = false;
         for (name, ctx) in [
@@ -1351,7 +1354,7 @@ mod tests {
 
     fn screen(mini: bool, width: u16) -> (String, App) {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None; // never offer (or save over) the real workspace
         app.sidebar_mini = mini;
         for (name, state, unseen) in [("web", State::Working, false), ("api-gateway-v2", State::Blocked, true), ("docs", State::Done, true), ("sh", State::Idle, false)] {

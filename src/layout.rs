@@ -63,7 +63,7 @@ pub fn to_toml(name: &str, agents: &[LayoutAgent]) -> String {
     let body = toml::to_string(&LayoutFile { agents: agents.to_vec() }).unwrap_or_default();
     format!(
         "# trix layout '{name}' · `trix layout open {name}` opens these tabs again\n\
-         # kind: claude, codex, shell or custom · args: extra arguments (for custom, the command)\n\
+         # kind: claude, codex, grok, opencode, cursor, shell or custom · args: extra arguments (for custom, the command)\n\
          # cwd: the folder; a relative one starts from your home folder\n\
          # session: the conversation `--resume` picks up; delete the line to always start fresh\n\n{body}"
     )
@@ -266,7 +266,7 @@ pub fn spec_for(a: &LayoutAgent, resume: bool) -> Result<Spawn, String> {
     if kind == Kind::Custom && command.is_none() {
         return Err("custom agent without a command (args)".into());
     }
-    let resume = a.session.clone().filter(|_| resume && matches!(kind, Kind::Claude | Kind::Codex));
+    let resume = a.session.clone().filter(|_| resume && kind.resumes());
     Ok(Spawn { kind, name: a.name.clone(), cwd, command, prompt: None, branch_note: None, resume })
 }
 
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn opening_skips_whats_open_and_reports_failures() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         let tmp = std::env::temp_dir().display().to_string();
         let job = |name: &str| {
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn opening_takes_over_matching_restore_entries() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         let tmp = std::env::temp_dir();
         let saved = |name: &str| SavedAgent { kind: "claude".into(), name: name.into(), cwd: tmp.clone(), command: None, session: Some(format!("s-{name}")) };
         app.pending_restore = Some(crate::state::Saved::new(2, vec![saved("web"), saved("api"), saved("docs")]));

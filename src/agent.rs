@@ -16,22 +16,32 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use crate::app::AppEvent;
-use crate::hooks::{self, HookMsg};
+use crate::hooks::{self, HookMsg, Integrations};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Claude,
     Codex,
+    /// xAI's Grok Build CLI (`grok`).
+    Grok,
+    /// OpenCode (`opencode`).
+    OpenCode,
+    /// Cursor's CLI agent, started as `cursor-agent`: newer installs also
+    /// name it `agent`, but Grok's installer claims that name too.
+    Cursor,
     Shell,
     Custom,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Claude, Kind::Codex, Kind::Shell, Kind::Custom];
+    pub const ALL: [Kind; 7] = [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Shell, Kind::Custom];
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
             Kind::Codex => "codex",
+            Kind::Grok => "grok",
+            Kind::OpenCode => "opencode",
+            Kind::Cursor => "cursor",
             Kind::Shell => "shell",
             Kind::Custom => "custom",
         }
@@ -45,7 +55,16 @@ impl Kind {
     /// A known coding agent, so typing a prompt into it is safe. A custom
     /// command may be anything (bash, ssh, psql), so it is not.
     pub fn takes_prompts(self) -> bool {
-        matches!(self, Kind::Claude | Kind::Codex)
+        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor)
+    }
+    /// It can be started again in the conversation it was in.
+    pub fn resumes(self) -> bool {
+        self.takes_prompts()
+    }
+    /// No hook reports its approval prompts, so while it works, its own
+    /// prompt UI on screen is how trix knows it needs you.
+    fn prompts_only_on_screen(self) -> bool {
+        matches!(self, Kind::Grok | Kind::Cursor)
     }
 }
 
@@ -141,7 +160,7 @@ pub struct Agent {
     submit_free: Instant,
     /// `screen_needs_input`'s last answer, and the (last output, last
     /// resize) it was for.
-    screen_seen: std::cell::Cell<Option<((Instant, Instant), bool)>>,
+    screen_seen: std::cell::Cell<Option<ScreenSeen>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
     /// process group is in the foreground.
     pty: std::fs::File,
@@ -197,6 +216,10 @@ pub struct Agent {
     /// When the newest hook applied had fired (`HookMsg::seq`), so a report
     /// that was overtaken on its way here is dropped, not applied late.
     last_hook_seq: u64,
+    /// Grok: when its terminal title last said "Action Required". The label
+    /// blinks while Grok thinks its terminal is unfocused, so it counts for
+    /// a moment after it goes.
+    title_attention: Option<Instant>,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -223,10 +246,13 @@ impl Agent {
         size: (u16, u16),
         tx: Sender<AppEvent>,
         socket: &std::path::Path,
-        claude_settings: Option<&std::path::Path>,
+        integrations: &Integrations,
         exe: &std::path::Path,
     ) -> anyhow::Result<Agent> {
-        let (program, args) = command_for(&spec, claude_settings, exe);
+        // Grok takes the id of a new conversation from its caller, so trix
+        // knows what to resume without asking it.
+        let fresh = (spec.kind == Kind::Grok && spec.resume.is_none() && !grok_picks_session(spec.command.as_deref())).then(new_session_id).flatten();
+        let (program, args) = command_for(&spec, integrations, exe, fresh.as_deref());
         let first_prompt = spec.kind.is_agent() && spec.prompt.as_deref().is_some_and(|p| !p.trim().is_empty());
         let command_line = std::iter::once(program.clone())
             .chain(args.iter().map(|a| if a.contains(' ') { format!("{a:?}") } else { a.clone() }))
@@ -245,6 +271,12 @@ impl Agent {
         if spec.kind == Kind::Codex {
             if let Some(chain) = codex_user_notify() {
                 env.insert("TRIX_CODEX_NOTIFY".into(), chain);
+            }
+        }
+        if spec.kind == Kind::OpenCode {
+            let theirs = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+            if let Some(c) = integrations.opencode_plugin.as_deref().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
+                env.insert("OPENCODE_CONFIG_CONTENT".into(), c);
             }
         }
 
@@ -295,7 +327,7 @@ impl Agent {
             last_resize: now,
             activity: spec.branch_note.unwrap_or_else(|| "launching".into()),
             last_prompt: spec.prompt,
-            session: spec.resume,
+            session: spec.resume.or(fresh),
             title: None,
             exit_code: None,
             last_output: now,
@@ -313,6 +345,7 @@ impl Agent {
             turn_seen: false,
             managed_by: None,
             last_hook_seq: 0,
+            title_attention: None,
         })
     }
 
@@ -446,6 +479,8 @@ impl Agent {
             // Codex's lifecycle hooks, which it runs once they're trusted.
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
+            // trix's own plugin (OpenCode, Cursor) or the user's hooks (Grok).
+            "opencode" | "cursor" | "grok" => self.hooked = true,
             _ => self.reported = true,
         }
         let tool = msg.tool.clone().unwrap_or_default();
@@ -514,6 +549,30 @@ impl Agent {
                 self.activity = "interrupted".into();
                 self.set_state(State::Idle, focused)
             }
+            // A tool that already ran, from agents that report tools only
+            // once they're done (Cursor).
+            "ToolDone" => {
+                self.turn_seen = true;
+                self.tools_used += 1;
+                self.activity = format!("{} ✓", described(&msg.detail));
+                self.set_state(State::Working, focused)
+            }
+            // The agent asks the human something (OpenCode's question tool).
+            "Question" => {
+                self.activity = msg.detail.clone().unwrap_or_else(|| "has a question".into());
+                self.set_state(State::Blocked, focused)
+            }
+            // A permission or a question was answered: back to work.
+            "Answered" => {
+                self.activity = "working".into();
+                self.set_state(State::Working, focused)
+            }
+            // Busy without a prompt seen (a queued message, a retry).
+            "Busy" if self.state != State::Working && self.state != State::Blocked => {
+                self.turn_seen = true;
+                self.activity = "working".into();
+                self.set_state(State::Working, focused)
+            }
             "SessionEnd" => self.set_state(State::Idle, focused),
             _ => None,
         }
@@ -549,6 +608,26 @@ impl Agent {
             return None;
         }
 
+        if self.kind == Kind::Grok
+            && let Some(sig) = grok_title(self.title.as_deref(), self.title_attention.is_some_and(|t| t.elapsed() < GROK_BLINK))
+            && let Some(s) = self.apply_title(sig, quiet, focused)
+        {
+            return s;
+        }
+
+        // Grok and Cursor have no hook for their approval prompts: the
+        // prompt on screen is the sign, read only from their own wording.
+        if self.kind.prompts_only_on_screen() {
+            if self.state == State::Working && quiet > Duration::from_millis(500) && self.screen_kind_prompt() {
+                self.activity = "needs your approval".into();
+                return self.set_state(State::Blocked, focused);
+            }
+            if self.hooked && self.state == State::Blocked && quiet > Duration::from_secs(2) && !self.screen_needs_input() {
+                self.activity = "working".into();
+                return self.set_state(State::Working, focused);
+            }
+        }
+
         let screen_question = || self.screen_needs_input();
 
         if self.hooked {
@@ -567,7 +646,8 @@ impl Agent {
             }
             // Claude redraws its spinner every second while working. A long
             // silence means the turn was interrupted without a Stop hook.
-            if self.state == State::Working && quiet > Duration::from_secs(6) {
+            // OpenCode and Cursor report an interrupted turn themselves.
+            if self.state == State::Working && quiet > Duration::from_secs(6) && !matches!(self.kind, Kind::OpenCode | Kind::Cursor) {
                 if screen_question() {
                     self.activity = "waiting for an answer".into();
                     return self.set_state(State::Blocked, focused);
@@ -575,7 +655,8 @@ impl Agent {
                 self.activity = "interrupted".into();
                 return self.set_state(State::Idle, focused);
             }
-            if self.state == State::Blocked && busy && !screen_question() {
+            // OpenCode reports the answer, and redraws while it waits.
+            if self.state == State::Blocked && busy && self.kind != Kind::OpenCode && !screen_question() {
                 return self.set_state(State::Working, focused);
             }
             // Denied / cancelled a prompt: no PostToolUse or Stop follows, and
@@ -640,6 +721,17 @@ impl Agent {
     /// question UI. Inline TUIs draw from the top of a fresh terminal, so
     /// that's the last rows with anything on them, not the last rows.
     pub fn screen_needs_input(&self) -> bool {
+        self.screen_prompts().0
+    }
+
+    /// Does the screen show this agent's own approval prompt, by wording only
+    /// it uses? Stricter than `screen_needs_input`: safe mid-turn, when the
+    /// agent's prose is on screen too.
+    fn screen_kind_prompt(&self) -> bool {
+        self.screen_prompts().1
+    }
+
+    fn screen_prompts(&self) -> (bool, bool) {
         // Only output or a resize changes the screen: while an agent sits
         // quiet, the heuristics ask this 4 times a second, for nothing.
         let key = (self.last_output, self.last_resize);
@@ -648,12 +740,70 @@ impl Agent {
         {
             return v;
         }
-        let v = self.read_screen_for_input();
+        let text = self.screen_bottom();
+        let own = kind_prompt(self.kind, &text);
+        let v = (own || needs_input(&text), own);
         self.screen_seen.set(Some((key, v)));
         v
     }
 
-    fn read_screen_for_input(&self) -> bool {
+    /// A new terminal title. Grok's says when it's busy and when it waits
+    /// on an approval.
+    pub fn on_title(&mut self, t: String) {
+        if self.kind == Kind::Grok && t.contains(GROK_ATTENTION) {
+            self.title_attention = Some(Instant::now());
+        }
+        self.title = Some(t);
+    }
+
+    /// Apply what Grok's title says. `None`: it doesn't say, carry on with
+    /// the other signals.
+    fn apply_title(&mut self, sig: TitleSignal, quiet: Duration, focused: bool) -> Option<Option<State>> {
+        match sig {
+            TitleSignal::Attention if self.state == State::Blocked => Some(None),
+            TitleSignal::Attention => {
+                self.activity = "needs your approval".into();
+                Some(self.set_state(State::Blocked, focused))
+            }
+            // Blocked by the title (seen as it turned Blocked, or since), and
+            // the label gone for good: the approval was answered.
+            _ if self.state == State::Blocked
+                && self.title_attention.is_some_and(|t| self.state_since.checked_sub(Duration::from_secs(1)).is_none_or(|s| t >= s)) =>
+            {
+                self.activity = "working".into();
+                let next = if matches!(sig, TitleSignal::Busy(_)) { State::Working } else { State::Idle };
+                Some(self.set_state(next, focused))
+            }
+            // The user's own Grok hooks report the turn: the title only adds
+            // approvals.
+            _ if self.hooked => None,
+            TitleSignal::Busy(what) => {
+                self.turn_seen = true;
+                if self.state == State::Working {
+                    if let Some(w) = what {
+                        self.activity = w;
+                    }
+                    return Some(None);
+                }
+                self.activity = what.unwrap_or_else(|| "working".into());
+                Some(self.set_state(State::Working, focused))
+            }
+            TitleSignal::Idle if self.state == State::Working && quiet > Duration::from_millis(500) => {
+                let worked = self.work_started.map(|t| t.elapsed()).unwrap_or_default();
+                if worked > Duration::from_secs(3) {
+                    self.activity = format!("finished after {}", crate::ui::fmt_dur(worked));
+                    Some(self.set_state(State::Done, focused))
+                } else {
+                    self.activity = "idle".into();
+                    Some(self.set_state(State::Idle, focused))
+                }
+            }
+            // Idle: dialogs at start (trust this folder) are on screen only.
+            TitleSignal::Idle => None,
+        }
+    }
+
+    fn screen_bottom(&self) -> String {
         let term = self.term.lock();
         let grid = term.grid();
         let cols = grid.columns();
@@ -670,7 +820,7 @@ impl Agent {
             }
             text.push('\n');
         }
-        needs_input(&text)
+        text
     }
 
     /// Plain-text dump of the visible screen (used for broadcast previews & copy).
@@ -728,6 +878,81 @@ fn needs_input(screen: &str) -> bool {
     PATTERNS.iter().any(|p| t.contains(p))
 }
 
+/// Wording only one agent's own approval prompts use, from their sources:
+/// Grok Build's permission footer and question dialog
+/// (`xai-grok-pager`), OpenCode's permission prompt
+/// (`packages/tui/src/routes/session/permission.tsx`), and Cursor CLI's
+/// approval prompts and workspace-trust screen.
+fn kind_prompt(kind: Kind, screen: &str) -> bool {
+    let t = screen.to_lowercase();
+    let any = |ps: &[&str]| ps.iter().any(|p| t.contains(p));
+    match kind {
+        Kind::Grok => any(&["ctrl+o:always-approve", "ctrl+o:yolo", "no, reject (type to add feedback)", "tab:next answer", "x:dismiss"]),
+        Kind::OpenCode => t.contains("△ permission required") || (t.contains("allow once") && t.contains("allow always")),
+        Kind::Cursor => {
+            any(&["skip (esc or n)", "waiting for approval...", "workspace trust required", "do you trust the contents of this directory"])
+                || (t.contains("run (once)") && t.contains("skip"))
+        }
+        _ => false,
+    }
+}
+
+/// Grok Build's title (`notifications/title.rs`): "⚠ Action Required" while
+/// a permission waits, a braille spinner and what it does while busy, then
+/// the session name and "grok", parts joined by " - ".
+const GROK_ATTENTION: &str = "Action Required";
+/// Unfocused, Grok blinks the "Action Required" label: off for half a second.
+const GROK_BLINK: Duration = Duration::from_millis(1500);
+
+/// The screen last read, by (last output, last resize): (any prompt, the
+/// agent's own prompt).
+type ScreenSeen = ((Instant, Instant), (bool, bool));
+
+#[derive(Debug, PartialEq)]
+enum TitleSignal {
+    Attention,
+    Busy(Option<String>),
+    Idle,
+}
+
+/// What Grok's title says, if it is one of Grok's titles.
+fn grok_title(title: Option<&str>, attention: bool) -> Option<TitleSignal> {
+    let title = title?;
+    if attention || title.contains(GROK_ATTENTION) {
+        return Some(TitleSignal::Attention);
+    }
+    let parts: Vec<&str> = title.split(" - ").map(str::trim).collect();
+    let spinner = |p: &str| {
+        let mut cs = p.chars();
+        matches!((cs.next(), cs.next()), (Some('\u{2801}'..='\u{28ff}'), None))
+    };
+    if let Some(i) = parts.iter().position(|p| spinner(p)) {
+        let what = parts.get(i + 1).filter(|p| **p != "grok").map(|p| hooks::one_line(p, 60));
+        return Some(TitleSignal::Busy(what));
+    }
+    (parts.last() == Some(&"grok")).then_some(TitleSignal::Idle)
+}
+
+/// A random (version 4) UUID, for a new Grok conversation.
+fn new_session_id() -> Option<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Some(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+}
+
+/// Do the user's extra Grok flags pick the conversation themselves?
+fn grok_picks_session(extra: Option<&str>) -> bool {
+    let Some(extra) = extra else { return false };
+    split_args(extra).iter().any(|a| {
+        let flag = a.split('=').next().unwrap_or(a);
+        matches!(flag, "-c" | "--continue" | "-r" | "--resume" | "-s" | "--session-id" | "--fork-session")
+    })
+}
+
 fn window_size((cols, lines): (u16, u16)) -> WindowSize {
     WindowSize { num_cols: cols, num_lines: lines, cell_width: 9, cell_height: 18 }
 }
@@ -775,12 +1000,51 @@ fn codex_hooks(exe: &Path) -> String {
     format!("hooks={{{}}}", events.join(","))
 }
 
-fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &std::path::Path) -> (String, Vec<String>) {
+fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path, new_session: Option<&str>) -> (String, Vec<String>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut args = Vec::new();
+    let extra = spec.command.as_deref().filter(|c| !c.trim().is_empty());
+    let prompt = spec.prompt.as_deref().filter(|p| !p.is_empty());
     match spec.kind {
+        // `grok [PROMPT]`; `--session-id` names a new conversation.
+        Kind::Grok => {
+            if let Some(id) = &spec.resume {
+                args.extend(["--resume".into(), id.clone()]);
+            } else if let Some(id) = new_session {
+                args.extend(["--session-id".into(), id.into()]);
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            if let Some(p) = prompt {
+                push_prompt(&mut args, p);
+            }
+            ("grok".into(), args)
+        }
+        // trix's plugin rides in `OPENCODE_CONFIG_CONTENT` (see `spawn`).
+        Kind::OpenCode => {
+            if let Some(id) = &spec.resume {
+                args.extend(["--session".into(), id.clone()]);
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            if let Some(p) = prompt {
+                args.push(format!("--prompt={p}"));
+            }
+            ("opencode".into(), args)
+        }
+        Kind::Cursor => {
+            if let Some(dir) = &integrations.cursor_plugin {
+                args.extend(["--plugin-dir".into(), dir.display().to_string()]);
+            }
+            if let Some(id) = &spec.resume {
+                args.extend(["--resume".into(), id.clone()]);
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            if let Some(p) = prompt {
+                push_prompt(&mut args, p);
+            }
+            ("cursor-agent".into(), args)
+        }
         Kind::Claude => {
-            if let Some(s) = claude_settings {
+            if let Some(s) = &integrations.claude_settings {
                 args.push("--settings".into());
                 args.push(s.display().to_string());
             }
@@ -849,7 +1113,7 @@ pub(crate) fn test_agent(kind: Kind) -> Agent {
         resume: None,
     };
     let sock = std::env::temp_dir().join("trix-test.sock");
-    let mut a = Agent::spawn(1, spec, (80, 24), tx, &sock, None, std::path::Path::new("/bin/true")).unwrap();
+    let mut a = Agent::spawn(1, spec, (80, 24), tx, &sock, &Integrations::default(), std::path::Path::new("/bin/true")).unwrap();
     a.kind = kind;
     a
 }
@@ -890,7 +1154,7 @@ mod tests {
         let mut s = spec(Kind::Custom);
         s.command = Some("exec bash --norc --noprofile -i".into());
         s.cwd = std::env::temp_dir();
-        let a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), None, Path::new("/bin/true")).unwrap();
+        let a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), &Integrations::default(), Path::new("/bin/true")).unwrap();
         std::thread::sleep(Duration::from_millis(500));
         assert!(!a.running_command(), "at the prompt");
         a.write(&b"sleep 5\r"[..]);
@@ -1157,7 +1421,7 @@ mod tests {
         s.command = Some("exec sleep 60".into());
         s.prompt = Some("go".into());
         s.cwd = std::env::temp_dir();
-        let mut a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), None, Path::new("/bin/true")).unwrap();
+        let mut a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), &Integrations::default(), Path::new("/bin/true")).unwrap();
         assert!(a.prompted.is_some());
         a.set_state(State::Idle, false);
         assert!(a.prompted.is_some(), "SessionStart's idle is not the turn");
@@ -1253,21 +1517,21 @@ mod tests {
         s.resume = Some("abc".into());
         s.command = Some(r#"--model opus --append-system-prompt "be terse""#.into());
         s.prompt = Some("fix it".into());
-        let (prog, args) = command_for(&s, Some(Path::new("/run/s.json")), Path::new("/bin/trix"));
+        let (prog, args) = command_for(&s, &Integrations { claude_settings: Some("/run/s.json".into()), ..Default::default() }, Path::new("/bin/trix"), None);
         assert_eq!(prog, "claude");
         assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--model", "opus", "--append-system-prompt", "be terse", "fix it"]);
 
         let mut s = spec(Kind::Claude);
         s.command = Some("   ".into());
         s.prompt = Some(String::new());
-        assert!(command_for(&s, None, Path::new("/bin/trix")).1.is_empty());
+        assert!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1.is_empty());
 
         let mut s = spec(Kind::Claude);
         s.prompt = Some("- fix lint\n- run tests".into());
-        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1, ["--", "- fix lint\n- run tests"], "not an option");
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--", "- fix lint\n- run tests"], "not an option");
         let mut s = spec(Kind::Codex);
         s.prompt = Some("--help is broken".into());
-        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1[4..], ["--", "--help is broken"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[4..], ["--", "--help is broken"]);
     }
 
     #[test]
@@ -1276,14 +1540,14 @@ mod tests {
         let hooks = codex_hooks(Path::new("/bin/trix"));
         let mut s = spec(Kind::Codex);
         s.prompt = Some("hi".into());
-        let (prog, args) = command_for(&s, None, Path::new("/bin/trix"));
+        let (prog, args) = command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None);
         assert_eq!(prog, "codex");
         assert_eq!(args, ["-c", notify, "-c", &hooks, "hi"]);
 
         // Resuming: the id goes last and a first prompt makes no sense.
         s.resume = Some("t-1".into());
         s.command = Some("--full-auto".into());
-        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1, ["resume", "-c", notify, "-c", &hooks, "--full-auto", "t-1"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "--full-auto", "t-1"]);
     }
 
     #[test]
@@ -1327,10 +1591,10 @@ mod tests {
     #[test]
     fn shell_and_custom_command_lines() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        assert_eq!(command_for(&spec(Kind::Shell), None, Path::new("/bin/trix")), (shell.clone(), vec![]));
+        assert_eq!(command_for(&spec(Kind::Shell), &Integrations::default(), Path::new("/bin/trix"), None), (shell.clone(), vec![]));
         let mut s = spec(Kind::Custom);
         s.command = Some("npm run dev".into());
-        assert_eq!(command_for(&s, None, Path::new("/bin/trix")), (shell, vec!["-lc".into(), "npm run dev".into()]));
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None), (shell, vec!["-lc".into(), "npm run dev".into()]));
     }
 
     #[test]
@@ -1347,5 +1611,226 @@ mod tests {
         assert_eq!(Kind::from_label("vim"), None);
         assert!(!Kind::Shell.is_agent() && Kind::Custom.is_agent());
         assert!(Kind::Claude.takes_prompts() && Kind::Codex.takes_prompts() && !Kind::Shell.takes_prompts() && !Kind::Custom.takes_prompts());
+        assert!([Kind::Grok, Kind::OpenCode, Kind::Cursor].iter().all(|k| k.takes_prompts() && k.resumes() && k.is_agent()));
+        assert_eq!((Kind::Grok.label(), Kind::OpenCode.label(), Kind::Cursor.label()), ("grok", "opencode", "cursor"));
+    }
+
+    fn ints() -> Integrations {
+        Integrations {
+            claude_settings: Some("/run/s.json".into()),
+            opencode_plugin: Some("/run/opencode-plugin-1.js".into()),
+            cursor_plugin: Some("/run/cursor-plugin-1".into()),
+        }
+    }
+
+    #[test]
+    fn grok_argv_names_or_resumes_the_conversation() {
+        let mut s = spec(Kind::Grok);
+        s.prompt = Some("fix it".into());
+        let id = "0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c";
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), Some(id)), ("grok".into(), vec!["--session-id".into(), id.into(), "fix it".into()]));
+        s.resume = Some("abc".into());
+        s.command = Some("--model grok-4".into());
+        s.prompt = Some("- go on".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--resume", "abc", "--model", "grok-4", "--", "- go on"]);
+    }
+
+    #[test]
+    fn grok_leaves_the_conversation_to_flags_that_pick_one() {
+        assert!(!grok_picks_session(None));
+        assert!(!grok_picks_session(Some("--model grok-4")));
+        for f in ["-c", "--continue", "-r", "--resume=x", "-s abc", "--session-id abc", "--fork-session"] {
+            assert!(grok_picks_session(Some(f)), "{f}");
+        }
+    }
+
+    #[test]
+    fn new_session_ids_are_uuid_v4() {
+        let id = new_session_id().unwrap();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert!(parts[2].starts_with('4') && "89ab".contains(&parts[3][..1]));
+        assert_ne!(id, new_session_id().unwrap());
+    }
+
+    #[test]
+    fn opencode_argv_resumes_and_prompts_with_a_flag() {
+        let mut s = spec(Kind::OpenCode);
+        s.prompt = Some("-v is broken".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None), ("opencode".into(), vec!["--prompt=-v is broken".into()]));
+        s.resume = Some("ses_1".into());
+        s.prompt = None;
+        s.command = Some("--model anthropic/claude".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--session", "ses_1", "--model", "anthropic/claude"]);
+    }
+
+    #[test]
+    fn cursor_argv_loads_the_plugin_and_resumes() {
+        let mut s = spec(Kind::Cursor);
+        s.prompt = Some("hi".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None), ("cursor-agent".into(), vec!["--plugin-dir".into(), "/run/cursor-plugin-1".into(), "hi".into()]));
+        s.resume = Some("chat-1".into());
+        s.prompt = None;
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--resume", "chat-1"]);
+    }
+
+    #[test]
+    fn claude_and_codex_argv_ignore_the_new_integrations() {
+        let s = spec(Kind::Claude);
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--settings", "/run/s.json"]);
+        let c = command_for(&spec(Kind::Codex), &ints(), Path::new("/bin/trix"), Some("x")).1;
+        assert!(!c.iter().any(|a| a.contains("plugin") || a == "x"));
+    }
+
+    #[test]
+    fn kind_prompts_read_only_their_own_wording() {
+        assert!(kind_prompt(Kind::Grok, "Allow bash?\n (○) Yes\n (○) No, reject (type to add feedback)\n1-3:select  Tab:next option  Ctrl+o:always-approve  Ctrl+c:cancel"));
+        assert!(kind_prompt(Kind::OpenCode, "△ Permission required\n  Allow once   Allow always   Reject"));
+        assert!(kind_prompt(Kind::Cursor, "Run this command?\n  ls -la\n → Run (once) (y)\n   Skip (esc or n)"));
+        assert!(kind_prompt(Kind::Cursor, "⚠ Workspace Trust Required\nDo you trust the contents of this directory?"));
+        // Prose that only the generic patterns would catch, or another agent's prompt.
+        let prose = "Would you like to add tests? I can run them (y/n) next.\nDo you want to proceed?";
+        for k in Kind::ALL {
+            assert!(!kind_prompt(k, prose), "{k:?}");
+        }
+        assert!(!kind_prompt(Kind::Grok, "Run this command?\n Run (once) (y)\n Skip (esc or n)"));
+        assert!(!kind_prompt(Kind::Claude, "△ Permission required\nAllow once Allow always"));
+        assert!(!kind_prompt(Kind::Cursor, "I ran the command and skipped the lint step."));
+    }
+
+    #[test]
+    fn cursor_turns_blocked_on_its_approval_prompt_mid_turn() {
+        let mut a = test_agent(Kind::Cursor);
+        a.on_hook(&hook("cursor", "UserPromptSubmit", None, Some("go")), false);
+        assert_eq!(a.state, State::Working);
+        show(&a, "Run this command?\n  rm -rf build\n → Run (once) (y)\n   Skip (esc or n)\n");
+        a.on_output();
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        // Approved: the prompt goes, the command runs quietly.
+        show(&a, "\x1b[2J\x1b[H  running…\n");
+        a.on_output();
+        a.last_output = ago(Duration::from_secs(3));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&hook("cursor", "ToolDone", Some("Shell"), Some("rm -rf build")), false);
+        assert_eq!((a.state, a.tools_used, a.activity.as_str()), (State::Working, 1, "Shell rm -rf build ✓"));
+        a.on_hook(&hook("cursor", "Stop", None, None), false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    #[test]
+    fn claude_mid_turn_prose_is_not_a_prompt() {
+        let mut a = test_agent(Kind::Claude);
+        a.on_hook(&claude("UserPromptSubmit", None, None), false);
+        show(&a, "Would you like to see Run (once)? Skip (esc or n)\n");
+        a.on_output();
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working, "only Grok and Cursor read the screen mid-turn");
+        a.shutdown();
+    }
+
+    #[test]
+    fn opencode_events_drive_the_state() {
+        let mut a = test_agent(Kind::OpenCode);
+        a.on_hook(&hook("opencode", "SessionStart", None, None), false);
+        assert!(a.hooked && !a.reported);
+        a.on_hook(&hook("opencode", "UserPromptSubmit", None, Some("hi")), false);
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&hook("opencode", "PermissionRequest", Some("bash"), Some("rm *")), false);
+        assert_eq!(a.state, State::Blocked);
+        a.on_hook(&hook("opencode", "Answered", None, None), false);
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&hook("opencode", "Question", None, Some("Which db?")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which db?"));
+        a.on_hook(&hook("opencode", "Busy", None, None), false);
+        assert_eq!(a.state, State::Blocked, "busy doesn't clear a question");
+        a.on_hook(&hook("opencode", "Answered", None, None), false);
+        a.on_hook(&hook("opencode", "Interrupt", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        a.on_hook(&hook("opencode", "Busy", None, None), false);
+        assert_eq!(a.state, State::Working, "a queued message starts a turn");
+        a.on_hook(&hook("opencode", "Stop", None, None), false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    #[test]
+    fn opencode_waits_for_its_own_events() {
+        let mut a = test_agent(Kind::OpenCode);
+        a.on_hook(&hook("opencode", "UserPromptSubmit", None, Some("hi")), false);
+        a.last_output = ago(Duration::from_secs(10));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working, "a long quiet tool isn't an interrupt");
+        a.on_hook(&hook("opencode", "Question", None, Some("Which db?")), false);
+        for _ in 0..8 {
+            a.on_output();
+        }
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked, "redrawing while it asks");
+        a.shutdown();
+    }
+
+    #[test]
+    fn grok_title_signals() {
+        assert_eq!(grok_title(None, false), None);
+        assert_eq!(grok_title(Some("vim"), false), None);
+        assert_eq!(grok_title(Some("grok"), false), Some(TitleSignal::Idle));
+        assert_eq!(grok_title(Some("fix login - grok"), false), Some(TitleSignal::Idle));
+        assert_eq!(grok_title(Some("⠋ - Running: cargo test - fix login - grok"), false), Some(TitleSignal::Busy(Some("Running: cargo test".into()))));
+        assert_eq!(grok_title(Some("⠙ - grok"), false), Some(TitleSignal::Busy(None)));
+        assert_eq!(grok_title(Some("⚠ Action Required - ⠙ - Waiting - grok"), false), Some(TitleSignal::Attention));
+        // The label blinked off, but was there a moment ago.
+        assert_eq!(grok_title(Some("⠙ - Waiting - grok"), true), Some(TitleSignal::Attention));
+    }
+
+    #[test]
+    fn grok_follows_its_title() {
+        let mut a = test_agent(Kind::Grok);
+        a.set_state(State::Idle, false);
+        a.on_title("⠋ - Thinking - grok".into());
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "Thinking"));
+        assert!(a.turn_seen);
+        a.on_title("⚠ Action Required - ⠙ - Waiting - grok".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        // Blinking off while unfocused: still waiting.
+        a.on_title("⠹ - Waiting - grok".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        // Answered: the label stays gone.
+        a.state_since = ago(Duration::from_secs(3));
+        a.title_attention = Some(ago(Duration::from_secs(2)));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working);
+        a.work_started = Some(ago(Duration::from_secs(10)));
+        a.on_title("grok".into());
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    #[test]
+    fn grok_with_user_hooks_takes_only_approvals_from_the_title() {
+        let mut a = test_agent(Kind::Grok);
+        a.set_state(State::Idle, false);
+        a.on_hook(&hook("grok", "UserPromptSubmit", None, Some("go")), false);
+        assert!(a.hooked && a.state == State::Working);
+        a.on_title("⚠ Action Required - ⠙ - grok".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        a.state_since = ago(Duration::from_secs(3));
+        a.title_attention = Some(ago(Duration::from_secs(2)));
+        a.on_title("⠙ - Running: ls - grok".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working);
+        a.on_hook(&hook("grok", "Stop", None, None), false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
     }
 }
