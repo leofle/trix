@@ -1776,11 +1776,23 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         app.agents[i].submit(b"one".to_vec());
         app.agents[i].submit(b"two".to_vec());
-        std::thread::sleep(Duration::from_millis(600));
-        let lines = crate::search::tail(&app.agents[i].term.lock(), 10);
-        let lines: Vec<&str> = lines.iter().map(|l| l.trim_end()).filter(|l| !l.is_empty()).collect();
-        // The terminal echoes each line, then cat prints it.
-        assert_eq!(lines, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter");
+        // The terminal echoes each line and cat prints it back. How the
+        // echoes and cat's output interleave is up to the scheduler (CI
+        // runners differ), so wait for all four, then check what matters:
+        // two separate submissions, not 'onetwo' and an empty Enter.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let lines = loop {
+            let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
+            let lines: Vec<String> = tail.iter().map(|l| l.trim_end().to_string()).filter(|l| !l.is_empty()).collect();
+            if lines.len() >= 4 || Instant::now() > deadline {
+                break lines;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let mut sorted = lines.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter: {lines:?}");
+        assert_eq!(lines[0], "one", "submitted in order: {lines:?}");
         app.agents[i].shutdown();
     }
 
