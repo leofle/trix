@@ -19,6 +19,25 @@ pub struct Config {
     pub keys: Keys,
     pub notify: Notify,
     pub sound: Sound,
+    pub strip: Strip,
+}
+
+/// The attention strip: the bar over your pane that says another agent
+/// needs you.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Strip {
+    /// Its color. `None`: the theme's red.
+    pub color: Option<Paint>,
+    /// Its text. `None`: the theme's dark or light, whichever reads best on it.
+    pub text: Option<Paint>,
+}
+
+/// A color in the config file: `#rrggbb`, or one of the theme's, so it
+/// follows a theme switch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Paint {
+    Rgb(u8, u8, u8),
+    Theme(&'static str),
 }
 
 /// What happens when an agent you're not looking at needs you or finishes.
@@ -113,6 +132,15 @@ struct File {
     notify: FileNotify,
     #[serde(default)]
     sound: FileSound,
+    #[serde(default)]
+    strip: FileStrip,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileStrip {
+    color: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -182,7 +210,29 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         sound.needs_you = tone("sound.needs_you", &s, dir)?;
     }
     sound.mute = f.sound.mute.unwrap_or_default();
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound })
+    let strip = Strip {
+        color: f.strip.color.as_deref().map(|s| paint("strip.color", s)).transpose()?,
+        text: f.strip.text.as_deref().map(|s| paint("strip.text", s)).transpose()?,
+    };
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip })
+}
+
+fn paint(what: &str, s: &str) -> Result<Paint, String> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix('#') {
+        let digits: Option<Vec<u8>> = hex.chars().map(|c| c.to_digit(16).map(|d| d as u8)).collect();
+        match digits.as_deref() {
+            Some(&[r1, r2, g1, g2, b1, b2]) => return Ok(Paint::Rgb(r1 * 16 + r2, g1 * 16 + g2, b1 * 16 + b2)),
+            // #f80 is #ff8800.
+            Some(&[r, g, b]) => return Ok(Paint::Rgb(r * 17, g * 17, b * 17)),
+            _ => {}
+        }
+    }
+    let name = t.to_lowercase().replace('-', "_");
+    match crate::theme::NAMES.iter().find(|n| **n == name) {
+        Some(n) => Ok(Paint::Theme(n)),
+        None => Err(format!("{what}: '{s}' is not a color: use \"#rrggbb\" or one of the theme's ({})", crate::theme::NAMES.join(", "))),
+    }
 }
 
 fn tone(what: &str, s: &str, dir: &Path) -> Result<Tone, String> {
@@ -612,6 +662,19 @@ mod tests {
         for (spec, shown) in [("alt+n", "alt+n"), ("Alt+N", "alt+shift+n"), ("ctrl+alt+x", "ctrl+alt+x"), ("alt++", "alt++"), ("alt+plus", "alt++"), ("alt+space", "alt+space"), ("f12", "f12"), ("alt+pgdn", "alt+pagedown"), ("option+k", "alt+k"), ("ctrl+1..9", "ctrl+1…9"), ("ctrl+1…9", "ctrl+1…9")] {
             assert_eq!(label(&chord(spec).unwrap()), shown, "{spec}");
         }
+    }
+
+    #[test]
+    fn strip_colors() {
+        let strip = |text: &str| parse(text, Path::new("/")).map(|c| c.strip);
+        assert_eq!(strip("").unwrap(), Strip::default(), "the theme's red, readable text");
+        assert_eq!(strip("[strip]\ncolor = \"#E0af68\"\ntext = \"#000\"\n").unwrap(), Strip { color: Some(Paint::Rgb(0xe0, 0xaf, 0x68)), text: Some(Paint::Rgb(0, 0, 0)) });
+        assert_eq!(strip("[strip]\ncolor = \"Magenta\"\ntext = \"fg-bright\"\n").unwrap(), Strip { color: Some(Paint::Theme("magenta")), text: Some(Paint::Theme("fg_bright")) });
+        for bad in ["pink", "#12345", "#ggg", "#1234567", ""] {
+            let e = strip(&format!("[strip]\ncolor = \"{bad}\"\n")).unwrap_err();
+            assert!(e.starts_with("strip.color: ") && e.contains("#rrggbb") && e.contains("magenta"), "{bad}: {e}");
+        }
+        assert!(strip("[strip]\ncolour = \"red\"\n").unwrap_err().contains("colour"));
     }
 
     #[test]

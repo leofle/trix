@@ -58,6 +58,47 @@ fn parse_hex(s: &str) -> Option<Color> {
     u32::from_str_radix(hex, 16).ok().map(rgb)
 }
 
+/// The theme's colors a config file may name (`[strip] color = "yellow"`).
+pub const NAMES: [&str; 10] = ["red", "yellow", "green", "cyan", "magenta", "orange", "accent", "fg", "fg_bright", "bg"];
+
+impl Theme {
+    /// A color from `NAMES`, as this theme has it.
+    pub fn named(&self, name: &str) -> Option<Color> {
+        Some(match name {
+            "red" => self.red,
+            "yellow" => self.yellow,
+            "green" => self.green,
+            "cyan" => self.cyan,
+            "magenta" => self.magenta,
+            "orange" => self.orange,
+            "accent" => self.accent,
+            "fg" => self.fg,
+            "fg_bright" => self.fg_bright,
+            "bg" => self.bg,
+            _ => return None,
+        })
+    }
+}
+
+/// How far apart two colors are to the eye: WCAG's contrast ratio, 1 (the
+/// same) to 21 (black on white). Only RGB colors can be told; others are 1.
+pub fn contrast(a: Color, b: Color) -> f32 {
+    let lum = |c: Color| match c {
+        Color::Rgb(r, g, b) => {
+            let lin = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            Some(0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b))
+        }
+        _ => None,
+    };
+    match (lum(a), lum(b)) {
+        (Some(x), Some(y)) => (x.max(y) + 0.05) / (x.min(y) + 0.05),
+        _ => 1.0,
+    }
+}
+
 /// Linear blend of two colors, `t` in 0..=1 towards `b`.
 pub fn mix(a: Color, b: Color, t: f32) -> Color {
     match (a, b) {
