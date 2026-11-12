@@ -204,7 +204,7 @@ pub struct App {
     pub themed_by_omarchy: bool,
     tx: Sender<AppEvent>,
     socket: PathBuf,
-    claude_settings: Option<PathBuf>,
+    integrations: crate::hooks::Integrations,
     exe: PathBuf,
     pub term_focused: bool,
     next_id: u32,
@@ -239,7 +239,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(tx: Sender<AppEvent>, socket: PathBuf, claude_settings: Option<PathBuf>, exe: PathBuf, out: Out) -> App {
+    pub fn new(tx: Sender<AppEvent>, socket: PathBuf, integrations: crate::hooks::Integrations, exe: PathBuf, out: Out) -> App {
         let mut theme_watch = ThemeWatcher::new();
         let polled = theme_watch.poll();
         let themed = polled.is_some();
@@ -261,7 +261,7 @@ impl App {
             themed_by_omarchy: themed,
             tx,
             socket,
-            claude_settings,
+            integrations,
             exe,
             term_focused: true,
             next_id: 1,
@@ -338,7 +338,9 @@ impl App {
                     // A shell may have cd'd since; agents stay where they started.
                     cwd: if a.kind == Kind::Shell { a.live_cwd() } else { spec.cwd.clone() },
                     command: spec.command.clone(),
-                    session: if matches!(a.kind, Kind::Claude | Kind::Codex) { a.session.clone() } else { None },
+                    // An id trix made up for Grok names no conversation until
+                    // a turn; one it resumed does from the start.
+                    session: if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) { a.session.clone() } else { None },
                 })
             })
             .collect()
@@ -384,7 +386,7 @@ impl App {
                 skipped.push(s.name);
                 continue;
             }
-            let resume = s.session.clone().filter(|_| matches!(kind, Kind::Claude | Kind::Codex));
+            let resume = s.session.clone().filter(|_| kind.resumes());
             let spec = Spawn {
                 kind,
                 name: self.unique_name(&s.name),
@@ -462,7 +464,7 @@ impl App {
             let mark = if a.unseen { "•" } else { " " };
             let name = format!("{:<w$}", a.name);
             out.push_str(&format!(
-                "{:>2} {mark} {name}  {:<6}  {:<9} {:>6}  {}  {}\n",
+                "{:>2} {mark} {name}  {:<8}  {:<9} {:>6}  {}  {}\n",
                 i + 1,
                 a.kind.label(),
                 a.state.label(),
@@ -569,7 +571,7 @@ impl App {
     fn start(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
-        let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe)?;
+        let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe)?;
         self.specs.insert(id, keep);
         self.agents.push(agent);
         self.sync_git_targets();
@@ -656,7 +658,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let size = self.agents[idx].size;
-        match Agent::spawn(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, self.claude_settings.as_deref(), &self.exe) {
+        match Agent::spawn(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, &self.integrations, &self.exe) {
             Ok(a) => {
                 self.agents[idx].shutdown();
                 self.agents[idx] = a;
@@ -806,7 +808,7 @@ impl App {
             }
             AppEvent::Title(id, t) => {
                 if let Some(i) = self.index_of(id) {
-                    self.agents[i].title = Some(t);
+                    self.agents[i].on_title(t);
                     self.dirty = true;
                 }
             }
@@ -1233,9 +1235,11 @@ impl App {
                     0 => match k.code {
                         KeyCode::Left | KeyCode::Char('h') => f.kind = (f.kind + Kind::ALL.len() - 1) % Kind::ALL.len(),
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => f.kind = (f.kind + 1) % Kind::ALL.len(),
-                        KeyCode::Char('c') => f.kind = 0,
-                        KeyCode::Char('x') => f.kind = 1,
-                        KeyCode::Char('s') => f.kind = 2,
+                        KeyCode::Char(c) => {
+                            if let Some(i) = Kind::from_shortcut(c).and_then(|k| Kind::ALL.iter().position(|a| *a == k)) {
+                                f.kind = i;
+                            }
+                        }
                         _ => {}
                     },
                     1 => {
@@ -1738,7 +1742,7 @@ mod tests {
 
     fn test_app() -> App {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
     }
@@ -1767,18 +1771,65 @@ mod tests {
     #[test]
     fn quick_submissions_stay_separate() {
         let mut app = test_app();
-        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("exec cat".into()), prompt: None, branch_note: None, resume: None };
+        // Echo off: what's on screen is only what cat received, line by line.
+        // With echo on, how the terminal's echoes interleave with cat's
+        // output is up to the scheduler, and CI runners differ.
+        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; exec cat".into()), prompt: None, branch_note: None, resume: None };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         app.agents[i].submit(b"one".to_vec());
         app.agents[i].submit(b"two".to_vec());
-        std::thread::sleep(Duration::from_millis(600));
-        let lines = crate::search::tail(&app.agents[i].term.lock(), 10);
-        let lines: Vec<&str> = lines.iter().map(|l| l.trim_end()).filter(|l| !l.is_empty()).collect();
-        // The terminal echoes each line, then cat prints it.
-        assert_eq!(lines, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let lines = loop {
+            let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
+            let lines: Vec<String> = tail.iter().map(|l| l.trim_end().to_string()).filter(|l| !l.is_empty()).collect();
+            if lines.len() >= 2 || Instant::now() > deadline {
+                // A moment more, so an extra line would show.
+                std::thread::sleep(Duration::from_millis(200));
+                let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
+                break tail.iter().map(|l| l.trim_end().to_string()).collect::<Vec<_>>();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let text: Vec<&str> = lines.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+        assert_eq!(text, ["one", "two"], "not 'onetwo' and an empty Enter");
         app.agents[i].shutdown();
+    }
+
+    #[test]
+    fn kind_letters_pick_their_kind() {
+        let mut app = test_app();
+        for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('s', Kind::Shell)] {
+            app.open_new();
+            app.modal_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+            assert_eq!(Kind::ALL[f.kind], kind, "{c}");
+            app.modal = None;
+        }
+        // Letters are unique, and none is a kind-row navigation key.
+        let letters: Vec<char> = Kind::ALL.iter().filter_map(|k| k.shortcut()).collect();
+        assert_eq!(letters.len(), letters.iter().collect::<HashSet<_>>().len());
+        assert!(!letters.iter().any(|c| matches!(c, 'h' | 'l' | ' ')));
+    }
+
+    #[test]
+    fn a_grok_session_is_saved_once_it_names_a_conversation() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Grok);
+        a.id = 3;
+        // Restored with --resume: the conversation exists before any new turn.
+        a.session = Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c".into());
+        assert!(!a.session_named_by_trix && !a.turn_seen);
+        app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
+        app.agents.push(a);
+        assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"), "restored, then saved again before you type");
+        // An id trix made up for a new conversation: nothing to resume until a turn.
+        app.agents[0].session_named_by_trix = true;
+        assert_eq!(app.open_agents()[0].session, None, "no turn yet: nothing to resume");
+        app.agents[0].turn_seen = true;
+        assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"));
+        app.agents[0].shutdown();
     }
 
     #[test]

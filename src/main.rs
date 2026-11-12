@@ -42,7 +42,8 @@ usage:
 
 agent control (for scripts, and for agents managing other agents):
   trix spawn <kind> [--name N] [--cwd DIR] [--worktree] [--prompt P] [--args A]
-                            start claude, codex, shell or custom; prints its name
+                            start claude, codex, grok, opencode, cursor (cursor-agent),
+                            shell or custom; prints its name
   trix send <agent> <prompt…>
                             type a prompt into an agent and submit it (prompt
                             from stdin when omitted). Refuses agents that need
@@ -231,6 +232,10 @@ fn main() -> anyhow::Result<()> {
         let kind = match a.as_str() {
             "claude" => Kind::Claude,
             "codex" => Kind::Codex,
+            "grok" => Kind::Grok,
+            "opencode" => Kind::OpenCode,
+            // Not `agent`: Grok's installer links that name too.
+            "cursor" | "cursor-agent" => Kind::Cursor,
             "shell" | "sh" => Kind::Shell,
             other => {
                 eprintln!("trix: unknown argument '{other}'\n\n{HELP}");
@@ -334,13 +339,13 @@ fn server() -> anyhow::Result<()> {
     hooks::sweep_stale();
     let socket = hooks::socket_path();
     hooks::serve(&socket, tx.clone())?;
-    let claude_settings = hooks::write_claude_settings(&exe).ok();
+    let integrations = hooks::Integrations::write(&exe);
     let control = session::control_path();
     session::listen(&control, tx.clone())?;
 
     let out = Out::default();
     let mut terminal = Terminal::new(RemoteBackend::new(out.clone()))?;
-    let mut app = App::new(tx.clone(), socket.clone(), claude_settings.clone(), exe, out.clone());
+    let mut app = App::new(tx.clone(), socket.clone(), integrations.clone(), exe, out.clone());
     app.term_focused = false;
 
     const FRAME: Duration = Duration::from_millis(8); // ~120 fps ceiling
@@ -429,9 +434,7 @@ fn server() -> anyhow::Result<()> {
     app.shutdown_all();
     let _ = std::fs::remove_file(&control);
     let _ = std::fs::remove_file(&socket);
-    if let Some(p) = claude_settings {
-        let _ = std::fs::remove_file(p);
-    }
+    integrations.remove();
     // Free the session for a new server, then let `trix kill` return.
     drop(lock);
     drop(killed);

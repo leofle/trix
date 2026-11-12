@@ -2,9 +2,10 @@
 //!
 //! Every pane gets `TRIX_SOCKET` and `TRIX_AGENT_ID` in its environment. Agents
 //! that support lifecycle hooks (Claude Code via `--settings`, Codex via
-//! `notify`) call `trix hook <kind>`, which condenses the hook payload into one
-//! small JSON line and writes it to the socket. Nothing in the user's own agent
-//! config is modified.
+//! `notify`, Cursor via a `--plugin-dir` plugin, OpenCode via a plugin named in
+//! `OPENCODE_CONFIG_CONTENT`) call `trix hook <kind>`, which condenses the hook
+//! payload into one small JSON line and writes it to the socket. Nothing in the
+//! user's own agent config is modified: everything is passed per process.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,11 +60,17 @@ pub fn sweep_stale() {
         let pid = name
             .trim_start_matches("trix-")
             .trim_start_matches("claude-settings-")
+            .trim_start_matches("opencode-plugin-")
+            .trim_start_matches("cursor-plugin-")
             .split('.')
             .next()
             .and_then(|p| p.parse::<u32>().ok());
         if pid.is_some_and(|pid| !crate::platform::alive(pid)) {
-            let _ = std::fs::remove_file(e.path());
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = std::fs::remove_dir_all(e.path());
+            } else {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
 }
@@ -114,13 +121,220 @@ pub fn write_claude_settings(exe: &Path) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// What trix hands each agent so it reports back, written once per server
+/// into the runtime dir and removed when the server stops.
+#[derive(Debug, Default, Clone)]
+pub struct Integrations {
+    /// Claude Code `--settings` overlay.
+    pub claude_settings: Option<PathBuf>,
+    /// OpenCode plugin, loaded through `OPENCODE_CONFIG_CONTENT`.
+    pub opencode_plugin: Option<PathBuf>,
+    /// Cursor plugin directory, loaded with `cursor-agent --plugin-dir`.
+    pub cursor_plugin: Option<PathBuf>,
+}
+
+impl Integrations {
+    /// Write them all. One that can't be written is left out, and that agent
+    /// falls back to reading its screen.
+    pub fn write(exe: &Path) -> Integrations {
+        Integrations {
+            claude_settings: write_claude_settings(exe).ok(),
+            opencode_plugin: write_opencode_plugin(exe).ok(),
+            cursor_plugin: write_cursor_plugin(exe).ok(),
+        }
+    }
+
+    pub fn remove(&self) {
+        for f in [&self.claude_settings, &self.opencode_plugin].into_iter().flatten() {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Some(d) = &self.cursor_plugin {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// `'<exe>' hook <source>`, for hook runners that take a shell string.
+fn hook_command(exe: &Path, source: &str) -> String {
+    let quoted = exe.display().to_string().replace('\'', r"'\''");
+    format!("'{quoted}' hook {source}")
+}
+
+/// OpenCode plugin. OpenCode runs its server, plugins included, in a worker
+/// of the TUI process with that process's environment, so the plugin only
+/// reports when it runs inside a trix pane. It hands each event to
+/// `trix hook opencode` as an argv (no shell), and keeps track of subagent
+/// sessions so a subagent finishing isn't taken for the pane's turn ending.
+pub fn opencode_plugin_source(exe: &Path) -> String {
+    let exe = serde_json::to_string(&exe.display().to_string()).unwrap_or_else(|_| "\"trix\"".into());
+    OPENCODE_PLUGIN.replace("__TRIX_EXE__", &exe)
+}
+
+const OPENCODE_PLUGIN: &str = r#"// Written by trix for the OpenCode agents it runs; removed when trix stops.
+import { spawn } from "node:child_process";
+
+const TRIX = __TRIX_EXE__;
+const KEYS = ["command", "filePath", "path", "pattern", "url", "query", "description"];
+const parents = new Map();
+const aborted = new Set();
+let seq = 0;
+
+const root = (id) => {
+  for (let n = 0; id && parents.has(id) && n < 64; n++) id = parents.get(id);
+  return id;
+};
+
+function report(payload) {
+  if (!process.env.TRIX_SOCKET || !process.env.TRIX_AGENT_ID) return;
+  seq = Math.max(seq + 1, Date.now() * 1000);
+  payload.trix_seq = seq;
+  try {
+    const child = spawn(TRIX, ["hook", "opencode", JSON.stringify(payload)], { stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+  } catch {}
+}
+
+function brief(args) {
+  const out = {};
+  for (const k of KEYS) {
+    const v = args?.[k];
+    if (typeof v === "string") out[k] = v.slice(0, 400);
+  }
+  return out;
+}
+
+export const TrixPlugin = async () => {
+  report({ type: "trix.loaded" });
+  return {
+    "chat.message": async (input, output) => {
+      if (parents.has(input?.sessionID)) return;
+      const text = (output?.parts ?? [])
+        .filter((p) => p?.type === "text" && !p.synthetic && typeof p.text === "string")
+        .map((p) => p.text)
+        .join(" ");
+      report({ type: "chat.message", sessionID: input?.sessionID, prompt: text.slice(0, 400) });
+    },
+    "tool.execute.before": async (input, output) => {
+      report({ type: "tool.execute.before", sessionID: root(input?.sessionID), tool: input?.tool, args: brief(output?.args) });
+    },
+    "tool.execute.after": async (input) => {
+      report({ type: "tool.execute.after", sessionID: root(input?.sessionID), tool: input?.tool });
+    },
+    event: async ({ event }) => {
+      const type = event?.type;
+      const p = event?.properties ?? {};
+      if (p.info?.id && p.info.parentID) parents.set(p.info.id, p.info.parentID);
+      const child = parents.has(p.sessionID);
+      switch (type) {
+        case "session.status": {
+          if (child) return;
+          let status = p.status?.type;
+          if (status === "idle" && aborted.delete(p.sessionID)) status = "aborted";
+          report({ type, sessionID: p.sessionID, status });
+          return;
+        }
+        case "session.error":
+          if (!child && p.error?.name === "MessageAbortedError") aborted.add(p.sessionID);
+          return;
+        case "permission.asked":
+          report({ type, sessionID: root(p.sessionID), permission: p.permission, patterns: p.patterns });
+          return;
+        case "question.asked":
+          report({ type, sessionID: root(p.sessionID), question: p.questions?.[0]?.question });
+          return;
+        case "permission.replied":
+        case "question.replied":
+        case "question.rejected":
+          report({ type, sessionID: root(p.sessionID) });
+          return;
+      }
+    },
+  };
+};
+"#;
+
+fn write_opencode_plugin(exe: &Path) -> anyhow::Result<PathBuf> {
+    let path = runtime_dir().join(format!("opencode-plugin-{}.js", std::process::id()));
+    std::fs::write(&path, opencode_plugin_source(exe))?;
+    Ok(path)
+}
+
+/// The `OPENCODE_CONFIG_CONTENT` that loads trix's plugin. OpenCode merges it
+/// over every other config and appends its `plugin` list to theirs. If the
+/// user already sets the variable, the plugin joins their list; if theirs
+/// isn't a plain JSON object with a list there, it is left alone and the
+/// agent goes without the plugin.
+pub fn opencode_config(plugin: &Path, existing: Option<&str>) -> Option<String> {
+    let url = format!("file://{}", file_url_path(plugin));
+    let mut config = match existing.filter(|e| !e.trim().is_empty()) {
+        None => serde_json::json!({}),
+        Some(e) => serde_json::from_str::<Value>(e).ok().filter(Value::is_object)?,
+    };
+    let list = config.as_object_mut()?.entry("plugin").or_insert_with(|| Value::Array(Vec::new()));
+    list.as_array_mut()?.push(Value::String(url));
+    serde_json::to_string(&config).ok()
+}
+
+/// A path as a file URL path: every byte but `/` and RFC 3986's unreserved
+/// ones percent-encoded.
+fn file_url_path(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for &b in p.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Cursor events trix listens to. None of them is one of Cursor's
+/// permission hooks (`preToolUse`, `beforeShellExecution`, …), whose answer
+/// decides whether a tool may run: trix only watches, it never approves.
+pub const CURSOR_HOOK_EVENTS: [&str; 6] = ["sessionStart", "beforeSubmitPrompt", "postToolUse", "postToolUseFailure", "stop", "sessionEnd"];
+
+/// A Cursor plugin holding only hooks, for `cursor-agent --plugin-dir`.
+fn write_cursor_plugin(exe: &Path) -> anyhow::Result<PathBuf> {
+    let dir = runtime_dir().join(format!("cursor-plugin-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".cursor-plugin"))?;
+    std::fs::create_dir_all(dir.join("hooks"))?;
+    let manifest = serde_json::json!({
+        "name": "trix",
+        "description": "Reports this agent's state to the trix pane it runs in",
+        "version": "1.0.0",
+        "author": { "name": "trix" },
+    });
+    std::fs::write(dir.join(".cursor-plugin/plugin.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    std::fs::write(dir.join("hooks/hooks.json"), serde_json::to_vec_pretty(&cursor_hooks(exe))?)?;
+    Ok(dir)
+}
+
+pub fn cursor_hooks(exe: &Path) -> Value {
+    let handler = serde_json::json!([{ "command": hook_command(exe, "cursor"), "timeout": 5 }]);
+    let hooks: serde_json::Map<String, Value> = CURSOR_HOOK_EVENTS.iter().map(|e| (e.to_string(), handler.clone())).collect();
+    serde_json::json!({ "version": 1, "hooks": hooks })
+}
+
 /// `trix hook <source> [payload]` — runs inside the agent's process tree.
 /// Must be fast, silent and never fail loudly: the agent is waiting on it.
 pub fn run_client(source: &str, arg_payload: Option<String>) {
-    let (Ok(sock), Ok(id)) = (std::env::var("TRIX_SOCKET"), std::env::var("TRIX_AGENT_ID")) else {
+    // Cursor reads every hook's stdout as its answer. trix's hooks only
+    // watch: answer with nothing to say (and let a prompt through), so no
+    // reply of ours can read as a decision.
+    if source == "cursor" {
+        let mut s = String::new();
+        let _ = std::io::stdin().take(64 << 20).read_to_string(&mut s);
+        let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+        let submit = v.get("hook_event_name").and_then(Value::as_str) == Some("beforeSubmitPrompt");
+        println!("{}", if submit { r#"{"continue":true}"# } else { "{}" });
+        return report(source, &v, None);
+    }
+    let (Ok(_), Ok(_)) = (std::env::var("TRIX_SOCKET"), std::env::var("TRIX_AGENT_ID")) else {
         return;
     };
-    let Ok(agent) = id.parse::<u32>() else { return };
     // Codex: hand the payload on to the user's own notify, which our
     // `-c notify=` replaced. Fire-and-forget, like Codex itself does.
     if source == "codex" {
@@ -150,8 +364,20 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
         }
     };
     let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let mut msg = condense(agent, source, &v);
-    msg.seq = seq;
+    report(source, &v, Some(seq));
+}
+
+/// Condense one payload and send it to the trix pane this runs in.
+fn report(source: &str, v: &Value, seq: Option<u64>) {
+    let (Ok(sock), Ok(id)) = (std::env::var("TRIX_SOCKET"), std::env::var("TRIX_AGENT_ID")) else {
+        return;
+    };
+    let Ok(agent) = id.parse::<u32>() else { return };
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+    let mut msg = condense(agent, source, v);
+    // OpenCode's plugin stamps each event as it happens: the processes it
+    // starts to report them may get here in another order.
+    msg.seq = v.get("trix_seq").and_then(Value::as_u64).or(seq).unwrap_or_else(now);
     if let Ok(mut stream) = UnixStream::connect(sock) {
         let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
         if let Ok(line) = serde_json::to_string(&msg) {
@@ -162,6 +388,12 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
 }
 
 fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
+    match source {
+        "opencode" => return condense_opencode(agent, v),
+        "cursor" => return condense_cursor(agent, v),
+        "grok" => return condense_grok(agent, v),
+        _ => {}
+    }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     let event = s("hook_event_name")
         .or_else(|| s("type")) // codex notify: {"type":"agent-turn-complete",...}
@@ -178,6 +410,119 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
     let session = s("session_id").or_else(|| s("thread-id")).filter(|id| !id.is_empty());
     let transcript = s("transcript_path").filter(|p| !p.is_empty());
     HookMsg { agent, source: source.into(), event, tool, detail, session, transcript, seq: 0 }
+}
+
+fn msg(agent: u32, source: &str, event: &str) -> HookMsg {
+    HookMsg { agent, source: source.into(), event: event.into(), tool: None, detail: None, session: None, transcript: None, seq: 0 }
+}
+
+fn text(v: &Value, k: &str) -> Option<String> {
+    v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// An event from trix's OpenCode plugin (see `OPENCODE_PLUGIN`): OpenCode's
+/// own event and hook names, put in Claude's terms. `sessionID` is the
+/// pane's conversation, a subagent's already traced back to it.
+fn condense_opencode(agent: u32, v: &Value) -> HookMsg {
+    let kind = text(v, "type").unwrap_or_default();
+    let event = match kind.as_str() {
+        "trix.loaded" => "SessionStart",
+        "chat.message" => "UserPromptSubmit",
+        "tool.execute.before" => "PreToolUse",
+        "tool.execute.after" => "PostToolUse",
+        "permission.asked" => "PermissionRequest",
+        "question.asked" => "Question",
+        "permission.replied" | "question.replied" | "question.rejected" => "Answered",
+        "session.status" => match v.get("status").and_then(Value::as_str) {
+            Some("idle") => "Stop",
+            Some("aborted") => "Interrupt",
+            Some("busy" | "retry") => "Busy",
+            _ => "unknown",
+        },
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "opencode", event);
+    m.session = text(v, "sessionID");
+    match event {
+        "UserPromptSubmit" => m.detail = text(v, "prompt").map(|p| one_line(&p, 80)),
+        "PreToolUse" | "PostToolUse" => {
+            m.tool = text(v, "tool");
+            if event == "PreToolUse" {
+                m.detail = v.get("args").and_then(|a| tool_detail(m.tool.as_deref(), a));
+            }
+        }
+        "PermissionRequest" => {
+            m.tool = text(v, "permission");
+            let patterns: Vec<&str> = v.get("patterns").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            m.detail = (!patterns.is_empty()).then(|| one_line(&patterns.join(", "), 60));
+        }
+        "Question" => m.detail = text(v, "question").map(|q| one_line(&q, 60)),
+        _ => {}
+    }
+    m
+}
+
+/// A Cursor hook payload. Cursor names its events in camelCase and its
+/// tools `Shell`, `Read`, `Write`…; `stop` says how the turn ended.
+fn condense_cursor(agent: u32, v: &Value) -> HookMsg {
+    let name = text(v, "hook_event_name").unwrap_or_default();
+    let event = match name.as_str() {
+        "sessionStart" => "SessionStart",
+        "beforeSubmitPrompt" => "UserPromptSubmit",
+        "postToolUse" | "postToolUseFailure" => "ToolDone",
+        "stop" if v.get("status").and_then(Value::as_str) == Some("aborted") => "Interrupt",
+        "stop" => "Stop",
+        "sessionEnd" => "SessionEnd",
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "cursor", event);
+    // A subagent's tool calls carry its own conversation id: only the
+    // prompt and the turn's end are surely the pane's conversation.
+    if matches!(name.as_str(), "beforeSubmitPrompt" | "stop") {
+        m.session = text(v, "conversation_id").or_else(|| text(v, "session_id"));
+    }
+    match event {
+        "UserPromptSubmit" => m.detail = text(v, "prompt").map(|p| one_line(&p, 80)),
+        "ToolDone" => {
+            m.tool = text(v, "tool_name");
+            m.detail = v.get("tool_input").and_then(|i| tool_detail(m.tool.as_deref(), i));
+        }
+        _ => {}
+    }
+    m
+}
+
+/// A Grok Build hook payload, from hooks the user installed themselves (trix
+/// can't pass Grok hooks per process). Grok sends Claude's event names in
+/// `hook_event_name` and its own fields in camelCase.
+fn condense_grok(agent: u32, v: &Value) -> HookMsg {
+    let name = text(v, "hook_event_name").unwrap_or_default();
+    let event = match name.as_str() {
+        "StopCancelled" => "Interrupt",
+        "StopFailure" => "Stop",
+        "PostToolUseFailure" => "PostToolUse",
+        // Grok has no `PermissionRequest` hook: a waiting permission prompt
+        // raises `Notification` with type `permission_prompt`.
+        "Notification" if text(v, "notificationType").or_else(|| text(v, "notification_type")).as_deref() == Some("permission_prompt") => "PermissionRequest",
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Notification" | "Stop" | "SessionEnd" => name.as_str(),
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "grok", event);
+    m.session = text(v, "sessionId").or_else(|| text(v, "session_id")).or_else(|| std::env::var("GROK_SESSION_ID").ok().filter(|s| !s.is_empty()));
+    m.tool = text(v, "toolName").or_else(|| text(v, "tool_name"));
+    let input = v.get("toolInput").or_else(|| v.get("tool_input"));
+    m.detail = match event {
+        "PreToolUse" => input.and_then(|i| tool_detail(m.tool.as_deref(), i)),
+        "UserPromptSubmit" => text(v, "prompt").map(|p| one_line(&p, 80)),
+        "Notification" => text(v, "message").or_else(|| text(v, "notificationType")).or_else(|| text(v, "notification_type")),
+        // Grok's own words for what waits, such as "Grok needs your permission".
+        "PermissionRequest" => text(v, "message").map(|m| one_line(&m, 80)),
+        _ => None,
+    };
+    if event == "PermissionRequest" && m.tool.is_none() {
+        m.tool = Some("permission".into());
+    }
+    m
 }
 
 /// A shell command as a string: Claude sends one; Codex may send an argv,
@@ -211,17 +556,21 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
     let g = |k: &str| input.get(k).and_then(Value::as_str);
     let base = |p: &str| Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.into());
     let d = match tool.unwrap_or("") {
-        "Bash" | "exec_command" | "shell" | "local_shell" => {
+        "Bash" | "exec_command" | "shell" | "local_shell" | "Shell" | "bash" | "run_terminal_command" => {
             shell_command(input.get("command").or_else(|| input.get("cmd"))).map(|c| one_line(&c, 60))
         }
         "apply_patch" => g("command").or(g("input")).or(g("patch")).and_then(patch_files),
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-            g("file_path").or(g("notebook_path")).map(base)
+            g("file_path").or(g("notebook_path")).or(g("path")).map(base)
         }
-        "Grep" | "Glob" => g("pattern").map(|p| one_line(p, 40)),
-        "WebFetch" => g("url").map(|u| one_line(u, 50)),
-        "WebSearch" => g("query").map(|q| one_line(q, 50)),
-        "Task" | "Agent" => g("description").map(|d| one_line(d, 50)),
+        // OpenCode's file tools, Grok's and Cursor's own.
+        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "search_replace" | "StrReplace" | "Delete" => {
+            g("filePath").or(g("file_path")).or(g("path")).or(g("target_file")).map(base)
+        }
+        "Grep" | "Glob" | "grep" | "glob" => g("pattern").map(|p| one_line(p, 40)),
+        "WebFetch" | "webfetch" | "web_fetch" => g("url").map(|u| one_line(u, 50)),
+        "WebSearch" | "websearch" | "web_search" => g("query").map(|q| one_line(q, 50)),
+        "Task" | "Agent" | "task" => g("description").map(|d| one_line(d, 50)),
         "AskUserQuestion" => input
             .get("questions")
             .and_then(|q| q.get(0))
@@ -372,5 +721,119 @@ mod tests {
             assert_eq!(cmd, r"'/opt/it'\''s/trix' hook claude", "{ev}");
         }
         assert_eq!(hooks["PreToolUse"][0]["matcher"], "*");
+    }
+
+    fn o(v: Value) -> HookMsg {
+        condense(7, "opencode", &v)
+    }
+
+    #[test]
+    fn condenses_opencode_plugin_events() {
+        let m = o(json!({"type":"chat.message","sessionID":"ses_1","prompt":"fix\nthe   login","trix_seq":5}));
+        assert_eq!((m.source.as_str(), m.event.as_str(), m.detail.as_deref(), m.session.as_deref()), ("opencode", "UserPromptSubmit", Some("fix the login"), Some("ses_1")));
+        let m = o(json!({"type":"tool.execute.before","sessionID":"ses_1","tool":"bash","args":{"command":"cargo test"}}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PreToolUse", Some("bash"), Some("cargo test")));
+        let m = o(json!({"type":"tool.execute.before","tool":"edit","args":{"filePath":"/src/app/main.rs"}}));
+        assert_eq!(m.detail.as_deref(), Some("main.rs"));
+        assert_eq!(o(json!({"type":"tool.execute.after","tool":"bash"})).event, "PostToolUse");
+        let m = o(json!({"type":"permission.asked","permission":"bash","patterns":["rm *","git push"]}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PermissionRequest", Some("bash"), Some("rm *, git push")));
+        let m = o(json!({"type":"question.asked","question":"Which database?"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Question", Some("Which database?")));
+        for t in ["permission.replied", "question.replied", "question.rejected"] {
+            assert_eq!(o(json!({ "type": t })).event, "Answered", "{t}");
+        }
+        let status = |s: &str| o(json!({"type":"session.status","status":s})).event;
+        assert_eq!((status("idle"), status("busy"), status("retry"), status("aborted")), ("Stop".into(), "Busy".into(), "Busy".into(), "Interrupt".into()));
+        assert_eq!(o(json!({"type":"trix.loaded"})).event, "SessionStart");
+        assert_eq!(o(json!({"type":"session.diff"})).event, "unknown");
+    }
+
+    #[test]
+    fn condenses_cursor_hooks() {
+        let c = |v: Value| condense(7, "cursor", &v);
+        let m = c(json!({"hook_event_name":"beforeSubmitPrompt","conversation_id":"conv-1","session_id":"conv-1","prompt":"add tests"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref(), m.session.as_deref()), ("UserPromptSubmit", Some("add tests"), Some("conv-1")));
+        let m = c(json!({"hook_event_name":"postToolUse","conversation_id":"sub-2","tool_name":"Shell","tool_input":{"command":"ls -la"}}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref(), m.session), ("ToolDone", Some("Shell"), Some("ls -la"), None), "a tool's conversation may be a subagent's");
+        let m = c(json!({"hook_event_name":"postToolUseFailure","tool_name":"Write","tool_input":{"path":"/a/b.rs"}}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("ToolDone", Some("b.rs")));
+        let m = c(json!({"hook_event_name":"stop","conversation_id":"conv-1","status":"completed"}));
+        assert_eq!((m.event.as_str(), m.session.as_deref()), ("Stop", Some("conv-1")));
+        assert_eq!(c(json!({"hook_event_name":"stop","status":"aborted"})).event, "Interrupt");
+        assert_eq!(c(json!({"hook_event_name":"stop","status":"error"})).event, "Stop");
+        assert_eq!(c(json!({"hook_event_name":"sessionStart"})).event, "SessionStart");
+        assert_eq!(c(json!({"hook_event_name":"sessionEnd"})).event, "SessionEnd");
+        assert_eq!(c(json!({"hook_event_name":"beforeShellExecution"})).event, "unknown");
+    }
+
+    #[test]
+    fn condenses_grok_hooks() {
+        let g = |v: Value| condense(7, "grok", &v);
+        let m = g(json!({"hook_event_name":"PreToolUse","hookEventName":"pre_tool_use","sessionId":"s-1","toolName":"run_terminal_command","toolInput":{"command":"cargo build"}}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref(), m.session.as_deref()), ("PreToolUse", Some("run_terminal_command"), Some("cargo build"), Some("s-1")));
+        let m = g(json!({"hook_event_name":"PreToolUse","toolName":"search_replace","toolInput":{"path":"src/x.rs"}}));
+        assert_eq!(m.detail.as_deref(), Some("x.rs"));
+        assert_eq!(g(json!({"hook_event_name":"StopCancelled"})).event, "Interrupt");
+        assert_eq!(g(json!({"hook_event_name":"StopFailure"})).event, "Stop");
+        assert_eq!(g(json!({"hook_event_name":"PostToolUseFailure"})).event, "PostToolUse");
+        let m = g(json!({"hook_event_name":"Notification","notificationType":"task_complete"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Notification", Some("task_complete")));
+        assert_eq!(g(json!({"hook_event_name":"PermissionDenied"})).event, "unknown");
+        let m = g(json!({"hook_event_name":"Notification","notificationType":"permission_prompt","notification_type":"permission_prompt","message":"Grok needs your permission"}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail), ("PermissionRequest", Some("permission"), Some("Grok needs your permission".into())));
+        assert_eq!(g(json!({"hook_event_name":"Notification","notification_type":"permission_prompt"})).event, "PermissionRequest");
+        assert_eq!(g(json!({"hook_event_name":"Notification","notificationType":"idle_prompt"})).event, "Notification");
+    }
+
+    #[test]
+    fn new_tool_names_get_details() {
+        let d = |t: &str, v: Value| tool_detail(Some(t), &v);
+        assert_eq!(d("run_terminal_command", json!({"command":"ls"})).as_deref(), Some("ls"));
+        assert_eq!(d("read_file", json!({"path":"/a/b.txt"})).as_deref(), Some("b.txt"));
+        assert_eq!(d("StrReplace", json!({"path":"c.rs"})).as_deref(), Some("c.rs"));
+        assert_eq!(d("webfetch", json!({"url":"https://x.ai"})).as_deref(), Some("https://x.ai"));
+        // Claude's own stay as they were.
+        assert_eq!(d("Read", json!({"file_path":"/a/z.rs"})).as_deref(), Some("z.rs"));
+    }
+
+    #[test]
+    fn opencode_config_adds_the_plugin_to_theirs() {
+        let p = Path::new("/run/u 1/opencode-plugin-9.js");
+        let c: Value = serde_json::from_str(&opencode_config(p, None).unwrap()).unwrap();
+        assert_eq!(c, json!({"plugin":["file:///run/u%201/opencode-plugin-9.js"]}));
+        let c: Value = serde_json::from_str(&opencode_config(p, Some(r#"{"model":"x","plugin":["mine"]}"#)).unwrap()).unwrap();
+        assert_eq!(c, json!({"model":"x","plugin":["mine","file:///run/u%201/opencode-plugin-9.js"]}));
+        assert!(opencode_config(p, Some("  ")).is_some());
+        assert_eq!(opencode_config(p, Some("not json")), None, "theirs is left alone");
+        assert_eq!(opencode_config(p, Some(r#"{"plugin":"one"}"#)), None);
+    }
+
+    #[test]
+    fn file_urls_percent_encode_all_but_unreserved_and_slash() {
+        assert_eq!(file_url_path(Path::new("/run/user/1000/trix/opencode-plugin-9.js")), "/run/user/1000/trix/opencode-plugin-9.js");
+        assert_eq!(file_url_path(Path::new("/a b/#?%&+=;:@[]'é~_.")), "/a%20b/%23%3F%25%26%2B%3D%3B%3A%40%5B%5D%27%C3%A9~_.");
+    }
+
+    #[test]
+    fn opencode_plugin_names_trix_and_runs_no_shell() {
+        let src = opencode_plugin_source(Path::new("/opt/it's \"trix\""));
+        assert!(src.contains(r#"const TRIX = "/opt/it's \"trix\"";"#));
+        assert!(!src.contains("__TRIX_EXE__"));
+        assert!(src.contains(r#"spawn(TRIX, ["hook", "opencode""#) && !src.contains("shell:") && !src.contains("exec("));
+    }
+
+    #[test]
+    fn cursor_plugin_hooks_only_watch() {
+        let h = cursor_hooks(Path::new("/opt/it's/trix"));
+        assert_eq!(h["version"], 1);
+        let hooks = h["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), CURSOR_HOOK_EVENTS.len());
+        for ev in ["preToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile", "subagentStart"] {
+            assert!(!hooks.contains_key(ev), "{ev} decides on tools");
+        }
+        for ev in CURSOR_HOOK_EVENTS {
+            assert_eq!(hooks[ev][0]["command"], r"'/opt/it'\''s/trix' hook cursor", "{ev}");
+        }
     }
 }
