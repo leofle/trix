@@ -227,7 +227,11 @@ pub fn run(cmd: Cmd) -> Result<bool, String> {
             if !reply.err.is_empty() {
                 eprintln!("trix: {}", reply.err);
             }
+            // Only once the workspace has gone through the layout's tabs: a
+            // refusal (say, from a different trix build) lists none.
+            let handled = !reply.out.is_empty();
             let hint = || match (in_pane, own_session) {
+                _ if !handled => {}
                 (false, _) => eprintln!("trix: `{}` attaches to the workspace", session::command()),
                 (true, false) => eprintln!("trix: session '{}' · `{}` from outside trix attaches to it", session::name(), session::command()),
                 (true, true) => {}
