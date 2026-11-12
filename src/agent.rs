@@ -183,6 +183,8 @@ pub struct Agent {
     /// `screen_needs_input`'s last answer, and the (last output, last
     /// resize) it was for.
     screen_seen: std::cell::Cell<Option<ScreenSeen>>,
+    /// It has been hung up on (`hang_up`): stopping it again does nothing.
+    stopping: std::cell::Cell<bool>,
     /// The folder its process was last seen in, for once it has exited.
     last_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
@@ -257,6 +259,10 @@ pub struct Agent {
 }
 
 pub const SPARK_LEN: usize = 48;
+
+/// How long a program may take to exit once hung up on, and then once told
+/// to terminate, before it's made to.
+pub const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// One thread per agent that sends each write when it's due, in the order
 /// queued. It ends when the agent (the only sender) goes away.
@@ -357,6 +363,7 @@ impl Agent {
             later,
             submit_free: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             screen_seen: std::cell::Cell::new(None),
+            stopping: std::cell::Cell::new(false),
             last_cwd: std::cell::RefCell::new(None),
             pty: master,
             pid,
@@ -435,8 +442,23 @@ impl Agent {
         self.term.lock().resize(TermSize { cols: cols as usize, lines: lines as usize });
     }
 
+    /// Stop it: hang up, and if its program ignores that, end it anyway in
+    /// the background (see `platform::stop`).
     pub fn shutdown(&self) {
+        if self.hang_up() {
+            let pid = self.pid;
+            let _ = std::thread::Builder::new().name("trix-stop".into()).spawn(move || crate::platform::stop(&[pid], STOP_GRACE));
+        }
+    }
+
+    /// Close its terminal, which hangs up on its program. False if that
+    /// was done already.
+    pub fn hang_up(&self) -> bool {
+        if self.stopping.replace(true) {
+            return false;
+        }
         let _ = self.sender.send(Msg::Shutdown);
+        true
     }
 
     pub fn set_state(&mut self, s: State, focused: bool) -> Option<State> {
@@ -1521,6 +1543,29 @@ mod tests {
     }
 
     // ── heuristics ──
+
+    /// A program that ignores both the hang-up and SIGTERM, as OpenCode 2
+    /// ignores the hang-up, is still stopped, children and all.
+    #[test]
+    fn a_program_that_ignores_the_hang_up_is_stopped_anyway() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut s = spec(Kind::Custom);
+        s.cwd = std::env::temp_dir();
+        s.command = Some("trap '' HUP TERM; while :; do sleep 0.1; done".into());
+        let a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), &Integrations::default(), Path::new("/bin/true")).unwrap();
+        let pid = a.pid;
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(a.hang_up());
+        assert!(!a.hang_up(), "once");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(crate::platform::alive(pid), "it ignored the hang-up");
+        crate::platform::stop(&[pid], Duration::from_millis(200));
+        let gone = Instant::now() + Duration::from_secs(3);
+        while crate::platform::alive(pid) && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!crate::platform::alive(pid), "killed, and reaped by its event loop");
+    }
 
     #[test]
     fn starting_settles_to_idle() {

@@ -1752,10 +1752,12 @@ impl App {
         }
     }
 
+    /// Stop every agent, and wait until each has. The server exits right
+    /// after, and a program that ignores the hang-up (OpenCode 2) would
+    /// outlive it.
     pub fn shutdown_all(&mut self) {
-        for a in &self.agents {
-            a.shutdown();
-        }
+        let pids: Vec<u32> = self.agents.iter().filter(|a| a.hang_up()).map(|a| a.pid).collect();
+        crate::platform::stop(&pids, crate::agent::STOP_GRACE);
     }
 }
 

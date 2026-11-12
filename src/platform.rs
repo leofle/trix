@@ -78,6 +78,71 @@ pub fn cwd_of(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// A process's parent.
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid …`, and the name may hold anything, ")" too.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn parent_of(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (n == size).then_some(info.pbi_ppid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Is `pid` still a child of this process? Once a child is gone and
+/// reaped, its pid may go to anything else: this is what makes signalling
+/// it safe.
+fn ours(pid: u32) -> bool {
+    pid != 0 && parent_of(pid) == Some(std::process::id())
+}
+
+/// Signal `pid` and, when it leads its own process group (an agent does:
+/// its terminal's session), everything in that group.
+fn signal(pid: u32, sig: libc::c_int) {
+    let Ok(p) = libc::pid_t::try_from(pid) else { return };
+    unsafe {
+        if libc::getpgid(p) == p {
+            libc::kill(-p, sig);
+        } else {
+            libc::kill(p, sig);
+        }
+    }
+}
+
+/// See that `pids`, our children that were just hung up on, stop: a program
+/// that ignores the hang-up (OpenCode 2 does) gets SIGTERM after `grace`,
+/// and SIGKILL after another. Blocks until they're gone or killed, at most
+/// about twice `grace`.
+pub fn stop(pids: &[u32], grace: std::time::Duration) {
+    let gone_by = |deadline: std::time::Instant| loop {
+        if !pids.iter().any(|&p| ours(p)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    for sig in [libc::SIGTERM, libc::SIGKILL] {
+        if gone_by(std::time::Instant::now() + grace) {
+            return;
+        }
+        for &p in pids.iter().filter(|&&p| ours(p)) {
+            signal(p, sig);
+        }
+    }
+}
+
 /// Wait for a short-lived helper off the main thread, so it can't linger as
 /// a zombie.
 pub fn reap(mut child: Child) {
@@ -220,5 +285,17 @@ mod tests {
         let mut after = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) };
         assert_eq!(after.rlim_cur, now);
+    }
+
+    #[test]
+    fn only_our_own_children_are_ours() {
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(ours(child.id()));
+        assert!(!ours(std::process::id()), "ourselves");
+        assert!(!ours(1), "launchd / init");
+        assert!(!ours(0));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!ours(child.id()), "reaped: its pid may be anyone's now");
     }
 }
