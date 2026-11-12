@@ -505,8 +505,13 @@ impl Agent {
             // Codex's lifecycle hooks, which it runs once they're trusted.
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
-            // trix's own plugin (OpenCode, Cursor) or the user's hooks (Grok).
-            "opencode" | "cursor" | "grok" => self.hooked = true,
+            // trix's own plugin (OpenCode) or the user's hooks (Grok).
+            "opencode" | "grok" => self.hooked = true,
+            // Cursor runs only `sessionStart` and the tool hooks from trix's
+            // plugin (cursor-agent 2026.11.11): no prompt, no turn end. Its
+            // screen says when a turn starts and ends; its hooks add what it
+            // ran and which conversation it is.
+            "cursor" => {}
             _ => self.reported = true,
         }
         let tool = msg.tool.clone().unwrap_or_default();
@@ -584,12 +589,16 @@ impl Agent {
                 self.set_state(State::Idle, focused)
             }
             // A tool that already ran, from agents that report tools only
-            // once they're done (Cursor).
+            // once they're done (Cursor). Cursor's screen says whether it's
+            // working: this names what it did, and one that lands after the
+            // turn ended changes nothing.
             "ToolDone" => {
                 self.turn_seen = true;
                 self.tools_used += 1;
-                self.activity = format!("{} ✓", described(&msg.detail));
-                self.set_state(State::Working, focused)
+                if self.state == State::Working {
+                    self.activity = format!("{} ✓", described(&msg.detail));
+                }
+                None
             }
             // The agent asks the human something (OpenCode's question tool).
             "Question" => {
@@ -642,11 +651,17 @@ impl Agent {
             return None;
         }
 
+        // Grok's title says it's idle: output now is a redraw, not a turn.
+        // Right after a turn, Grok names the conversation and redraws, which
+        // would otherwise read as a new turn and undo its Done.
+        let mut title_idle = false;
         if self.kind == Kind::Grok
             && let Some(sig) = grok_title(self.title.as_deref(), self.title_attention.is_some_and(|t| t.elapsed() < GROK_BLINK))
-            && let Some(s) = self.apply_title(sig, quiet, focused)
         {
-            return s;
+            title_idle = sig == TitleSignal::Idle;
+            if let Some(s) = self.apply_title(sig, quiet, focused) {
+                return s;
+            }
         }
 
         // Grok and Cursor have no hook for their approval prompts: the
@@ -671,7 +686,9 @@ impl Agent {
             }
         }
 
-        let screen_question = || self.screen_needs_input();
+        // Grok and Cursor ask only through their own prompt UI. Their prose
+        // ("would you like me to…?") at the end of a turn is not a prompt.
+        let screen_question = || if self.kind.prompts_only_on_screen() { self.screen_kind_prompt() } else { self.screen_needs_input() };
 
         if self.hooked {
             // `SessionStart` comes before the trust-this-folder dialog, and no
@@ -689,8 +706,8 @@ impl Agent {
             }
             // Claude redraws its spinner every second while working. A long
             // silence means the turn was interrupted without a Stop hook.
-            // OpenCode and Cursor report an interrupted turn themselves.
-            if self.state == State::Working && quiet > Duration::from_secs(6) && !matches!(self.kind, Kind::OpenCode | Kind::Cursor) {
+            // OpenCode reports an interrupted turn itself.
+            if self.state == State::Working && quiet > Duration::from_secs(6) && self.kind != Kind::OpenCode {
                 if screen_question() {
                     self.activity = "waiting for an answer".into();
                     return self.set_state(State::Blocked, focused);
@@ -744,8 +761,9 @@ impl Agent {
                 self.activity = "idle".into();
                 self.set_state(State::Idle, focused)
             }
-            State::Idle | State::Done if busy => {
-                self.activity = self.title.clone().unwrap_or_else(|| "working".into());
+            State::Idle | State::Done if busy && !title_idle => {
+                // Cursor's title names the conversation, not what it does.
+                self.activity = self.title.clone().filter(|_| self.kind != Kind::Cursor).unwrap_or_else(|| "working".into());
                 self.set_state(State::Working, focused)
             }
             State::Idle | State::Done if quiet > Duration::from_millis(800) && self.kind.is_agent() => {
@@ -1754,26 +1772,51 @@ mod tests {
         assert!(!kind_prompt(Kind::Cursor, "I ran the command and skipped the lint step."));
     }
 
+    /// Output the way an agent redraws while it works: a burst, none of it
+    /// the echo of keystrokes or a resize's redraw.
+    fn redraw(a: &mut Agent) {
+        a.last_input = ago(Duration::from_secs(5));
+        a.last_resize = ago(Duration::from_secs(5));
+        for _ in 0..8 {
+            a.on_output();
+        }
+    }
+
     #[test]
-    fn cursor_turns_blocked_on_its_approval_prompt_mid_turn() {
+    fn cursor_turns_come_from_its_screen() {
         let mut a = test_agent(Kind::Cursor);
-        a.on_hook(&hook("cursor", "UserPromptSubmit", None, Some("go")), false);
-        assert_eq!(a.state, State::Working);
-        show(&a, "Run this command?\n  rm -rf build\n → Run (once) (y)\n   Skip (esc or n)\n");
+        a.set_state(State::Idle, false);
+        let mut start = hook("cursor", "SessionStart", None, None);
+        start.session = Some("conv-1".into());
+        a.on_hook(&start, false);
+        assert_eq!((a.state, a.session.as_deref()), (State::Idle, Some("conv-1")));
+        assert!(!a.hooked, "its hooks don't report turns");
+        // It thinks and streams: working. Its title names the conversation.
+        a.title = Some("Pseudo Terminal Explainer".into());
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "working"));
+        // Its approval prompt, as cursor-agent 2026.11.11 draws it: blocked.
+        show(&a, "Run this command?\n Not in allowlist: rm\n  → Run (once) (y)\n    Skip & tell the agent what to do instead (esc or n)\n");
         a.on_output();
         a.last_output = ago(Duration::from_secs(1));
         a.heuristics(false);
-        assert_eq!(a.state, State::Blocked);
-        // Approved: the prompt goes, the command runs quietly.
-        show(&a, "\x1b[2J\x1b[H  running…\n");
-        a.on_output();
-        a.last_output = ago(Duration::from_secs(3));
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "needs your approval"));
+        // Approved: the command runs and Cursor redraws its timer.
+        show(&a, "\x1b[2J\x1b[H$ rm -rf build 2s\n");
+        redraw(&mut a);
         a.heuristics(false);
         assert_eq!(a.state, State::Working);
         a.on_hook(&hook("cursor", "ToolDone", Some("Shell"), Some("rm -rf build")), false);
         assert_eq!((a.state, a.tools_used, a.activity.as_str()), (State::Working, 1, "Shell rm -rf build ✓"));
-        a.on_hook(&hook("cursor", "Stop", None, None), false);
+        // It replies and goes quiet: done.
+        a.work_started = Some(ago(Duration::from_secs(10)));
+        a.last_output = ago(Duration::from_secs(2));
+        a.heuristics(false);
         assert_eq!(a.state, State::Done);
+        // A tool report that lands after the turn ended doesn't reopen it.
+        assert_eq!(a.on_hook(&hook("cursor", "ToolDone", Some("Read"), Some("a.rs")), false), None);
+        assert!(a.state == State::Done && a.activity.starts_with("finished after"), "{:?} {}", a.state, a.activity);
         a.shutdown();
     }
 
@@ -1858,9 +1901,12 @@ mod tests {
     }
 
     #[test]
-    fn cursor_prose_does_not_keep_it_blocked() {
+    fn cursor_prose_is_not_a_prompt() {
         let mut a = test_agent(Kind::Cursor);
-        a.on_hook(&hook("cursor", "UserPromptSubmit", None, Some("go")), false);
+        a.set_state(State::Idle, false);
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working);
         show(&a, "Run this command?\n → Run (once) (y)\n   Skip (esc or n)\n");
         a.on_output();
         a.heuristics(false);
@@ -1868,13 +1914,46 @@ mod tests {
         a.last_output = ago(Duration::from_millis(700));
         a.heuristics(false);
         assert_eq!(a.state, State::Blocked);
-        // Approved: the prompt is gone, the agent's question is still on screen.
-        show(&a, "\x1b[2J\x1b[HWould you like to add tests too?\n  running…\n");
-        a.on_output();
-        a.last_output = ago(Duration::from_secs(3));
+        // Approved: the prompt goes, its question to you stays on screen.
+        show(&a, "\x1b[2J\x1b[HDone. Would you like to add tests too? (y/n)\n");
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working, "the prompt went");
+        // The turn ends on that question: done, not waiting on you.
+        a.work_started = Some(ago(Duration::from_secs(10)));
+        a.last_output = ago(Duration::from_secs(2));
         assert!(a.screen_needs_input(), "the generic patterns would see a question");
         a.heuristics(false);
+        assert_eq!(a.state, State::Done);
+        // And it stays done while it sits there.
+        a.last_output = ago(Duration::from_secs(5));
+        a.state_since = ago(Duration::from_secs(3));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    #[test]
+    fn grok_stays_done_through_its_redraw_after_a_turn() {
+        let mut a = test_agent(Kind::Grok);
+        a.set_state(State::Idle, false);
+        a.on_title("⠋ - Responding - grok".into());
+        a.heuristics(false);
         assert_eq!(a.state, State::Working);
+        a.work_started = Some(ago(Duration::from_secs(10)));
+        a.on_title("grok".into());
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Done);
+        // Grok names the conversation and redraws: its title still says idle.
+        a.on_title("Count lines in fruit.txt - grok".into());
+        redraw(&mut a);
+        a.heuristics(false);
+        assert!(a.state == State::Done && a.activity.starts_with("finished after"), "{:?} {}", a.state, a.activity);
+        // A real turn shows its spinner.
+        a.on_title("⠙ - Thinking - Count lines in fruit.txt - grok".into());
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "Thinking"));
         a.shutdown();
     }
 

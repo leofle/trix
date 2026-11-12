@@ -477,8 +477,10 @@ fn condense_cursor(agent: u32, v: &Value) -> HookMsg {
     };
     let mut m = msg(agent, "cursor", event);
     // A subagent's tool calls carry its own conversation id: only the
-    // prompt and the turn's end are surely the pane's conversation.
-    if matches!(name.as_str(), "beforeSubmitPrompt" | "stop") {
+    // session's start, the prompt and the turn's end are surely the pane's
+    // conversation. cursor-agent 2026.11.11 runs only `sessionStart` and the
+    // tool hooks from a plugin, and a subagent doesn't run `sessionStart`.
+    if matches!(name.as_str(), "sessionStart" | "beforeSubmitPrompt" | "stop") {
         m.session = text(v, "conversation_id").or_else(|| text(v, "session_id"));
     }
     match event {
@@ -762,7 +764,9 @@ mod tests {
         assert_eq!((m.event.as_str(), m.session.as_deref()), ("Stop", Some("conv-1")));
         assert_eq!(c(json!({"hook_event_name":"stop","status":"aborted"})).event, "Interrupt");
         assert_eq!(c(json!({"hook_event_name":"stop","status":"error"})).event, "Stop");
-        assert_eq!(c(json!({"hook_event_name":"sessionStart"})).event, "SessionStart");
+        // As cursor-agent 2026.11.11 sends it: the pane's conversation, which `--resume` takes.
+        let m = c(json!({"hook_event_name":"sessionStart","conversation_id":"conv-1","session_id":"conv-1","is_background_agent":false}));
+        assert_eq!((m.event.as_str(), m.session.as_deref()), ("SessionStart", Some("conv-1")));
         assert_eq!(c(json!({"hook_event_name":"sessionEnd"})).event, "SessionEnd");
         assert_eq!(c(json!({"hook_event_name":"beforeShellExecution"})).event, "unknown");
     }
