@@ -171,7 +171,10 @@ pub fn run(args: &[String]) -> i32 {
         };
         let argv = via.argv();
         println!("\x1b[1mtrix:\x1b[0m {program} isn't installed yet. Installing it with {}:\n  {}\n", via.label(), argv.join(" "));
-        match Command::new(&argv[0]).args(&argv[1..]).status() {
+        // Homebrew 7 asks before it installs (or upgrades a dependency), and
+        // a question in a pane that reads as "installing" waits unseen. The
+        // variable, not `--yes`: older Homebrew has no such flag.
+        match Command::new(&argv[0]).args(&argv[1..]).env("HOMEBREW_NO_ASK", "1").status() {
             Ok(s) if s.success() => println!("\n\x1b[1mtrix:\x1b[0m {program} is installed. Starting it…\n"),
             Ok(s) => {
                 eprintln!("\ntrix: installing {program} failed ({s}). Press Enter to try again, or install it yourself and then press Enter.");
