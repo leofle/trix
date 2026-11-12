@@ -280,6 +280,8 @@ impl App {
         if cwd.is_dir() {
             self.start_dir = cwd;
         }
+        // Another session may have changed it since this one started.
+        self.sidebar_mini = state::load_prefs().sidebar_mini;
         self.term_focused = true;
         if let Some(a) = self.agents.get_mut(self.focus) {
             a.unseen = false;
@@ -878,7 +880,10 @@ impl App {
                     // From hidden, alt+m brings the sidebar back small.
                     self.sidebar_mini = !self.sidebar || !self.sidebar_mini;
                     self.sidebar = true;
-                    if let Err(e) = state::store_prefs(&state::Prefs { sidebar_mini: self.sidebar_mini }) {
+                    // Load first: change only this, whatever else prefs.json holds.
+                    let mut prefs = state::load_prefs();
+                    prefs.sidebar_mini = self.sidebar_mini;
+                    if let Err(e) = state::store_prefs(&prefs) {
                         self.toast(format!("couldn't remember the sidebar size: {e}"), ToastKind::Bad);
                     }
                     true

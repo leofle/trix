@@ -47,11 +47,7 @@ impl From<&SavedAgent> for LayoutAgent {
 // ───────────────────────────── files ─────────────────────────────
 
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
-    base.join("trix/layouts")
+    crate::state::xdg_dir("XDG_CONFIG_HOME", ".config").join("trix/layouts")
 }
 
 fn file_in(dir: &Path, name: &str) -> PathBuf {
@@ -98,11 +94,8 @@ fn load_from(dir: &Path, name: &str) -> Result<Vec<LayoutAgent>, String> {
 }
 
 fn store_in(dir: &Path, name: &str, agents: &[LayoutAgent]) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
     let path = file_in(dir, name);
-    let tmp = path.with_extension(format!("toml.{}", std::process::id()));
-    std::fs::write(&tmp, to_toml(name, agents))?;
-    std::fs::rename(&tmp, &path)?;
+    crate::state::write_atomic(&path, to_toml(name, agents).as_bytes())?;
     Ok(path)
 }
 
@@ -285,12 +278,12 @@ fn home_relative(cwd: &str) -> PathBuf {
 
 /// `trix layout open`: start every entry that isn't open already.
 pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgent>, resume: bool) -> Reply {
-    let by = from.and_then(|id| app.agents.iter().find(|a| a.id == id)).map(|a| a.name.clone());
+    let by = control::caller_name(app, from);
     let w = agents.iter().map(|a| a.name.chars().count()).max().unwrap_or(0);
     let (mut out, mut opened, mut failed) = (String::new(), 0, 0);
     for a in &agents {
-        let line = if app.agents.iter().any(|x| x.name == a.name) {
-            "skipped  already open".to_string()
+        let (verb, rest) = if app.agents.iter().any(|x| x.name == a.name) {
+            ("skipped", "already open".to_string())
         } else {
             match spec_for(a, resume).and_then(|spec| {
                 let resumed = spec.resume.is_some();
@@ -301,16 +294,15 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
                     if let Some(x) = app.agents.iter_mut().find(|x| x.id == id) {
                         x.managed_by = by.clone();
                     }
-                    format!("opened   {}{}", a.cwd, if resumed { " · resuming its conversation" } else { "" })
+                    ("opened", format!("{}{}", a.cwd, if resumed { " · resuming its conversation" } else { "" }))
                 }
                 Err(e) => {
                     failed += 1;
-                    format!("failed   {e}")
+                    ("failed", e)
                 }
             }
         };
-        let (verb, rest) = line.split_at(9);
-        out.push_str(&format!("{verb}{:<w$}  {rest}\n", a.name));
+        out.push_str(&format!("{verb:<9}{:<w$}  {rest}\n", a.name));
     }
     drop_from_restore(app, &agents);
     if opened > 0 {

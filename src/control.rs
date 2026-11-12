@@ -242,7 +242,7 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
     reply(&mut stream, &r);
 }
 
-fn caller_name(app: &App, from: Option<u32>) -> Option<String> {
+pub(crate) fn caller_name(app: &App, from: Option<u32>) -> Option<String> {
     let id = from?;
     app.agents.iter().find(|a| a.id == id).map(|a| a.name.clone())
 }

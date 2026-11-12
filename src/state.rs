@@ -49,11 +49,32 @@ impl Saved {
 }
 
 fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
+    xdg_dir("XDG_STATE_HOME", ".local/state").join("trix")
+}
+
+/// An XDG base folder: `$var` when it's an absolute path, else `~/<fallback>`.
+pub fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
-    base.join("trix")
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(fallback))
+}
+
+/// Write `bytes` to `path` through a temporary file and a rename, so a crash
+/// mid-write never leaves half a file. Creates the folder; a failed write
+/// leaves no temporary file behind.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// One file per session; the default one keeps the original name.
@@ -88,12 +109,7 @@ fn store_at(path: &Path, saved: &Saved) -> std::io::Result<()> {
             _ => Ok(()),
         };
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("json.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(saved)?)?;
-    std::fs::rename(&tmp, path)
+    write_atomic(path, &serde_json::to_vec_pretty(saved)?)
 }
 
 /// How you like trix to look, whatever the session or workspace. Kept apart
@@ -123,12 +139,7 @@ pub fn store_prefs(prefs: &Prefs) -> std::io::Result<()> {
 }
 
 fn store_prefs_at(path: &Path, prefs: &Prefs) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("json.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(prefs)?)?;
-    std::fs::rename(&tmp, path)
+    write_atomic(path, &serde_json::to_vec_pretty(prefs)?)
 }
 
 #[cfg(test)]
@@ -200,6 +211,23 @@ mod tests {
         assert_eq!(load_from(&path), None, "other version");
         std::fs::write(&path, r#"{"version":1,"agents":[]}"#).unwrap();
         assert_eq!(load_from(&path), None, "no agents");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temporary_file() {
+        let dir = tmp();
+        let path = dir.join("sub/file.json");
+        write_atomic(&path, b"one").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one", "creates the folder");
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        // Renaming over a non-empty folder fails after the write succeeded.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join("inside")).unwrap();
+        assert!(write_atomic(&blocked, b"x").is_err());
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 2, "only sub/ and blocked/: {left:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
