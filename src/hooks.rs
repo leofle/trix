@@ -31,11 +31,14 @@ pub struct HookMsg {
 }
 
 pub fn runtime_dir() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("trix");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(base) => PathBuf::from(base).join("trix"),
+        // /tmp is shared by every user: the first one to create a plain
+        // /tmp/trix would own it and lock everyone else out.
+        None => std::env::temp_dir().join(format!("trix-{}", unsafe { libc::getuid() })),
+    };
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
     dir
 }
 
@@ -126,7 +129,9 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
         Some(p) => p,
         None => {
             let mut s = String::new();
-            let _ = std::io::stdin().take(256 * 1024).read_to_string(&mut s);
+            // Approvals carry the full content (a Write of a big file): cut it
+            // short and the JSON, event name included, no longer parses.
+            let _ = std::io::stdin().take(64 << 20).read_to_string(&mut s);
             s
         }
     };

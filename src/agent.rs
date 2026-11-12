@@ -347,9 +347,10 @@ impl Agent {
         let prev = self.state;
         self.state = s;
         self.state_since = Instant::now();
-        // The turn a prompt was sent for has visibly begun (or ended, or it
-        // is waiting on the human): idle alone isn't evidence of any of that.
-        if s != State::Idle {
+        // The turn a prompt was sent for has visibly begun (or it is waiting
+        // on the human, or gone). Idle isn't evidence of that, and neither is
+        // Done: a prompt sent mid-turn waits for that turn to end first.
+        if !matches!(s, State::Idle | State::Done) {
             self.prompted = None;
         }
         match s {
@@ -746,7 +747,7 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
                 args.extend(split_args(extra));
             }
             if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
-                args.push(p.into());
+                push_prompt(&mut args, p);
             }
             ("claude".into(), args)
         }
@@ -766,7 +767,7 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
             if let Some(id) = &spec.resume {
                 args.push(id.clone());
             } else if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
-                args.push(p.into());
+                push_prompt(&mut args, p);
             }
             ("codex".into(), args)
         }
@@ -776,6 +777,16 @@ fn command_for(spec: &Spawn, claude_settings: Option<&std::path::Path>, exe: &st
             (shell, vec!["-lc".into(), cmd])
         }
     }
+}
+
+/// The first prompt, last on the command line. One starting with `-` (a
+/// markdown list, "--help is broken") goes after `--`, or the CLI would take
+/// it for an option.
+fn push_prompt(args: &mut Vec<String>, prompt: &str) {
+    if prompt.starts_with('-') {
+        args.push("--".into());
+    }
+    args.push(prompt.into());
 }
 
 /// A real agent around `sleep`: a live PTY and emulator, but nothing on screen
@@ -1059,6 +1070,12 @@ mod tests {
         assert!(a.prompted.is_some(), "SessionStart's idle is not the turn");
         a.set_state(State::Working, false);
         assert!(a.prompted.is_none());
+        // Sent while it works: the end of this turn isn't the prompt's turn.
+        a.prompted = Some(Instant::now());
+        a.set_state(State::Done, false);
+        assert!(a.prompted.is_some(), "the turn it was sent during ended");
+        a.set_state(State::Working, false);
+        assert!(a.prompted.is_none(), "its own turn began");
         a.shutdown();
     }
 
@@ -1151,6 +1168,13 @@ mod tests {
         s.command = Some("   ".into());
         s.prompt = Some(String::new());
         assert!(command_for(&s, None, Path::new("/bin/trix")).1.is_empty());
+
+        let mut s = spec(Kind::Claude);
+        s.prompt = Some("- fix lint\n- run tests".into());
+        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1, ["--", "- fix lint\n- run tests"], "not an option");
+        let mut s = spec(Kind::Codex);
+        s.prompt = Some("--help is broken".into());
+        assert_eq!(command_for(&s, None, Path::new("/bin/trix")).1[4..], ["--", "--help is broken"]);
     }
 
     #[test]

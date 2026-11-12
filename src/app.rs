@@ -488,10 +488,7 @@ impl App {
     }
 
     pub fn unique_name(&self, base: &str) -> String {
-        if !self.agents.iter().any(|a| a.name == base) {
-            return base.to_string();
-        }
-        (2..).map(|n| format!("{base}-{n}")).find(|n| !self.agents.iter().any(|a| &a.name == n)).unwrap()
+        unique_in(&self.agents, base)
     }
 
     pub fn spawn(&mut self, spec: Spawn) -> anyhow::Result<()> {
@@ -539,7 +536,24 @@ impl App {
             f.field = 5;
             return;
         }
-        let name = if f.name.text.trim().is_empty() { "agent".to_string() } else { f.name.text.trim().to_string() };
+        if kind == Kind::Custom && !f.prompt.text.trim().is_empty() {
+            f.error = Some("a custom command takes no prompt: put it in Args, or send it once it runs".into());
+            f.field = 3;
+            return;
+        }
+        let typed = f.name.text.trim().to_string();
+        // A name you typed must be free; a suggested one is made unique.
+        let name = if f.name_touched && !typed.is_empty() {
+            if self.agents.iter().any(|a| a.name == typed) {
+                f.error = Some(format!("there is already an agent named '{typed}'"));
+                f.field = 2;
+                return;
+            }
+            typed
+        } else {
+            let base = if typed.is_empty() { "agent".to_string() } else { typed };
+            unique_in(&self.agents, &base)
+        };
         let mut note = None;
         if f.worktree {
             match make_worktree(&cwd, &slug(&name)) {
@@ -1072,6 +1086,11 @@ impl App {
             Modal::Rename(id, t) => {
                 if k.code == KeyCode::Enter {
                     let (id, name) = (*id, t.text.trim().to_string());
+                    if self.agents.iter().any(|a| a.id != id && a.name == name) {
+                        // Keep the box open: two agents with one name can't be told apart.
+                        self.toast(format!("there is already an agent named '{name}'"), ToastKind::Bad);
+                        return;
+                    }
                     if let Some(i) = self.index_of(id) {
                         if !name.is_empty() {
                             self.agents[i].name = name.clone();
@@ -1403,8 +1422,14 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
-/// is true when an existing worktree (e.g. from an earlier session) was reused.
+/// `base`, or `base-2`, `base-3`… whichever no agent has yet.
+fn unique_in(agents: &[Agent], base: &str) -> String {
+    if !agents.iter().any(|a| a.name == base) {
+        return base.to_string();
+    }
+    (2..).map(|n| format!("{base}-{n}")).find(|n| !agents.iter().any(|a| &a.name == n)).unwrap()
+}
+
 /// A slug that is also a safe folder and branch name: no `.` or `..`, no
 /// leading or trailing dot, no `..` inside, no `.lock` ending.
 fn worktree_name(slug: &str) -> String {
@@ -1421,6 +1446,8 @@ fn worktree_name(slug: &str) -> String {
     if out.is_empty() { "agent".into() } else { out }
 }
 
+/// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
+/// is true when an existing worktree (e.g. from an earlier session) was reused.
 pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
     let name = &worktree_name(name);
     let top = git(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
@@ -1585,6 +1612,48 @@ mod tests {
         // The terminal echoes each line, then cat prints it.
         assert_eq!(lines, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter");
         app.agents[i].shutdown();
+    }
+
+    #[test]
+    fn names_from_the_form_and_rename_stay_unique() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.id = 7;
+        a.name = "web".into();
+        app.agents.push(a);
+        let tmp = std::env::temp_dir();
+        let form = |name: &str, touched: bool| {
+            let mut f = NewForm { kind: Kind::ALL.iter().position(|k| *k == Kind::Custom).unwrap(), field: 0, name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
+            f.args = TextInput::new("exec sleep 60");
+            Modal::New(f)
+        };
+        app.modal = Some(form("web", true));
+        app.launch_form();
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert_eq!(f.error.as_deref(), Some("there is already an agent named 'web'"));
+
+        app.modal = Some(form("web", false));
+        app.launch_form();
+        assert!(app.modal.is_none());
+        assert_eq!(app.agents.last().unwrap().name, "web-2", "a suggested name is made unique");
+
+        let mut f = form("job", true);
+        if let Modal::New(f) = &mut f {
+            f.prompt = TextInput::new("do it");
+        }
+        app.modal = Some(f);
+        app.launch_form();
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert!(f.error.as_deref().unwrap().contains("takes no prompt"));
+
+        let other = app.agents.last().unwrap().id;
+        app.modal = Some(Modal::Rename(other, TextInput::new("web")));
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Rename(..))), "rename to a taken name is refused");
+        assert_eq!(app.agents.last().unwrap().name, "web-2");
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]

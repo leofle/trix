@@ -442,6 +442,9 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
     if prompt.is_some() && !kind.is_agent() {
         return Reply::fail("a shell takes no prompt (start it, then `trix send --force`)");
     }
+    if prompt.is_some() && kind == Kind::Custom {
+        return Reply::fail("a custom command takes no prompt: put it in --args, or start it and `trix send` it");
+    }
     let name = match name {
         Some(n) => {
             let n = n.trim().to_string();

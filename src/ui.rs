@@ -542,7 +542,7 @@ fn attention_banner(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Rect {
     f.render_widget(Paragraph::new(line), r);
     let hint = TLine::from(vec![Span::styled(" alt+a ", Style::new().fg(t.bg).bg(t.red).add_modifier(Modifier::BOLD)), Span::styled(" jump ", Style::new().fg(t.fg))]);
     f.render_widget(Paragraph::new(hint).alignment(Alignment::Right), r);
-    Rect { y: area.y + 1, height: area.height - 1, ..area }
+    Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area }
 }
 
 fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
@@ -586,7 +586,7 @@ fn pane_overlays(f: &mut Frame, a: &Agent, outer: Rect, inner: Rect, t: &Theme) 
             format!(" ↑ {offset} lines · shift+pgdn "),
             Style::new().fg(t.bg).bg(t.accent),
         )]);
-        let r = Rect { x: outer.x + 2, y: outer.bottom() - 1, width: (s.width() as u16).min(outer.width.saturating_sub(4)), height: 1 };
+        let r = Rect { x: outer.x + 2, y: outer.bottom().saturating_sub(1), width: (s.width() as u16).min(outer.width.saturating_sub(4)), height: 1 };
         f.render_widget(Paragraph::new(s), r);
     }
     if a.state == State::Exited && inner.height > 2 {
@@ -951,7 +951,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     Rect { y: inner.y + 4, height: 1, ..inner },
                 );
             }
-            let (spans, cur) = input_spans(inp, true, "message to send…", t, inner.width as usize - 2);
+            let (spans, cur) = input_spans(inp, true, "message to send…", t, (inner.width as usize).saturating_sub(2));
             let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
             line.extend(spans);
             f.render_widget(Paragraph::new(TLine::from(line)), Rect { y: inner.y + 2, height: 1, ..inner });
@@ -966,7 +966,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     Span::styled(" send", Style::new().fg(t.dim)),
                 ]))
                 .alignment(Alignment::Right),
-                Rect { y: r.bottom() - 2, height: 1, ..inner },
+                Rect { y: r.bottom().saturating_sub(2), height: 1, ..inner },
             );
         }
         Modal::Rename(_, inp) => {
@@ -976,7 +976,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let inner = block.inner(r);
             f.render_widget(block, r);
             let row = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: 1 };
-            let (spans, cur) = input_spans(inp, true, "name", t, row.width as usize - 2);
+            let (spans, cur) = input_spans(inp, true, "name", t, (row.width as usize).saturating_sub(2));
             let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
             line.extend(spans);
             f.render_widget(Paragraph::new(TLine::from(line)), row);
@@ -1145,7 +1145,7 @@ fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
             Span::styled(" close", Style::new().fg(t.dim)),
         ]))
         .alignment(Alignment::Right),
-        Rect { y: r.bottom() - 2, height: 1, ..inner },
+        Rect { y: r.bottom().saturating_sub(2), height: 1, ..inner },
     );
 }
 
@@ -1202,7 +1202,7 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
         Span::styled("• ", Style::new().fg(t.green)),
         Span::styled("unseen", Style::new().fg(t.dim)),
     ]);
-    f.render_widget(Paragraph::new(legend).alignment(Alignment::Center), Rect { y: r.bottom() - 2, height: 1, x: r.x, width: r.width });
+    f.render_widget(Paragraph::new(legend).alignment(Alignment::Center), Rect { y: r.bottom().saturating_sub(2), height: 1, x: r.x, width: r.width });
     let _ = Instant::now();
 }
 
@@ -1218,6 +1218,27 @@ mod tests {
         assert_eq!(spark_width(1), 1);
         assert_eq!(spark_width(0), 0);
         assert_eq!(spark_width(100), SPARK_LEN);
+    }
+
+    #[test]
+    fn modals_survive_tiny_terminals() {
+        let (_, mut app) = screen(false, 60);
+        let id = app.agents[0].id;
+        let modals = || vec![
+            Modal::Broadcast(TextInput::new("hello"), BroadcastTarget::All),
+            Modal::Rename(id, TextInput::new("web")),
+            Modal::Help,
+        ];
+        for (w, h) in [(1, 1), (2, 2), (6, 2), (8, 3), (12, 4), (3, 18)] {
+            for m in modals() {
+                app.modal = Some(m);
+                let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+            }
+        }
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     /// The whole screen, drawn into a test terminal: four agents, the second

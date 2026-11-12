@@ -148,10 +148,12 @@ pub fn relocate<T>(term: &Term<T>, hit: &Hit, query: &str) -> Option<Hit> {
     let moved = |p: Point| Point::new(Line(p.line.0 - shift), p.column);
     let guess = Hit { start: moved(hit.start), end: moved(hit.end), history, ..hit.clone() };
     let top = -(history as i32);
-    if guess.start.line.0 >= top {
+    let bottom = grid.screen_lines() as i32 - 1;
+    // The scrollback can shrink too (cleared, or reflowed by a resize), which
+    // moves the guess down, possibly past the last line.
+    if guess.start.line.0 >= top && guess.end.line.0 <= bottom {
         let (line, _) = logical_ending_at(term, guess.end.line.0);
         if line.text() == hit.text && line.points.get(hit.at) == Some(&guess.start) {
-            let bottom = grid.screen_lines() as i32 - 1;
             return Some(Hit { from_bottom: (bottom - guess.end.line.0) as usize, ..guess });
         }
     }
@@ -282,6 +284,18 @@ mod tests {
         let h = search_term(&t, 1, "error", 10);
         assert_eq!(h[0].at, 3, "chars, not cells");
         assert_eq!(h[0].start.column.0, 5, "cells: each wide char takes two");
+    }
+
+    #[test]
+    fn relocate_after_the_scrollback_was_cleared() {
+        let out: String = (0..50).map(|i| format!("x{i}\n")).collect();
+        let mut t = term(20, 5, &out);
+        let hit = search_term(&t, 1, "x40", 10).remove(0);
+        assert!(hit.start.line.0 < 0, "found in the scrollback");
+        feed(&mut t, "\x1b[3J");
+        assert_eq!(t.grid().history_size(), 0);
+        // Must not read past the screen; it's gone, so nothing to jump to.
+        assert_eq!(relocate(&t, &hit, "x40"), None);
     }
 
     #[test]

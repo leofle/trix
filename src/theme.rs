@@ -54,10 +54,8 @@ fn rgb(v: u32) -> Color {
 
 fn parse_hex(s: &str) -> Option<Color> {
     let s = s.trim().trim_start_matches('#');
-    if s.len() < 6 {
-        return None;
-    }
-    u32::from_str_radix(&s[..6], 16).ok().map(rgb)
+    let hex = s.get(..6).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    u32::from_str_radix(hex, 16).ok().map(rgb)
 }
 
 /// Linear blend of two colors, `t` in 0..=1 towards `b`.
@@ -131,6 +129,15 @@ fn from_toml(text: &str) -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_parsing_never_cuts_a_character() {
+        assert_eq!(parse_hex("#12345é"), None);
+        assert_eq!(parse_hex("éééééé"), None);
+        assert_eq!(parse_hex("+12345"), None, "from_str_radix would take the sign");
+        assert_eq!(parse_hex("#a1b2c3"), Some(Color::Rgb(0xa1, 0xb2, 0xc3)));
+        assert_eq!(parse_hex(" a1b2c3ff "), Some(Color::Rgb(0xa1, 0xb2, 0xc3)), "alpha is ignored");
+    }
 
     #[test]
     fn hex_colors() {
