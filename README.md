@@ -219,7 +219,7 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 
 ## macOS
 
-trix runs on Linux and macOS. macOS support is new: if something doesn't work, please [open an issue](https://github.com/leofle/trix/issues) and include `$TMPDIR/trix/server.log`.
+trix runs on Linux and macOS. macOS support is new: if something doesn't work, please [open an issue](https://github.com/leofle/trix/issues) and include `$TMPDIR/trix-$(id -u)/server.log` (`server-<name>.log` for a named session).
 
 ### Install
 
@@ -238,7 +238,7 @@ Then set your terminal's Option key to send Alt (below), and run `trix claude` i
 - **Make Option send Alt.** Every trix key is `alt+…`, and macOS terminals type `˜` for Option-N unless told otherwise. In Ghostty, set `macos-option-as-alt = true`. In iTerm2, go to Settings › Profiles › Keys and set Left Option to `Esc+`. In Terminal.app, go to Settings › Profiles › Keyboard and turn on "Use Option as Meta key". In kitty, set `macos_option_as_alt yes`.
 - **Notifications** go through `osascript`. They appear as coming from Script Editor; allow it once in System Settings › Notifications.
 - **The chime** plays through `afplay`. **Copying** goes through OSC 52, plus `pbcopy` for terminals that ignore it (Terminal.app).
-- **Files:** sockets and logs live under `$TMPDIR/trix` (there's no `XDG_RUNTIME_DIR`). The saved workspace lives in `~/.local/state/trix`. Without Omarchy, the theme is Tokyo Night, or whatever `TRIX_THEME` points at.
+- **Files:** sockets and logs live under `$TMPDIR/trix-<uid>`, where `<uid>` is your user ID (`id -u`), because there's no `XDG_RUNTIME_DIR`. The saved workspace lives in `~/.local/state/trix`. Without Omarchy, the theme is Tokyo Night, or whatever `TRIX_THEME` points at.
 
 ## Supported agents
 
