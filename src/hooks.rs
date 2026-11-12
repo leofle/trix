@@ -127,10 +127,16 @@ pub fn write_claude_settings(exe: &Path) -> anyhow::Result<PathBuf> {
 pub struct Integrations {
     /// Claude Code `--settings` overlay.
     pub claude_settings: Option<PathBuf>,
-    /// OpenCode plugin, loaded through `OPENCODE_CONFIG_CONTENT`.
+    /// OpenCode plugin, loaded through `OPENCODE_CONFIG_CONTENT`: a file for
+    /// OpenCode 1, a folder for OpenCode 2.
     pub opencode_plugin: Option<PathBuf>,
+    pub opencode_plugin_dir: Option<PathBuf>,
     /// Cursor plugin directory, loaded with `cursor-agent --plugin-dir`.
     pub cursor_plugin: Option<PathBuf>,
+    /// OpenCode takes `--standalone` (2.x). Without it, OpenCode 2 joins a
+    /// background server that the first OpenCode started, with that one's
+    /// environment: the plugin, the pane and the trix server it reports to.
+    pub opencode_standalone: bool,
 }
 
 impl Integrations {
@@ -140,18 +146,58 @@ impl Integrations {
         Integrations {
             claude_settings: write_claude_settings(exe).ok(),
             opencode_plugin: write_opencode_plugin(exe).ok(),
+            opencode_plugin_dir: write_opencode_plugin_dir(exe).ok(),
             cursor_plugin: write_cursor_plugin(exe).ok(),
+            opencode_standalone: opencode_has_standalone(),
         }
+    }
+
+    /// The plugin for the OpenCode installed: OpenCode 2 is the one with
+    /// `--standalone`.
+    pub fn opencode_plugin_for_version(&self) -> Option<&Path> {
+        if self.opencode_standalone { self.opencode_plugin_dir.as_deref() } else { self.opencode_plugin.as_deref() }
     }
 
     pub fn remove(&self) {
         for f in [&self.claude_settings, &self.opencode_plugin].into_iter().flatten() {
             let _ = std::fs::remove_file(f);
         }
-        if let Some(d) = &self.cursor_plugin {
+        for d in [&self.cursor_plugin, &self.opencode_plugin_dir].into_iter().flatten() {
             let _ = std::fs::remove_dir_all(d);
         }
     }
+}
+
+/// Does the OpenCode on `PATH` know `--standalone`? One that isn't installed
+/// yet will be the latest, which does. Its help, read once per server, says;
+/// one that doesn't answer within 3 s gets the flag left out (OpenCode 1.x
+/// refuses options it doesn't know).
+fn opencode_has_standalone() -> bool {
+    use std::process::{Command, Stdio};
+    if crate::install::missing("opencode") {
+        return true;
+    }
+    let Ok(mut child) = Command::new("opencode").arg("--help").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return false;
+    };
+    let mut out = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(o) = out.as_mut() {
+            let _ = o.read_to_string(&mut s);
+        }
+        s
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return reader.join().is_ok_and(|s| s.contains("--standalone"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// `'<exe>' hook <source>`, for hook runners that take a shell string.
@@ -160,16 +206,20 @@ fn hook_command(exe: &Path, source: &str) -> String {
     format!("'{quoted}' hook {source}")
 }
 
-/// OpenCode plugin. OpenCode runs its server, plugins included, in a worker
-/// of the TUI process with that process's environment, so the plugin only
-/// reports when it runs inside a trix pane. It hands each event to
-/// `trix hook opencode` as an argv (no shell), and keeps track of subagent
-/// sessions so a subagent finishing isn't taken for the pane's turn ending.
-pub fn opencode_plugin_source(exe: &Path) -> String {
+/// OpenCode plugin, for OpenCode 1 or 2. OpenCode runs its server, plugins
+/// included, with the environment of the process that started it (each
+/// pane's own, with `--standalone`), so the plugin only reports when it runs
+/// inside a trix pane. It hands each event to `trix hook opencode` as an argv
+/// (no shell), and keeps track of subagent sessions so a subagent finishing
+/// isn't taken for the pane's turn ending.
+pub fn opencode_plugin_source(exe: &Path, v2: bool) -> String {
     let exe = serde_json::to_string(&exe.display().to_string()).unwrap_or_else(|_| "\"trix\"".into());
-    OPENCODE_PLUGIN.replace("__TRIX_EXE__", &exe)
+    let tail = if v2 { OPENCODE_PLUGIN_V2 } else { OPENCODE_PLUGIN_V1 };
+    format!("{OPENCODE_PLUGIN}{tail}").replace("__TRIX_EXE__", &exe)
 }
 
+/// What both versions share: reporting, cutting text short, tool arguments
+/// and subagent sessions.
 const OPENCODE_PLUGIN: &str = r#"// Written by trix for the OpenCode agents it runs; removed when trix stops.
 import { spawn } from "node:child_process";
 
@@ -211,7 +261,11 @@ function brief(args) {
   }
   return out;
 }
+"#;
 
+/// OpenCode 1: a named export returning its hooks, with every event through
+/// `event`.
+const OPENCODE_PLUGIN_V1: &str = r#"
 export const TrixPlugin = async () => {
   report({ type: "trix.loaded" });
   return {
@@ -262,10 +316,111 @@ export const TrixPlugin = async () => {
 };
 "#;
 
+/// OpenCode 2: a default `{ id, setup }` export. Events come from
+/// `ctx.event.subscribe()` with their fields under `data`, tools from
+/// `ctx.tool.hook`. Each is reported as the OpenCode 1 plugin would, so
+/// `condense_opencode` reads both: a turn is `session.execution.*`, a prompt
+/// is a user item in the session's inbox, and a question is a form.
+const OPENCODE_PLUGIN_V2: &str = r#"
+function on(event) {
+  const type = event?.type;
+  const d = event?.data ?? {};
+  if (type === "session.created" && d.parentID) {
+    parents.set(d.sessionID, d.parentID);
+    return;
+  }
+  const child = parents.has(d.sessionID);
+  const status = (s) => {
+    if (!child) report({ type: "session.status", sessionID: d.sessionID, status: s });
+  };
+  switch (type) {
+    case "session.inbox.enqueued": {
+      const text = d.item?.payload?.text;
+      if (!child && d.item?.type === "user" && typeof text === "string") report({ type: "chat.message", sessionID: d.sessionID, prompt: cut(text) });
+      return;
+    }
+    case "session.execution.started":
+      return status("busy");
+    case "session.status":
+      if (d.status?.type === "retry") status("retry");
+      return;
+    case "session.execution.succeeded":
+    case "session.execution.failed":
+      return status("idle");
+    case "session.execution.interrupted":
+      return status(d.reason === "user" ? "aborted" : "idle");
+    case "permission.asked":
+      report({ type, sessionID: root(d.sessionID), permission: d.action, patterns: d.resources });
+      return;
+    case "permission.replied":
+      report({ type, sessionID: root(d.sessionID) });
+      return;
+    case "form.created": {
+      const f = d.form ?? {};
+      const q = f.fields?.[0]?.title ?? f.title;
+      report({ type: "question.asked", sessionID: root(f.sessionID), question: typeof q === "string" ? cut(q) : undefined });
+      return;
+    }
+    case "form.replied":
+      report({ type: "question.replied", sessionID: root(d.sessionID) });
+      return;
+    case "form.cancelled":
+      report({ type: "question.rejected", sessionID: root(d.sessionID) });
+      return;
+  }
+}
+
+export default {
+  id: "trix",
+  setup: async (ctx) => {
+    report({ type: "trix.loaded" });
+    const undo = [];
+    const hook = (name, fn) => {
+      try {
+        const h = ctx.tool?.hook?.(name, fn);
+        if (typeof h === "function") undo.push(h);
+        else if (typeof h?.dispose === "function") undo.push(() => h.dispose());
+      } catch {}
+    };
+    hook("execute.before", async (input) => {
+      report({ type: "tool.execute.before", sessionID: root(input?.sessionID), tool: input?.tool, args: brief(input?.input) });
+    });
+    hook("execute.after", async (input) => {
+      report({ type: "tool.execute.after", sessionID: root(input?.sessionID), tool: input?.tool });
+    });
+    let stopped = false;
+    (async () => {
+      try {
+        for await (const event of ctx.event.subscribe()) {
+          if (stopped) break;
+          on(event);
+        }
+      } catch {}
+    })();
+    return async () => {
+      stopped = true;
+      for (const u of undo) {
+        try {
+          await u();
+        } catch {}
+      }
+    };
+  },
+};
+"#;
+
 fn write_opencode_plugin(exe: &Path) -> anyhow::Result<PathBuf> {
     let path = runtime_dir().join(format!("opencode-plugin-{}.js", std::process::id()));
-    std::fs::write(&path, opencode_plugin_source(exe))?;
+    std::fs::write(&path, opencode_plugin_source(exe, false))?;
     Ok(path)
+}
+
+/// OpenCode 2 loads a plugin from a folder only: its `index.js`.
+fn write_opencode_plugin_dir(exe: &Path) -> anyhow::Result<PathBuf> {
+    let dir = runtime_dir().join(format!("opencode-plugin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("index.js"), opencode_plugin_source(exe, true))?;
+    Ok(dir)
 }
 
 /// The `OPENCODE_CONFIG_CONTENT` that loads trix's plugin. OpenCode merges it
@@ -843,13 +998,93 @@ mod tests {
 
     #[test]
     fn opencode_plugin_names_trix_and_runs_no_shell() {
-        let src = opencode_plugin_source(Path::new("/opt/it's \"trix\""));
-        assert!(src.contains(r#"const TRIX = "/opt/it's \"trix\"";"#));
-        assert!(!src.contains("__TRIX_EXE__"));
-        assert!(src.contains(r#"spawn(TRIX, ["hook", "opencode""#) && !src.contains("shell:") && !src.contains("exec("));
-        // Text is cut without splitting an emoji, which JSON can't carry.
-        assert!(src.contains("out[k] = cut(v)") && src.contains("prompt: cut(text)"));
-        assert_eq!(src.matches("slice(0, 400)").count(), 1, "only inside cut()");
+        for v2 in [false, true] {
+            let src = opencode_plugin_source(Path::new("/opt/it's \"trix\""), v2);
+            assert!(src.contains(r#"const TRIX = "/opt/it's \"trix\"";"#));
+            assert!(!src.contains("__TRIX_EXE__"));
+            assert!(src.contains(r#"spawn(TRIX, ["hook", "opencode""#) && !src.contains("shell:") && !src.contains("exec("));
+            // Text is cut without splitting an emoji, which JSON can't carry.
+            assert!(src.contains("out[k] = cut(v)") && src.contains("prompt: cut(text)"));
+            assert_eq!(src.matches("slice(0, 400)").count(), 1, "only inside cut()");
+        }
+        // Each version's own entry point, and only that one.
+        let (v1, v2) = (opencode_plugin_source(Path::new("/t"), false), opencode_plugin_source(Path::new("/t"), true));
+        assert!(v1.contains("export const TrixPlugin") && !v1.contains("export default"));
+        assert!(v2.contains("export default {\n  id: \"trix\",\n  setup:") && !v2.contains("export const"));
+    }
+
+    /// The OpenCode 2 plugin, run by Node against a fake `ctx`: what it
+    /// reports for each event, in the OpenCode 1 plugin's terms.
+    #[test]
+    fn opencode_2_plugin_reports_like_the_first() {
+        let src = opencode_plugin_source(Path::new("/t"), true)
+            .replace(r#"import { spawn } from "node:child_process";"#, "")
+            .replace("export default", "const plugin =");
+        let script = format!(
+            r#"{src}
+const out = [];
+process.env.TRIX_SOCKET = "s"; process.env.TRIX_AGENT_ID = "1";
+globalThis.spawn = (_exe, argv) => {{ const p = JSON.parse(argv[2]); delete p.trix_seq; out.push(p); return {{ on() {{}}, unref() {{}} }}; }};
+const hooks = {{}};
+const events = [
+  {{ type: "session.created", data: {{ sessionID: "sub", parentID: "s1" }} }},
+  {{ type: "session.inbox.enqueued", data: {{ sessionID: "s1", item: {{ type: "user", payload: {{ text: "hi" }} }} }} }},
+  {{ type: "session.execution.started", data: {{ sessionID: "s1" }} }},
+  {{ type: "session.execution.started", data: {{ sessionID: "sub" }} }},
+  {{ type: "permission.asked", data: {{ sessionID: "sub", action: "shell", resources: ["rm -rf dist"] }} }},
+  {{ type: "permission.replied", data: {{ sessionID: "sub" }} }},
+  {{ type: "form.created", data: {{ form: {{ sessionID: "s1", title: "Question", fields: [{{ title: "Which one?" }}] }} }} }},
+  {{ type: "form.cancelled", data: {{ sessionID: "s1" }} }},
+  {{ type: "session.execution.succeeded", data: {{ sessionID: "sub" }} }},
+  {{ type: "session.execution.interrupted", data: {{ sessionID: "s1", reason: "user" }} }},
+  {{ type: "session.execution.succeeded", data: {{ sessionID: "s1" }} }},
+];
+const ctx = {{
+  tool: {{ hook: (name, fn) => {{ hooks[name] = fn; }} }},
+  event: {{ subscribe: async function* () {{ for (const e of events) yield e; }} }},
+}};
+await plugin.setup(ctx);
+await new Promise((r) => setTimeout(r, 50));
+await hooks["execute.before"]({{ sessionID: "sub", tool: "shell", input: {{ command: "ls", other: 1 }} }});
+await hooks["execute.after"]({{ sessionID: "sub", tool: "shell" }});
+process.stdout.write(JSON.stringify(out));"#
+        );
+        let script = script.replace("spawn(TRIX", "globalThis.spawn(TRIX");
+        let Ok(out) = std::process::Command::new("node").arg("--input-type=module").arg("-e").arg(&script).output() else { return };
+        if !out.status.success() {
+            panic!("{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let got: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let types: Vec<&str> = got.as_array().unwrap().iter().map(|p| p["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "trix.loaded",
+                "chat.message",
+                "session.status",
+                "permission.asked",
+                "permission.replied",
+                "question.asked",
+                "question.rejected",
+                "session.status",
+                "session.status",
+                "tool.execute.before",
+                "tool.execute.after",
+            ],
+            "{got}"
+        );
+        let g = got.as_array().unwrap();
+        assert_eq!(g[1], serde_json::json!({ "type": "chat.message", "sessionID": "s1", "prompt": "hi" }));
+        assert_eq!(g[2]["status"], "busy");
+        // Approvals and tools in a subagent show on the pane's own session.
+        assert_eq!(g[3], serde_json::json!({ "type": "permission.asked", "sessionID": "s1", "permission": "shell", "patterns": ["rm -rf dist"] }));
+        assert_eq!(g[5]["question"], "Which one?");
+        // The subagent's own turn never shows; the pane's: aborted, then idle.
+        assert_eq!((g[7]["status"].as_str(), g[8]["status"].as_str()), (Some("aborted"), Some("idle")));
+        assert_eq!(g[9], serde_json::json!({ "type": "tool.execute.before", "sessionID": "s1", "tool": "shell", "args": { "command": "ls" } }));
+        // And each one reads as the same hook trix already knows.
+        let events: Vec<String> = g.iter().map(|p| condense_opencode(1, p).event).collect();
+        assert_eq!(events, ["SessionStart", "UserPromptSubmit", "Busy", "PermissionRequest", "Answered", "Question", "Answered", "Interrupt", "Stop", "PreToolUse", "PostToolUse"]);
     }
 
     /// The plugin's `cut`, run by Node when it's installed.

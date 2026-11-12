@@ -318,7 +318,7 @@ impl Agent {
         }
         if spec.kind == Kind::OpenCode {
             let theirs = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
-            if let Some(c) = integrations.opencode_plugin.as_deref().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
+            if let Some(c) = integrations.opencode_plugin_for_version().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
                 env.insert("OPENCODE_CONFIG_CONTENT".into(), c);
             }
         }
@@ -1192,10 +1192,16 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
         }
         // trix's plugin rides in `OPENCODE_CONFIG_CONTENT` (see `spawn`).
         Kind::OpenCode => {
+            let theirs = extra.map(split_args).unwrap_or_default();
+            // Its own server, with this pane's environment, unless you
+            // picked one (see `Integrations::opencode_standalone`).
+            if integrations.opencode_standalone && !theirs.iter().any(|a| a == "--standalone" || a == "--server" || a.starts_with("--server=")) {
+                args.push("--standalone".into());
+            }
             if let Some(id) = &spec.resume {
                 args.extend(["--session".into(), id.clone()]);
             }
-            args.extend(extra.map(split_args).unwrap_or_default());
+            args.extend(theirs);
             if let Some(p) = prompt {
                 args.push(format!("--prompt={p}"));
             }
@@ -1841,7 +1847,9 @@ mod tests {
         Integrations {
             claude_settings: Some("/run/s.json".into()),
             opencode_plugin: Some("/run/opencode-plugin-1.js".into()),
+            opencode_plugin_dir: Some("/run/opencode-plugin-1".into()),
             cursor_plugin: Some("/run/cursor-plugin-1".into()),
+            opencode_standalone: false,
         }
     }
 
@@ -1884,6 +1892,19 @@ mod tests {
         s.prompt = None;
         s.command = Some("--model anthropic/claude".into());
         assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--session", "ses_1", "--model", "anthropic/claude"]);
+    }
+
+    #[test]
+    fn opencode_2_gets_its_own_server_unless_you_pick_one() {
+        let two = Integrations { opencode_standalone: true, ..ints() };
+        let mut s = spec(Kind::OpenCode);
+        s.resume = Some("ses_1".into());
+        assert_eq!(command_for(&s, &two, Path::new("/bin/trix"), None).1, ["--standalone", "--session", "ses_1"]);
+        for theirs in ["--standalone", "--server http://localhost:4096", "--server=http://localhost:4096"] {
+            s.command = Some(theirs.into());
+            // Yours stands; trix adds none of its own.
+            assert_eq!(command_for(&s, &two, Path::new("/bin/trix"), None).1.iter().filter(|a| *a == "--standalone").count(), usize::from(theirs == "--standalone"));
+        }
     }
 
     #[test]
