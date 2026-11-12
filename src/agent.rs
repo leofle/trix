@@ -185,6 +185,10 @@ pub struct Agent {
     screen_seen: std::cell::Cell<Option<ScreenSeen>>,
     /// It has been hung up on (`hang_up`): stopping it again does nothing.
     stopping: std::cell::Cell<bool>,
+    /// Anything has ever been asked of it: a first prompt, `trix send`, or
+    /// keys typed into it. Until then, an agent's output is it starting up
+    /// (Codex redraws for seconds), never finished work.
+    asked: bool,
     /// The folder its process was last seen in, for once it has exited.
     last_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
@@ -364,6 +368,7 @@ impl Agent {
             submit_free: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             screen_seen: std::cell::Cell::new(None),
             stopping: std::cell::Cell::new(false),
+            asked: first_prompt,
             last_cwd: std::cell::RefCell::new(None),
             pty: master,
             pid,
@@ -419,6 +424,7 @@ impl Agent {
         const GAP: Duration = Duration::from_millis(30);
         let now = Instant::now();
         self.last_input = now;
+        self.note_asked();
         let start = now.max(self.submit_free + GAP);
         let enter = start + ENTER_AFTER;
         let _ = self.later.send((start, Cow::Owned(paste)));
@@ -426,8 +432,17 @@ impl Agent {
         self.submit_free = enter;
     }
 
+    /// Input counts as asking it something, except an answer to a prompt
+    /// or dialog it's waiting on (trust this folder? these hooks?).
+    fn note_asked(&mut self) {
+        if self.state != State::Blocked {
+            self.asked = true;
+        }
+    }
+
     pub fn user_input(&mut self, bytes: Vec<u8>) {
         self.last_input = Instant::now();
+        self.note_asked();
         self.write(bytes);
     }
 
@@ -840,7 +855,8 @@ impl Agent {
                 } else {
                     let worked = self.work_started.map(|t| t.elapsed()).unwrap_or_default();
                     let long = worked > Duration::from_secs(if self.kind.is_agent() { 3 } else { 8 });
-                    if long {
+                    // An agent nobody has asked anything was starting up.
+                    if long && (self.asked || !self.kind.takes_prompts()) {
                         self.activity = format!("finished after {}", crate::ui::fmt_dur(worked));
                         self.set_state(State::Done, focused)
                     } else {
@@ -1071,8 +1087,9 @@ fn needs_input(screen: &str) -> bool {
 /// Wording only one agent's own approval prompts use, from their sources:
 /// Grok Build's permission footer and question dialog
 /// (`xai-grok-pager`), OpenCode's permission prompt
-/// (`packages/tui/src/routes/session/permission.tsx`), and Cursor CLI's
-/// approval prompts and workspace-trust screen.
+/// (`packages/tui/src/routes/session/permission.tsx`), Cursor CLI's
+/// approval prompts and workspace-trust screen, and Codex's folder-trust
+/// and hooks-review dialogs (as Codex 0.167.2 draws them).
 fn kind_prompt(kind: Kind, screen: &str) -> bool {
     let t = screen.to_lowercase();
     let any = |ps: &[&str]| ps.iter().any(|p| t.contains(p));
@@ -1086,6 +1103,9 @@ fn kind_prompt(kind: Kind, screen: &str) -> bool {
             any(&["skip (esc or n)", "waiting for approval...", "workspace trust required", "do you trust the contents of this directory"])
                 || (t.contains("run (once)") && t.contains("skip"))
         }
+        // Codex 0.167's start-up dialogs: trusting the folder, then
+        // trix's hooks (and any of yours) once they're new or changed.
+        Kind::Codex => any(&["trust and continue", "your trust decision will be saved", "hooks need review", "need review before they can run", "continue without trusting"]),
         _ => false,
     }
 }
@@ -1719,9 +1739,67 @@ mod tests {
         a.shutdown();
     }
 
+    /// Codex 0.167 redraws for seconds as it starts. Nobody has asked it
+    /// anything yet: that's it starting up, not a finished turn.
+    #[test]
+    fn output_before_anything_was_asked_is_not_done() {
+        let mut a = test_agent(Kind::Codex);
+        a.set_state(State::Working, true);
+        a.work_started = Some(ago(Duration::from_secs(4)));
+        a.last_output = ago(Duration::from_secs(2));
+        a.heuristics(true);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "idle"));
+        // Answering its trust dialog isn't asking it anything either.
+        a.set_state(State::Blocked, true);
+        a.user_input(b"\r".to_vec());
+        assert!(!a.asked, "an answer, not a request");
+        // A prompt is: what follows is a turn, and it ends done.
+        a.set_state(State::Idle, true);
+        a.user_input(b"fix the tests\r".to_vec());
+        assert!(a.asked);
+        a.set_state(State::Working, true);
+        a.work_started = Some(ago(Duration::from_secs(4)));
+        a.last_output = ago(Duration::from_secs(2));
+        a.heuristics(true);
+        assert_eq!(a.state, State::Done);
+        // A custom command does its work unasked (a dev server starting).
+        let mut c = test_agent(Kind::Custom);
+        c.set_state(State::Working, true);
+        c.work_started = Some(ago(Duration::from_secs(10)));
+        c.last_output = ago(Duration::from_secs(2));
+        c.heuristics(true);
+        assert_eq!(c.state, State::Done);
+        a.shutdown();
+        c.shutdown();
+    }
+
+    /// Codex 0.167.2's start-up dialogs, as drawn: they need you.
+    #[test]
+    fn codex_trust_and_hooks_dialogs_need_you() {
+        let trust = "  permission settings. Folder settings can\n  run code automatically, even without a\n  model request. Continue only if you trust\n  these files. Your trust decision will be\n  saved.\n› 1. Trust and continue\n  2. Back to Agent Command Center\n  enter continue · esc back\n";
+        let hooks = "  Hooks need review\n  9 hooks are new or changed.\n  Hooks can run outside the sandbox after you trust them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n  enter confirm · esc skip\n";
+        let list = "  Hooks\n  Lifecycle hooks from config and enabled plugins.\n  ⚠ 9 hooks need review before they can run.\n  t trust all · enter review · esc close\n";
+        for screen in [trust, hooks, list] {
+            assert!(kind_prompt(Kind::Codex, screen), "{screen}");
+        }
+        assert!(!kind_prompt(Kind::Codex, "› Ask Codex to do anything\n  gpt-5 · ~/Projects/trix\n"), "its prompt bar");
+        assert!(!kind_prompt(Kind::Claude, hooks), "Codex's own wording");
+        // From idle, on screen: needs you.
+        let mut a = test_agent(Kind::Codex);
+        a.set_state(State::Idle, false);
+        a.state_since = ago(Duration::from_secs(2));
+        show(&a, hooks);
+        a.on_output();
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "waiting for an answer"));
+        a.shutdown();
+    }
+
     #[test]
     fn unhooked_long_work_is_done_short_work_is_idle() {
         let mut a = test_agent(Kind::Claude);
+        a.asked = true;
         a.set_state(State::Working, true);
         a.work_started = Some(ago(Duration::from_secs(10)));
         a.last_output = ago(Duration::from_secs(2));
@@ -2010,6 +2088,7 @@ mod tests {
     fn cursor_turns_come_from_its_screen() {
         let mut a = test_agent(Kind::Cursor);
         a.set_state(State::Idle, false);
+        a.asked = true;
         let mut start = hook("cursor", "SessionStart", None, None);
         start.session = Some("conv-1".into());
         a.on_hook(&start, false);
@@ -2128,6 +2207,7 @@ mod tests {
     fn cursor_prose_is_not_a_prompt() {
         let mut a = test_agent(Kind::Cursor);
         a.set_state(State::Idle, false);
+        a.asked = true;
         redraw(&mut a);
         a.heuristics(false);
         assert_eq!(a.state, State::Working);
