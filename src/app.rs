@@ -1770,29 +1770,29 @@ mod tests {
     #[test]
     fn quick_submissions_stay_separate() {
         let mut app = test_app();
-        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("exec cat".into()), prompt: None, branch_note: None, resume: None };
+        // Echo off: what's on screen is only what cat received, line by line.
+        // With echo on, how the terminal's echoes interleave with cat's
+        // output is up to the scheduler, and CI runners differ.
+        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; exec cat".into()), prompt: None, branch_note: None, resume: None };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         app.agents[i].submit(b"one".to_vec());
         app.agents[i].submit(b"two".to_vec());
-        // The terminal echoes each line and cat prints it back. How the
-        // echoes and cat's output interleave is up to the scheduler (CI
-        // runners differ), so wait for all four, then check what matters:
-        // two separate submissions, not 'onetwo' and an empty Enter.
         let deadline = Instant::now() + Duration::from_secs(5);
         let lines = loop {
             let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
             let lines: Vec<String> = tail.iter().map(|l| l.trim_end().to_string()).filter(|l| !l.is_empty()).collect();
-            if lines.len() >= 4 || Instant::now() > deadline {
-                break lines;
+            if lines.len() >= 2 || Instant::now() > deadline {
+                // A moment more, so an extra line would show.
+                std::thread::sleep(Duration::from_millis(200));
+                let tail = crate::search::tail(&app.agents[i].term.lock(), 10);
+                break tail.iter().map(|l| l.trim_end().to_string()).collect::<Vec<_>>();
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        let mut sorted = lines.clone();
-        sorted.sort();
-        assert_eq!(sorted, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter: {lines:?}");
-        assert_eq!(lines[0], "one", "submitted in order: {lines:?}");
+        let text: Vec<&str> = lines.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+        assert_eq!(text, ["one", "two"], "not 'onetwo' and an empty Enter");
         app.agents[i].shutdown();
     }
 
