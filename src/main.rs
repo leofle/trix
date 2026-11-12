@@ -353,15 +353,17 @@ fn server() -> anyhow::Result<()> {
     loop {
         let now = Instant::now();
         let attached = out.attached();
-        let anim = attached && app.animating();
+        // Animations draw when the picture changes, not on a fixed beat: a
+        // blinking "needs you" alone means a frame every 540 ms, not 11 a second.
+        let anim = if attached { app.next_frame_change() } else { None };
         let frame_due = if attached && app.dirty {
             last_draw + FRAME
-        } else if anim {
-            last_draw + ANIM
+        } else if let Some(t) = anim {
+            t.max(last_draw + ANIM)
         } else {
             now + Duration::from_secs(5)
         };
-        let deadline = frame_due.min(last_tick + TICK);
+        let deadline = frame_due.min(last_tick + TICK).min(app.search_due.unwrap_or(frame_due));
         match rx.recv_timeout(deadline.saturating_duration_since(now)) {
             Ok(ev) => {
                 dispatch(ev, &mut app, &mut terminal, &out, &mut killed);
@@ -390,6 +392,7 @@ fn server() -> anyhow::Result<()> {
             out.bye(&format!("[detached from trix · run `{}` to come back]", session::command()));
             app.on_detach();
         }
+        app.run_due_search();
         let now = Instant::now();
         if now >= last_tick + TICK {
             last_tick = now;
@@ -404,7 +407,7 @@ fn server() -> anyhow::Result<()> {
             app.dirty = false;
             continue;
         }
-        if anim && now >= last_draw + ANIM {
+        if anim.is_some_and(|t| now >= t) && now >= last_draw + ANIM {
             app.dirty = true;
         }
         if app.dirty && now >= last_draw + FRAME {

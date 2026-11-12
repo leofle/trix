@@ -168,6 +168,18 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     f.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
 }
 
+/// Every time shown on screen as text: the clock and each agent's time in
+/// its state. Redrawing for the clock only matters when this changes, which
+/// is once a minute once every timer is past an hour.
+pub fn times_shown(app: &App) -> String {
+    let mut s = clock();
+    for a in &app.agents {
+        s.push(' ');
+        s.push_str(&fmt_dur(elapsed(a)));
+    }
+    s
+}
+
 fn clock() -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

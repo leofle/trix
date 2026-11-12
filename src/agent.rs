@@ -134,6 +134,9 @@ pub struct Agent {
     later: Sender<(Instant, Cow<'static, [u8]>)>,
     /// When the last submission's Enter goes out.
     submit_free: Instant,
+    /// `screen_needs_input`'s last answer, and the (last output, last
+    /// resize) it was for.
+    screen_seen: std::cell::Cell<Option<((Instant, Instant), bool)>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
     /// process group is in the foreground.
     pty: std::fs::File,
@@ -266,6 +269,7 @@ impl Agent {
             sender,
             later,
             submit_free: Instant::now() - Duration::from_secs(1),
+            screen_seen: std::cell::Cell::new(None),
             pty: master,
             pid,
             size,
@@ -609,6 +613,20 @@ impl Agent {
     /// question UI. Inline TUIs draw from the top of a fresh terminal, so
     /// that's the last rows with anything on them, not the last rows.
     pub fn screen_needs_input(&self) -> bool {
+        // Only output or a resize changes the screen: while an agent sits
+        // quiet, the heuristics ask this 4 times a second, for nothing.
+        let key = (self.last_output, self.last_resize);
+        if let Some((k, v)) = self.screen_seen.get()
+            && k == key
+        {
+            return v;
+        }
+        let v = self.read_screen_for_input();
+        self.screen_seen.set(Some((key, v)));
+        v
+    }
+
+    fn read_screen_for_input(&self) -> bool {
         let term = self.term.lock();
         let grid = term.grid();
         let cols = grid.columns();
@@ -1028,6 +1046,17 @@ mod tests {
     fn show(a: &Agent, text: &str) {
         let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
         p.advance(&mut *a.term.lock(), text.replace('\n', "\r\n").as_bytes());
+    }
+
+    #[test]
+    fn the_screen_is_read_again_only_after_output() {
+        let mut a = test_agent(Kind::Codex);
+        assert!(!a.screen_needs_input());
+        show(&a, "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n");
+        assert!(!a.screen_needs_input(), "no output reported since: the last answer stands");
+        a.on_output();
+        assert!(a.screen_needs_input(), "output: read again");
+        a.shutdown();
     }
 
     #[test]

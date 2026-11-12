@@ -198,8 +198,99 @@ fn send_msg(w: &mut impl Write, msg: &ClientMsg) -> io::Result<()> {
 
 // ───────────────────────────── server side ─────────────────────────────
 
+/// One client's socket, written by a thread of its own: a terminal that stops
+/// reading (stalled SSH, a suspended terminal) never blocks the server, which
+/// only queues frames. One that falls `MAX_BEHIND` bytes behind is dropped.
+struct Peer {
+    stream: UnixStream,
+    tx: Sender<Job>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum Job {
+    Frame(Vec<u8>),
+    /// Everything queued so far is written: hang up.
+    Close,
+}
+
+/// A few seconds of full-screen frames.
+const MAX_BEHIND: usize = 8 << 20;
+
+impl Peer {
+    fn new(stream: UnixStream) -> Peer {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(mut w) = stream.try_clone() {
+            // Only this thread waits on it; a write that can't finish in this
+            // long means the reader is gone for good.
+            let _ = w.set_write_timeout(Some(Duration::from_secs(10)));
+            let (queued, done) = (queued.clone(), done.clone());
+            let _ = std::thread::Builder::new().name("trix-peer".into()).spawn(move || {
+                for job in rx {
+                    match job {
+                        Job::Frame(b) => {
+                            let ok = w.write_all(&b).and_then(|()| w.flush()).is_ok();
+                            queued.fetch_sub(b.len(), Ordering::Relaxed);
+                            if !ok {
+                                break;
+                            }
+                        }
+                        Job::Close => break,
+                    }
+                }
+                // Its reader thread sees this and reports `Detached`.
+                let _ = w.shutdown(std::net::Shutdown::Both);
+                done.store(true, Ordering::Release);
+            });
+        } else {
+            done.store(true, Ordering::Release);
+        }
+        Peer { stream, tx, queued, done }
+    }
+
+    /// Queue one frame. False when the client is gone or too far behind,
+    /// and then it has been hung up on.
+    fn send(&self, kind: u8, payload: &[u8]) -> bool {
+        let len = payload.len() + 5;
+        if self.done.load(Ordering::Acquire) || self.queued.load(Ordering::Relaxed) + len > MAX_BEHIND {
+            self.hang_up();
+            return false;
+        }
+        let mut buf = Vec::with_capacity(len);
+        buf.push(kind);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
+        self.queued.fetch_add(len, Ordering::Relaxed);
+        if self.tx.send(Job::Frame(buf)).is_err() {
+            self.hang_up();
+            return false;
+        }
+        true
+    }
+
+    /// Hang up once what's queued (a goodbye, say) has been written.
+    fn close(&self) {
+        if self.tx.send(Job::Close).is_err() {
+            self.hang_up();
+        }
+    }
+
+    fn hang_up(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Wait until the writer is done (after `close`), but not past `until`.
+    fn wait_done(&self, until: Instant) {
+        while !self.done.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 struct Link {
-    client: Option<(u64, UnixStream)>,
+    client: Option<(u64, Peer)>,
     /// A controller `frame` dropped for being gone or stalled, whose
     /// `Detached` hasn't been handled yet.
     dropped: Option<u64>,
@@ -212,7 +303,7 @@ struct Link {
 
 struct Viewer {
     id: u64,
-    stream: UnixStream,
+    peer: Peer,
     size: (u16, u16),
     /// What this viewer's screen shows now; `None` repaints from scratch.
     shown: Option<Buffer>,
@@ -232,11 +323,10 @@ impl Default for Out {
 
 impl Link {
     fn frame(&mut self, kind: u8, payload: &[u8]) {
-        if let Some((id, s)) = &mut self.client {
-            if write_frame(s, kind, payload).is_err() {
-                // Gone or stalled: drop it. Its reader thread sees the
-                // shutdown and reports `Detached`.
-                let _ = s.shutdown(std::net::Shutdown::Both);
+        if let Some((id, p)) = &self.client {
+            if !p.send(kind, payload) {
+                // Gone or stalled: dropped. Its reader thread sees the hang-up
+                // and reports `Detached`.
                 self.dropped = Some(*id);
                 self.client = None;
             }
@@ -244,21 +334,15 @@ impl Link {
     }
 
     fn bye(&mut self, message: &str) {
-        self.frame(BYE, message.as_bytes());
-        if let Some((_, s)) = self.client.take() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        if let Some((_, p)) = self.client.take() {
+            p.send(BYE, message.as_bytes());
+            p.close();
         }
     }
 
     /// Send to every viewer, dropping the ones that are gone or stalled.
     fn send_viewers(&mut self, kind: u8, payload: &[u8]) {
-        self.viewers.retain_mut(|v| {
-            let ok = write_frame(&mut v.stream, kind, payload).is_ok();
-            if !ok {
-                let _ = v.stream.shutdown(std::net::Shutdown::Both);
-            }
-            ok
-        });
+        self.viewers.retain(|v| v.peer.send(kind, payload));
     }
 }
 
@@ -295,8 +379,7 @@ impl Out {
     }
 
     pub fn add_viewer(&self, id: u64, stream: UnixStream, size: (u16, u16)) {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-        self.link().viewers.push(Viewer { id, stream, size: (size.0.max(1), size.1.max(1)), shown: None });
+        self.link().viewers.push(Viewer { id, peer: Peer::new(stream), size: (size.0.max(1), size.1.max(1)), shown: None });
     }
 
     pub fn resize_viewer(&self, id: u64, cols: u16, rows: u16) {
@@ -310,9 +393,9 @@ impl Out {
     pub fn bye_viewer(&self, id: u64, message: &str) -> bool {
         let mut l = self.link();
         let Some(i) = l.viewers.iter().position(|v| v.id == id) else { return false };
-        let mut v = l.viewers.remove(i);
-        let _ = write_frame(&mut v.stream, BYE, message.as_bytes());
-        let _ = v.stream.shutdown(std::net::Shutdown::Both);
+        let v = l.viewers.remove(i);
+        v.peer.send(BYE, message.as_bytes());
+        v.peer.close();
         true
     }
 
@@ -326,8 +409,7 @@ impl Out {
         l.viewers.retain_mut(|v| {
             let next = viewer_frame(frame, v.size, badge);
             let bytes = paint(v.shown.as_ref(), &next);
-            if write_frame(&mut v.stream, OUT, &bytes).is_err() {
-                let _ = v.stream.shutdown(std::net::Shutdown::Both);
+            if !v.peer.send(OUT, &bytes) {
                 return false;
             }
             v.shown = Some(next);
@@ -343,8 +425,7 @@ impl Out {
         if kicked {
             l.bye("[trix attached from another terminal · `trix view` watches without taking over]");
         }
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-        l.client = Some((id, stream));
+        l.client = Some((id, Peer::new(stream)));
         l.dropped = None;
         l.size = (size.0.max(1), size.1.max(1));
         l.buf.clear();
@@ -359,10 +440,19 @@ impl Out {
     /// The workspace is going away: everyone is done.
     pub fn bye_all(&self, message: &str) {
         let mut l = self.link();
-        l.bye(message);
-        l.send_viewers(BYE, message.as_bytes());
-        for v in l.viewers.drain(..) {
-            let _ = v.stream.shutdown(std::net::Shutdown::Both);
+        let mut peers: Vec<Peer> = l.client.take().map(|(_, p)| p).into_iter().collect();
+        peers.extend(l.viewers.drain(..).map(|v| v.peer));
+        drop(l);
+        for p in &peers {
+            p.send(BYE, message.as_bytes());
+            p.close();
+        }
+        // The server is about to exit: let the goodbyes go out first, but
+        // don't wait long on a terminal that isn't reading.
+        let until = Instant::now() + Duration::from_secs(1);
+        for p in &peers {
+            p.wait_done(until);
+            p.hang_up();
         }
     }
 
@@ -372,7 +462,9 @@ impl Out {
         let mut l = self.link();
         l.viewers.retain(|v| v.id != id);
         if l.client.as_ref().is_some_and(|(c, _)| *c == id) {
-            l.client = None;
+            if let Some((_, p)) = l.client.take() {
+                p.hang_up();
+            }
             return true;
         }
         // Dropped earlier for stalling, and nobody has taken over since.
@@ -779,6 +871,35 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_viewer_that_never_reads_cannot_block_the_server() {
+        let out = Out::default();
+        let (server_end, _client_end) = UnixStream::pair().unwrap();
+        out.add_viewer(1, server_end, (80, 24));
+        let chunk = vec![b'x'; 64 << 10];
+        let start = Instant::now();
+        let mut sent = 0;
+        while out.viewers() == 1 && sent < 1000 {
+            out.send_all(&chunk);
+            sent += 1;
+        }
+        assert_eq!(out.viewers(), 0, "dropped once too far behind");
+        assert!(start.elapsed() < Duration::from_millis(500), "never waited on it: {:?}", start.elapsed());
+        assert!(sent * chunk.len() > MAX_BEHIND, "not before it fell behind ({sent} frames)");
+    }
+
+    #[test]
+    fn goodbyes_reach_a_reading_viewer() {
+        let out = Out::default();
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+        out.add_viewer(1, server_end, (80, 24));
+        out.send_all(b"hello");
+        out.bye_all("[trix quit]");
+        assert_eq!(read_frame(&mut client_end).unwrap(), (OUT, b"hello".to_vec()));
+        assert_eq!(read_frame(&mut client_end).unwrap(), (BYE, b"[trix quit]".to_vec()));
+        assert!(read_frame(&mut client_end).is_err(), "hung up after");
+    }
     use std::io::Cursor;
 
     #[test]

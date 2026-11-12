@@ -182,6 +182,13 @@ struct Drag {
 }
 
 pub struct App {
+    /// A search the typing outran, and when it's due (see `search_changed`).
+    pub search_due: Option<Instant>,
+    /// The times on screen at the last `slow_tick` (`ui::times_shown`).
+    times_shown: String,
+    /// The last workspace that failed to save, and when.
+    save_failed: Option<(Saved, Instant)>,
+    last_search: Option<Instant>,
     pub agents: Vec<Agent>,
     specs: HashMap<u32, Spawn>,
     pub focus: usize,
@@ -208,7 +215,7 @@ pub struct App {
     pub started: Instant,
     pub start_dir: PathBuf,
     drag: Option<Drag>,
-    git_targets: Arc<Mutex<Vec<(u32, PathBuf)>>>,
+    git_targets: Arc<Mutex<GitTargets>>,
     pub last_title: String,
     pub pane_size: (u16, u16),
     /// Read-only terminals watching (`trix view`).
@@ -233,7 +240,7 @@ impl App {
         let mut theme_watch = ThemeWatcher::new();
         let polled = theme_watch.poll();
         let themed = polled.is_some();
-        let git_targets = Arc::new(Mutex::new(Vec::new()));
+        let git_targets = Arc::new(Mutex::new(GitTargets::default()));
         spawn_git_watcher(git_targets.clone(), tx.clone());
         let prefs = state::load_prefs();
         App {
@@ -258,6 +265,10 @@ impl App {
             quit: false,
             detach: false,
             dirty: true,
+            search_due: None,
+            last_search: None,
+            times_shown: String::new(),
+            save_failed: None,
             started: Instant::now(),
             start_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             drag: None,
@@ -327,15 +338,30 @@ impl App {
             .collect()
     }
 
-    /// Save the workspace if it changed since last time.
+    /// Save the workspace if it changed since last time. A save that fails
+    /// (disk full, read-only folder) is retried when the workspace changes or
+    /// a minute later, and logged once, not every second.
     pub fn persist(&mut self) {
         let snap = self.snapshot();
         if self.last_saved.as_ref() == Some(&snap) {
             return;
         }
+        if self.save_failed.as_ref().is_some_and(|(s, at)| *s == snap && at.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
         match state::store(&snap) {
-            Ok(()) => self.last_saved = Some(snap),
-            Err(e) => eprintln!("trix: could not save workspace to {}: {e}", state::path().display()),
+            Ok(()) => {
+                if self.save_failed.take().is_some() {
+                    eprintln!("trix: saving the workspace works again");
+                }
+                self.last_saved = Some(snap);
+            }
+            Err(e) => {
+                if self.save_failed.is_none() {
+                    eprintln!("trix: could not save workspace to {}: {e} (retrying quietly)", state::path().display());
+                }
+                self.save_failed = Some((snap, Instant::now()));
+            }
         }
     }
 
@@ -455,9 +481,30 @@ impl App {
         self.dirty = true;
     }
 
-    pub fn animating(&self) -> bool {
-        self.agents.iter().any(|a| matches!(a.state, State::Working | State::Blocked | State::Starting))
-            || self.toast.as_ref().is_some_and(|t| t.at.elapsed() < Duration::from_secs(4))
+    /// When the picture next changes on its own: the next spinner step (every
+    /// 90 ms), the next blink of a "needs you" glyph (every 540 ms), a toast
+    /// fading. `None` when nothing moves. Frames are numbered from `started`
+    /// (see `ui::frame_no`), so these are exact.
+    pub fn next_frame_change(&self) -> Option<Instant> {
+        const STEP: u128 = 90;
+        let ms = self.started.elapsed().as_millis();
+        let at = |n: u128| self.started + Duration::from_millis((n + 1) as u64);
+        let spin = self.agents.iter().any(|a| matches!(a.state, State::Working | State::Starting));
+        let blink = self.agents.iter().any(|a| a.state == State::Blocked);
+        let mut next: Option<Instant> = None;
+        let mut take = |t: Instant| next = Some(next.map_or(t, |n: Instant| n.min(t)));
+        if spin {
+            take(at((ms / STEP + 1) * STEP));
+        } else if blink {
+            take(at((ms / (6 * STEP) + 1) * 6 * STEP));
+        }
+        if let Some(t) = &self.toast {
+            let fade = t.at + Duration::from_millis(3200);
+            if Instant::now() < fade {
+                take(fade + Duration::from_millis(1));
+            }
+        }
+        next
     }
 
     // ───────────────────────────── spawning ─────────────────────────────
@@ -631,8 +678,12 @@ impl App {
     }
 
     fn sync_git_targets(&self) {
-        let list = self.agents.iter().map(|a| (a.id, a.live_cwd())).collect();
-        *self.git_targets.lock().unwrap() = list;
+        // An exited agent's branch and diff can't change under it.
+        let agents = self.agents.iter().filter(|a| a.state != State::Exited).map(|a| (a.id, a.live_cwd())).collect();
+        let watched = self.out.attached();
+        let mut t = self.git_targets.lock().unwrap();
+        t.agents = agents;
+        t.watched = watched;
     }
 
     pub fn set_focus(&mut self, idx: usize) {
@@ -807,7 +858,12 @@ impl App {
         }
         self.sync_git_targets();
         self.persist();
-        self.dirty = true; // clocks & elapsed timers
+        // The clock and the timers: redraw when what they show changed.
+        let shown = crate::ui::times_shown(self);
+        if shown != self.times_shown {
+            self.times_shown = shown;
+            self.dirty = true;
+        }
     }
 
     fn transitioned(&mut self, i: usize, prev: State) {
@@ -1013,7 +1069,7 @@ impl App {
                 Modal::Broadcast(t, _) | Modal::Rename(_, t) => t.insert(&s.replace('\n', " ")),
                 Modal::Search(q) => {
                     q.input.insert(s.lines().next().unwrap_or(""));
-                    self.refresh_search();
+                    self.search_changed();
                 }
                 _ => {}
             }
@@ -1027,6 +1083,10 @@ impl App {
     }
 
     fn modal_key(&mut self, k: KeyEvent) {
+        // Jump to a hit for what's typed now, not for what was typed last scan.
+        if k.code == KeyCode::Enter && self.search_due.is_some() && matches!(self.modal, Some(Modal::Search(_))) {
+            self.refresh_search();
+        }
         let Some(modal) = &mut self.modal else { return };
         if k.code == KeyCode::Esc {
             self.modal = None;
@@ -1055,7 +1115,7 @@ impl App {
                         let before = s.input.text.clone();
                         s.input.key(&k);
                         if s.input.text != before {
-                            self.refresh_search();
+                            self.search_changed();
                         }
                     }
                 }
@@ -1178,8 +1238,28 @@ impl App {
     }
 
     /// Re-run the open search over every agent's scrollback.
+    /// The query changed. A search reads every agent's whole scrollback
+    /// (tens of ms with a few full ones), so while typing it runs at most
+    /// every `SEARCH_EVERY`, and once more when the typing stops.
+    fn search_changed(&mut self) {
+        const SEARCH_EVERY: Duration = Duration::from_millis(150);
+        match self.last_search {
+            Some(t) if t.elapsed() < SEARCH_EVERY => self.search_due = Some(t + SEARCH_EVERY),
+            _ => self.refresh_search(),
+        }
+    }
+
+    /// Run the search `search_changed` put off, once it's due.
+    pub fn run_due_search(&mut self) {
+        if self.search_due.is_some_and(|t| Instant::now() >= t) {
+            self.refresh_search();
+        }
+    }
+
     fn refresh_search(&mut self) {
+        self.search_due = None;
         let Some(Modal::Search(s)) = &self.modal else { return };
+        self.last_search = Some(Instant::now());
         let query = s.input.text.clone();
         let mut hits = Vec::new();
         let (mut agents, mut capped) = (0, false);
@@ -1487,24 +1567,62 @@ pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String,
     Ok((path, branch, false))
 }
 
-fn spawn_git_watcher(targets: Arc<Mutex<Vec<(u32, PathBuf)>>>, tx: Sender<AppEvent>) {
+/// A folder's branch, and its diff against HEAD (files, insertions, deletions).
+type GitInfo = (Option<String>, Option<(u32, u32, u32)>);
+
+/// What the git watcher looks at: each live agent's folder, and whether
+/// anyone is attached to see the result.
+#[derive(Default)]
+struct GitTargets {
+    agents: Vec<(u32, PathBuf)>,
+    watched: bool,
+}
+
+/// Branch and diff of every agent's folder, refreshed every few seconds while
+/// someone is attached and less often while not (`trix ls --json` still reads
+/// them). git runs once per folder however many agents share it, and only a
+/// change is sent on.
+fn spawn_git_watcher(targets: Arc<Mutex<GitTargets>>, tx: Sender<AppEvent>) {
+    const WATCHED: Duration = Duration::from_secs(3);
+    const UNWATCHED: Duration = Duration::from_secs(20);
     std::thread::Builder::new()
         .name("trix-git".into())
-        .spawn(move || loop {
-            let list = targets.lock().unwrap().clone();
-            for (id, dir) in list {
-                let branch = git(&dir, &["branch", "--show-current"])
-                    .filter(|b| !b.is_empty())
-                    .or_else(|| git(&dir, &["rev-parse", "--short", "HEAD"]));
-                let diff = branch.as_ref().and_then(|_| {
-                    let s = git(&dir, &["diff", "HEAD", "--shortstat"])?;
-                    Some(parse_shortstat(&s))
-                });
-                if tx.send(AppEvent::Git(id, branch, diff)).is_err() {
-                    return;
+        .spawn(move || {
+            let mut known: HashMap<u32, GitInfo> = HashMap::new();
+            let mut last_run: Option<Instant> = None;
+            loop {
+                let (agents, watched) = {
+                    let t = targets.lock().unwrap();
+                    (t.agents.clone(), t.watched)
+                };
+                let every = if watched { WATCHED } else { UNWATCHED };
+                // Look again every second, so attaching speeds it up at once.
+                if last_run.is_some_and(|t| t.elapsed() < every) && agents.iter().all(|(id, _)| known.contains_key(id)) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
+                last_run = Some(Instant::now());
+                let mut by_dir: HashMap<&PathBuf, GitInfo> = HashMap::new();
+                for (id, dir) in &agents {
+                    let now = by_dir
+                        .entry(dir)
+                        .or_insert_with(|| {
+                            let branch = git(dir, &["branch", "--show-current"])
+                                .filter(|b| !b.is_empty())
+                                .or_else(|| git(dir, &["rev-parse", "--short", "HEAD"]));
+                            let diff = branch.as_ref().and_then(|_| Some(parse_shortstat(&git(dir, &["diff", "HEAD", "--shortstat"])?)));
+                            (branch, diff)
+                        })
+                        .clone();
+                    if known.get(id) != Some(&now) {
+                        known.insert(*id, now.clone());
+                        if tx.send(AppEvent::Git(*id, now.0, now.1)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                known.retain(|id, _| agents.iter().any(|(a, _)| a == id));
             }
-            std::thread::sleep(Duration::from_secs(3));
         })
         .ok();
 }
@@ -1651,6 +1769,63 @@ mod tests {
         app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.modal, Some(Modal::Rename(..))), "rename to a taken name is refused");
         assert_eq!(app.agents.last().unwrap().name, "web-2");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn fast_typing_searches_once_more_when_it_stops() {
+        let mut app = test_app();
+        app.agents.push(crate::agent::test_agent(Kind::Claude));
+        app.modal = Some(Modal::Search(Search::default()));
+        for c in "error".chars() {
+            app.modal_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let first = app.last_search.expect("the first key searches at once");
+        assert!(app.search_due.is_some(), "the rest wait for a pause");
+        app.run_due_search();
+        assert_eq!(app.last_search, Some(first), "not due yet");
+        std::thread::sleep(Duration::from_millis(160));
+        app.run_due_search();
+        assert!(app.search_due.is_none() && app.last_search != Some(first), "ran once typing stopped");
+
+        // Enter jumps with the hits for what's typed, even mid-wait.
+        app.modal_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.search_due.is_some());
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search_due.is_none());
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn frames_are_scheduled_for_when_the_picture_changes() {
+        let mut app = test_app();
+        app.toast = None;
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.set_state(State::Idle, false);
+        app.agents.push(a);
+        assert_eq!(app.next_frame_change(), None, "nothing moves");
+        let until = |app: &App| app.next_frame_change().unwrap().saturating_duration_since(Instant::now());
+        app.agents[0].set_state(State::Blocked, false);
+        let wait = until(&app);
+        assert!(wait <= Duration::from_millis(541), "next blink: {wait:?}");
+        // Over a second of blinking, only the blinks are drawn.
+        let mut frames = 0;
+        let end = Instant::now() + Duration::from_millis(1100);
+        while Instant::now() < end {
+            std::thread::sleep(until(&app));
+            frames += 1;
+        }
+        assert!((2..=3).contains(&frames), "{frames} frames for a blink every 540 ms");
+        app.agents[0].set_state(State::Working, false);
+        assert!(until(&app) <= Duration::from_millis(91), "spinner steps every 90 ms");
+        app.agents[0].set_state(State::Done, false);
+        app.toast("hi", ToastKind::Info);
+        let wait = until(&app);
+        assert!(wait > Duration::from_millis(3000) && wait <= Duration::from_millis(3201), "the toast fades: {wait:?}");
         for a in &app.agents {
             a.shutdown();
         }

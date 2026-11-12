@@ -8,7 +8,7 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::Term;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Flags, LineLength};
 
 /// Most hits kept per agent, so one chatty pane can't drown the rest.
 pub const PER_AGENT: usize = 200;
@@ -35,7 +35,23 @@ fn exact(query: &str) -> bool {
 }
 
 fn fold(c: char, exact: bool) -> char {
-    if exact { c } else { c.to_lowercase().next().unwrap_or(c) }
+    if exact {
+        c
+    } else if c.is_ascii() {
+        c.to_ascii_lowercase()
+    } else {
+        c.to_lowercase().next().unwrap_or(c)
+    }
+}
+
+/// Where the already folded `needle` first occurs in the already folded
+/// `hay`: the fast path for scanning the whole scrollback.
+fn find_folded(hay: &[char], needle: &[char]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| hay[i] == first && hay[i + 1..i + needle.len()] == *rest)
 }
 
 /// Where `needle` first occurs in `hay`, in chars.
@@ -110,14 +126,47 @@ pub fn search_term<T>(term: &Term<T>, agent: u32, query: &str, limit: usize) -> 
         return Vec::new();
     }
     let exact = exact(query);
+    // Rows are scanned without their blank ends, so check them for the query
+    // without its trailing blanks: never a miss, and the exact `find` on the
+    // full line below still decides.
+    let mut folded: Vec<char> = needle.iter().map(|&c| fold(c, exact)).collect();
+    while folded.last().is_some_and(|c| c.is_whitespace()) {
+        folded.pop();
+    }
     let grid = term.grid();
     let history = grid.history_size();
     let bottom = grid.screen_lines() as i32 - 1;
     let top = -(history as i32);
+    let cols = grid.columns();
     let mut hits = Vec::new();
+    // Most lines don't match: check each one with a reused buffer of folded
+    // chars, and build the full line (text and cell positions) only for hits.
+    let mut hay: Vec<char> = Vec::with_capacity(cols);
     // Walk up one logical line at a time, from the bottom of the screen.
     let mut last = bottom;
     while last >= top && hits.len() < limit {
+        let mut first = last;
+        while first > top && grid[Line(first - 1)][Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+            first -= 1;
+        }
+        hay.clear();
+        for row in first..=last {
+            let r = &grid[Line(row)];
+            // The blank end of a row holds nothing `folded` can match.
+            let len = if row < last { cols } else { r.line_length().0 };
+            for c in 0..len {
+                let cell = &r[Column(c)];
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' || cell.c == '\t' { ' ' } else { cell.c };
+                hay.push(fold(ch, exact));
+            }
+        }
+        if find_folded(&hay, &folded).is_none() {
+            last = first - 1;
+            continue;
+        }
         let (line, first) = logical_ending_at(term, last);
         if let Some(at) = find(&line.chars, &needle, exact) {
             let end = at + needle.len() - 1;
@@ -284,6 +333,16 @@ mod tests {
         let h = search_term(&t, 1, "error", 10);
         assert_eq!(h[0].at, 3, "chars, not cells");
         assert_eq!(h[0].start.column.0, 5, "cells: each wide char takes two");
+    }
+
+    #[test]
+    fn a_query_ending_in_a_blank_still_matches_at_the_end_of_a_line() {
+        let t = term(20, 5, "an error\nerrors here\n");
+        let hits = search_term(&t, 1, "error ", 10);
+        assert_eq!(hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(), ["an error"]);
+        assert_eq!(search_term(&t, 1, "ERROR", 10), vec![], "a capital means exact case");
+        assert_eq!(search_term(&t, 1, "Error", 10).len(), 0);
+        assert_eq!(search_term(&t, 1, "errors", 10)[0].text, "errors here");
     }
 
     #[test]
