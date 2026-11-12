@@ -226,7 +226,7 @@ git clone https://github.com/leofle/trix.git && cd trix
 cargo install --path .          # installs ~/.cargo/bin/trix
 ```
 
-Then set your terminal's Option key to send Alt (below), and run `trix claude` in a project folder. trix starts [Claude Code](https://claude.com/claude-code), Codex and the [other supported agents](#supported-agents) but doesn't install them, so have them installed and logged in first.
+Then set your terminal's Option key to send Alt (below), and run `trix claude` in a project folder. trix starts [Claude Code](https://claude.com/claude-code), Codex and the [other supported agents](#supported-agents). One that isn't installed yet installs in its own pane the first time you start it, with Homebrew or npm (see [Not installed yet](#not-installed-yet)). Log in to each agent yourself the first time it runs.
 
 ### Differences
 
@@ -237,7 +237,7 @@ Then set your terminal's Option key to send Alt (below), and run `trix claude` i
 
 ## Supported agents
 
-trix starts each of these agents by name, with an argv (never through a shell), and installs nothing into your agent configs: everything it adds is passed to that one process and lives in `$XDG_RUNTIME_DIR/trix` until the server stops. Have the agents installed and logged in first.
+trix starts each of these agents by name, with an argv (never through a shell), and installs nothing into your agent configs: everything it adds is passed to that one process and lives in `$XDG_RUNTIME_DIR/trix` until the server stops. An agent that isn't installed yet installs first, in its own pane ([below](#not-installed-yet)). Log in to each agent yourself the first time it runs.
 
 | kind | runs | live state from | needs-you from | resume |
 | --- | --- | --- | --- | --- |
@@ -262,6 +262,24 @@ trix starts each of these agents by name, with an argv (never through a shell), 
 - **OpenCode** gets a small plugin, appended to your own `OPENCODE_CONFIG_CONTENT` if you set one (left alone if that isn't a JSON object). It hands OpenCode's events (`session.status`, `permission.asked`, `question.asked`, `tool.execute.before`, …) to `trix hook opencode`, and tells a subagent's sessions from the pane's own so a subagent finishing isn't the turn finishing. It reports only inside a trix pane.
 - **Cursor** gets a plugin directory, `--plugin-dir`, holding only observing hooks: `sessionStart`, `beforeSubmitPrompt`, `postToolUse(Failure)`, `stop`, `sessionEnd`. None of Cursor's permission hooks (`preToolUse`, `beforeShellExecution`, …): their answer decides whether a tool runs, and trix never approves anything. `trix hook cursor` answers `{}` (and `{"continue": true}` before a prompt). cursor-agent 2026.11.11 runs only `sessionStart` and the tool hooks from a plugin, not `beforeSubmitPrompt` or `stop`. So Cursor's screen says when a turn starts and ends: it redraws while it thinks, streams and runs a command, and is silent at its prompt and while an approval waits. The tool hooks add what it ran (`Shell wc -l fruit.txt ✓`), and `sessionStart` names the conversation that restore resumes. Cursor has no hook for its approval prompts either, so trix reads those from the screen: `Run (once)`, `Skip (esc or n)`, `Waiting for approval...`, workspace trust. Only that wording counts, so a question in Cursor's reply doesn't hold the pane on needs-you. If your team's Cursor settings disallow local plugins, the hooks don't run: the state still comes from the screen, but there's no tool detail and restore has no conversation to resume.
 - **Context gauge** stays Claude and Codex only.
+
+### Not installed yet
+
+When an agent's command isn't on trix's `PATH`, its pane installs the agent first, then starts it with the arguments it would have had (its first prompt, `--resume`, trix's hooks). You watch the install as it runs. Until it's done, the pane shows `installing grok (npm)` and counts as starting: `trix send` waits for it and `trix wait` keeps waiting, and the install output never reads as the agent working. If the install fails, its output stays on screen and Enter tries again. Two panes starting the same agent don't install it twice: the second one waits, then starts it.
+
+trix uses the first of these you have:
+
+| kind | mise (as on Omarchy) | Homebrew | npm | install script |
+| --- | --- | --- | --- | --- |
+| `claude` | `claude` | cask `claude-code` | `@anthropic-ai/claude-code` | `claude.ai/install.sh` |
+| `codex` | `codex` | cask `codex` | `@openai/codex` | |
+| `grok` | `npm:@xai-official/grok` | none (Homebrew's `grok` is another program) | `@xai-official/grok` | |
+| `opencode` | `opencode` | `opencode` | `opencode-ai` | |
+| `cursor` | | cask `cursor-cli` | | `cursor.com/install` |
+
+- **mise** runs `mise use -g <package>`. If mise's shims aren't on trix's `PATH`, the agent runs through `mise x`.
+- **The install scripts** are the vendors' own, fetched with curl and run by bash. They put the agent in `~/.local/bin`, which trix adds to that agent's `PATH` if it's missing.
+- trix only reads its own `PATH` to decide, so an agent installed some other way, somewhere on your `PATH`, is never installed again. The server keeps the `PATH` of the terminal that started it: after installing a tool like mise or Homebrew, restart trix from a new terminal (`trix kill`, then `trix`).
 
 ## Codex
 
