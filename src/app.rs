@@ -338,8 +338,9 @@ impl App {
                     // A shell may have cd'd since; agents stay where they started.
                     cwd: if a.kind == Kind::Shell { a.live_cwd() } else { spec.cwd.clone() },
                     command: spec.command.clone(),
-                    // A Grok id is trix's own until a turn makes it a conversation.
-                    session: if a.kind.resumes() && (a.kind != Kind::Grok || a.turn_seen) { a.session.clone() } else { None },
+                    // An id trix made up for Grok names no conversation until
+                    // a turn; one it resumed does from the start.
+                    session: if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) { a.session.clone() } else { None },
                 })
             })
             .collect()
@@ -1813,16 +1814,32 @@ mod tests {
     }
 
     #[test]
-    fn a_grok_session_is_saved_only_after_a_turn() {
+    fn a_new_grok_session_is_saved_only_after_a_turn() {
         let mut app = test_app();
         let mut a = crate::agent::test_agent(Kind::Grok);
         a.id = 3;
         a.session = Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c".into());
+        a.session_named_by_trix = true;
         app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
         app.agents.push(a);
         assert_eq!(app.open_agents()[0].session, None, "no turn yet: nothing to resume");
         app.agents[0].turn_seen = true;
         assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"));
+        app.agents[0].shutdown();
+    }
+
+    #[test]
+    fn a_resumed_grok_session_is_saved_before_a_turn() {
+        let mut app = test_app();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // Grok isn't installed on CI: run a stand-in, with the spec a restore makes.
+        let spec = Spawn { kind: Kind::Custom, name: "g".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 30".into()), prompt: None, branch_note: None, resume: Some("b1c2".into()) };
+        let mut a = Agent::spawn(4, spec, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), &Default::default(), Path::new("/bin/true")).unwrap();
+        a.kind = Kind::Grok;
+        assert!(!a.session_named_by_trix && !a.turn_seen);
+        app.specs.insert(4, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
+        app.agents.push(a);
+        assert_eq!(app.open_agents()[0].session.as_deref(), Some("b1c2"), "restored, then saved again before you type");
         app.agents[0].shutdown();
     }
 

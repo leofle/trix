@@ -242,6 +242,9 @@ pub struct Agent {
     /// blinks while Grok thinks its terminal is unfocused, so it counts for
     /// a moment after it goes.
     title_attention: Option<Instant>,
+    /// `session` is an id trix made up for a new Grok conversation, not one
+    /// it resumed: no conversation exists under it until a turn.
+    pub session_named_by_trix: bool,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -349,6 +352,7 @@ impl Agent {
             last_resize: now,
             activity: spec.branch_note.unwrap_or_else(|| "launching".into()),
             last_prompt: spec.prompt,
+            session_named_by_trix: fresh.is_some(),
             session: spec.resume.or(fresh),
             title: None,
             exit_code: None,
