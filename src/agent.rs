@@ -66,6 +66,28 @@ impl Kind {
     fn prompts_only_on_screen(self) -> bool {
         matches!(self, Kind::Grok | Kind::Cursor)
     }
+    /// Kinds whose own approval wording `kind_prompt` knows, so a prompt on
+    /// screen turns them blocked mid-turn. OpenCode's come as events too:
+    /// the screen is a second source, never the only one.
+    fn reads_prompts_on_screen(self) -> bool {
+        self.prompts_only_on_screen() || self == Kind::OpenCode
+    }
+    /// The new-agent dialog's letter for this kind. Not `h` or `l`, which
+    /// step through the kinds.
+    pub fn shortcut(self) -> Option<char> {
+        match self {
+            Kind::Claude => Some('c'),
+            Kind::Codex => Some('x'),
+            Kind::Grok => Some('g'),
+            Kind::OpenCode => Some('o'),
+            Kind::Cursor => Some('u'),
+            Kind::Shell => Some('s'),
+            Kind::Custom => None,
+        }
+    }
+    pub fn from_shortcut(c: char) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.shortcut() == Some(c))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,6 +555,9 @@ impl Agent {
                     None
                 }
             }
+            // OpenCode reports its session idle at start too, and the new
+            // agents' turn ends mean nothing before a turn began.
+            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok") && !self.turn_seen => None,
             "Stop" | "agent-turn-complete" => {
                 self.activity = match self.tools_used {
                     0 => "replied".into(),
@@ -617,12 +642,16 @@ impl Agent {
 
         // Grok and Cursor have no hook for their approval prompts: the
         // prompt on screen is the sign, read only from their own wording.
+        // OpenCode's TUI may keep redrawing under its prompt, so no quiet
+        // spell is asked for: the wording alone is specific enough.
+        if self.kind.reads_prompts_on_screen() && self.state == State::Working && self.screen_kind_prompt() {
+            self.activity = "needs your approval".into();
+            return self.set_state(State::Blocked, focused);
+        }
         if self.kind.prompts_only_on_screen() {
-            if self.state == State::Working && quiet > Duration::from_millis(500) && self.screen_kind_prompt() {
-                self.activity = "needs your approval".into();
-                return self.set_state(State::Blocked, focused);
-            }
-            if self.hooked && self.state == State::Blocked && quiet > Duration::from_secs(2) && !self.screen_needs_input() {
+            // The agent's prose ("would you like to…") can stay on screen
+            // after the prompt goes: only its own prompt wording keeps it.
+            if self.hooked && self.state == State::Blocked && quiet > Duration::from_secs(2) && !self.screen_kind_prompt() {
                 self.activity = "working".into();
                 return self.set_state(State::Working, focused);
             }
@@ -887,7 +916,10 @@ fn kind_prompt(kind: Kind, screen: &str) -> bool {
     let t = screen.to_lowercase();
     let any = |ps: &[&str]| ps.iter().any(|p| t.contains(p));
     match kind {
-        Kind::Grok => any(&["ctrl+o:always-approve", "ctrl+o:yolo", "no, reject (type to add feedback)", "tab:next answer", "x:dismiss"]),
+        Kind::Grok => {
+            any(&["ctrl+o:always-approve", "ctrl+o:yolo", "no, reject (type to add feedback)", "tab:next answer", "x:dismiss"])
+                || (t.contains("yes, proceed") && t.contains("no, quit"))
+        }
         Kind::OpenCode => t.contains("△ permission required") || (t.contains("allow once") && t.contains("allow always")),
         Kind::Cursor => {
             any(&["skip (esc or n)", "waiting for approval...", "workspace trust required", "do you trust the contents of this directory"])
@@ -1771,6 +1803,51 @@ mod tests {
         }
         a.heuristics(false);
         assert_eq!(a.state, State::Blocked, "redrawing while it asks");
+        a.shutdown();
+    }
+
+    #[test]
+    fn opencode_idle_at_start_is_not_done() {
+        let mut a = test_agent(Kind::OpenCode);
+        a.on_hook(&hook("opencode", "SessionStart", None, None), false);
+        assert_eq!(a.on_hook(&hook("opencode", "Stop", None, None), false), None);
+        assert_eq!(a.state, State::Idle, "no turn yet: no Done, no chime");
+        a.on_hook(&hook("opencode", "UserPromptSubmit", None, Some("hi")), false);
+        a.on_hook(&hook("opencode", "Stop", None, None), false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    #[test]
+    fn opencode_prompt_on_screen_blocks_mid_turn() {
+        let mut a = test_agent(Kind::OpenCode);
+        a.on_hook(&hook("opencode", "UserPromptSubmit", None, Some("hi")), false);
+        show(&a, "△ Permission required\n  $ rm -rf dist\n  Allow once   Allow always   Reject\n");
+        for _ in 0..8 {
+            a.on_output();
+        }
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked, "even while it redraws, and before permission.asked");
+        a.on_hook(&hook("opencode", "Answered", None, None), false);
+        assert_eq!(a.state, State::Working);
+        a.shutdown();
+    }
+
+    #[test]
+    fn cursor_prose_does_not_keep_it_blocked() {
+        let mut a = test_agent(Kind::Cursor);
+        a.on_hook(&hook("cursor", "UserPromptSubmit", None, Some("go")), false);
+        show(&a, "Run this command?\n → Run (once) (y)\n   Skip (esc or n)\n");
+        a.on_output();
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked);
+        // Approved: the prompt is gone, the agent's question is still on screen.
+        show(&a, "\x1b[2J\x1b[HWould you like to add tests too?\n  running…\n");
+        a.on_output();
+        a.last_output = ago(Duration::from_secs(3));
+        assert!(a.screen_needs_input(), "the generic patterns would see a question");
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working);
         a.shutdown();
     }
 

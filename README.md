@@ -164,7 +164,7 @@ The sidebar size you pick with `alt+m` is kept separately, in `prefs.json` in th
 
 | key | action |
 | --- | --- |
-| `alt+n` | new agent (claude · codex · grok · opencode · cursor · shell · custom command, folder, first prompt, worktree) |
+| `alt+n` | new agent (claude · codex · grok · opencode · cursor · shell · custom command, folder, first prompt, worktree); on the kind row, `c` `x` `g` `o` `u` `s` pick claude, codex, grok, opencode, cursor, shell |
 | `alt+1…9` / `alt+j` `alt+k` | jump / next / previous |
 | `alt+a` | next agent that needs you |
 | `alt+g` | grid ⇄ focus |
@@ -223,10 +223,11 @@ trix starts each of these agents by name, with an argv (never through a shell), 
       "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "trix hook grok" }] }],
       "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "trix hook grok" }] }],
       "Stop":             [{ "hooks": [{ "type": "command", "command": "trix hook grok" }] }],
-      "StopCancelled":    [{ "hooks": [{ "type": "command", "command": "trix hook grok" }] }]
+      "StopCancelled":    [{ "hooks": [{ "type": "command", "command": "trix hook grok" }] }],
+      "Notification":     [{ "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "trix hook grok" }] }]
   } }
   ```
-  With it, the hooks report the turn and the title only adds approvals. Grok's installer also links the name `agent`, which Cursor's installer uses too, so trix never runs `agent`.
+  With it, the hooks report the turn and the title only adds approvals. Grok has no `PermissionRequest` hook; a waiting permission prompt raises `Notification` with type `permission_prompt` ([Grok hook events](https://docs.x.ai/build/features/hooks)), which trix shows as needs-you. Grok's installer also links the name `agent`, which Cursor's installer uses too, so trix never runs `agent`.
 - **OpenCode** gets a small plugin, appended to your own `OPENCODE_CONFIG_CONTENT` if you set one (left alone if that isn't a JSON object). It hands OpenCode's events (`session.status`, `permission.asked`, `question.asked`, `tool.execute.before`, …) to `trix hook opencode`, and tells a subagent's sessions from the pane's own so a subagent finishing isn't the turn finishing. It reports only inside a trix pane.
 - **Cursor** gets a plugin directory, `--plugin-dir`, holding only observing hooks: `sessionStart`, `beforeSubmitPrompt`, `postToolUse(Failure)`, `stop`, `sessionEnd`. None of Cursor's permission hooks (`preToolUse`, `beforeShellExecution`, …): their answer decides whether a tool runs, and trix never approves anything. `trix hook cursor` answers `{}` (and `{"continue": true}` before a prompt). Cursor has no hook for its approval prompts, so trix reads those from the screen: `Run (once)`, `Skip (esc or n)`, `Waiting for approval...`, workspace trust. If your team's Cursor settings disallow local plugins, the hooks don't run and Cursor falls back to screen heuristics, and restore has no conversation to resume.
 - **Context gauge** stays Claude and Codex only.

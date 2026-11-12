@@ -374,10 +374,10 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     let spark_w = spark_width(10usize.min(w.saturating_sub(16)));
     let mut spans = vec![
         Span::raw("       "),
-        Span::styled(format!("{kind:<7}"), Style::new().fg(mix(kind_color(t, a.kind), bg, 0.25))),
+        Span::styled(format!("{kind:<8}"), Style::new().fg(mix(kind_color(t, a.kind), bg, 0.25))),
     ];
     spans.extend(sparkline(a, spark_w, if a.state == State::Idle || a.state == State::Exited { t.dim } else { sc }, mix(t.muted, bg, 0.4)));
-    let used = 7 + 7 + spark_w;
+    let used = 7 + 8 + spark_w;
     let mut git = String::new();
     let mut diff = None;
     if let Some((files, add, del)) = a.diff.filter(|d| d.0 > 0) {

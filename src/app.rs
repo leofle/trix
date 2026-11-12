@@ -1234,9 +1234,11 @@ impl App {
                     0 => match k.code {
                         KeyCode::Left | KeyCode::Char('h') => f.kind = (f.kind + Kind::ALL.len() - 1) % Kind::ALL.len(),
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => f.kind = (f.kind + 1) % Kind::ALL.len(),
-                        KeyCode::Char('c') => f.kind = 0,
-                        KeyCode::Char('x') => f.kind = 1,
-                        KeyCode::Char('s') => f.kind = 2,
+                        KeyCode::Char(c) => {
+                            if let Some(i) = Kind::from_shortcut(c).and_then(|k| Kind::ALL.iter().position(|a| *a == k)) {
+                                f.kind = i;
+                            }
+                        }
                         _ => {}
                     },
                     1 => {
@@ -1780,6 +1782,36 @@ mod tests {
         // The terminal echoes each line, then cat prints it.
         assert_eq!(lines, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter");
         app.agents[i].shutdown();
+    }
+
+    #[test]
+    fn kind_letters_pick_their_kind() {
+        let mut app = test_app();
+        for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('s', Kind::Shell)] {
+            app.open_new();
+            app.modal_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+            assert_eq!(Kind::ALL[f.kind], kind, "{c}");
+            app.modal = None;
+        }
+        // Letters are unique, and none is a kind-row navigation key.
+        let letters: Vec<char> = Kind::ALL.iter().filter_map(|k| k.shortcut()).collect();
+        assert_eq!(letters.len(), letters.iter().collect::<HashSet<_>>().len());
+        assert!(!letters.iter().any(|c| matches!(c, 'h' | 'l' | ' ')));
+    }
+
+    #[test]
+    fn a_grok_session_is_saved_only_after_a_turn() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Grok);
+        a.id = 3;
+        a.session = Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c".into());
+        app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
+        app.agents.push(a);
+        assert_eq!(app.open_agents()[0].session, None, "no turn yet: nothing to resume");
+        app.agents[0].turn_seen = true;
+        assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"));
+        app.agents[0].shutdown();
     }
 
     #[test]

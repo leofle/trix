@@ -276,16 +276,16 @@ pub fn opencode_config(plugin: &Path, existing: Option<&str>) -> Option<String> 
     serde_json::to_string(&config).ok()
 }
 
-/// A path as a file URL path: the bytes a URL treats specially, escaped.
+/// A path as a file URL path: every byte but `/` and RFC 3986's unreserved
+/// ones percent-encoded.
 fn file_url_path(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
     let mut out = String::new();
-    for c in p.display().to_string().chars() {
-        match c {
-            ' ' => out.push_str("%20"),
-            '#' => out.push_str("%23"),
-            '?' => out.push_str("%3F"),
-            '%' => out.push_str("%25"),
-            c => out.push(c),
+    for &b in p.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
         }
     }
     out
@@ -501,6 +501,9 @@ fn condense_grok(agent: u32, v: &Value) -> HookMsg {
         "StopCancelled" => "Interrupt",
         "StopFailure" => "Stop",
         "PostToolUseFailure" => "PostToolUse",
+        // Grok has no `PermissionRequest` hook: a waiting permission prompt
+        // raises `Notification` with type `permission_prompt`.
+        "Notification" if text(v, "notificationType").or_else(|| text(v, "notification_type")).as_deref() == Some("permission_prompt") => "PermissionRequest",
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Notification" | "Stop" | "SessionEnd" => name.as_str(),
         _ => "unknown",
     };
@@ -514,6 +517,9 @@ fn condense_grok(agent: u32, v: &Value) -> HookMsg {
         "Notification" => text(v, "message").or_else(|| text(v, "notificationType")).or_else(|| text(v, "notification_type")),
         _ => None,
     };
+    if event == "PermissionRequest" && m.tool.is_none() {
+        m.tool = Some("permission".into());
+    }
     m
 }
 
@@ -769,9 +775,13 @@ mod tests {
         assert_eq!(g(json!({"hook_event_name":"StopCancelled"})).event, "Interrupt");
         assert_eq!(g(json!({"hook_event_name":"StopFailure"})).event, "Stop");
         assert_eq!(g(json!({"hook_event_name":"PostToolUseFailure"})).event, "PostToolUse");
-        let m = g(json!({"hook_event_name":"Notification","notificationType":"permission_prompt"}));
-        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Notification", Some("permission_prompt")));
+        let m = g(json!({"hook_event_name":"Notification","notificationType":"task_complete"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Notification", Some("task_complete")));
         assert_eq!(g(json!({"hook_event_name":"PermissionDenied"})).event, "unknown");
+        let m = g(json!({"hook_event_name":"Notification","notificationType":"permission_prompt","notification_type":"permission_prompt","message":"Grok needs your permission"}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail), ("PermissionRequest", Some("permission"), None));
+        assert_eq!(g(json!({"hook_event_name":"Notification","notification_type":"permission_prompt"})).event, "PermissionRequest");
+        assert_eq!(g(json!({"hook_event_name":"Notification","notificationType":"idle_prompt"})).event, "Notification");
     }
 
     #[test]
@@ -795,6 +805,12 @@ mod tests {
         assert!(opencode_config(p, Some("  ")).is_some());
         assert_eq!(opencode_config(p, Some("not json")), None, "theirs is left alone");
         assert_eq!(opencode_config(p, Some(r#"{"plugin":"one"}"#)), None);
+    }
+
+    #[test]
+    fn file_urls_percent_encode_all_but_unreserved_and_slash() {
+        assert_eq!(file_url_path(Path::new("/run/user/1000/trix/opencode-plugin-9.js")), "/run/user/1000/trix/opencode-plugin-9.js");
+        assert_eq!(file_url_path(Path::new("/a b/#?%&+=;:@[]'é~_.")), "/a%20b/%23%3F%25%26%2B%3D%3B%3A%40%5B%5D%27%C3%A9~_.");
     }
 
     #[test]
