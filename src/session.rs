@@ -823,6 +823,15 @@ pub fn control(msg: &ClientMsg, wait: Option<u64>) -> Result<crate::control::Rep
     }
 }
 
+/// Connect and send `msg`, leaving the replies to the caller (`trix events`).
+pub fn open(msg: &ClientMsg) -> Result<UnixStream, String> {
+    let Some(mut s) = connect() else {
+        return Err(if is_default() { "no workspace running".into() } else { format!("no session '{}' running", name()) });
+    };
+    send_msg(&mut s, msg).map_err(|e| format!("talking to the workspace: {e}"))?;
+    Ok(s)
+}
+
 pub fn send_once(session: &str, msg: &ClientMsg) -> bool {
     match connect_to(session) {
         Some(mut s) => {
