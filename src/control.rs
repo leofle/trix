@@ -83,12 +83,15 @@ impl Reply {
 
 pub const COMMANDS: [&str; 5] = ["send", "read", "wait", "spawn", "close"];
 
+/// Flags whose next argument is their value, whatever it looks like.
+pub const VALUE_FLAGS: &[&str] = &["--lines", "-n", "--timeout", "-t", "--name", "--cwd", "--prompt", "--args"];
+
 /// Parse `trix <command> …` (session flags already taken out).
 pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
     let (cmd, rest) = args.split_first().ok_or("no command")?;
     let mut pos = Vec::new();
     let mut flags: Vec<(String, Option<String>)> = Vec::new();
-    let takes_value = |f: &str| matches!(f, "--lines" | "-n" | "--timeout" | "-t" | "--name" | "--cwd" | "--prompt" | "--args");
+    let takes_value = |f: &str| VALUE_FLAGS.contains(&f);
     let mut it = rest.iter();
     let mut only_pos = false;
     while let Some(a) = it.next() {
@@ -220,7 +223,8 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
     if let Request::Wait { targets, all, timeout_secs } = req {
         match wait(app, from, &targets) {
             Ok(agents) => {
-                let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+                // Too far off to represent is the same as no deadline.
+                let deadline = (timeout_secs > 0).then(|| Instant::now().checked_add(Duration::from_secs(timeout_secs))).flatten();
                 app.waiters.push(Waiter { stream, agents, all, deadline });
                 poll(app);
             }
@@ -310,9 +314,7 @@ fn send(app: &mut App, from: Option<u32>, target: &str, text: &str, force: bool)
     let by = caller_name(app, from);
     let a = &mut app.agents[i];
     let mode = *a.term.lock().mode();
-    a.user_input(crate::input::encode_paste(text, mode));
-    // Submit a beat later so TUIs see the paste and Enter as separate events.
-    a.write_later(&b"\r"[..], Duration::from_millis(80));
+    a.submit(crate::input::encode_paste(text, mode));
     a.prompted = Some(Instant::now());
     if by.is_some() {
         a.managed_by = by.clone();
@@ -390,7 +392,8 @@ pub fn poll(app: &mut App) {
         let present: Vec<&Agent> = w.agents.iter().filter_map(|id| app.agents.iter().find(|a| a.id == *id)).collect();
         let gone = w.agents.len() - present.len();
         let done: Vec<&Agent> = present.iter().copied().filter(|a| settled(a, now)).collect();
-        let finished = if w.all { done.len() == present.len() } else { !done.is_empty() || present.is_empty() };
+        // Without --all, a target closed while waited on has stopped too.
+        let finished = if w.all { done.len() == present.len() } else { !done.is_empty() || gone > 0 };
         if finished {
             let out: String = (if w.all { &present } else { &done }).iter().map(|a| status_line(a)).collect();
             let r = match gone {

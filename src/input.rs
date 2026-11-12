@@ -118,7 +118,11 @@ pub fn encode_key(key: &KeyEvent, mode: TermMode) -> Vec<u8> {
 
 pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     if mode.contains(TermMode::BRACKETED_PASTE) {
-        let clean = text.replace("\x1b[201~", "");
+        // Repeat: removing one marker can join the bytes around it into another.
+        let mut clean = text.to_string();
+        while clean.contains("\x1b[201~") {
+            clean = clean.replace("\x1b[201~", "");
+        }
         let mut v = b"\x1b[200~".to_vec();
         v.extend_from_slice(clean.as_bytes());
         v.extend_from_slice(b"\x1b[201~");
@@ -220,6 +224,8 @@ mod tests {
         // A pasted end marker must not be able to end the paste early.
         let sneaky = encode_paste("a\x1b[201~rm -rf /\n", TermMode::BRACKETED_PASTE);
         assert_eq!(sneaky, b"\x1b[200~arm -rf /\n\x1b[201~");
+        let nested = encode_paste("a\x1b[20\x1b[201~1~rm -rf ~\r", TermMode::BRACKETED_PASTE);
+        assert_eq!(nested, b"\x1b[200~arm -rf ~\r\x1b[201~", "a marker rebuilt by removing one is removed too");
         assert_eq!(encode_paste("a\r\nb\nc", TermMode::empty()), b"a\rb\rc");
     }
 }

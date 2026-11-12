@@ -77,7 +77,8 @@ pub enum SessionEvent {
     Detached(u64),
     List(UnixStream),
     Control { stream: UnixStream, from: Option<u32>, req: crate::control::Request },
-    Kill,
+    /// Held open until the server has stopped, so `trix kill` can wait for it.
+    Kill(UnixStream),
 }
 
 // ───────────────────────────── naming ─────────────────────────────
@@ -199,6 +200,9 @@ fn send_msg(w: &mut impl Write, msg: &ClientMsg) -> io::Result<()> {
 
 struct Link {
     client: Option<(u64, UnixStream)>,
+    /// A controller `frame` dropped for being gone or stalled, whose
+    /// `Detached` hasn't been handled yet.
+    dropped: Option<u64>,
     buf: Vec<u8>,
     /// The controller's size, kept after it leaves: viewers keep seeing the
     /// layout it had, and agents keep their terminal size.
@@ -222,17 +226,18 @@ pub struct Out(Arc<Mutex<Link>>);
 
 impl Default for Out {
     fn default() -> Self {
-        Out(Arc::new(Mutex::new(Link { client: None, buf: Vec::new(), size: (80, 24), viewers: Vec::new() })))
+        Out(Arc::new(Mutex::new(Link { client: None, dropped: None, buf: Vec::new(), size: (80, 24), viewers: Vec::new() })))
     }
 }
 
 impl Link {
     fn frame(&mut self, kind: u8, payload: &[u8]) {
-        if let Some((_, s)) = &mut self.client {
+        if let Some((id, s)) = &mut self.client {
             if write_frame(s, kind, payload).is_err() {
                 // Gone or stalled: drop it. Its reader thread sees the
                 // shutdown and reports `Detached`.
                 let _ = s.shutdown(std::net::Shutdown::Both);
+                self.dropped = Some(*id);
                 self.client = None;
             }
         }
@@ -340,6 +345,7 @@ impl Out {
         }
         let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
         l.client = Some((id, stream));
+        l.dropped = None;
         l.size = (size.0.max(1), size.1.max(1));
         l.buf.clear();
         kicked
@@ -368,6 +374,11 @@ impl Out {
         if l.client.as_ref().is_some_and(|(c, _)| *c == id) {
             l.client = None;
             return true;
+        }
+        // Dropped earlier for stalling, and nobody has taken over since.
+        if l.dropped == Some(id) {
+            l.dropped = None;
+            return l.client.is_none();
         }
         false
     }
@@ -606,7 +617,7 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
             send(SessionEvent::List(s));
         }
         Ok(ClientMsg::Kill) => {
-            send(SessionEvent::Kill);
+            send(SessionEvent::Kill(s));
         }
         Ok(ClientMsg::Control { protocol, from, req }) => {
             if protocol != crate::control::CONTROL {
@@ -681,7 +692,7 @@ pub fn control(msg: &ClientMsg, wait: Option<u64>) -> Result<crate::control::Rep
     send_msg(&mut s, msg).map_err(|e| format!("talking to the workspace: {e}"))?;
     let timeout = match wait {
         Some(0) => None,
-        Some(secs) => Some(Duration::from_secs(secs + 10)),
+        Some(secs) => Some(Duration::from_secs(secs.saturating_add(10))),
         None => Some(Duration::from_secs(15)),
     };
     let _ = s.set_read_timeout(timeout);

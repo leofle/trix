@@ -605,7 +605,10 @@ impl App {
             a.shutdown();
             self.specs.remove(&id);
             self.parked.remove(&id);
-            if self.focus >= self.agents.len() {
+            if i < self.focus {
+                // Everything after it moved up one: stay on the same agent.
+                self.focus -= 1;
+            } else if self.focus >= self.agents.len() {
                 self.focus = self.agents.len().saturating_sub(1);
             }
             self.toast(format!("closed {}", a.name), ToastKind::Info);
@@ -1216,9 +1219,7 @@ impl App {
                 continue;
             }
             let mode = *a.term.lock().mode();
-            a.user_input(input::encode_paste(text, mode));
-            // Submit a beat later so TUIs see the paste and Enter as separate events.
-            a.write_later(&b"\r"[..], Duration::from_millis(80));
+            a.submit(input::encode_paste(text, mode));
             n += 1;
         }
         self.toast(format!("sent to {n} agent{}", if n == 1 { "" } else { "s" }), ToastKind::Good);
@@ -1404,7 +1405,24 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
 /// is true when an existing worktree (e.g. from an earlier session) was reused.
+/// A slug that is also a safe folder and branch name: no `.` or `..`, no
+/// leading or trailing dot, no `..` inside, no `.lock` ending.
+fn worktree_name(slug: &str) -> String {
+    let mut out = String::new();
+    for c in slug.chars() {
+        if !(c == '.' && out.ends_with('.')) {
+            out.push(c);
+        }
+    }
+    let mut out = out.trim_matches('.').to_string();
+    while let Some(s) = out.strip_suffix(".lock") {
+        out = s.trim_end_matches('.').to_string();
+    }
+    if out.is_empty() { "agent".into() } else { out }
+}
+
 pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
+    let name = &worktree_name(name);
     let top = git(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
     let top = PathBuf::from(top);
     let common = git(&top, &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| ".git".into());
@@ -1523,6 +1541,61 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> App {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app
+    }
+
+    #[test]
+    fn closing_an_agent_before_the_focused_one_keeps_the_focus() {
+        let mut app = test_app();
+        for (id, name) in [(1, "a"), (2, "b"), (3, "c")] {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            app.agents.push(a);
+        }
+        app.focus = 1;
+        let a = app.agents[0].id;
+        app.close(a);
+        assert_eq!(app.agents[app.focus].name, "b", "still on b");
+        let c = app.agents[1].id;
+        app.close(c);
+        assert_eq!(app.agents[app.focus].name, "b");
+        let b = app.agents[0].id;
+        app.close(b);
+        assert_eq!(app.focus, 0);
+    }
+
+    #[test]
+    fn quick_submissions_stay_separate() {
+        let mut app = test_app();
+        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("exec cat".into()), prompt: None, branch_note: None, resume: None };
+        let id = app.spawn_quiet(spec).unwrap();
+        let i = app.index_of(id).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        app.agents[i].submit(b"one".to_vec());
+        app.agents[i].submit(b"two".to_vec());
+        std::thread::sleep(Duration::from_millis(600));
+        let lines = crate::search::tail(&app.agents[i].term.lock(), 10);
+        let lines: Vec<&str> = lines.iter().map(|l| l.trim_end()).filter(|l| !l.is_empty()).collect();
+        // The terminal echoes each line, then cat prints it.
+        assert_eq!(lines, ["one", "one", "two", "two"], "not 'onetwo' and an empty Enter");
+        app.agents[i].shutdown();
+    }
+
+    #[test]
+    fn worktree_names_are_safe_folders_and_branches() {
+        assert_eq!(worktree_name(".."), "agent");
+        assert_eq!(worktree_name("."), "agent");
+        assert_eq!(worktree_name("a..b"), "a.b");
+        assert_eq!(worktree_name(".hidden."), "hidden");
+        assert_eq!(worktree_name("fix.lock"), "fix");
+        assert_eq!(worktree_name("v1.2-api"), "v1.2-api");
+    }
 
     #[test]
     fn completion_chime_groups_a_burst_without_extending_the_cooldown() {

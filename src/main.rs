@@ -18,6 +18,7 @@ use crossterm::event::{
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, queue};
 use ratatui::Terminal;
+use std::os::unix::net::UnixStream;
 use std::io::{Write, stdout};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -84,6 +85,15 @@ fn take_session(args: &mut Vec<String>) -> Result<Option<String>, String> {
     let mut found = None;
     let mut i = 0;
     while i < args.len() {
+        // Past `--`, everything is positional: a prompt may say "-s".
+        if args[i] == "--" {
+            break;
+        }
+        // Another flag's value (`--args '-s x'`, `--prompt -s`) isn't ours.
+        if control::VALUE_FLAGS.contains(&args[i].as_str()) {
+            i += 2;
+            continue;
+        }
         let value = if args[i] == "-s" || args[i] == "--session" {
             if i + 1 >= args.len() {
                 return Err(format!("{} needs a session name", args[i]));
@@ -313,7 +323,7 @@ fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
 /// The background workspace. Owns every agent; renders into whichever client
 /// is attached, or nowhere.
 fn server() -> anyhow::Result<()> {
-    let Some(_lock) = session::lock()? else {
+    let Some(lock) = session::lock()? else {
         // Another server won the race; the client will connect to that one.
         return Ok(());
     };
@@ -337,7 +347,8 @@ fn server() -> anyhow::Result<()> {
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut last_tick = Instant::now();
     let mut last_slow = Instant::now();
-    let mut killed = false;
+    // `trix kill` connections, closed once everything has stopped.
+    let mut killed: Vec<UnixStream> = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -365,7 +376,7 @@ fn server() -> anyhow::Result<()> {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        if killed {
+        if !killed.is_empty() {
             out.bye_all("[trix stopped by `trix kill`]");
             break;
         }
@@ -416,6 +427,9 @@ fn server() -> anyhow::Result<()> {
     if let Some(p) = claude_settings {
         let _ = std::fs::remove_file(p);
     }
+    // Free the session for a new server, then let `trix kill` return.
+    drop(lock);
+    drop(killed);
     Ok(())
 }
 
@@ -431,14 +445,14 @@ fn viewers_changed(app: &mut App, out: &Out, what: &str) {
     app.dirty = true;
 }
 
-fn dispatch(ev: AppEvent, app: &mut App, terminal: &mut Terminal<RemoteBackend>, out: &Out, killed: &mut bool) {
+fn dispatch(ev: AppEvent, app: &mut App, terminal: &mut Terminal<RemoteBackend>, out: &Out, killed: &mut Vec<UnixStream>) {
     match ev {
         AppEvent::Session(s) => on_session(s, app, terminal, out, killed),
         ev => app.handle(ev),
     }
 }
 
-fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBackend>, out: &Out, killed: &mut bool) {
+fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBackend>, out: &Out, killed: &mut Vec<UnixStream>) {
     match ev {
         SessionEvent::Attach { id, stream, cols, rows, cwd, spawn } => {
             let kicked = out.attach(id, stream, (cols, rows));
@@ -478,10 +492,12 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
             }
         }
         SessionEvent::Detached(id) => {
-            let had = out.viewers();
             if out.lost(id) {
                 app.on_detach();
-            } else if out.viewers() < had {
+            }
+            // Compare with what was last shown, not with just now: a viewer
+            // whose write failed was already removed before this arrived.
+            if out.viewers() < app.viewers {
                 viewers_changed(app, out, "a viewer left");
             }
         }
@@ -489,7 +505,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
             let _ = session::write_frame(&mut stream, session::TEXT, app.listing().as_bytes());
         }
         SessionEvent::Control { stream, from, req } => control::handle(app, stream, from, req),
-        SessionEvent::Kill => *killed = true,
+        SessionEvent::Kill(stream) => killed.push(stream),
     }
 }
 
@@ -509,6 +525,14 @@ mod tests {
         assert_eq!(run(&["ls", "-s", "work"]), (Ok(Some("work".into())), vec!["ls".into()]));
         assert_eq!(run(&["attach", "--session", "w2"]), (Ok(Some("w2".into())), vec!["attach".into()]));
         assert_eq!(run(&["--session=w3", "claude", "codex"]), (Ok(Some("w3".into())), vec!["claude".into(), "codex".into()]));
+    }
+
+    #[test]
+    fn session_flag_is_not_taken_from_prompts() {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(run(&["send", "web", "--", "-s", "quiet"]), (Ok(None), v(&["send", "web", "--", "-s", "quiet"])));
+        assert_eq!(run(&["spawn", "custom", "--args", "-s", "x"]), (Ok(None), v(&["spawn", "custom", "--args", "-s", "x"])));
+        assert_eq!(run(&["-s", "w", "send", "web", "--", "-s", "q"]), (Ok(Some("w".into())), v(&["send", "web", "--", "-s", "q"])));
     }
 
     #[test]

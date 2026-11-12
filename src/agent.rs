@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use crate::app::AppEvent;
@@ -130,6 +130,10 @@ pub struct Agent {
     pub command_line: String,
     pub term: Arc<FairMutex<Term<Listener>>>,
     sender: EventLoopSender,
+    /// Writes due later, sent in order by one thread (see `submit`).
+    later: Sender<(Instant, Cow<'static, [u8]>)>,
+    /// When the last submission's Enter goes out.
+    submit_free: Instant,
     /// Our own handle on the PTY's master side, to ask the terminal which
     /// process group is in the foreground.
     pty: std::fs::File,
@@ -182,6 +186,21 @@ pub struct Agent {
 
 pub const SPARK_LEN: usize = 48;
 
+/// One thread per agent that sends each write when it's due, in the order
+/// queued. It ends when the agent (the only sender) goes away.
+fn delayed_writer(sender: EventLoopSender) -> Sender<(Instant, Cow<'static, [u8]>)> {
+    let (tx, rx) = mpsc::channel::<(Instant, Cow<'static, [u8]>)>();
+    let _ = std::thread::Builder::new().name("trix-later".into()).spawn(move || {
+        for (due, bytes) in rx {
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            if sender.send(Msg::Input(bytes)).is_err() {
+                break;
+            }
+        }
+    });
+    tx
+}
+
 impl Agent {
     pub fn spawn(
         id: u32,
@@ -232,6 +251,7 @@ impl Agent {
         let ev = EventLoop::new(term.clone(), listener, pty, true, false)?;
         let sender = ev.channel();
         ev.spawn();
+        let later = delayed_writer(sender.clone());
 
         let now = Instant::now();
         let mut spark = VecDeque::with_capacity(SPARK_LEN);
@@ -244,6 +264,8 @@ impl Agent {
             command_line,
             term,
             sender,
+            later,
+            submit_free: Instant::now() - Duration::from_secs(1),
             pty: master,
             pid,
             size,
@@ -282,12 +304,20 @@ impl Agent {
         }
     }
 
-    pub fn write_later(&self, bytes: &'static [u8], delay: Duration) {
-        let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            let _ = sender.send(Msg::Input(Cow::Borrowed(bytes)));
-        });
+    /// Type `paste` and press Enter a beat later, so TUIs see the paste and
+    /// the Enter as separate events. A submission made before the previous
+    /// one's Enter has gone out waits for it: two quick `trix send`s stay two
+    /// prompts instead of pasting both and then pressing Enter twice.
+    pub fn submit(&mut self, paste: Vec<u8>) {
+        const ENTER_AFTER: Duration = Duration::from_millis(80);
+        const GAP: Duration = Duration::from_millis(30);
+        let now = Instant::now();
+        self.last_input = now;
+        let start = now.max(self.submit_free + GAP);
+        let enter = start + ENTER_AFTER;
+        let _ = self.later.send((start, Cow::Owned(paste)));
+        let _ = self.later.send((enter, Cow::Borrowed(&b"\r"[..])));
+        self.submit_free = enter;
     }
 
     pub fn user_input(&mut self, bytes: Vec<u8>) {
