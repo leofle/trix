@@ -1549,12 +1549,22 @@ mod tests {
     #[test]
     fn a_program_that_ignores_the_hang_up_is_stopped_anyway() {
         let (tx, _rx) = std::sync::mpsc::channel();
+        // It says when its traps are set: a login shell may take a while to
+        // get there (CI's bash reads /etc/profile first), and a hang-up
+        // before that would end it for real.
+        let ready = std::env::temp_dir().join(format!("trix-stop-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&ready);
         let mut s = spec(Kind::Custom);
         s.cwd = std::env::temp_dir();
-        s.command = Some("trap '' HUP TERM; while :; do sleep 0.1; done".into());
+        s.command = Some(format!("trap '' HUP TERM; : > '{}'; while :; do sleep 0.1; done", ready.display()));
         let a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), &Integrations::default(), Path::new("/bin/true")).unwrap();
         let pid = a.pid;
-        std::thread::sleep(Duration::from_millis(300));
+        let by = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ready.exists(), "its traps were never set");
+        let _ = std::fs::remove_file(&ready);
         assert!(a.hang_up());
         assert!(!a.hang_up(), "once");
         std::thread::sleep(Duration::from_millis(300));
