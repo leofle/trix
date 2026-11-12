@@ -852,15 +852,25 @@ fn input_spans(inp: &TextInput, active: bool, placeholder: &str, t: &Theme, max:
         }
         return (v, active.then_some(0));
     }
-    // Keep the cursor visible in long inputs by scrolling the window.
+    // Keep the cursor visible in long inputs by scrolling the window. `max`
+    // is in cells, and CJK and emoji take two, so count cells, not chars.
     let chars: Vec<char> = inp.text.chars().collect();
-    let start = inp.cursor.saturating_sub(max.saturating_sub(1));
-    let shown: String = chars[start..].iter().take(max).collect();
-    let pre: String = chars[start..inp.cursor].iter().collect();
-    (
-        vec![Span::styled(shown, Style::new().fg(if active { t.fg_bright } else { t.fg }))],
-        active.then_some(pre.width() as u16),
-    )
+    let cells = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    let cursor = inp.cursor.min(chars.len());
+    let (mut start, mut before) = (cursor, 0);
+    while start > 0 && before + cells(chars[start - 1]) < max {
+        start -= 1;
+        before += cells(chars[start]);
+    }
+    let (mut shown, mut used) = (String::new(), 0);
+    for &c in &chars[start..] {
+        if used + cells(c) > max {
+            break;
+        }
+        used += cells(c);
+        shown.push(c);
+    }
+    (vec![Span::styled(shown, Style::new().fg(if active { t.fg_bright } else { t.fg }))], active.then_some(before as u16))
 }
 
 fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
@@ -1241,6 +1251,20 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_text_in_an_input_stays_inside_it() {
+        let t = Theme::default();
+        let cells = |spans: &[Span<'static>]| spans.iter().map(|s| s.content.width()).sum::<usize>();
+        for (text, cursor) in [("漢".repeat(45), 45), ("漢".repeat(45), 0), ("a😀b".repeat(20), 30), ("x".repeat(80), 80)] {
+            let mut inp = TextInput::new(&text);
+            inp.cursor = cursor;
+            let (spans, x) = input_spans(&inp, true, "", &t, 20);
+            let x = x.unwrap() as usize;
+            assert!(cells(&spans) <= 20, "{text:?}@{cursor}: {} cells in 20", cells(&spans));
+            assert!(x < 20, "{text:?}@{cursor}: cursor at cell {x}");
+        }
+    }
+
     use super::*;
 
     #[test]

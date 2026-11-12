@@ -637,7 +637,13 @@ pub fn listen(path: &Path, tx: Sender<AppEvent>) -> io::Result<()> {
     let listener = UnixListener::bind(path)?;
     static NEXT: AtomicU64 = AtomicU64::new(1);
     std::thread::Builder::new().name("trix-control".into()).spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for stream in listener.incoming() {
+            // A failing accept (out of file descriptors, say) fails again at
+            // once: back off instead of spinning a core.
+            let Ok(stream) = stream else {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
             let tx = tx.clone();
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
             let _ = std::thread::Builder::new().name("trix-client".into()).spawn(move || serve_client(id, stream, tx));
@@ -656,6 +662,7 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
     let send = |e: SessionEvent| tx.send(AppEvent::Session(e)).is_ok();
     match first {
         Ok(ClientMsg::Hello { protocol, cols, rows, cwd, spawn }) => {
+            let (cols, rows) = clamp_size(cols, rows);
             if protocol != PROTOCOL {
                 let msg = "trix: the running workspace is from a different trix build — `trix kill` it (stops its agents) and start again";
                 let _ = write_frame(&mut s, BYE, msg.as_bytes());
@@ -672,7 +679,10 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
                     Event::Key(k) => AppEvent::Key(k),
                     Event::Mouse(m) => AppEvent::Mouse(m),
                     Event::Paste(s) => AppEvent::Paste(s),
-                    Event::Resize(c, r) => AppEvent::Session(SessionEvent::Resize(id, c, r)),
+                    Event::Resize(c, r) => {
+                        let (c, r) = clamp_size(c, r);
+                        AppEvent::Session(SessionEvent::Resize(id, c, r))
+                    }
                     Event::FocusGained => AppEvent::FocusGained,
                     Event::FocusLost => AppEvent::FocusLost,
                 };
@@ -683,6 +693,7 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
             send(SessionEvent::Detached(id));
         }
         Ok(ClientMsg::View { protocol, cols, rows }) => {
+            let (cols, rows) = clamp_size(cols, rows);
             if protocol != PROTOCOL {
                 let msg = "trix: the running workspace is from a different trix build — `trix kill` it (stops its agents) and start again";
                 let _ = write_frame(&mut s, BYE, msg.as_bytes());
@@ -696,7 +707,10 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
             while let Ok((MSG, p)) = read_frame(&mut r) {
                 let ev = match serde_json::from_slice::<ClientMsg>(&p) {
                     Ok(ClientMsg::Event(Event::Key(k))) if leaves(&k) => SessionEvent::Unview(id),
-                    Ok(ClientMsg::Event(Event::Resize(c, r))) => SessionEvent::ViewResize(id, c, r),
+                    Ok(ClientMsg::Event(Event::Resize(c, r))) => {
+                        let (c, r) = clamp_size(c, r);
+                        SessionEvent::ViewResize(id, c, r)
+                    }
                     _ => continue,
                 };
                 if !send(ev) {
@@ -775,6 +789,15 @@ pub fn query(session: &str, msg: &ClientMsg) -> Option<String> {
         Ok((TEXT, p)) => Some(String::from_utf8_lossy(&p).into_owned()),
         _ => Some(String::new()),
     }
+}
+
+/// The biggest terminal a client may claim. A client that says 65535 by 65535
+/// would make the server allocate billions of cells.
+const MAX_COLS: u16 = 1000;
+const MAX_ROWS: u16 = 500;
+
+fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS))
 }
 
 /// Send a control request to this session and wait for its reply: up to
@@ -891,6 +914,13 @@ mod tests {
         // The frame that overflowed is the last one counted, so the viewer held
         // everything up to MAX_BEHIND and was dropped on the next.
         assert!(sent * chunk.len() >= MAX_BEHIND, "not before it fell behind ({sent} frames)");
+    }
+
+    #[test]
+    fn absurd_terminal_sizes_are_clamped() {
+        assert_eq!(clamp_size(65535, 65535), (MAX_COLS, MAX_ROWS));
+        assert_eq!(clamp_size(0, 0), (1, 1));
+        assert_eq!(clamp_size(120, 40), (120, 40));
     }
 
     #[test]

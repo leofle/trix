@@ -68,7 +68,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}", std::process::id()));
+    // Two writers in one process (the usage thread and the UI both store
+    // prefs) must not share a temporary file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    tmp.push(format!(".{}.{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let tmp = PathBuf::from(tmp);
     let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {

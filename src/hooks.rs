@@ -31,6 +31,12 @@ pub struct HookMsg {
     /// Claude's `transcript_path`: the conversation log the context gauge reads.
     #[serde(default)]
     pub transcript: Option<String>,
+    /// When the hook fired, in microseconds since the epoch. Each hook is its
+    /// own process and the server reads them on separate threads, so two that
+    /// fire close together can arrive in the wrong order: this tells which was
+    /// first. Zero when unknown.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 pub fn runtime_dir() -> PathBuf {
@@ -71,7 +77,11 @@ pub fn serve(path: &Path, tx: Sender<AppEvent>) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     std::thread::Builder::new().name("trix-hooks".into()).spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -128,6 +138,7 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
             }
         }
     }
+    let seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let raw = match arg_payload {
         Some(p) => p,
         None => {
@@ -139,7 +150,8 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
         }
     };
     let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let msg = condense(agent, source, &v);
+    let mut msg = condense(agent, source, &v);
+    msg.seq = seq;
     if let Ok(mut stream) = UnixStream::connect(sock) {
         let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
         if let Ok(line) = serde_json::to_string(&msg) {
@@ -165,7 +177,7 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
     };
     let session = s("session_id").or_else(|| s("thread-id")).filter(|id| !id.is_empty());
     let transcript = s("transcript_path").filter(|p| !p.is_empty());
-    HookMsg { agent, source: source.into(), event, tool, detail, session, transcript }
+    HookMsg { agent, source: source.into(), event, tool, detail, session, transcript, seq: 0 }
 }
 
 /// A shell command as a string: Claude sends one; Codex may send an argv,

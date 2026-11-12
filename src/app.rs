@@ -597,6 +597,11 @@ impl App {
         let typed = f.name.text.trim().to_string();
         // A name you typed must be free; a suggested one is made unique.
         let name = if f.name_touched && !typed.is_empty() {
+            if only_digits(&typed) {
+                f.error = Some("a name can't be only digits: it would read as an agent number".into());
+                f.field = 2;
+                return;
+            }
             if self.agents.iter().any(|a| a.name == typed) {
                 f.error = Some(format!("there is already an agent named '{typed}'"));
                 f.field = 2;
@@ -672,11 +677,21 @@ impl App {
             a.shutdown();
             self.specs.remove(&id);
             self.parked.remove(&id);
+            let was_focused = i == self.focus;
             if i < self.focus {
                 // Everything after it moved up one: stay on the same agent.
                 self.focus -= 1;
             } else if self.focus >= self.agents.len() {
                 self.focus = self.agents.len().saturating_sub(1);
+            }
+            // The next agent slid into the focused slot: it is the one being
+            // looked at now, so it is seen, and may want to know it has focus.
+            if was_focused && let Some(next) = self.agents.get_mut(self.focus) {
+                next.unseen = false;
+                if next.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
+                    next.write(&b"\x1b[I"[..]);
+                }
+                self.dirty = true;
             }
             self.toast(format!("closed {}", a.name), ToastKind::Info);
             self.sync_git_targets();
@@ -1167,6 +1182,10 @@ impl App {
             Modal::Rename(id, t) => {
                 if k.code == KeyCode::Enter {
                     let (id, name) = (*id, t.text.trim().to_string());
+                    if only_digits(&name) {
+                        self.toast("a name can't be only digits: it would read as an agent number", ToastKind::Bad);
+                        return;
+                    }
                     if self.agents.iter().any(|a| a.id != id && a.name == name) {
                         // Keep the box open: two agents with one name can't be told apart.
                         self.toast(format!("there is already an agent named '{name}'"), ToastKind::Bad);
@@ -1452,17 +1471,25 @@ impl App {
 
 /// Whether a broadcast should be typed into this agent. Only Claude and Codex:
 /// never a shell or a custom command (the prompt would run as a command), and
-/// never an agent sitting on a prompt:
+/// never an agent sitting on a prompt (by its state, or by what its screen shows):
 /// the trailing Enter would answer it — e.g. approve a pending `rm -rf`.
 /// Starting agents may be on a "trust this folder?" dialog, so skip those too.
+/// A name of only digits would be taken for an agent's number (`trix close 2`).
+pub fn only_digits(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())
+}
+
 pub fn broadcast_reaches(a: &Agent, target: BroadcastTarget) -> bool {
     if !a.kind.takes_prompts() {
         return false;
     }
-    match target {
+    let by_state = match target {
         BroadcastTarget::All => matches!(a.state, State::Idle | State::Working | State::Done),
         BroadcastTarget::Waiting => matches!(a.state, State::Idle | State::Done),
-    }
+    };
+    // The state can lag behind the screen: a permission dialog is up before
+    // its hook arrives. The trailing Enter would answer it, so look too.
+    by_state && !a.screen_needs_input()
 }
 
 fn viewport_point<T>(t: &alacritty_terminal::term::Term<T>, r: Rect, x: u16, y: u16) -> Point {
@@ -1791,6 +1818,34 @@ mod tests {
         app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.modal, Some(Modal::Rename(..))), "rename to a taken name is refused");
         assert_eq!(app.agents.last().unwrap().name, "web-2");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn digit_names_are_refused() {
+        assert!(only_digits("1") && only_digits("42"));
+        assert!(!only_digits("") && !only_digits("web2") && !only_digits("2web") && !only_digits("-1"));
+    }
+
+    #[test]
+    fn closing_the_focused_agent_marks_the_next_one_seen() {
+        let mut app = test_app();
+        for id in 1..=3 {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        let (first, second, third) = (app.agents[0].id, app.agents[1].id, app.agents[2].id);
+        app.agents[1].unseen = true;
+        app.agents[2].unseen = true;
+        app.focus = 0;
+        app.close(first);
+        assert_eq!(app.agents[app.focus].id, second, "the next agent is focused");
+        assert!(!app.agents[app.focus].unseen, "and is no longer unseen");
+        assert!(app.agents.iter().find(|a| a.id == third).unwrap().unseen, "others keep their flag");
         for a in &app.agents {
             a.shutdown();
         }

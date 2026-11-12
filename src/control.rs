@@ -20,7 +20,7 @@
 //!   every send is announced with a toast, so the human can tell.
 
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -119,6 +119,10 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
     if let Some((f, _)) = flags.iter().find(|(f, _)| !allowed.contains(&f.as_str())) {
         return Err(format!("{cmd}: unknown option '{f}'"));
     }
+    if let Some((f, _)) = flags.iter().find(|(f, v)| v.is_some() && ["--force", "--all", "--worktree"].contains(&f.as_str())) {
+        // `--force=false` would otherwise count as --force.
+        return Err(format!("{cmd}: {f} takes no value"));
+    }
     let has = |names: &[&str]| flags.iter().any(|(f, _)| names.contains(&f.as_str()));
     let value = |names: &[&str]| flags.iter().rev().find(|(f, _)| names.contains(&f.as_str())).and_then(|(_, v)| v.clone());
     let number = |names: &[&str], default: u64| -> Result<u64, String> {
@@ -138,6 +142,9 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
         "send" => {
             let [target, text @ ..] = pos.as_slice() else { return Err("send needs an agent and a prompt".into()) };
             let text = if text.is_empty() || text == ["-"] {
+                if text.is_empty() && io::stdin().is_terminal() {
+                    return Err("send needs a prompt: put it after the agent, or pipe it in".into());
+                }
                 let mut s = String::new();
                 io::stdin().read_to_string(&mut s).map_err(|e| format!("reading the prompt from stdin: {e}"))?;
                 s
@@ -190,6 +197,8 @@ pub fn caller() -> Option<u32> {
 pub fn run(req: Request) -> ! {
     let wait = match &req {
         Request::Wait { timeout_secs, .. } => Some(*timeout_secs),
+        // Making a worktree in a big repo can take a while.
+        Request::Spawn { .. } => Some(50),
         _ => None,
     };
     let reply = match session::control(&ClientMsg::Control { protocol: CONTROL, from: caller(), req }, wait) {
@@ -448,6 +457,9 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
     let name = match name {
         Some(n) => {
             let n = n.trim().to_string();
+            if app::only_digits(&n) {
+                return Reply::fail(format!("'{n}' can't be a name: a number means the agent at that position in `trix ls`"));
+            }
             if app.agents.iter().any(|a| a.name == n) {
                 return Reply::fail(format!("there is already an agent named '{n}'"));
             }
@@ -628,6 +640,10 @@ mod tests {
     fn rejects_bad_commands() {
         assert!(p(&["send", "web", "--force-it", "x"]).unwrap_err().contains("unknown option"));
         assert!(p(&["read"]).unwrap_err().contains("needs"));
+        for bad in [&["close", "web", "--force=false"][..], &["wait", "a", "--all=0"], &["spawn", "shell", "--worktree=no"]] {
+            assert!(p(bad).unwrap_err().contains("takes no value"), "{bad:?}");
+        }
+        assert!(p(&["wait", "a", "--timeout=5"]).is_ok(), "value flags keep their =value");
         assert!(p(&["read", "a", "b"]).unwrap_err().contains("one"));
         assert!(p(&["read", "-n", "lots", "a"]).unwrap_err().contains("not a number"));
         assert!(p(&["read", "a", "-n"]).unwrap_err().contains("needs a value"));

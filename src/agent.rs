@@ -194,6 +194,9 @@ pub struct Agent {
     pub turn_seen: bool,
     /// The agent that started or last prompted this one through `trix`.
     pub managed_by: Option<String>,
+    /// When the newest hook applied had fired (`HookMsg::seq`), so a report
+    /// that was overtaken on its way here is dropped, not applied late.
+    last_hook_seq: u64,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -277,7 +280,7 @@ impl Agent {
             term,
             sender,
             later,
-            submit_free: Instant::now() - Duration::from_secs(1),
+            submit_free: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             screen_seen: std::cell::Cell::new(None),
             pty: master,
             pid,
@@ -296,7 +299,7 @@ impl Agent {
             title: None,
             exit_code: None,
             last_output: now,
-            last_input: now - Duration::from_secs(60),
+            last_input: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
             spark,
             spark_tick: now,
             burst: VecDeque::new(),
@@ -309,6 +312,7 @@ impl Agent {
             prompted: first_prompt.then(Instant::now),
             turn_seen: false,
             managed_by: None,
+            last_hook_seq: 0,
         })
     }
 
@@ -419,6 +423,15 @@ impl Agent {
         // dead pane: Enter-to-restart only works while it reads as exited.
         if self.state == State::Exited {
             return None;
+        }
+        // Hooks are separate processes read on separate threads, so a
+        // PostToolUse can land after the Stop that followed it and flip a
+        // finished agent back to Working.
+        if msg.seq != 0 {
+            if msg.seq < self.last_hook_seq {
+                return None;
+            }
+            self.last_hook_seq = msg.seq;
         }
         // `/clear` and friends start a new conversation: always track the latest.
         if let Some(id) = &msg.session {
@@ -854,6 +867,7 @@ mod tests {
             detail: detail.map(Into::into),
             session: None,
             transcript: None,
+            seq: 0,
         }
     }
     fn claude(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
@@ -950,6 +964,24 @@ mod tests {
 
         a.on_hook(&claude("Stop", None, None), false);
         assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 2 tools"));
+    }
+
+    #[test]
+    fn a_late_hook_does_not_undo_a_newer_one() {
+        let mut a = test_agent(Kind::Claude);
+        let at = |mut m: HookMsg, seq: u64| {
+            m.seq = seq;
+            m
+        };
+        a.on_hook(&at(claude("UserPromptSubmit", None, None), 10), true);
+        a.on_hook(&at(claude("Stop", None, None), 30), true);
+        // The PostToolUse fired before the Stop but was read after it.
+        a.on_hook(&at(claude("PostToolUse", Some("Bash"), None), 20), true);
+        assert_eq!(a.state, State::Done, "the stale report is dropped");
+        a.on_hook(&at(claude("UserPromptSubmit", None, None), 40), true);
+        assert_eq!(a.state, State::Working, "newer ones still apply");
+        a.on_hook(&claude("Stop", None, None), true);
+        assert_eq!(a.state, State::Done, "no stamp: always applied");
     }
 
     #[test]
@@ -1064,6 +1096,20 @@ mod tests {
     fn show(a: &Agent, text: &str) {
         let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
         p.advance(&mut *a.term.lock(), text.replace('\n', "\r\n").as_bytes());
+    }
+
+    #[test]
+    fn broadcast_skips_a_dialog_the_state_has_not_caught_up_with() {
+        use crate::app::{BroadcastTarget, broadcast_reaches};
+        let mut a = test_agent(Kind::Claude);
+        a.set_state(State::Working, false);
+        assert!(broadcast_reaches(&a, BroadcastTarget::All), "working, nothing on screen");
+        // The permission dialog is up; its hook has not arrived, so the state still says Working.
+        show(&a, "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n");
+        a.on_output();
+        assert_eq!(a.state, State::Working);
+        assert!(!broadcast_reaches(&a, BroadcastTarget::All), "the screen shows a prompt");
+        a.shutdown();
     }
 
     #[test]

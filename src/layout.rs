@@ -286,8 +286,13 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
     let w = agents.iter().map(|a| a.name.chars().count()).max().unwrap_or(0);
     let (mut out, mut opened, mut failed) = (String::new(), 0, 0);
     for a in &agents {
+        // Resuming a conversation that another tab already has open would run
+        // it twice.
+        let held_by = a.session.as_deref().filter(|_| resume).and_then(|s| app.agents.iter().find(|x| x.session.as_deref() == Some(s))).map(|x| x.name.clone());
         let (verb, rest) = if app.agents.iter().any(|x| x.name == a.name) {
             ("skipped", "already open".to_string())
+        } else if let Some(other) = held_by {
+            ("skipped", format!("its conversation is open in {other}"))
         } else {
             match spec_for(a, resume).and_then(|spec| {
                 let resumed = spec.resume.is_some();

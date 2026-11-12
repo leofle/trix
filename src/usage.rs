@@ -50,7 +50,7 @@ impl Context {
 pub fn tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{}k", (n as f64 / 1_000.0).round() as u64),
+        1_000..999_500 => format!("{}k", (n as f64 / 1_000.0).round() as u64),
         _ => {
             let m = n as f64 / 1_000_000.0;
             if m >= 10.0 || (m - m.round()).abs() < 0.05 { format!("{}M", m.round() as u64) } else { format!("{m:.1}M") }
@@ -378,6 +378,8 @@ mod tests {
         assert_eq!(tokens(800), "800");
         assert_eq!(tokens(137_648), "138k");
         assert_eq!(tokens(690_540), "691k");
+        assert_eq!(tokens(999_499), "999k");
+        assert_eq!(tokens(999_500), "1M", "not \"1000k\"");
         assert_eq!(tokens(1_000_000), "1M");
         assert_eq!(tokens(1_234_000), "1.2M");
         let c = Context { used: 309_460, window: 1_000_000, exact: false };

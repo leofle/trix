@@ -346,7 +346,7 @@ fn server() -> anyhow::Result<()> {
     const FRAME: Duration = Duration::from_millis(8); // ~120 fps ceiling
     const ANIM: Duration = Duration::from_millis(90);
     const TICK: Duration = Duration::from_millis(250);
-    let mut last_draw = Instant::now() - Duration::from_secs(1);
+    let mut last_draw = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
     let mut last_tick = Instant::now();
     let mut last_slow = Instant::now();
     // `trix kill` connections, closed once everything has stopped.
