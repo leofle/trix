@@ -957,7 +957,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             f.render_widget(block, r);
             let inner = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height };
             let n = app.agents.iter().filter(|a| crate::app::broadcast_reaches(a, *target)).count();
-            let held = app.agents.iter().filter(|a| a.kind.is_agent() && matches!(a.state, State::Blocked | State::Starting)).count();
+            let held = app.agents.iter().filter(|a| a.kind.takes_prompts() && matches!(a.state, State::Blocked | State::Starting)).count();
             let pill = |on: bool, s: &'static str| {
                 if on {
                     Span::styled(format!(" {s} "), Style::new().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD))

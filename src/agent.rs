@@ -42,6 +42,11 @@ impl Kind {
     pub fn is_agent(self) -> bool {
         !matches!(self, Kind::Shell)
     }
+    /// A known coding agent, so typing a prompt into it is safe. A custom
+    /// command may be anything (bash, ssh, psql), so it is not.
+    pub fn takes_prompts(self) -> bool {
+        matches!(self, Kind::Claude | Kind::Codex)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -866,12 +871,15 @@ mod tests {
         let a = test_agent(Kind::Shell);
         assert!(!a.running_command(), "sleep leads its own foreground group");
         a.shutdown();
-        // A shell with job control hands the terminal to the command it runs.
+        // An interactive shell hands the terminal to the command it runs.
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut s = spec(Kind::Custom);
-        s.command = Some("exec sh -mc 'sleep 5; true'".into());
+        s.command = Some("exec bash --norc --noprofile -i".into());
         s.cwd = std::env::temp_dir();
         let a = Agent::spawn(1, s, (80, 24), tx, &std::env::temp_dir().join("trix-test.sock"), None, Path::new("/bin/true")).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!a.running_command(), "at the prompt");
+        a.write(&b"sleep 5\r"[..]);
         let deadline = Instant::now() + Duration::from_secs(3);
         while !a.running_command() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -1292,5 +1300,6 @@ mod tests {
         }
         assert_eq!(Kind::from_label("vim"), None);
         assert!(!Kind::Shell.is_agent() && Kind::Custom.is_agent());
+        assert!(Kind::Claude.takes_prompts() && Kind::Codex.takes_prompts() && !Kind::Shell.takes_prompts() && !Kind::Custom.takes_prompts());
     }
 }

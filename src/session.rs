@@ -736,7 +736,7 @@ fn connect_to(session: &str) -> Option<UnixStream> {
 /// Start a detached server and wait for it to accept connections.
 pub fn start_server() -> anyhow::Result<UnixStream> {
     let exe = std::env::current_exe()?;
-    let log = File::create(log_path())?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path())?;
     let mut cmd = Command::new(exe);
     cmd.arg("server").env("TRIX_SESSION", name()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // New session: no controlling terminal, so closing this one can't SIGHUP it.
@@ -752,7 +752,9 @@ pub fn start_server() -> anyhow::Result<UnixStream> {
         if let Some(s) = connect() {
             return Ok(s);
         }
-        if let Ok(Some(status)) = child.try_wait() {
+        // A clean exit means another trix won the race to start the server and
+        // ours stepped aside: keep trying to reach it until the deadline.
+        if let Ok(Some(status)) = child.try_wait().map(|s| s.filter(|s| !s.success())) {
             let log = std::fs::read_to_string(log_path()).unwrap_or_default();
             anyhow::bail!("server exited ({status}){}{}", if log.trim().is_empty() { "" } else { ":\n" }, log.trim());
         }
@@ -886,7 +888,9 @@ mod tests {
         }
         assert_eq!(out.viewers(), 0, "dropped once too far behind");
         assert!(start.elapsed() < Duration::from_millis(500), "never waited on it: {:?}", start.elapsed());
-        assert!(sent * chunk.len() > MAX_BEHIND, "not before it fell behind ({sent} frames)");
+        // The frame that overflowed is the last one counted, so the viewer held
+        // everything up to MAX_BEHIND and was dropped on the next.
+        assert!(sent * chunk.len() >= MAX_BEHIND, "not before it fell behind ({sent} frames)");
     }
 
     #[test]

@@ -1450,12 +1450,13 @@ impl App {
     }
 }
 
-/// Whether a broadcast should be typed into this agent. Never shells (the
-/// prompt would run as a command), and never an agent sitting on a prompt:
+/// Whether a broadcast should be typed into this agent. Only Claude and Codex:
+/// never a shell or a custom command (the prompt would run as a command), and
+/// never an agent sitting on a prompt:
 /// the trailing Enter would answer it — e.g. approve a pending `rm -rf`.
 /// Starting agents may be on a "trust this folder?" dialog, so skip those too.
 pub fn broadcast_reaches(a: &Agent, target: BroadcastTarget) -> bool {
-    if !a.kind.is_agent() {
+    if !a.kind.takes_prompts() {
         return false;
     }
     match target {
@@ -1986,5 +1987,9 @@ mod tests {
         let mut sh = test_agent(Kind::Shell);
         sh.set_state(State::Idle, true);
         assert!(!broadcast_reaches(&sh, BroadcastTarget::All), "shells are skipped");
+        let mut custom = test_agent(Kind::Custom);
+        custom.set_state(State::Idle, true);
+        assert!(!broadcast_reaches(&custom, BroadcastTarget::All), "a custom command may be bash or ssh: skipped");
+        assert!(!broadcast_reaches(&custom, BroadcastTarget::Waiting));
     }
 }
