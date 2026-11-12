@@ -24,7 +24,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too. Which of these happen, and which sound plays, is up to you: see [Config](#config).
 - **Context at a glance.** Each Claude and Codex agent shows how full its context window is on its pane: `context 31% · ~691k left`, yellow from 70%, red from 85%. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
-- **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little. Tiles keep a readable size: when they'd get too small, the grid shows a page at a time, the one with the focused agent, and `alt+c` fits them all on screen instead. The sidebar likewise keeps full cards and scrolls, or shows one-line cards after `alt+c`.
+- **Many agents, one glance.** `alt+g` tiles your agents live, up to four at a time. The focused tile is accented, blocked tiles turn red, and the rest fade back a little. A page holds up to four, two to a row, and three are two on top and one below. With more agents, the grid shows the page with the focused agent, and `alt+j`/`alt+k` move through them. The sidebar keeps full cards and scrolls, or shows one-line cards after `alt+c`.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
@@ -205,7 +205,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
 | `alt+m` | mini sidebar: one line per agent, half the width (remembered) |
-| `alt+c` | shrink to fit. In the sidebar: one-line cards instead of full ones that scroll. In the grid: every agent on screen instead of full-size tiles a page at a time (remembered) |
+| `alt+c` | compact sidebar: one-line cards instead of full ones that scroll (remembered) |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
 | `alt+?` | all keys |

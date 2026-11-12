@@ -624,48 +624,32 @@ fn attention_banner(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Rect {
     Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area }
 }
 
-/// The smallest a grid tile gets before the grid goes a page at a time
-/// (unless alt+c asked for every agent on screen).
-const TILE_MIN: (u16, u16) = (60, 15);
+/// Agents per grid page: more than that and each gets too small to read.
+const GRID_PAGE: usize = 4;
 
 /// Where each agent shown in the grid goes, and which page of how many
-/// this is (1 of 1 when every agent fits).
-fn grid_tiles(n: usize, focus: usize, area: Rect, fit_all: bool) -> (Vec<(usize, Rect)>, usize, usize) {
+/// this is. A page holds up to four, two to a row; an odd one out gets its
+/// row's whole width (three: two on top, one below).
+fn grid_tiles(n: usize, focus: usize, area: Rect) -> (Vec<(usize, Rect)>, usize, usize) {
     if n == 0 {
         return (Vec::new(), 1, 1);
     }
-    let wide = area.width as f32 / (area.height as f32 * 2.2);
-    let cols = ((n as f32 * wide).sqrt().ceil() as usize).clamp(1, n);
-    let rows = n.div_ceil(cols);
-    let roomy = area.width / cols as u16 >= TILE_MIN.0 && area.height / rows as u16 >= TILE_MIN.1;
-    let mut tiles = Vec::with_capacity(n);
-    if fit_all || roomy {
-        // Every agent, the last row's tiles sharing its whole width.
-        let row_rects = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-        for (ri, rr) in row_rects.iter().enumerate() {
-            let start = ri * cols;
-            let in_row = (n - start).min(cols);
-            let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row]).split(*rr);
-            tiles.extend(cells.iter().enumerate().map(|(k, c)| (start + k, *c)));
-        }
-        return (tiles, 1, 1);
-    }
-    // Full-size tiles, as many as fit, on the page with the focused agent.
-    // Every page has the same grid, so tiles keep their size page to page.
-    let cols = (area.width / TILE_MIN.0).max(1) as usize;
-    let rows = (area.height / TILE_MIN.1).max(1) as usize;
-    let per = cols * rows;
-    let page = focus.min(n - 1) / per;
+    let page = focus.min(n - 1) / GRID_PAGE;
+    let first = page * GRID_PAGE;
+    let here = (n - first).min(GRID_PAGE);
+    let rows = here.div_ceil(2);
     let row_rects = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-    for (k, i) in (page * per..((page + 1) * per).min(n)).enumerate() {
-        let cells = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols]).split(row_rects[k / cols]);
-        tiles.push((i, cells[k % cols]));
+    let mut tiles = Vec::with_capacity(here);
+    for (r, rr) in row_rects.iter().enumerate() {
+        let in_row = (here - r * 2).min(2);
+        let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row]).split(*rr);
+        tiles.extend(cells.iter().enumerate().map(|(k, c)| (first + r * 2 + k, *c)));
     }
-    (tiles, page + 1, n.div_ceil(per))
+    (tiles, page + 1, n.div_ceil(GRID_PAGE))
 }
 
 fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
-    let (tiles, page, pages) = grid_tiles(app.agents.len(), app.focus, area, app.grid_fit);
+    let (tiles, page, pages) = grid_tiles(app.agents.len(), app.focus, area);
     let mut cursor = None;
     for (i, c) in tiles {
         let focused = i == app.focus;
@@ -688,8 +672,7 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
     if pages > 1 {
         // On the bottom border: which page, and how to get to the others.
         let next = app.config.keys.label(Action::Next).unwrap_or_default();
-        let fit = app.config.keys.label(Action::Compact).map(|k| format!(" · {k} fit all")).unwrap_or_default();
-        let s = format!(" page {page}/{pages} · {next} next{fit} ");
+        let s = format!(" page {page}/{pages} · {next} next ");
         let w = (s.chars().count() as u16).min(area.width);
         let r = Rect { x: area.x + area.width.saturating_sub(w) / 2, y: area.bottom().saturating_sub(1), width: w, height: 1 };
         f.render_widget(Paragraph::new(Span::styled(s, Style::new().fg(t.bg).bg(t.accent))), r);
@@ -1378,7 +1361,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Grid), "grid ⇄ focus"),
         (k(Action::Sidebar), "toggle sidebar"),
         (k(Action::MiniSidebar), "mini sidebar"),
-        (k(Action::Compact), "compact cards · fit grid"),
+        (k(Action::Compact), "compact sidebar cards"),
         ("shift+pgup".into(), "scroll back"),
         ("wheel".into(), "scroll · click focus"),
         ("drag".into(), "select & copy"),
@@ -1643,29 +1626,26 @@ mod tests {
     }
 
     #[test]
-    fn grid_tiles_keep_their_size_a_page_at_a_time() {
-        let area = Rect::new(0, 0, 180, 45);
-        // Few agents: every one, as large as they come.
-        let (tiles, page, pages) = grid_tiles(4, 0, area, false);
-        assert_eq!((tiles.len(), page, pages), (4, 1, 1));
-        assert!(tiles.iter().all(|(_, r)| r.width >= TILE_MIN.0 && r.height >= TILE_MIN.1));
-        // Many: full-size tiles, the page with the focus on it.
-        let (tiles, page, pages) = grid_tiles(24, 10, area, false);
-        assert_eq!((page, pages), (2, 3), "3×3 per page");
-        assert_eq!(tiles.iter().map(|(i, _)| *i).collect::<Vec<_>>(), (9..18).collect::<Vec<_>>());
-        assert!(tiles.iter().all(|(_, r)| r.width >= TILE_MIN.0 && r.height >= TILE_MIN.1), "{tiles:?}");
-        // The last page has the same grid, partly empty, not stretched.
-        let (last, page, _) = grid_tiles(24, 23, area, false);
-        assert_eq!((last.len(), page), (6, 3));
-        assert_eq!((last[0].1.width, last[0].1.height), (tiles[0].1.width, tiles[0].1.height));
-        // Fit all (alt+c): every agent on one screen, however small.
-        let (all, page, pages) = grid_tiles(24, 10, area, true);
-        assert_eq!((all.len(), page, pages), (24, 1, 1));
-        assert!(all.iter().any(|(_, r)| r.width < TILE_MIN.0 || r.height < TILE_MIN.1));
-        // A terminal smaller than one tile still shows the focused agent.
-        let (one, ..) = grid_tiles(3, 2, Rect::new(0, 0, 40, 10), false);
-        assert_eq!(one.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [2]);
-        assert_eq!(grid_tiles(0, 0, area, false).0.len(), 0);
+    fn the_grid_shows_four_at_most_two_to_a_row() {
+        let area = Rect::new(0, 0, 180, 46);
+        let (w, h) = (90, 23);
+        let shape = |n: usize, focus: usize| {
+            let (tiles, page, pages) = grid_tiles(n, focus, area);
+            (tiles.iter().map(|(i, r)| (*i, r.x, r.y, r.width, r.height)).collect::<Vec<_>>(), page, pages)
+        };
+        assert_eq!(shape(1, 0), (vec![(0, 0, 0, 180, 46)], 1, 1), "one: the whole area");
+        assert_eq!(shape(2, 1), (vec![(0, 0, 0, w, 46), (1, w, 0, w, 46)], 1, 1), "two: side by side");
+        assert_eq!(shape(3, 0), (vec![(0, 0, 0, w, h), (1, w, 0, w, h), (2, 0, h, 180, h)], 1, 1), "three: two up, one below");
+        assert_eq!(shape(4, 3), (vec![(0, 0, 0, w, h), (1, w, 0, w, h), (2, 0, h, w, h), (3, w, h, w, h)], 1, 1), "four: 2×2");
+        // More: four to a page, the page with the focused agent.
+        let (tiles, page, pages) = shape(10, 5);
+        assert_eq!((page, pages), (2, 3));
+        assert_eq!(tiles.iter().map(|t| t.0).collect::<Vec<_>>(), [4, 5, 6, 7]);
+        // The last page lays out what's left the same way: two, side by side.
+        let (tiles, page, _) = shape(10, 9);
+        assert_eq!((page, tiles.len()), (3, 2));
+        assert_eq!((tiles[0].0, tiles[1].0, tiles[0].4), (8, 9, 46));
+        assert_eq!(grid_tiles(0, 0, area).0.len(), 0);
     }
 
     #[test]
@@ -1708,7 +1688,7 @@ mod tests {
         // The help names the key.
         app.modal = Some(Modal::Help);
         let help = frame(&mut app);
-        assert!(help.contains("alt+c") && help.contains("compact cards"), "{help}");
+        assert!(help.contains("alt+c") && help.contains("compact sidebar cards"), "{help}");
         for a in &app.agents {
             a.shutdown();
         }
