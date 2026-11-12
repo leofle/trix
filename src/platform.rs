@@ -123,7 +123,8 @@ pub fn play(wav: &'static [u8]) {
         // afplay only reads files: keep one copy next to the sockets.
         std::thread::spawn(move || {
             let path = crate::hooks::runtime_dir().join("chime.wav");
-            if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(wav.len() as u64) && std::fs::write(&path, wav).is_err() {
+            // Compare contents, not size: a new chime can be the same length.
+            if std::fs::read(&path).ok().as_deref() != Some(wav) && std::fs::write(&path, wav).is_err() {
                 return;
             }
             if let Ok(mut c) = quiet(Command::new("afplay").arg(&path)).spawn() {
