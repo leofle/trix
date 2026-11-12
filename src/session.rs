@@ -689,7 +689,7 @@ pub fn control(msg: &ClientMsg, wait: Option<u64>) -> Result<crate::control::Rep
         Ok((TEXT, p)) => serde_json::from_slice(&p).map_err(|e| format!("bad reply from the workspace: {e}")),
         Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Err("the workspace didn't answer in time".into()),
         _ => Err(format!(
-            "the running workspace was started by an older trix without agent control — restart it (alt+q, then `{}`) to use this",
+            "the running workspace is from an older trix that doesn't know this command — restart it (alt+q, then `{}`) to use it",
             command()
         )),
     }

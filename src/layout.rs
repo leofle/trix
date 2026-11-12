@@ -219,13 +219,14 @@ pub fn run(cmd: Cmd) -> Result<bool, String> {
             if !reply.err.is_empty() {
                 eprintln!("trix: {}", reply.err);
             }
-            if inside {
-                if reply.code != 0 {
-                    std::process::exit(reply.code);
+            if reply.code != 0 {
+                // Attaching would cover what failed and why with the TUI.
+                if !inside {
+                    eprintln!("trix: `{}` attaches to the workspace", session::command());
                 }
-                return Ok(false);
+                std::process::exit(reply.code);
             }
-            Ok(true)
+            Ok(!inside)
         }
     }
 }
@@ -280,6 +281,7 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
         let (verb, rest) = line.split_at(9);
         out.push_str(&format!("{verb}{:<w$}  {rest}\n", a.name));
     }
+    drop_from_restore(app, &agents);
     if opened > 0 {
         app.toast(format!("opened layout {name} · {opened} agent{}", if opened == 1 { "" } else { "s" }), ToastKind::Good);
     }
@@ -289,6 +291,25 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
         r.err = format!("{failed} of layout {name}'s agents couldn't start");
     }
     r
+}
+
+/// A workspace that `layout open` started still offers to restore the last
+/// session. Its entries for tabs this layout now has open would come back a
+/// second time (`web-2`, maybe in the same conversation), so the layout takes
+/// them over and the offer keeps only the rest.
+fn drop_from_restore(app: &mut App, agents: &[LayoutAgent]) {
+    let Some(p) = &mut app.pending_restore else { return };
+    let covered = |s: &SavedAgent| agents.iter().any(|a| a.name == s.name) && app.agents.iter().any(|x| x.name == s.name);
+    let focused = p.agents.get(p.focus).filter(|s| !covered(s)).map(|s| s.name.clone());
+    p.agents.retain(|s| !covered(s));
+    p.focus = focused.and_then(|f| p.agents.iter().position(|s| s.name == f)).unwrap_or(0);
+    if p.agents.is_empty() {
+        app.pending_restore = None;
+        if matches!(app.modal, Some(app::Modal::Restore)) {
+            app.modal = None;
+        }
+    }
+    app.dirty = true;
 }
 
 #[cfg(test)]
@@ -405,6 +426,33 @@ mod tests {
         assert!(again.out.contains("opened   c"), "{}", again.out);
         assert!(again.out.contains("failed   gone") && again.out.contains("folder not found"), "{}", again.out);
         assert_eq!(again.code, 1);
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn opening_takes_over_matching_restore_entries() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), None, "/bin/true".into(), crate::session::Out::default());
+        let tmp = std::env::temp_dir();
+        let saved = |name: &str| SavedAgent { kind: "claude".into(), name: name.into(), cwd: tmp.clone(), command: None, session: Some(format!("s-{name}")) };
+        app.pending_restore = Some(crate::state::Saved::new(2, vec![saved("web"), saved("api"), saved("docs")]));
+        app.modal = Some(app::Modal::Restore);
+        let mut job = entry("custom", "web", &tmp.display().to_string());
+        job.args = Some("exec sleep 60".into());
+        let gone = entry("shell", "api", "/no/such/dir");
+        assert_eq!(open(&mut app, None, "work", vec![job, gone], false).code, 1);
+        let p = app.pending_restore.as_ref().expect("api and docs are still on offer");
+        assert_eq!(p.agents.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["api", "docs"], "only web is open now");
+        assert_eq!(p.agents[p.focus].name, "docs", "focus follows the entry");
+
+        let mut docs = entry("custom", "docs", &tmp.display().to_string());
+        docs.args = Some("exec sleep 60".into());
+        let mut api = docs.clone();
+        api.name = "api".into();
+        open(&mut app, None, "rest", vec![docs, api], false);
+        assert!(app.pending_restore.is_none() && app.modal.is_none(), "nothing left to restore, so no prompt");
         for a in &app.agents {
             a.shutdown();
         }

@@ -396,7 +396,7 @@ fn kind_color(t: &Theme, k: Kind) -> Color {
 /// The widest bar count up to `room` that divides `SPARK_LEN`, so every bar
 /// covers the same number of seconds and the line spans the whole history.
 fn spark_width(room: usize) -> usize {
-    (1..=room.min(SPARK_LEN)).rev().find(|n| SPARK_LEN % n == 0).unwrap_or(0)
+    (1..=room.min(SPARK_LEN)).rev().find(|&n| SPARK_LEN.is_multiple_of(n)).unwrap_or(0)
 }
 
 fn sparkline(a: &Agent, width: usize, color: Color, base: Color) -> Vec<Span<'static>> {

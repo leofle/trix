@@ -30,9 +30,11 @@ use crate::agent::{Agent, Kind, Spawn, State};
 use crate::app::{self, App, ToastKind};
 use crate::session::{self, ClientMsg, TEXT};
 
-/// Version of the control requests below. A server that doesn't know
-/// `ClientMsg::Control` at all just hangs up, which the client reports.
-pub const CONTROL: u32 = 1;
+/// Version of the control requests below: bump it whenever `Request` or
+/// `Reply` changes. A server that can't parse a request (older than
+/// `ClientMsg::Control`, or than the request's variant) just hangs up, which
+/// the client reports.
+pub const CONTROL: u32 = 2;
 
 /// How long after a `send` an agent that hasn't moved still counts as busy:
 /// enough for any agent to show it started, so `send` then `wait` doesn't
