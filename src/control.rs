@@ -30,10 +30,11 @@ use crate::agent::{Agent, Kind, Spawn, State};
 use crate::app::{self, App, ToastKind};
 use crate::session::{self, ClientMsg, TEXT};
 
-/// Version of the control requests below: bump it whenever `Request` or
-/// `Reply` changes. A server that can't parse a request (older than
-/// `ClientMsg::Control`, or than the request's variant) just hangs up, which
-/// the client reports.
+/// Version of the control requests below: bump it whenever an existing
+/// `Request` or `Reply` changes shape. A new variant needs no bump: a server
+/// that can't parse a request (older than `ClientMsg::Control`, or than the
+/// request's variant) just hangs up, which the client reports, while every
+/// other command keeps working with it.
 pub const CONTROL: u32 = 2;
 
 /// How long after a `send` an agent that hasn't moved still counts as busy:
@@ -61,6 +62,8 @@ pub enum Request {
     Layout,
     /// Start a saved layout's agents (`trix layout open`).
     Open { name: String, agents: Vec<crate::layout::LayoutAgent>, resume: bool },
+    /// Follow what these agents (none: all of them) do (`trix events`).
+    Events { targets: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
@@ -81,7 +84,7 @@ impl Reply {
 
 // ───────────────────────────── client side ─────────────────────────────
 
-pub const COMMANDS: [&str; 5] = ["send", "read", "wait", "spawn", "close"];
+pub const COMMANDS: [&str; 6] = ["send", "read", "wait", "spawn", "close", "events"];
 
 /// Flags whose next argument is their value, whatever it looks like.
 pub const VALUE_FLAGS: &[&str] = &["--lines", "-n", "--timeout", "-t", "--name", "--cwd", "--prompt", "--args"];
@@ -114,6 +117,7 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
         "wait" => &["--all", "--timeout", "-t"],
         "spawn" => &["--name", "--cwd", "--prompt", "--args", "--worktree"],
         "close" => &["--force", "-f"],
+        "events" => &["--json"],
         other => return Err(format!("unknown command '{other}'")),
     };
     if let Some((f, _)) = flags.iter().find(|(f, _)| !allowed.contains(&f.as_str())) {
@@ -177,6 +181,7 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
             }
         }
         "close" => Request::Close { target: one("agent")?, force: has(&["--force", "-f"]) },
+        "events" => Request::Events { targets: pos.clone() },
         _ => unreachable!(),
     })
 }
@@ -229,6 +234,9 @@ pub fn reply(stream: &mut UnixStream, r: &Reply) {
 }
 
 pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Request) {
+    if let Request::Events { targets } = &req {
+        return crate::events::subscribe(app, stream, targets);
+    }
     if let Request::Wait { targets, all, timeout_secs } = req {
         match wait(app, from, &targets) {
             Ok(agents) => {
@@ -250,7 +258,7 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Close { target, force } => close(app, from, &target, force),
         Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
         Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
-        Request::Wait { .. } => unreachable!(),
+        Request::Wait { .. } | Request::Events { .. } => unreachable!(),
     };
     reply(&mut stream, &r);
 }
@@ -428,10 +436,11 @@ pub fn stop_all(app: &mut App, why: &str) {
     for mut w in std::mem::take(&mut app.waiters) {
         reply(&mut w.stream, &Reply::fail(why));
     }
+    crate::events::stop_all(app);
 }
 
 /// Did the other end close? (EOF on a peek; a waiting client never writes.)
-fn hung_up(s: &UnixStream) -> bool {
+pub(crate) fn hung_up(s: &UnixStream) -> bool {
     let mut b = [0u8; 1];
     let n = unsafe { libc::recv(s.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
     n == 0 || (n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock)

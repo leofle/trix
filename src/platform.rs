@@ -135,6 +135,40 @@ pub fn play(wav: &'static [u8]) {
     feed(Command::new("pw-play").args(["--media-role", "Notification", "-"]), wav.to_vec());
 }
 
+/// Play a sound file once, in the background: anything `pw-play` (wav, flac,
+/// ogg) or `afplay` (also mp3, m4a) can play.
+pub fn play_file(path: &std::path::Path) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        Command::new("afplay")
+    } else {
+        let mut c = Command::new("pw-play");
+        c.args(["--media-role", "Notification"]);
+        c
+    };
+    if let Ok(c) = quiet(cmd.arg(path).stdin(Stdio::null())).spawn() {
+        reap(c);
+    }
+}
+
+/// Run a user's command (an argv, no shell) with `input` on its stdin and
+/// `env` added, in the background. Only starting it can fail here.
+pub fn run(argv: &[String], env: &[(&str, String)], input: Vec<u8>) -> std::io::Result<()> {
+    let (prog, args) = argv.split_first().ok_or_else(|| std::io::Error::other("empty command"))?;
+    let mut cmd = Command::new(prog);
+    cmd.args(args).envs(env.iter().map(|(k, v)| (*k, v.as_str())));
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.current_dir(home);
+    }
+    let mut child = quiet(&mut cmd).stdin(Stdio::piped()).spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
+    reap(child);
+    Ok(())
+}
+
 /// Put text on the system clipboard, for terminals that ignore OSC 52.
 pub fn copy(text: &str) {
     if cfg!(target_os = "macos") {

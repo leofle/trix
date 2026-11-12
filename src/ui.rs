@@ -8,6 +8,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TLine, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+
+use crate::config::Action;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -188,22 +190,26 @@ fn clock() -> String {
 }
 
 fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
-    let key = |k: &'static str| Span::styled(format!(" {k} "), Style::new().fg(t.fg_bright).bg(t.surface_hi));
+    let key = |k: String| Span::styled(format!(" {k} "), Style::new().fg(t.fg_bright).bg(t.surface_hi));
     let lab = |l: &'static str| Span::styled(format!(" {l}   "), Style::new().fg(t.dim));
     let mut spans = vec![Span::raw(" ")];
-    let hints: &[(&str, &str)] = if app.modal.is_some() {
-        &[("esc", "cancel")]
-    } else if app.agents.is_empty() {
-        &[("alt+n", "new agent"), ("alt+?", "keys"), ("alt+q", "quit")]
+    let hints: Vec<(String, &str)> = if app.modal.is_some() {
+        vec![("esc".into(), "cancel")]
     } else {
-        &[
-            ("alt+n", "new"),
-            ("alt+a", "attention"),
-            ("alt+1-9", "jump"),
-            ("alt+g", "grid"),
-            ("alt+b", "broadcast"),
-            ("alt+?", "keys"),
-        ]
+        let shown: &[(Action, &str)] = if app.agents.is_empty() {
+            &[(Action::New, "new agent"), (Action::Help, "keys"), (Action::Quit, "quit")]
+        } else {
+            &[
+                (Action::New, "new"),
+                (Action::Attention, "attention"),
+                (Action::Jump, "jump"),
+                (Action::Grid, "grid"),
+                (Action::Broadcast, "broadcast"),
+                (Action::Help, "keys"),
+            ]
+        };
+        // An action with no key has nothing to hint at.
+        shown.iter().filter_map(|&(a, l)| Some((app.config.keys.label(a)?, l))).collect()
     };
     for (k, l) in hints {
         spans.push(key(k));
@@ -267,9 +273,9 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         Span::styled(if mini { "new" } else { "new agent" }, Style::new().fg(t.fg)),
     ]);
     f.render_widget(Paragraph::new(line), btn);
-    if !mini {
+    if let Some(k) = app.config.keys.label(Action::New).filter(|_| !mini) {
         f.render_widget(
-            Paragraph::new(Span::styled("alt+n ", Style::new().fg(t.muted))).alignment(Alignment::Right),
+            Paragraph::new(Span::styled(format!("{k} "), Style::new().fg(t.muted))).alignment(Alignment::Right),
             btn,
         );
     }
@@ -543,7 +549,7 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     let a = &app.agents[app.focus];
     app.hits.panes.push((inner, a.id));
     let cur = render_term(f.buffer_mut(), inner, a, t, app.term_focused);
-    pane_overlays(f, a, area, inner, t);
+    pane_overlays(f, a, area, inner, &app.key(Action::Close), t);
     cur
 }
 
@@ -576,8 +582,10 @@ fn attention_banner(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Rect {
         Span::styled(more, Style::new().fg(t.dim)),
     ]);
     f.render_widget(Paragraph::new(line), r);
-    let hint = TLine::from(vec![Span::styled(" alt+a ", Style::new().fg(t.bg).bg(t.red).add_modifier(Modifier::BOLD)), Span::styled(" jump ", Style::new().fg(t.fg))]);
-    f.render_widget(Paragraph::new(hint).alignment(Alignment::Right), r);
+    if let Some(k) = app.config.keys.label(Action::Attention) {
+        let hint = TLine::from(vec![Span::styled(format!(" {k} "), Style::new().fg(t.bg).bg(t.red).add_modifier(Modifier::BOLD)), Span::styled(" jump ", Style::new().fg(t.fg))]);
+        f.render_widget(Paragraph::new(hint).alignment(Alignment::Right), r);
+    }
     Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area }
 }
 
@@ -609,13 +617,13 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
                 // Unfocused tiles recede a little.
                 fade(f.buffer_mut(), inner, t, 0.35);
             }
-            pane_overlays(f, a, *c, inner, t);
+            pane_overlays(f, a, *c, inner, &app.key(Action::Close), t);
         }
     }
     cursor
 }
 
-fn pane_overlays(f: &mut Frame, a: &Agent, outer: Rect, inner: Rect, t: &Theme) {
+fn pane_overlays(f: &mut Frame, a: &Agent, outer: Rect, inner: Rect, close: &str, t: &Theme) {
     let offset = a.term.lock().grid().display_offset();
     if offset > 0 {
         let s = TLine::from(vec![Span::styled(
@@ -634,7 +642,7 @@ fn pane_overlays(f: &mut Frame, a: &Agent, outer: Rect, inner: Rect, t: &Theme) 
             Span::styled(format!("process exited{code}"), Style::new().fg(t.fg)),
             Span::styled("    enter", Style::new().fg(t.accent)),
             Span::styled(" restart", Style::new().fg(t.dim)),
-            Span::styled("   alt+w", Style::new().fg(t.accent)),
+            Span::styled(format!("   {close}"), Style::new().fg(t.accent)),
             Span::styled(" close", Style::new().fg(t.dim)),
         ]);
         f.render_widget(Paragraph::new(line), r);
@@ -813,16 +821,20 @@ fn empty_state(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect { x: area.x, y, width: area.width, height: 1 });
     };
     center(f, y0 + 3, TLine::from(Span::styled("a workspace where agents live", Style::new().fg(t.dim))));
-    let row = |k: &'static str, l: &'static str| {
-        TLine::from(vec![
-            Span::styled(format!(" {k:<7}"), Style::new().fg(t.accent)),
+    let rows = [
+        ("enter".to_string(), "spawn your first agent"),
+        (app.key(Action::New), "new agent anytime"),
+        (app.key(Action::Attention), "jump to who needs you"),
+        (app.key(Action::Help), "every shortcut"),
+    ];
+    let w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0).max(6) + 1;
+    for (y, (k, l)) in (y0 + 6..).zip(rows) {
+        let line = TLine::from(vec![
+            Span::styled(format!(" {k:<w$}"), Style::new().fg(t.accent)),
             Span::styled(format!("{l:<22}"), Style::new().fg(t.fg)),
-        ])
-    };
-    center(f, y0 + 6, row("enter", "spawn your first agent"));
-    center(f, y0 + 7, row("alt+n", "new agent anytime"));
-    center(f, y0 + 8, row("alt+a", "jump to who needs you"));
-    center(f, y0 + 9, row("alt+?", "every shortcut"));
+        ]);
+        center(f, y, line);
+    }
     let theme_note = if app.themed_by_omarchy { "following your omarchy theme" } else { "tokyo night" };
     center(f, y0 + 12, TLine::from(Span::styled(theme_note, Style::new().fg(t.muted))));
 }
@@ -1036,9 +1048,10 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
         Modal::ConfirmQuit => {
             let live = app.agents.iter().filter(|a| a.state != State::Exited).count();
-            confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped. alt+d detaches instead.", if live == 1 { " is" } else { "s are" }));
+            let detach = app.config.keys.label(Action::Detach).map(|k| format!(" {k} detaches instead.")).unwrap_or_default();
+            confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped.{detach}", if live == 1 { " is" } else { "s are" }));
         }
-        Modal::Help => help(f, area, t),
+        Modal::Help => help(f, app, area, t),
         Modal::Restore => {
             let summary = app.pending_restore.as_ref().map(|p| p.summary()).unwrap_or_default();
             restore_prompt(f, area, t, &summary);
@@ -1195,35 +1208,44 @@ fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
     );
 }
 
-fn help(f: &mut Frame, area: Rect, t: &Theme) {
+/// Two actions' keys as one label: `alt+j / k` when they share a prefix.
+fn key_pair(a: &str, b: &str) -> String {
+    match (a.rsplit_once('+'), b.rsplit_once('+')) {
+        (Some((pa, _)), Some((pb, kb))) if pa == pb && !kb.is_empty() => format!("{a} / {kb}"),
+        _ => format!("{a} / {b}"),
+    }
+}
+
+fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let r = centered(area, 78, 19);
     f.render_widget(Clear, r);
     let block = modal_block("Keys", t);
     let inner = block.inner(r);
     f.render_widget(block, r);
-    let left: &[(&str, &str)] = &[
-        ("", "AGENTS"),
-        ("alt+n", "new agent"),
-        ("alt+1…9", "jump to agent"),
-        ("alt+j / k", "next / previous"),
-        ("alt+a", "next one that needs you"),
-        ("alt+b", "broadcast a prompt"),
-        ("alt+f", "search all scrollback"),
-        ("alt+r", "rename"),
-        ("alt+w", "close"),
-        ("enter", "restart an exited agent"),
+    let k = |a| app.key(a);
+    let left: Vec<(String, &str)> = vec![
+        (String::new(), "AGENTS"),
+        (k(Action::New), "new agent"),
+        (k(Action::Jump), "jump to agent"),
+        (key_pair(&k(Action::Next), &k(Action::Prev)), "next / previous"),
+        (k(Action::Attention), "next one that needs you"),
+        (k(Action::Broadcast), "broadcast a prompt"),
+        (k(Action::Search), "search all scrollback"),
+        (k(Action::Rename), "rename"),
+        (k(Action::Close), "close"),
+        ("enter".into(), "restart an exited agent"),
     ];
-    let right: &[(&str, &str)] = &[
-        ("", "VIEW"),
-        ("alt+g", "grid ⇄ focus"),
-        ("alt+s", "toggle sidebar"),
-        ("alt+m", "mini sidebar"),
-        ("shift+pgup", "scroll back"),
-        ("wheel", "scroll · click focus"),
-        ("drag", "select & copy"),
-        ("shift+enter", "newline to agent"),
-        ("alt+d", "detach · keeps running"),
-        ("alt+q", "quit · stops agents"),
+    let right: Vec<(String, &str)> = vec![
+        (String::new(), "VIEW"),
+        (k(Action::Grid), "grid ⇄ focus"),
+        (k(Action::Sidebar), "toggle sidebar"),
+        (k(Action::MiniSidebar), "mini sidebar"),
+        ("shift+pgup".into(), "scroll back"),
+        ("wheel".into(), "scroll · click focus"),
+        ("drag".into(), "select & copy"),
+        ("shift+enter".into(), "newline to agent"),
+        (k(Action::Detach), "detach · keeps running"),
+        (k(Action::Quit), "quit · stops agents"),
     ];
     let cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(1) });
     for (col, items) in cols.iter().zip([left, right]) {
@@ -1231,7 +1253,7 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
             let line = if k.is_empty() {
                 TLine::from(Span::styled(*d, Style::new().fg(t.dim).add_modifier(Modifier::BOLD)))
             } else {
-                TLine::from(vec![Span::styled(format!("{k:<13}"), Style::new().fg(t.accent)), Span::styled(*d, Style::new().fg(t.fg))])
+                TLine::from(vec![Span::styled(format!("{k:<12} "), Style::new().fg(t.accent)), Span::styled(*d, Style::new().fg(t.fg))])
             };
             f.render_widget(Paragraph::new(line), Rect { y: col.y + i as u16 + if i > 0 { 1 } else { 0 }, height: 1, ..*col });
         }

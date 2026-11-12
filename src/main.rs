@@ -1,6 +1,8 @@
 mod agent;
 mod app;
+mod config;
 mod control;
+mod events;
 mod hooks;
 mod input;
 mod layout;
@@ -55,6 +57,10 @@ agent control (for scripts, and for agents managing other agents):
                             seconds (300; 0 waits forever)
   trix close <agent> [--force]
                             close it; --force if it is working or needs you
+  trix events [agent…] [--json]
+                            follow what agents do, live: one line per change
+                            (spawned, state, renamed, closed). --json for
+                            scripts: one JSON object per line
   <agent> is a name, or its number in `trix ls`.
 
 layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
@@ -66,6 +72,9 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
                             skipped. From outside trix, starts it and attaches
   trix layout ls            list saved layouts
   trix layout rm <name>     remove one
+
+  trix config               check ~/.config/trix/config.toml (keys, sounds,
+                            notifications); trix reloads it on every save
 
   trix hook <source>        (internal) agent lifecycle reporter
   trix server               (internal) the background workspace
@@ -79,7 +88,7 @@ is in control at a time; `trix view` lets any number of others watch. Each named
 session is its own workspace, with its own agents and saved layout. Without
 -s, `trix ls` shows every running session.
 
-keys inside trix: alt+n new agent · alt+a who needs you · alt+g grid · alt+d detach · alt+? all keys
+keys inside trix (the defaults): alt+n new agent · alt+a who needs you · alt+g grid · alt+d detach · alt+? all keys
 ";
 
 /// Pull `-s <name>` / `--session <name>` / `--session=<name>` out of `args`.
@@ -175,6 +184,7 @@ fn main() -> anyhow::Result<()> {
         Some(cmd) if control::COMMANDS.contains(&cmd) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
             match control::parse(&args, cwd) {
+                Ok(control::Request::Events { targets }) => events::run(targets, args.iter().any(|a| a == "--json")),
                 Ok(req) => control::run(req),
                 Err(e) => {
                     eprintln!("trix: {e}\n\n{HELP}");
@@ -190,6 +200,22 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             print!("{}", texts.join("\n"));
+            return Ok(());
+        }
+        Some("config") => {
+            if args.len() > 1 {
+                eprintln!("trix: config takes no arguments\n\n{HELP}");
+                std::process::exit(2);
+            }
+            let path = app::tilde(&config::path());
+            match (config::load(), config::stamp()) {
+                (Ok(_), None) => println!("{path}: no file, so the defaults. See the README's Config section."),
+                (Ok(_), Some(_)) => println!("{path}: ok"),
+                (Err(e), _) => {
+                    eprintln!("trix: {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
             return Ok(());
         }
         Some("kill") => {
@@ -408,8 +434,11 @@ fn server() -> anyhow::Result<()> {
             if now >= last_slow + Duration::from_secs(1) {
                 last_slow = now;
                 app.slow_tick();
+                events::prune(&mut app);
             }
         }
+        // Whatever changed this turn, from any source.
+        events::publish(&mut app);
         if !out.attached() {
             app.dirty = false;
             continue;

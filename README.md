@@ -21,15 +21,15 @@ A workspace where coding agents live. Run Claude Code, Codex, Grok, OpenCode, Cu
 Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and Rex added agent awareness, but they still treat the agent as just another pane. In trix, the agent comes first:
 
 - **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>`, Codex with `-c` hook overrides, OpenCode with a plugin in `OPENCODE_CONFIG_CONTENT` and Cursor with `--plugin-dir`, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex).) Agents without hooks fall back to output cadence and screen heuristics. See [Supported agents](#supported-agents).
-- **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too.
-- **Context at a glance.** Each Claude and Codex agent shows how full its context window is: a pie and a percentage in the sidebar (`◔31%`, yellow from 70%, red from 85%), and `context 31% · ~691k left` on its pane. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
+- **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip appears over your current pane. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too. Which of these happen, and which sound plays, is up to you: see [Config](#config).
+- **Context at a glance.** Each Claude and Codex agent shows how full its context window is on its pane: `context 31% · ~691k left`, yellow from 70%, red from 85%. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles every agent live. The focused tile is accented, blocked tiles turn red, and the rest fade back a little.
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
 - **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching.
-- **Agents can run agents.** `trix spawn`, `send`, `read`, `wait` and `close` let a script, or an agent in another pane, work the workspace the way you do. A "lead" Claude can start workers in their own worktrees, hand them tasks, wait for them and read what they did. It never answers a permission prompt for you, and the sidebar shows which agent it is driving. See [Agent control](#agent-control).
+- **Agents can run agents.** `trix spawn`, `send`, `read`, `wait`, `close` and `events` let a script, or an agent in another pane, work the workspace the way you do. A "lead" Claude can start workers in their own worktrees, hand them tasks, wait for them and read what they did. It never answers a permission prompt for you, and the sidebar shows which agent it is driving. See [Agent control](#agent-control).
 - **Layouts on demand.** `trix layout save work` remembers the tabs you have open, with their folders. `trix layout open work` brings them back whenever you want, with fresh conversations, or the old ones with `--resume`. See [Layouts](#layouts).
 - **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
@@ -72,7 +72,7 @@ trix kill --all           # stop every running session
 
 ### Agent control
 
-Six commands drive a running workspace from any shell. They're meant for scripts and for agents managing other agents:
+Seven commands drive a running workspace from any shell. They're meant for scripts and for agents managing other agents:
 
 ```sh
 trix spawn claude --name api --worktree --prompt "add rate limiting to /login"
@@ -81,10 +81,12 @@ trix wait api                                 # blocks until api stops working
 trix read api -n 80                           # the last 80 lines of its screen and scrollback
 trix ls --json                                # every agent: state, activity, branch, diff, last prompt…
 trix close api
+trix events --json                            # follow every change, live: one JSON object per line
 ```
 
 - `<agent>` is an agent's name, or its number in `trix ls`. Names are safer, because numbers shift when an agent closes. `spawn` prints the new agent's name and folder. It refuses a name that's already taken, and it never steals focus from the agent you're looking at.
 - `wait` takes one or more agents and returns when one of them stops working (`--all`: when every one has). It prints one `name<TAB>state<TAB>activity` line per agent, where the state is `done`, `idle`, `needs-you` or `exited`. A prompt just sent with `send` counts as work until the agent's turn starts, so `send` followed by `wait` waits for that turn. After `-t` seconds (default 300, `0` waits forever) it exits with 124, and you can simply run it again. A shell counts as done when it's back at its prompt. Builtins and shell functions run inside the shell itself, so `wait` can't see them.
+- `events` follows the workspace live, the way `wait` would if it never returned. It starts with one `present` line per agent, then prints a line per change: `spawned`, `state` (with the state it left), `renamed` and `closed`. Name agents to follow only those. Without `--json` it prints a line a person can read (`14:02:11  api  working → needs-you  approve Bash rm -rf dist`). With `--json`, each line is an object with `event`, `at` (Unix ms), `session`, `id`, `number`, `name`, `kind`, `state`, `prev`, `activity`, `unseen`, `cwd` and `managed_by`, the same states as `wait`. It exits 0 when the workspace stops. A reader that stops reading isn't waited for: once 1024 events are queued for it, trix drops it, and it exits 1 saying it fell behind.
 - Exit codes: 0 ok, 1 refused or failed (the reason goes to stderr), 2 bad usage, 124 `wait` timed out.
 
 Guard rails, enforced by the server:
@@ -126,6 +128,34 @@ trix layout rm work-layout
 - From a terminal outside trix, `open` starts the workspace if needed and attaches to it, unless a tab failed to start: then it reports why and leaves attaching to you. From inside a pane, it just adds the tabs, so an agent can run it too: "open my work layout". `trix -s <name> layout open …` from a pane starts that session if needed and opens the tabs there.
 - `--resume` only applies to Claude, Codex, Grok, OpenCode and Cursor tabs that have a saved `session`. Everything else starts fresh either way.
 - How this differs from [Restore](#restore): restore brings back whatever was open after a crash or restart, and it's per session and one-shot. A layout stays until you remove it, and you can open it into any session, any number of times.
+
+### Config
+
+`~/.config/trix/config.toml` (`$XDG_CONFIG_HOME` if set) changes keys, sounds and notifications. Every setting is optional, and without the file trix works as described above. trix reloads the file within a second of each save and says so in a toast. If the file has a mistake, the toast names the line and trix keeps the previous settings. `trix config` checks the file from the command line.
+
+```toml
+[keys]
+new = "alt+t"                     # one key…
+next = ["alt+j", "ctrl+down"]     # …or several
+jump = "ctrl+1..9"                # jump is the only one that takes a range
+grid = []                         # none: alt+g then reaches the agent
+
+[notify]
+on = ["needs-you"]                # which events notify: needs-you, done (both by default)
+desktop = true                    # the desktop notification
+bell = true                       # the terminal bell: the urgency hint while trix is unfocused
+command = "~/bin/ping-phone"      # also run this, for each notification
+
+[sound]
+done = "chime"                    # the built-in chime (default), "off", or a sound file
+needs_you = "~/sounds/knock.ogg"  # off by default
+mute = ["codex", "scratch"]       # agent kinds or names that never make a sound
+```
+
+- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `search`, `broadcast`, `rename`, `close`, `detach`, `help` and `quit`. Naming an action replaces its keys, and the actions you leave out keep theirs. A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents. The exception is an F-key, which may stand alone. `super`/`cmd` is refused, because terminals don't pass it on. A key bound to two actions is an error. The footer, the help (`alt+?`) and the other hints show the keys you chose.
+- **Notifications** cover agents you're not looking at, as before. `on` picks the events; `desktop`, `bell` and `command` pick where they go. `command` runs without a shell (as an argv, or a string split like one; `~` works in the program), from your home folder, with the event's JSON on stdin (the same object as `trix events --json`). It also gets `TRIX_NOTIFY_EVENT` (`needs-you` or `done`), `TRIX_NOTIFY_AGENT`, `TRIX_NOTIFY_TITLE`, `TRIX_NOTIFY_BODY` and `TRIX_NOTIFY_SESSION`. For example, `command = ['sh', '-c', 'curl -s -d "$TRIX_NOTIFY_TITLE" ntfy.sh/my-agents']` puts every notification on your phone through [ntfy](https://ntfy.sh).
+- **Sounds** follow their own settings, separate from `on`. A sound file can be anything `pw-play` (wav, flac, ogg) or `afplay` (also mp3, m4a) plays. A relative path is looked up next to `config.toml`. Sounds within two seconds of each other share one sound, done and needs-you separately.
+- `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
 
 ### Context gauge
 
@@ -264,6 +294,8 @@ src/search.rs  search across agent scrollbacks
 src/layout.rs  saved layouts: save / open / ls / rm, TOML files
 src/usage.rs   context gauge: follows Claude / Codex conversation logs
 src/control.rs agent control: spawn / send / read / wait / close, ls --json, guard rails
+src/events.rs  `trix events`: the live event stream, its subscribers and the client
+src/config.rs  config.toml: keys, notifications, sounds
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
@@ -274,9 +306,9 @@ src/theme.rs   Omarchy theme loading / live reload
 src/platform.rs Linux / macOS differences: process liveness and folders, foreground job, notifications, sound, clipboard
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
+`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds and their errors), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
 
-Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes completion chimes independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
+Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes every sound independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
 ## Next
 

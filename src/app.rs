@@ -236,6 +236,13 @@ pub struct App {
     parked: HashSet<u32>,
     /// `trix wait`s still waiting.
     pub waiters: Vec<crate::control::Waiter>,
+    /// `trix events` subscribers, and what they last heard about each agent.
+    pub subscribers: Vec<crate::events::Subscriber>,
+    pub published: HashMap<u32, crate::events::Published>,
+    /// `~/.config/trix/config.toml`, and the write it was read from.
+    pub config: crate::config::Config,
+    config_stamp: Option<(std::time::SystemTime, u64)>,
+    last_needs_you_sound: Option<Instant>,
 }
 
 impl App {
@@ -248,7 +255,13 @@ impl App {
         let usage_targets = crate::usage::Targets::default();
         crate::usage::spawn_watcher(usage_targets.clone(), tx.clone());
         let prefs = state::load_prefs();
-        App {
+        // Tests never read the developer's own config.
+        let (loaded, config_stamp) = if cfg!(test) { (Ok(Default::default()), None) } else { (crate::config::load(), crate::config::stamp()) };
+        let (config, config_error) = match loaded {
+            Ok(c) => (c, None),
+            Err(e) => (crate::config::Config::default(), Some(e)),
+        };
+        let mut app = App {
             agents: Vec::new(),
             specs: HashMap::new(),
             focus: 0,
@@ -289,7 +302,39 @@ impl App {
             last_completion_sound: None,
             parked: HashSet::new(),
             waiters: Vec::new(),
+            subscribers: Vec::new(),
+            published: HashMap::new(),
+            config,
+            config_stamp,
+            last_needs_you_sound: None,
+        };
+        if let Some(e) = config_error {
+            app.toast(format!("config: {e} — using the defaults (`trix config` checks it)"), ToastKind::Bad);
         }
+        app
+    }
+
+    /// The config file changed: use it, or say why not and keep the old one.
+    fn reload_config(&mut self) {
+        let stamp = crate::config::stamp();
+        if stamp == self.config_stamp || cfg!(test) {
+            return;
+        }
+        self.config_stamp = stamp;
+        match crate::config::load() {
+            Ok(c) if c == self.config => {}
+            Ok(c) => {
+                self.config = c;
+                self.toast("config reloaded", ToastKind::Good);
+            }
+            Err(e) => self.toast(format!("config: {e} — kept the previous settings"), ToastKind::Bad),
+        }
+        self.dirty = true;
+    }
+
+    /// The key for an action, as the help shows it. Unbound: "—".
+    pub fn key(&self, a: crate::config::Action) -> String {
+        self.config.keys.label(a).unwrap_or_else(|| "—".into())
     }
 
     /// A terminal attached: it starts from a blank screen and its own folder.
@@ -896,6 +941,7 @@ impl App {
         }
         self.sync_git_targets();
         self.persist();
+        self.reload_config();
         // The clock and the timers: redraw when what they show changed.
         let shown = crate::ui::times_shown(self);
         if shown != self.times_shown {
@@ -907,6 +953,7 @@ impl App {
     fn transitioned(&mut self, i: usize, prev: State) {
         let a = &self.agents[i];
         let looking = i == self.focus && self.term_focused;
+        let needs_you = a.state == State::Blocked;
         let (title, body, urgent) = match a.state {
             State::Blocked => (format!("{} needs you", a.name), a.activity.clone(), true),
             State::Done if prev == State::Working => {
@@ -914,20 +961,50 @@ impl App {
             }
             _ => return,
         };
+        if looking {
+            return;
+        }
         let title = if crate::session::is_default() { title } else { format!("{title} · {}", crate::session::name()) };
-        if !looking {
+        let n = &self.config.notify;
+        let wanted = if needs_you { n.needs_you } else { n.done };
+        if wanted && n.desktop {
             desktop_notify(&title, &body, urgent);
-            if a.state == State::Done && std::env::var_os("TRIX_NO_SOUND").is_none() {
-                let now = Instant::now();
-                if completion_sound_due(self.last_completion_sound, now) {
-                    self.last_completion_sound = Some(now);
-                    play_completion_sound();
+        }
+        let command = n.command.clone().filter(|_| wanted);
+        let bell = wanted && n.bell && !self.term_focused;
+        let sound = &self.config.sound;
+        let tone = if needs_you { sound.needs_you.clone() } else { sound.done.clone() };
+        let tone = tone.filter_muted(sound.muted(a.kind.label(), &a.name));
+        let event = command.as_ref().map(|_| crate::events::agent_event("state", a, i + 1, Some(prev)).to_string());
+        let agent = a.name.clone();
+
+        if let (Some(argv), Some(event)) = (command, event) {
+            let env = [
+                ("TRIX_NOTIFY_EVENT", if needs_you { "needs-you" } else { "done" }.to_string()),
+                ("TRIX_NOTIFY_AGENT", agent),
+                ("TRIX_NOTIFY_TITLE", title),
+                ("TRIX_NOTIFY_BODY", body),
+                ("TRIX_NOTIFY_SESSION", crate::session::name().to_string()),
+            ];
+            if let Err(e) = crate::platform::run(&argv, &env, event.into_bytes()) {
+                self.toast(format!("notify.command {}: {e}", argv[0]), ToastKind::Bad);
+            }
+        }
+        if tone != crate::config::Tone::Off && std::env::var_os("TRIX_NO_SOUND").is_none() {
+            // A burst of them makes one sound, needs-you and done apart.
+            let last = if needs_you { &mut self.last_needs_you_sound } else { &mut self.last_completion_sound };
+            let now = Instant::now();
+            if completion_sound_due(*last, now) {
+                *last = Some(now);
+                match tone {
+                    crate::config::Tone::File(p) => crate::platform::play_file(&p),
+                    _ => play_completion_sound(),
                 }
             }
-            if !self.term_focused {
-                // Bell → compositor urgency hint on the terminal window.
-                self.out.send_all(b"\x07");
-            }
+        }
+        if bell {
+            // Bell → compositor urgency hint on the terminal window.
+            self.out.send_all(b"\x07");
         }
     }
 
@@ -951,44 +1028,26 @@ impl App {
             self.modal_key(k);
             return;
         }
-        let alt = k.modifiers.contains(KeyModifiers::ALT);
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if alt && !ctrl {
-            let handled = match k.code {
-                KeyCode::Char('n') => {
-                    self.open_new();
-                    true
-                }
-                KeyCode::Char(c @ '1'..='9') => {
-                    self.set_focus(c as usize - '1' as usize);
-                    true
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
+        if let Some((action, n)) = self.config.keys.lookup(&k) {
+            use crate::config::Action;
+            match action {
+                Action::New => self.open_new(),
+                Action::Jump => self.set_focus(n),
+                Action::Next => {
                     if !self.agents.is_empty() {
                         self.set_focus((self.focus + 1) % self.agents.len());
                     }
-                    true
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                Action::Prev => {
                     if !self.agents.is_empty() {
                         self.set_focus((self.focus + self.agents.len() - 1) % self.agents.len());
                     }
-                    true
                 }
-                KeyCode::Char('a') => {
-                    self.next_attention();
-                    true
-                }
-                KeyCode::Char('g') => {
-                    self.view = if self.view == View::Grid { View::Focus } else { View::Grid };
-                    true
-                }
-                KeyCode::Char('s') => {
-                    self.sidebar = !self.sidebar;
-                    true
-                }
-                KeyCode::Char('m') => {
-                    // From hidden, alt+m brings the sidebar back small.
+                Action::Attention => self.next_attention(),
+                Action::Grid => self.view = if self.view == View::Grid { View::Focus } else { View::Grid },
+                Action::Sidebar => self.sidebar = !self.sidebar,
+                Action::MiniSidebar => {
+                    // From hidden, it brings the sidebar back small.
                     self.sidebar_mini = !self.sidebar || !self.sidebar_mini;
                     self.sidebar = true;
                     // Load first: change only this, whatever else prefs.json holds.
@@ -997,31 +1056,27 @@ impl App {
                     if let Err(e) = state::store_prefs(&prefs) {
                         self.toast(format!("couldn't remember the sidebar size: {e}"), ToastKind::Bad);
                     }
-                    true
                 }
-                KeyCode::Char('f') => {
+                Action::Search => {
                     if self.agents.is_empty() {
                         self.toast("no agents to search yet", ToastKind::Info);
                     } else {
                         self.modal = Some(Modal::Search(Search::default()));
                     }
-                    true
                 }
-                KeyCode::Char('b') => {
+                Action::Broadcast => {
                     if self.agents.is_empty() {
                         self.toast("no agents to talk to yet", ToastKind::Info);
                     } else {
                         self.modal = Some(Modal::Broadcast(TextInput::default(), BroadcastTarget::All));
                     }
-                    true
                 }
-                KeyCode::Char('r') => {
+                Action::Rename => {
                     if let Some(a) = self.focused() {
                         self.modal = Some(Modal::Rename(a.id, TextInput::new(&a.name)));
                     }
-                    true
                 }
-                KeyCode::Char('w') => {
+                Action::Close => {
                     if let Some(a) = self.focused() {
                         if a.state == State::Exited {
                             let id = a.id;
@@ -1030,29 +1085,18 @@ impl App {
                             self.modal = Some(Modal::ConfirmClose(a.id));
                         }
                     }
-                    true
                 }
-                KeyCode::Char('d') => {
-                    self.detach = true;
-                    true
-                }
-                KeyCode::Char('/') | KeyCode::Char('?') => {
-                    self.modal = Some(Modal::Help);
-                    true
-                }
-                KeyCode::Char('q') => {
+                Action::Detach => self.detach = true,
+                Action::Help => self.modal = Some(Modal::Help),
+                Action::Quit => {
                     if self.agents.iter().any(|a| a.state != State::Exited) {
                         self.modal = Some(Modal::ConfirmQuit);
                     } else {
                         self.quit = true;
                     }
-                    true
                 }
-                _ => false,
-            };
-            if handled {
-                return;
             }
+            return;
         }
 
         let Some(a) = self.agents.get_mut(self.focus) else {
