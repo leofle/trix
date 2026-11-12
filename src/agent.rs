@@ -311,10 +311,10 @@ impl Agent {
         env.insert("TRIX_AGENT_ID".into(), id.to_string());
         env.insert("TRIX_AGENT_NAME".into(), spec.name.clone());
         env.insert("TRIX_SESSION".into(), crate::session::name().into());
-        if spec.kind == Kind::Codex {
-            if let Some(chain) = codex_user_notify() {
-                env.insert("TRIX_CODEX_NOTIFY".into(), chain);
-            }
+        if spec.kind == Kind::Codex
+            && let Some(chain) = codex_user_notify()
+        {
+            env.insert("TRIX_CODEX_NOTIFY".into(), chain);
         }
         if spec.kind == Kind::OpenCode {
             let theirs = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
@@ -631,10 +631,10 @@ impl Agent {
                     0 => "replied".into(),
                     n => format!("finished · {n} tool{}", if n == 1 { "" } else { "s" }),
                 };
-                if let Some(d) = &msg.detail {
-                    if msg.event == "agent-turn-complete" {
-                        self.activity = d.clone();
-                    }
+                if let Some(d) = &msg.detail
+                    && msg.event == "agent-turn-complete"
+                {
+                    self.activity = d.clone();
                 }
                 self.set_state(State::Done, focused)
             }

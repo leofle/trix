@@ -90,7 +90,7 @@ pub fn encode_key(key: &KeyEvent, mode: TermMode) -> Vec<u8> {
         KeyCode::F(n) => {
             return match n {
                 1..=4 => {
-                    let f = [b'P', b'Q', b'R', b'S'][(n - 1) as usize] as char;
+                    let f = b"PQRS"[(n - 1) as usize] as char;
                     if modnum > 1 {
                         format!("\x1b[1;{modnum}{f}").into_bytes()
                     } else {

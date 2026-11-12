@@ -323,13 +323,13 @@ impl Default for Out {
 
 impl Link {
     fn frame(&mut self, kind: u8, payload: &[u8]) {
-        if let Some((id, p)) = &self.client {
-            if !p.send(kind, payload) {
-                // Gone or stalled: dropped. Its reader thread sees the hang-up
-                // and reports `Detached`.
-                self.dropped = Some(*id);
-                self.client = None;
-            }
+        if let Some((id, p)) = &self.client
+            && !p.send(kind, payload)
+        {
+            // Gone or stalled: dropped. Its reader thread sees the hang-up
+            // and reports `Detached`.
+            self.dropped = Some(*id);
+            self.client = None;
         }
     }
 

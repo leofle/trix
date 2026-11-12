@@ -55,7 +55,7 @@ fn glyph(app: &App, s: State) -> (&'static str, Style) {
         State::Starting => (SPINNER[f % 10], Style::new().fg(t.cyan)),
         State::Working => (SPINNER[f % 10], Style::new().fg(t.yellow)),
         State::Blocked => {
-            let on = (f / 6) % 2 == 0;
+            let on = (f / 6).is_multiple_of(2);
             ("▲", Style::new().fg(if on { t.red } else { mix(t.red, t.surface, 0.55) }).add_modifier(Modifier::BOLD))
         }
         State::Done => ("✓", Style::new().fg(t.green).add_modifier(Modifier::BOLD)),
@@ -514,11 +514,11 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme)
     if let Some(b) = &a.branch {
         right.push(Span::styled(format!("  {b}"), Style::new().fg(t.magenta)));
     }
-    if let Some((files, add, del)) = a.diff {
-        if files > 0 {
-            right.push(Span::styled(format!(" +{add}"), Style::new().fg(t.green)));
-            right.push(Span::styled(format!(" −{del}"), Style::new().fg(t.red)));
-        }
+    if let Some((files, add, del)) = a.diff
+        && files > 0
+    {
+        right.push(Span::styled(format!(" +{add}"), Style::new().fg(t.green)));
+        right.push(Span::styled(format!(" −{del}"), Style::new().fg(t.red)));
     }
     right.push(Span::raw(" "));
     let mut status = vec![];
