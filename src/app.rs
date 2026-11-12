@@ -231,6 +231,8 @@ pub struct HitMap {
     /// Each pane's title row: its top border, where its name is.
     pub titles: Vec<(Rect, u32)>,
     pub new_button: Option<Rect>,
+    /// The attention strip, and the agent it's about.
+    pub strip: Option<(Rect, u32)>,
     /// An open menu: all of it, and the row of each item.
     pub menu: Option<Rect>,
     pub menu_items: Vec<(Rect, MenuItem)>,
@@ -311,6 +313,8 @@ pub struct App {
     last_needs_you_sound: Option<Instant>,
     /// The last left click on a card or title: when, which agent, which row.
     last_click: Option<(Instant, u32, u16)>,
+    /// The attention strip on screen: whose, and since when (its drop-in).
+    pub strip: Option<(u32, Instant)>,
 }
 
 impl App {
@@ -379,6 +383,7 @@ impl App {
             config_failed: config_error.is_some(),
             last_needs_you_sound: None,
             last_click: None,
+            strip: None,
         };
         if let Some(e) = config_error {
             app.toast(format!("config: {e} — using the defaults (`trix config` checks it)"), ToastKind::Bad);
@@ -782,6 +787,12 @@ impl App {
             take(at((ms / STEP + 1) * STEP));
         } else if blink {
             take(at((ms / (6 * STEP) + 1) * 6 * STEP));
+        }
+        // The strip's drop-in, step by step.
+        if let Some((_, since)) = self.strip
+            && let Some(&ms) = crate::ui::STRIP_STEPS.iter().find(|&&ms| since.elapsed() < Duration::from_millis(ms))
+        {
+            take(since + Duration::from_millis(ms));
         }
         if let Some(t) = &self.toast {
             let fade = t.at + Duration::from_millis(3200);
@@ -1670,7 +1681,8 @@ impl App {
         let (x, y) = (m.column, m.row);
         let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
         // An agent's name: its card in the sidebar, or its pane's title.
-        let named = self.hits.cards.iter().chain(&self.hits.titles).find(|(r, _)| inside(r)).map(|&(_, id)| id);
+        // The strip is about the agent it names: click it to go there.
+        let named = self.hits.strip.iter().chain(&self.hits.cards).chain(&self.hits.titles).find(|(r, _)| inside(r)).map(|&(_, id)| id);
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
                 if let Some(id) = named.or_else(|| self.hits.panes.iter().find(|(r, _)| inside(r)).map(|&(_, id)| id)) {
@@ -1683,6 +1695,15 @@ impl App {
                 {
                     self.open_new();
                     self.dirty = true;
+                    return;
+                }
+                // The strip jumps, and its agent's own title takes its place:
+                // a quick second click mustn't read as a double-click there.
+                if let Some(&(_, id)) = self.hits.strip.iter().find(|(r, _)| inside(r)) {
+                    self.last_click = None;
+                    if let Some(i) = self.index_of(id) {
+                        self.set_focus(i);
+                    }
                     return;
                 }
                 if let Some(id) = named {
@@ -2192,6 +2213,23 @@ mod tests {
         click(&mut app, MouseButton::Left, 70, 20);
         assert!(app.modal.is_none());
         assert_eq!(app.focus, 0, "the click that closed it did nothing else");
+    }
+
+    #[test]
+    fn clicking_the_strip_goes_to_who_waits() {
+        let mut app = menu_app();
+        app.hits.strip = Some((Rect::new(23, 1, 58, 1), 2));
+        click(&mut app, MouseButton::Left, 40, 1);
+        assert_eq!((app.focus, app.last_click), (1, None), "there, and no half double-click");
+        // Its own title is there now; a quick second click doesn't rename.
+        app.hits.strip = None;
+        app.hits.titles = vec![(Rect::new(22, 1, 60, 1), 2)];
+        click(&mut app, MouseButton::Left, 40, 1);
+        assert!(app.modal.is_none());
+        // Right-click: the menu of the agent it names.
+        app.hits.strip = Some((Rect::new(23, 1, 58, 1), 1));
+        click(&mut app, MouseButton::Right, 40, 1);
+        assert_eq!(menu_of(&app).map(|m| m.agent), Some(1));
     }
 
     #[test]

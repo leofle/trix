@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
 use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
-use crate::theme::{Theme, mix};
+use crate::theme::{Theme, contrast, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SIDEBAR_W: u16 = 36;
@@ -91,6 +91,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         sidebar(f, app, s, &t);
     }
     let main = Rect { x: main.x + 1, width: main.width.saturating_sub(2), ..main };
+    if app.view != View::Focus || app.agents.is_empty() {
+        // Only the focus view has a strip: back there, it drops in again.
+        app.strip = None;
+    }
     let cursor = if app.agents.is_empty() {
         empty_state(f, app, main, &t);
         None
@@ -571,7 +575,6 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme)
 }
 
 fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
-    let area = attention_banner(f, app, area, t);
     let block = pane_block(app, &app.agents[app.focus], true, false, t);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -585,43 +588,95 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     app.hits.panes.push((inner, a.id));
     let cur = render_term(f.buffer_mut(), inner, a, t, app.term_focused);
     pane_overlays(f, a, area, inner, &app.key(Action::Close), t);
+    attention_strip(f, app, area, t);
     cur
 }
 
-/// A slim strip above the pane when someone *else* is waiting on the human.
-fn attention_banner(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Rect {
+/// When the strip's drop-in steps, in ms from when it appeared: its lower
+/// edge first, then the whole bar, flashing bright and settling.
+pub const STRIP_STEPS: [u64; 3] = [90, 180, 270];
+
+/// A config color, as this theme has it.
+fn paint(t: &Theme, p: crate::config::Paint) -> Color {
+    match p {
+        crate::config::Paint::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        crate::config::Paint::Theme(name) => t.named(name).unwrap_or(t.red),
+    }
+}
+
+/// The strip's colors: the configured ones, or the theme's red with
+/// whichever of its dark and light reads best on it.
+fn strip_colors(app: &App, t: &Theme) -> (Color, Color) {
+    let bar = app.config.strip.color.map_or(t.red, |p| paint(t, p));
+    let text = match app.config.strip.text {
+        Some(p) => paint(t, p),
+        None if contrast(t.bg, bar) >= contrast(t.fg_bright, bar) => t.bg,
+        None => t.fg_bright,
+    };
+    (bar, text)
+}
+
+/// The bar over the focused pane's title when someone *else* is waiting
+/// on the human. It covers the title rather than taking a row, so nothing
+/// moves and no agent is resized when it comes and goes.
+fn attention_strip(f: &mut Frame, app: &mut App, pane: Rect, t: &Theme) {
     let waiting: Vec<(usize, &Agent)> = app
         .agents
         .iter()
         .enumerate()
         .filter(|(i, a)| *i != app.focus && a.state == State::Blocked)
         .collect();
-    let Some(&(i, first)) = waiting.iter().min_by_key(|(_, a)| a.state_since) else {
-        return area;
+    let Some(&(i, first)) = waiting.iter().min_by_key(|(_, a)| a.state_since).filter(|_| pane.width >= 24 && pane.height >= 3) else {
+        app.strip = None;
+        return;
     };
-    if area.height < 8 {
-        return area;
-    }
-    let r = Rect { height: 1, ..area };
-    let bg = mix(t.red, t.bg, 0.82);
-    f.buffer_mut().set_style(r, Style::new().bg(bg));
-    let (g, gs) = glyph(app, State::Blocked);
+    let (id, name, activity) = (first.id, first.name.clone(), first.activity.clone());
+    let waited = fmt_dur(elapsed(first));
     let more = if waiting.len() > 1 { format!("  +{} more", waiting.len() - 1) } else { String::new() };
-    let line = TLine::from(vec![
-        Span::raw(" "),
-        Span::styled(g, gs),
-        Span::raw(" "),
-        Span::styled(first.name.clone(), Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" ({}) ", i + 1), Style::new().fg(t.dim)),
-        Span::styled(trunc(&first.activity, area.width.saturating_sub(40) as usize), Style::new().fg(t.red)),
-        Span::styled(more, Style::new().fg(t.dim)),
-    ]);
-    f.render_widget(Paragraph::new(line), r);
-    if let Some(k) = app.config.keys.label(Action::Attention) {
-        let hint = TLine::from(vec![Span::styled(format!(" {k} "), Style::new().fg(t.bg).bg(t.red).add_modifier(Modifier::BOLD)), Span::styled(" jump ", Style::new().fg(t.fg))]);
-        f.render_widget(Paragraph::new(hint).alignment(Alignment::Right), r);
+    let since = match app.strip {
+        Some((shown, at)) if shown == id => at,
+        _ => Instant::now(),
+    };
+    app.strip = Some((id, since));
+    let r = Rect { x: pane.x + 1, width: pane.width - 2, ..Rect { height: 1, ..pane } };
+    app.hits.strip = Some((r, id));
+
+    let (bar, text) = strip_colors(app, t);
+    let ms = since.elapsed().as_millis() as u64;
+    let buf = f.buffer_mut();
+    if ms < STRIP_STEPS[0] {
+        // Its lower edge, coming down over the title.
+        for x in r.x..r.right() {
+            if let Some(c) = buf.cell_mut((x, r.y)) {
+                c.set_symbol("▀").set_fg(bar);
+            }
+        }
+        return;
     }
-    Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area }
+    let white = Color::Rgb(255, 255, 255);
+    let bg = if ms < STRIP_STEPS[1] { mix(bar, white, 0.45) } else if ms < STRIP_STEPS[2] { mix(bar, white, 0.2) } else { bar };
+    let st = Style::new().fg(text).bg(bg);
+    let bold = st.add_modifier(Modifier::BOLD);
+    for x in r.x..r.right() {
+        if let Some(c) = buf.cell_mut((x, r.y)) {
+            c.set_symbol(" ").set_style(st);
+        }
+    }
+    let number = format!(" ({})", i + 1);
+    let wait = format!(" · {waited}");
+    let right = app.config.keys.label(Action::Attention).map(|k| (k, "  jump "));
+    let right_w = right.as_ref().map_or(0, |(k, j)| k.width() + j.width());
+    let fixed = 3 + name.width() + number.width() + 2 + wait.width() + more.width() + right_w + 1;
+    let room = (r.width as usize).saturating_sub(fixed);
+    let mut left = vec![Span::styled(" ▲ ", bold), Span::styled(name, bold), Span::styled(number, st), Span::styled("  ", st)];
+    if room >= 4 {
+        left.push(Span::styled(trunc(&activity, room), st));
+    }
+    left.extend([Span::styled(wait, st), Span::styled(more, st)]);
+    f.render_widget(Paragraph::new(TLine::from(left)), r);
+    if let Some((k, jump)) = right {
+        f.render_widget(Paragraph::new(TLine::from(vec![Span::styled(k, bold), Span::styled(jump, st)])).alignment(Alignment::Right), r);
+    }
 }
 
 /// Agents per grid page: more than that and each gets too small to read.
@@ -1532,6 +1587,73 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (text, app)
+    }
+
+    #[test]
+    fn the_strip_drops_over_the_title_and_moves_nothing() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        for (id, name) in [(1, "web"), (2, "api"), (3, "docs")] {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        let t = app.theme.clone();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
+        let mut frame = |app: &mut App| {
+            term.draw(|f| draw(f, app)).unwrap();
+            term.backend().buffer().clone()
+        };
+        let row = |b: &Buffer, y: u16| (0..b.area.width).map(|x| b[(x, y)].symbol().to_string()).collect::<String>();
+        frame(&mut app);
+        let (size, title) = (app.pane_size, app.hits.titles[0].0);
+        assert!(app.hits.strip.is_none() && app.strip.is_none());
+
+        app.agents[1].set_state(State::Blocked, false);
+        app.agents[1].activity = "approve Bash rm -rf dist".into();
+        // It drops in: its lower edge first, over the title.
+        let b = frame(&mut app);
+        let (r, id) = app.hits.strip.expect("a strip");
+        assert_eq!((id, r.y, r.x, r.right()), (2, title.y, title.x + 1, title.right() - 1), "over the title, inside its corners");
+        assert_eq!(app.pane_size, size, "the pane keeps its size");
+        assert!((r.x..r.right()).all(|x| b[(x, r.y)].symbol() == "▀" && b[(x, r.y)].fg == t.red), "{}", row(&b, r.y));
+        assert!(app.next_frame_change().is_some_and(|n| n <= Instant::now() + Duration::from_millis(90)), "the next step is due");
+        // Then the bar, flashing and settling.
+        let since = |ms| Instant::now().checked_sub(Duration::from_millis(ms)).unwrap();
+        app.strip = Some((2, since(120)));
+        let b = frame(&mut app);
+        assert_eq!(b[(r.x + 1, r.y)].bg, mix(t.red, Color::Rgb(255, 255, 255), 0.45));
+        app.strip = Some((2, since(1000)));
+        let b = frame(&mut app);
+        let line = row(&b, r.y);
+        println!("{}\n{}\n{}", row(&b, 0), line, row(&b, r.y + 1));
+        assert!(line.contains("▲ api (2)  approve Bash rm -rf dist · ") && line.contains("alt+a  jump"), "{line}");
+        assert_eq!((b[(r.x + 1, r.y)].bg, b[(r.x + 1, r.y)].fg), (t.red, t.bg), "the theme's red, dark text");
+        assert!(app.next_frame_change().is_none_or(|n| n > Instant::now() + Duration::from_millis(200)), "settled: no more steps");
+        // A second agent waiting.
+        app.agents[2].set_state(State::Blocked, false);
+        assert!(row(&frame(&mut app), r.y).contains("+1 more"));
+        // Its color is yours; the text stays readable.
+        app.config.strip.color = Some(crate::config::Paint::Rgb(0x10, 0x20, 0x60));
+        let b = frame(&mut app);
+        assert_eq!((b[(r.x + 1, r.y)].bg, b[(r.x + 1, r.y)].fg), (Color::Rgb(0x10, 0x20, 0x60), t.fg_bright), "light text on a dark bar");
+        app.config.strip.color = Some(crate::config::Paint::Theme("yellow"));
+        app.config.strip.text = Some(crate::config::Paint::Rgb(0, 0, 0));
+        let b = frame(&mut app);
+        assert_eq!((b[(r.x + 1, r.y)].bg, b[(r.x + 1, r.y)].fg), (t.yellow, Color::Rgb(0, 0, 0)));
+        // The grid has red tiles instead, and coming back drops it in again.
+        app.view = View::Grid;
+        frame(&mut app);
+        assert!(app.hits.strip.is_none() && app.strip.is_none());
+        // Looking at the agent that waits: no strip about it.
+        app.view = View::Focus;
+        app.agents[2].set_state(State::Idle, false);
+        app.focus = 1;
+        frame(&mut app);
+        assert!(app.hits.strip.is_none());
     }
 
     #[test]
