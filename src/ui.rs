@@ -359,7 +359,7 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
 
     // Row 3: kind · output sparkline · git.
     let kind = a.kind.label();
-    let spark_w = 10usize.min(w.saturating_sub(16));
+    let spark_w = spark_width(10usize.min(w.saturating_sub(16)));
     let mut spans = vec![
         Span::raw("       "),
         Span::styled(format!("{kind:<7}"), Style::new().fg(mix(kind_color(t, a.kind), bg, 0.25))),
@@ -391,6 +391,12 @@ fn kind_color(t: &Theme, k: Kind) -> Color {
         Kind::Shell => t.dim,
         Kind::Custom => t.magenta,
     }
+}
+
+/// The widest bar count up to `room` that divides `SPARK_LEN`, so every bar
+/// covers the same number of seconds and the line spans the whole history.
+fn spark_width(room: usize) -> usize {
+    (1..=room.min(SPARK_LEN)).rev().find(|n| SPARK_LEN % n == 0).unwrap_or(0)
 }
 
 fn sparkline(a: &Agent, width: usize, color: Color, base: Color) -> Vec<Span<'static>> {
@@ -1203,6 +1209,16 @@ fn help(f: &mut Frame, area: Rect, t: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_width_divides_the_history() {
+        assert_eq!(spark_width(10), 8);
+        assert_eq!(spark_width(12), 12);
+        assert_eq!(spark_width(5), 4);
+        assert_eq!(spark_width(1), 1);
+        assert_eq!(spark_width(0), 0);
+        assert_eq!(spark_width(100), SPARK_LEN);
+    }
 
     /// The whole screen, drawn into a test terminal: four agents, the second
     /// one needing you, the third with unseen finished work.
