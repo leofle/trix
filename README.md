@@ -131,7 +131,7 @@ trix layout rm work-layout
 
 ### Config
 
-`~/.config/trix/config.toml` (`$XDG_CONFIG_HOME` if set) changes keys, sounds and notifications. Every setting is optional, and without the file trix works as described above. trix reloads the file within a second of each save and says so in a toast. If the file has a mistake, the toast names the line and trix keeps the previous settings. `trix config` checks the file from the command line.
+`~/.config/trix/config.toml` (`$XDG_CONFIG_HOME` if set) changes keys, sounds and notifications. Every setting is optional, and without the file trix works as described above. trix reloads the file within a second of each save and says so in a toast. If the file has a mistake, the toast names the line and trix keeps the previous settings, then tells you when it's fixed. `trix config` checks the file from the command line.
 
 ```toml
 [keys]
