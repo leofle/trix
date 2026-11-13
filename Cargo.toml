@@ -19,6 +19,13 @@ toml = "1.2.1"
 toml_edit = "0.25.19"
 unicode-width = "0.2.3"
 
+# Desktop notifications from trix.app, so they carry trix's icon (src/notifier.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationTrigger"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -7,6 +7,8 @@ mod hooks;
 mod input;
 mod install;
 mod layout;
+#[cfg(target_os = "macos")]
+mod notifier;
 mod platform;
 mod search;
 mod session;
@@ -135,6 +137,11 @@ fn take_session(args: &mut Vec<String>) -> Result<Option<String>, String> {
 
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // The copy of trix that posts macOS notifications, and nothing else.
+    #[cfg(target_os = "macos")]
+    if notifier::is_app() {
+        std::process::exit(notifier::run(&args));
+    }
     if args.first().map(String::as_str) == Some("hook") {
         let source = args.get(1).cloned().unwrap_or_else(|| "custom".into());
         hooks::run_client(&source, args.get(2).cloned());
