@@ -24,6 +24,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Context at a glance.** Each Claude and Codex agent shows how full its context window is on its pane: `context 31% · ~691k left`, yellow from 70%, red from 85%. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles your agents live, up to four at a time. The focused tile is accented, blocked tiles turn red, and the rest fade back a little. A page holds up to four, two to a row, and three are two on top and one below. With more agents, the grid shows the page with the focused agent, and `alt+j`/`alt+k` move through them. The sidebar keeps full cards and scrolls, or shows one-line cards after `alt+c`.
+- **Pin what matters.** Every pane's title starts with a red pin (`⚲`). Click it and that agent moves to the top of the sidebar, with the pin on its card and *pinned* on its title. Up to two agents can be pinned, in the order you pinned them. Click the pin again to unpin it, and it goes right below the ones still pinned. The pin is the same red in every theme, and pins come back with a restored workspace. With a Nerd Font, `[ui] nerd_font = true` draws it as `` (see [Config](#config)).
 - **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other.
 - **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
@@ -137,6 +138,7 @@ trix layout rm work-layout
 - **Theme in agent panes** is on by default: a theme of trix's own paints the panes, and Claude, Grok and OpenCode take it too. Off, trix's bars and sidebar keep the theme, but the panes keep your terminal's colors (and its window transparency), and the agents keep their own themes. It does nothing while trix follows Omarchy's theme, which themes the terminal itself.
 - **Needs-you strip** sets the color of the bar that says another agent needs you: the theme's red, orange, yellow, green, cyan, accent or magenta, so it follows a theme switch, or the `#rrggbb` your config names.
 - **Sidebar** (wide or narrow) and **sidebar cards** (full or compact) do the same as `alt+m` and `alt+c`, and are remembered the same way.
+- **Nerd Font icons** is off by default. On, the pane pin comes from a Nerd Font. The row shows the pin as it will look, so if it shows as a box, your font isn't a Nerd Font: leave it off.
 - **New ones start as** picks the agent `alt+n`'s form starts on: claude (the default), codex, grok, opencode, cursor, copilot, shell, or *last*, the one you started last. **New ones in a worktree** ticks the form's worktree box to begin with.
 - **Bring back the last workspace** is what a fresh trix does with the workspace saved last time: *ask* (the default), *always* bring it back, or *never*, starting fresh (see [Restore](#restore)).
 - **Notify me** sets whether you hear about an agent you're not looking at when it needs you and when it's done, and whether that comes as a desktop notification, with the terminal bell, or both.
@@ -180,6 +182,9 @@ kinds = ["claude", "codex", "opencode", "shell"]  # alt+n's kind row; the rest g
 [theme]
 panes = false                     # keep the panes in the terminal's colors (on by default)
 
+[ui]
+nerd_font = true                  # draw icons from a Nerd Font (off by default: plain Unicode)
+
 [workspace]
 restore = "always"                # a fresh trix and the saved workspace: "ask" (default), "always", "never"
 ```
@@ -190,6 +195,7 @@ restore = "always"                # a fresh trix and the saved workspace: "ask" 
 - **The strip** is the theme's red by default. `color` and `text` take `#rrggbb` (or `#rgb`), or the name of one of the theme's colors (`red`, `yellow`, `green`, `cyan`, `magenta`, `orange`, `accent`, `fg`, `fg_bright`, `bg`), which follows a theme switch. Without `text`, trix picks the theme's dark or light, whichever contrasts more with the strip.
 - **New agents** take `agent` and `worktree` as where `alt+n`'s form starts; you can still change both in it. `"last"` is the kind you started last from the form, remembered in `prefs.json`, or claude before you've started one. `kinds` is the form's kind row, in your order: claude, codex, shell and custom by default. Every other kind, including any trix adds later, waits under *more ▸*, and its letter picks it all the same. A name that isn't a kind, or one named twice, is a mistake.
 - **`[theme] panes = false`** keeps a theme of trix's own to its bars, sidebar and cards (see [Themes](#themes)).
+- **`[ui] nerd_font = true`** draws the pane pin from a Nerd Font (``) instead of plain Unicode (`⚲`). Turn it on only if your terminal's font is a Nerd Font: trix can't see the font, and without one the icon shows as an empty box.
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
 

@@ -260,6 +260,9 @@ impl MenuItem {
     }
 }
 
+/// At most this many agents are pinned to the top of the list at once.
+pub const PIN_LIMIT: usize = 2;
+
 /// Two clicks on one agent's card or title within this are a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
@@ -283,6 +286,8 @@ pub struct HitMap {
     pub panes: Vec<(Rect, u32)>,
     /// Each pane's title row: its top border, where its name is.
     pub titles: Vec<(Rect, u32)>,
+    /// Each pane's pin, on its title: click to pin it to the top.
+    pub pins: Vec<(Rect, u32)>,
     pub new_button: Option<Rect>,
     /// The attention strip, and the agent it's about.
     pub strip: Option<(Rect, u32)>,
@@ -599,6 +604,7 @@ impl App {
                     // An id trix made up for Grok names no conversation until
                     // a turn; one it resumed does from the start.
                     session: if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) && written { a.session.clone() } else { None },
+                    pinned: a.pinned,
                 })
             })
             .collect()
@@ -644,6 +650,7 @@ impl App {
                 skipped.push(s.name);
                 continue;
             }
+            let pinned = s.pinned;
             let resume = s.session.clone().filter(|_| kind.resumes());
             let spec = Spawn {
                 kind,
@@ -673,6 +680,13 @@ impl App {
             match res {
                 Ok(()) => {
                     restored += 1;
+                    // Saved in list order, so the pinned ones come back on top.
+                    if pinned
+                        && self.agents.iter().filter(|a| a.pinned).count() < PIN_LIMIT
+                        && let Some(a) = self.agents.last_mut()
+                    {
+                        a.pinned = true;
+                    }
                     if i == saved.focus || focus.is_none() {
                         focus = Some(self.agents.len() - 1);
                     }
@@ -1129,6 +1143,35 @@ impl App {
             self.toast(format!("closed {}", a.name), ToastKind::Info);
             self.sync_git_targets();
         }
+    }
+
+    /// Pin an agent to the top of the list, or unpin it. Pinned agents are
+    /// the first ones in `agents`, in the order they were pinned; one that's
+    /// unpinned goes right below those still pinned. The focus stays on the
+    /// agent it was on.
+    pub fn toggle_pin(&mut self, id: u32) {
+        let Some(i) = self.index_of(id) else { return };
+        let focused = self.agents.get(self.focus).map(|a| a.id);
+        let pinned = self.agents.iter().filter(|a| a.pinned).count();
+        let mut a = self.agents.remove(i);
+        let to = if a.pinned {
+            a.pinned = false;
+            pinned - 1
+        } else if pinned >= PIN_LIMIT {
+            self.agents.insert(i, a);
+            self.toast(format!("only {PIN_LIMIT} agents can be pinned: unpin one first"), ToastKind::Bad);
+            return;
+        } else {
+            a.pinned = true;
+            pinned
+        };
+        let msg = format!("{} {}", if a.pinned { "pinned" } else { "unpinned" }, a.name);
+        self.agents.insert(to.min(self.agents.len()), a);
+        if let Some(f) = focused.and_then(|f| self.index_of(f)) {
+            self.focus = f;
+        }
+        self.toast(msg, ToastKind::Info);
+        self.dirty = true;
     }
 
     fn sync_git_targets(&self) {
@@ -1661,6 +1704,10 @@ impl App {
             }
             Row::SidebarMini => self.set_sidebar_mini(!self.sidebar_mini),
             Row::SidebarCompact => self.set_sidebar_compact(!self.sidebar_compact),
+            Row::NerdFont => {
+                let on = !self.config.ui.nerd_font;
+                self.set_config("ui", "nerd_font", on.into(), !on);
+            }
             Row::NotifyNeedsYou | Row::NotifyDone => {
                 let (needs_you, done) = if row == Row::NotifyNeedsYou { (!n.needs_you, n.done) } else { (n.needs_you, !n.done) };
                 let on: toml_edit::Array = [needs_you.then_some("needs-you"), done.then_some("done")].into_iter().flatten().collect();
@@ -2176,6 +2223,11 @@ impl App {
                     self.dirty = true;
                     return;
                 }
+                if let Some(&(_, id)) = self.hits.pins.iter().find(|(r, _)| inside(r)) {
+                    self.last_click = None;
+                    self.toggle_pin(id);
+                    return;
+                }
                 // The strip jumps, and its agent's own title takes its place:
                 // a quick second click mustn't read as a double-click there.
                 if let Some(&(_, id)) = self.hits.strip.iter().find(|(r, _)| inside(r)) {
@@ -2648,6 +2700,36 @@ mod tests {
         app.modal = None;
         click(&mut app, MouseButton::Right, 90, 30);
         assert!(app.modal.is_none(), "nothing there, no menu");
+    }
+
+    #[test]
+    fn pins_keep_at_most_two_agents_on_top() {
+        let mut app = test_app();
+        for (id, name) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            app.agents.push(a);
+        }
+        let order = |app: &App| app.agents.iter().map(|a| a.name.as_str()).collect::<String>();
+        app.focus = 2; // c
+        // Clicking a pane's pin pins it.
+        app.hits.pins = vec![(Rect::new(25, 1, 2, 1), 3)];
+        click(&mut app, MouseButton::Left, 25, 1);
+        assert_eq!(order(&app), "cabd");
+        assert_eq!(app.focus, 0, "the focus stays on c");
+        app.toggle_pin(4);
+        assert_eq!(order(&app), "cdab", "pinned in the order they were pinned");
+        app.toggle_pin(2);
+        assert_eq!(order(&app), "cdab", "no more than two");
+        assert!(!app.agents[3].pinned);
+        // Unpinned: right below the ones still pinned.
+        app.toggle_pin(3);
+        assert_eq!(order(&app), "dcab");
+        assert_eq!(app.agents.iter().filter(|a| a.pinned).count(), 1);
+        assert_eq!(app.focus, 1, "still on c");
+        app.toggle_pin(2);
+        assert_eq!(order(&app), "dbca");
     }
 
     #[test]
@@ -3421,6 +3503,10 @@ mod tests {
         let file = || std::fs::read_to_string(&path).unwrap_or_default();
         app.change_setting(Row::ThemePanes, true);
         assert!(!app.config.theme.panes && file().contains("[theme]\npanes = false\n"));
+        app.change_setting(Row::NerdFont, true);
+        assert!(app.config.ui.nerd_font && file().contains("[ui]\nnerd_font = true\n"));
+        app.change_setting(Row::NerdFont, true);
+        assert!(!app.config.ui.nerd_font && file().contains("[ui]\nnerd_font = false\n"), "a line of yours stays, set back");
         app.change_setting(Row::Strip, true);
         assert_eq!(app.config.strip.color, Some(Paint::Theme("orange")), "on from the theme's red");
         assert!(file().contains("[strip]\ncolor = \"orange\"\n"));

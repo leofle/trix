@@ -21,6 +21,9 @@ pub struct SavedAgent {
     /// Claude `session_id` / Codex `thread-id`.
     #[serde(default)]
     pub session: Option<String>,
+    /// Pinned to the top of the list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -183,7 +186,7 @@ mod tests {
     }
 
     fn agent(kind: &str, name: &str, session: Option<&str>) -> SavedAgent {
-        SavedAgent { kind: kind.into(), name: name.into(), cwd: "/tmp".into(), command: None, session: session.map(Into::into) }
+        SavedAgent { kind: kind.into(), name: name.into(), cwd: "/tmp".into(), command: None, session: session.map(Into::into), pinned: false }
     }
 
     #[test]

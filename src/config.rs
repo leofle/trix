@@ -1,5 +1,6 @@
 //! `~/.config/trix/config.toml`: key bindings, sounds, notifications, how
-//! new agents start, the theme in the panes, and restoring the workspace.
+//! new agents start, the theme in the panes, Nerd Font icons, and restoring
+//! the workspace.
 //!
 //! The server reads it when it starts and again whenever the file changes
 //! (checked once a second). A file that doesn't parse leaves the settings as
@@ -23,7 +24,16 @@ pub struct Config {
     pub strip: Strip,
     pub new: NewAgent,
     pub theme: ThemeOpts,
+    pub ui: Ui,
     pub workspace: Workspace,
+}
+
+/// How trix draws its own icons.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Ui {
+    /// The terminal's font is a Nerd Font, so its icons can be drawn (the
+    /// pane pin). Off, plain Unicode that every font has.
+    pub nerd_font: bool,
 }
 
 /// alt+n's form, as it opens.
@@ -203,7 +213,15 @@ struct File {
     #[serde(default)]
     theme: FileTheme,
     #[serde(default)]
+    ui: FileUi,
+    #[serde(default)]
     workspace: FileWorkspace,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileUi {
+    nerd_font: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -333,7 +351,8 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         None => Restore::Ask,
         Some(s) => Restore::ALL.into_iter().find(|r| r.name() == s).ok_or_else(|| format!("workspace.restore: '{s}' is not ask, always or never"))?,
     };
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, workspace: Workspace { restore } })
+    let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false) };
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore } })
 }
 
 fn paint(what: &str, s: &str) -> Result<Paint, String> {
@@ -795,6 +814,9 @@ mod tests {
         assert_eq!((c.new.agent, c.new.worktree, c.theme.panes, c.workspace.restore), (Some(Kind::Claude), false, true, Restore::Ask));
         let c = read("[new]\nagent = \"codex\"\nworktree = true\n[theme]\npanes = false\n[workspace]\nrestore = \"never\"\n").unwrap();
         assert_eq!((c.new.agent, c.new.worktree, c.theme.panes, c.workspace.restore), (Some(Kind::Codex), true, false, Restore::Never));
+        assert!(!c.ui.nerd_font, "plain Unicode by default");
+        assert!(read("[ui]\nnerd_font = true\n").unwrap().ui.nerd_font);
+        assert!(read("[ui]\nnerd_fonts = true\n").is_err(), "a misspelling is a mistake");
         assert_eq!(read("[new]\nagent = \"last\"\n").unwrap().new.agent, None, "the one started last");
         assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
         assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));
