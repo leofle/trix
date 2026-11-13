@@ -19,6 +19,7 @@ use crate::hooks::HookMsg;
 use crate::input;
 use crate::search::{self, Hit};
 use crate::session::{Out, SessionEvent};
+use crate::settings::{Picker, Row, Settings};
 use crate::state::{self, Saved, SavedAgent};
 use crate::theme::{Source as ThemeSource, Theme, ThemeWatcher};
 
@@ -160,6 +161,8 @@ pub enum Modal {
     Restore,
     Help,
     Menu(Menu),
+    /// alt+, or "settings" in the bottom bar.
+    Settings(Settings),
 }
 
 /// One agent's menu: right-click it, or the menu key for the focused one.
@@ -240,6 +243,12 @@ pub struct HitMap {
     /// An open menu: all of it, and the row of each item.
     pub menu: Option<Rect>,
     pub menu_items: Vec<(Rect, MenuItem)>,
+    /// The bottom bar's hints, each a button for its action.
+    pub hints: Vec<(Rect, Action)>,
+    /// The settings: all of them, and each row (a setting, or a theme in
+    /// the theme list) by its number.
+    pub settings: Option<Rect>,
+    pub settings_rows: Vec<(Rect, usize)>,
 }
 
 struct Drag {
@@ -274,6 +283,11 @@ pub struct App {
     pub theme_source: ThemeSource,
     /// The theme in Claude's settings overlay now (`None`: the user's own).
     claude_theme: Option<&'static str>,
+    /// The theme to go back to while the settings try one on.
+    theme_preview: Option<(Theme, ThemeSource)>,
+    /// Where the settings write: `config.toml`, and trix's own `colors.toml`.
+    pub config_path: PathBuf,
+    pub theme_path: PathBuf,
     tx: Sender<AppEvent>,
     socket: PathBuf,
     integrations: crate::hooks::Integrations,
@@ -338,6 +352,13 @@ impl App {
             Ok(c) => (c, None),
             Err(e) => (crate::config::Config::default(), Some(e)),
         };
+        // A test's settings go to a folder of its own.
+        let (config_path, theme_path) = if cfg!(test) {
+            let dir = test_dir();
+            (dir.join("config.toml"), dir.join("colors.toml"))
+        } else {
+            (crate::config::path(), crate::theme::own_path())
+        };
         let mut app = App {
             agents: Vec::new(),
             specs: HashMap::new(),
@@ -352,6 +373,9 @@ impl App {
             theme_watch,
             theme_source,
             claude_theme: None,
+            theme_preview: None,
+            config_path,
+            theme_path,
             tx,
             socket,
             integrations,
@@ -1226,11 +1250,21 @@ impl App {
     }
 
     pub fn slow_tick(&mut self) {
+        let trying = matches!(&self.modal, Some(Modal::Settings(Settings { picker: Some(_), .. })));
         if let Some((t, source)) = self.theme_watch.poll() {
-            self.theme = t;
-            self.theme_source = source;
-            self.sync_agent_themes();
-            self.dirty = true;
+            if trying {
+                // Changed while one is tried on: what to go back to.
+                self.theme_preview = Some((t, source));
+            } else {
+                self.theme = t;
+                self.theme_source = source;
+                self.sync_agent_themes();
+                self.dirty = true;
+            }
+        }
+        // The theme list went some way other than its own keys.
+        if !trying {
+            self.untry_theme();
         }
         self.sync_git_targets();
         self.persist();
@@ -1316,84 +1350,100 @@ impl App {
         }
     }
 
+    /// What a key does, or a hint in the bottom bar clicked; `n` is which
+    /// agent `jump` goes to (0-based).
+    fn run(&mut self, action: Action, n: usize) {
+        match action {
+            Action::New => self.open_new(),
+            Action::Jump => self.set_focus(n),
+            Action::Next => {
+                if !self.agents.is_empty() {
+                    self.set_focus((self.focus + 1) % self.agents.len());
+                }
+            }
+            Action::Prev => {
+                if !self.agents.is_empty() {
+                    self.set_focus((self.focus + self.agents.len() - 1) % self.agents.len());
+                }
+            }
+            Action::Attention => self.next_attention(),
+            Action::Grid => self.view = if self.view == View::Grid { View::Focus } else { View::Grid },
+            Action::Sidebar => self.sidebar = !self.sidebar,
+            // From hidden, it brings the sidebar back small.
+            Action::MiniSidebar => self.set_sidebar_mini(!self.sidebar || !self.sidebar_mini),
+            Action::Compact => {
+                let on = !self.sidebar_compact;
+                self.toast(if on { "sidebar: compact cards" } else { "sidebar: full cards, scrolling" }, ToastKind::Info);
+                self.set_sidebar_compact(on);
+            }
+            Action::Search => {
+                if self.agents.is_empty() {
+                    self.toast("no agents to search yet", ToastKind::Info);
+                } else {
+                    self.modal = Some(Modal::Search(Search::default()));
+                }
+            }
+            Action::Broadcast => {
+                if self.agents.is_empty() {
+                    self.toast("no agents to talk to yet", ToastKind::Info);
+                } else {
+                    self.modal = Some(Modal::Broadcast(TextInput::default(), BroadcastTarget::All));
+                }
+            }
+            Action::Rename => {
+                if let Some(id) = self.focused().map(|a| a.id) {
+                    self.start_rename(id);
+                }
+            }
+            Action::Close => {
+                if let Some(id) = self.focused().map(|a| a.id) {
+                    self.ask_close(id);
+                }
+            }
+            Action::Menu => self.open_focused_menu(),
+            Action::Detach => self.detach = true,
+            Action::Help => self.modal = Some(Modal::Help),
+            Action::Settings => self.open_settings(),
+            Action::Quit => {
+                if self.agents.iter().any(|a| a.state != State::Exited) {
+                    self.modal = Some(Modal::ConfirmQuit);
+                } else {
+                    self.quit = true;
+                }
+            }
+        }
+    }
+
+    /// alt+m, or the settings: the narrow sidebar, remembered.
+    fn set_sidebar_mini(&mut self, on: bool) {
+        self.sidebar_mini = on;
+        self.sidebar = true;
+        // Load first: change only this, whatever else prefs.json holds.
+        let mut prefs = state::load_prefs();
+        prefs.sidebar_mini = on;
+        if let Err(e) = state::store_prefs(&prefs) {
+            self.toast(format!("couldn't remember the sidebar size: {e}"), ToastKind::Bad);
+        }
+    }
+
+    /// alt+c, or the settings: one-line cards, remembered.
+    fn set_sidebar_compact(&mut self, on: bool) {
+        self.sidebar_compact = on;
+        self.sidebar = true;
+        let mut prefs = state::load_prefs();
+        prefs.sidebar_compact = on;
+        if let Err(e) = state::store_prefs(&prefs) {
+            self.toast(format!("couldn't remember that: {e}"), ToastKind::Bad);
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         if self.modal.is_some() {
             self.modal_key(k);
             return;
         }
         if let Some((action, n)) = self.config.keys.lookup(&k) {
-            match action {
-                Action::New => self.open_new(),
-                Action::Jump => self.set_focus(n),
-                Action::Next => {
-                    if !self.agents.is_empty() {
-                        self.set_focus((self.focus + 1) % self.agents.len());
-                    }
-                }
-                Action::Prev => {
-                    if !self.agents.is_empty() {
-                        self.set_focus((self.focus + self.agents.len() - 1) % self.agents.len());
-                    }
-                }
-                Action::Attention => self.next_attention(),
-                Action::Grid => self.view = if self.view == View::Grid { View::Focus } else { View::Grid },
-                Action::Sidebar => self.sidebar = !self.sidebar,
-                Action::MiniSidebar => {
-                    // From hidden, it brings the sidebar back small.
-                    self.sidebar_mini = !self.sidebar || !self.sidebar_mini;
-                    self.sidebar = true;
-                    // Load first: change only this, whatever else prefs.json holds.
-                    let mut prefs = state::load_prefs();
-                    prefs.sidebar_mini = self.sidebar_mini;
-                    if let Err(e) = state::store_prefs(&prefs) {
-                        self.toast(format!("couldn't remember the sidebar size: {e}"), ToastKind::Bad);
-                    }
-                }
-                Action::Compact => {
-                    self.sidebar_compact = !self.sidebar_compact;
-                    self.sidebar = true;
-                    self.toast(if self.sidebar_compact { "sidebar: compact cards" } else { "sidebar: full cards, scrolling" }, ToastKind::Info);
-                    let mut prefs = state::load_prefs();
-                    prefs.sidebar_compact = self.sidebar_compact;
-                    if let Err(e) = state::store_prefs(&prefs) {
-                        self.toast(format!("couldn't remember that: {e}"), ToastKind::Bad);
-                    }
-                }
-                Action::Search => {
-                    if self.agents.is_empty() {
-                        self.toast("no agents to search yet", ToastKind::Info);
-                    } else {
-                        self.modal = Some(Modal::Search(Search::default()));
-                    }
-                }
-                Action::Broadcast => {
-                    if self.agents.is_empty() {
-                        self.toast("no agents to talk to yet", ToastKind::Info);
-                    } else {
-                        self.modal = Some(Modal::Broadcast(TextInput::default(), BroadcastTarget::All));
-                    }
-                }
-                Action::Rename => {
-                    if let Some(id) = self.focused().map(|a| a.id) {
-                        self.start_rename(id);
-                    }
-                }
-                Action::Close => {
-                    if let Some(id) = self.focused().map(|a| a.id) {
-                        self.ask_close(id);
-                    }
-                }
-                Action::Menu => self.open_focused_menu(),
-                Action::Detach => self.detach = true,
-                Action::Help => self.modal = Some(Modal::Help),
-                Action::Quit => {
-                    if self.agents.iter().any(|a| a.state != State::Exited) {
-                        self.modal = Some(Modal::ConfirmQuit);
-                    } else {
-                        self.quit = true;
-                    }
-                }
-            }
+            self.run(action, n);
             return;
         }
 
@@ -1462,6 +1512,268 @@ impl App {
         }
     }
 
+    // ───────────────────────────── settings ─────────────────────────────
+
+    pub fn open_settings(&mut self) {
+        let file = |t: &crate::config::Tone| match t {
+            crate::config::Tone::File(p) => Some(p.clone()),
+            _ => None,
+        };
+        let files = [file(&self.config.sound.needs_you), file(&self.config.sound.done)];
+        self.modal = Some(Modal::Settings(Settings { sel: Row::Theme, theme: self.theme_name(), files, picker: None }));
+        self.dirty = true;
+    }
+
+    fn close_settings(&mut self) {
+        self.modal = None;
+        self.untry_theme();
+        self.dirty = true;
+    }
+
+    /// The theme in use, by name.
+    fn theme_name(&self) -> String {
+        if let Some(p) = self.theme_override() {
+            return format!("$TRIX_THEME ({})", tilde(p));
+        }
+        let (choices, current) = crate::theme::choices_here(&self.theme_path);
+        choices.into_iter().nth(current).map(|c| c.name).unwrap_or_default()
+    }
+
+    /// `$TRIX_THEME`'s file, when it's the theme in use: one the settings
+    /// can't change.
+    pub fn theme_override(&self) -> Option<&Path> {
+        match &self.theme_source {
+            ThemeSource::File(p) if *p != self.theme_path => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Change a setting to the next value along, or with `forward` false
+    /// the one before. The theme opens its list instead.
+    fn change_setting(&mut self, row: Row, forward: bool) {
+        use crate::config::Tone;
+        let n = self.config.notify.clone();
+        match row {
+            Row::Theme => self.open_picker(),
+            Row::SidebarMini => self.set_sidebar_mini(!self.sidebar_mini),
+            Row::SidebarCompact => self.set_sidebar_compact(!self.sidebar_compact),
+            Row::NotifyNeedsYou | Row::NotifyDone => {
+                let (needs_you, done) = if row == Row::NotifyNeedsYou { (!n.needs_you, n.done) } else { (n.needs_you, !n.done) };
+                let on: toml_edit::Array = [needs_you.then_some("needs-you"), done.then_some("done")].into_iter().flatten().collect();
+                self.set_config("notify", "on", on.into(), needs_you && done);
+            }
+            Row::Desktop => {
+                self.set_config("notify", "desktop", (!n.desktop).into(), !n.desktop);
+            }
+            Row::Bell => {
+                self.set_config("notify", "bell", (!n.bell).into(), !n.bell);
+            }
+            Row::SoundNeedsYou | Row::SoundDone => {
+                let Some(Modal::Settings(s)) = &self.modal else { return };
+                let needs_you = row == Row::SoundNeedsYou;
+                let (now, file) = if needs_you { (&self.config.sound.needs_you, &s.files[0]) } else { (&self.config.sound.done, &s.files[1]) };
+                let next = crate::settings::next_tone(now, file.as_deref(), forward);
+                let (key, default) = if needs_you { ("needs_you", Tone::Off) } else { ("done", Tone::Chime) };
+                let text = crate::settings::tone_text(&next);
+                // Hear what it is now.
+                if self.set_config("sound", key, text.into(), next == default) && !cfg!(test) && std::env::var_os("TRIX_NO_SOUND").is_none() {
+                    match &next {
+                        Tone::Chime => play_completion_sound(),
+                        Tone::File(p) => crate::platform::play_file(p),
+                        Tone::Off => {}
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Set `[table] key` in `config.toml`, keeping the rest of the file as
+    /// written (see `settings::edit`), and use it now. `false`, with a
+    /// toast saying why, when it can't: the file has a mistake to fix
+    /// first, or can't be written.
+    fn set_config(&mut self, table: &str, key: &str, value: toml_edit::Value, default: bool) -> bool {
+        let path = self.config_path.clone();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                self.toast(format!("couldn't read {}: {e}", tilde(&path)), ToastKind::Bad);
+                return false;
+            }
+        };
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let edited = crate::settings::edit(&text, table, key, value, default).and_then(|new| crate::config::parse(&new, dir).map(|c| (new, c)));
+        let (new, config) = match edited {
+            Ok(x) => x,
+            Err(e) => {
+                self.toast(format!("{}: {e} — fix that first (`trix config` checks it)", tilde(&path)), ToastKind::Bad);
+                return false;
+            }
+        };
+        if new != text
+            && let Err(e) = state::write_through(&path, new.as_bytes())
+        {
+            self.toast(format!("couldn't write {}: {e}", tilde(&path)), ToastKind::Bad);
+            return false;
+        }
+        // In use now; reading it back a second later finds nothing new.
+        self.config = config;
+        self.config_failed = false;
+        self.config_stamp = crate::config::stamp_of(&path);
+        true
+    }
+
+    fn open_picker(&mut self) {
+        if let Some(p) = self.theme_override() {
+            let p = tilde(p);
+            self.toast(format!("TRIX_THEME is set, so trix uses {p}: unset it to pick a theme here"), ToastKind::Info);
+            return;
+        }
+        let (choices, current) = crate::theme::choices_here(&self.theme_path);
+        if let Some(Modal::Settings(s)) = &mut self.modal {
+            s.picker = Some(Picker { choices, sel: current, current });
+            self.theme_preview = Some((self.theme.clone(), self.theme_source.clone()));
+        }
+    }
+
+    /// Show theme `sel` of the list, without keeping it yet.
+    fn try_theme(&mut self, sel: usize) {
+        let Some(Modal::Settings(Settings { picker: Some(p), .. })) = &mut self.modal else { return };
+        let Some(c) = p.choices.get(sel) else { return };
+        p.sel = sel;
+        self.theme = c.look.clone();
+        self.theme_source = c.source.clone();
+        self.dirty = true;
+    }
+
+    /// Back to the theme there was before trying any on.
+    fn untry_theme(&mut self) {
+        if let Some((t, source)) = self.theme_preview.take() {
+            self.theme = t;
+            self.theme_source = source;
+            self.sync_agent_themes();
+            self.dirty = true;
+        }
+    }
+
+    /// Keep the theme tried on: trix's own `colors.toml` becomes it.
+    fn keep_theme(&mut self) {
+        let Some(Modal::Settings(s)) = &mut self.modal else { return };
+        let Some(p) = s.picker.take() else { return };
+        let choice = p.choices[p.sel].clone();
+        match crate::theme::install(&choice, &self.theme_path, &p.choices) {
+            Ok(backup) => {
+                s.theme = choice.name.clone();
+                self.theme_preview = None;
+                // It's showing already; the watcher sees the file now, not
+                // a second later, and has the final word on where it's from.
+                if let Some((t, source)) = self.theme_watch.poll() {
+                    self.theme = t;
+                    self.theme_source = source;
+                }
+                self.sync_agent_themes();
+                let text = match backup {
+                    Some(b) => format!("theme: {} · your colors.toml is now {}", choice.name, tilde(&b)),
+                    None => format!("theme: {}", choice.name),
+                };
+                self.toast(text, ToastKind::Good);
+            }
+            Err(e) => {
+                let text = format!("couldn't write {}: {e}", tilde(&self.theme_path));
+                self.toast(text, ToastKind::Bad);
+                self.untry_theme();
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn settings_key(&mut self, k: KeyEvent) {
+        let Some(Modal::Settings(s)) = &mut self.modal else { return };
+        // Letters only as themselves: ctrl+c is "go away".
+        let plain = !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let away = k.code == KeyCode::Esc || (ctrl && matches!(k.code, KeyCode::Char('c' | 'g')));
+        // The settings key closes them from anywhere in them.
+        if self.config.keys.lookup(&k).is_some_and(|(a, _)| a == Action::Settings) {
+            self.close_settings();
+            return;
+        }
+        let up = matches!(k.code, KeyCode::Up | KeyCode::BackTab) || (plain && k.code == KeyCode::Char('k'));
+        let down = matches!(k.code, KeyCode::Down | KeyCode::Tab) || (plain && k.code == KeyCode::Char('j'));
+        let left = plain && matches!(k.code, KeyCode::Left | KeyCode::Char('h'));
+        let go = plain && matches!(k.code, KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ' | 'l'));
+        if let Some(p) = &s.picker {
+            let (sel, last) = (p.sel, p.choices.len().saturating_sub(1));
+            if away || left {
+                s.picker = None;
+                self.untry_theme();
+            } else if go {
+                self.keep_theme();
+            } else {
+                let to = match k.code {
+                    _ if up => if sel == 0 { last } else { sel - 1 },
+                    _ if down => if sel >= last { 0 } else { sel + 1 },
+                    KeyCode::PageUp => sel.saturating_sub(10),
+                    KeyCode::PageDown => (sel + 10).min(last),
+                    KeyCode::Home => 0,
+                    KeyCode::End => last,
+                    _ => return,
+                };
+                self.try_theme(to);
+            }
+            self.dirty = true;
+            return;
+        }
+        let row = s.sel;
+        if away {
+            self.close_settings();
+        } else if up || down {
+            s.sel = row.step(down);
+        } else if k.code == KeyCode::Home {
+            s.sel = Row::ALL[0];
+        } else if k.code == KeyCode::End {
+            s.sel = Row::ALL[Row::ALL.len() - 1];
+        } else if go {
+            self.change_setting(row, true);
+        } else if left && row != Row::Theme {
+            self.change_setting(row, false);
+        }
+        self.dirty = true;
+    }
+
+    /// The mouse in the settings: click a setting to change it, or a theme
+    /// to try it and again to keep it; the wheel moves; a click away closes.
+    fn settings_mouse(&mut self, e: MouseEvent) {
+        let Some(Modal::Settings(s)) = &mut self.modal else { return };
+        let (x, y) = (e.column, e.row);
+        let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        let under = self.hits.settings_rows.iter().find(|(r, _)| inside(r)).map(|&(_, i)| i);
+        let picking = s.picker.as_ref().map(|p| (p.sel, p.choices.len()));
+        match e.kind {
+            MouseEventKind::Down(MouseButton::Left) => match (under, picking) {
+                (Some(i), Some((sel, _))) if i == sel => self.keep_theme(),
+                (Some(i), Some(_)) => self.try_theme(i),
+                (Some(i), None) => {
+                    let Some(&row) = Row::ALL.get(i) else { return };
+                    s.sel = row;
+                    self.change_setting(row, true);
+                }
+                (None, _) if !self.hits.settings.is_some_and(|r| inside(&r)) => self.close_settings(),
+                (None, _) => {}
+            },
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = e.kind == MouseEventKind::ScrollDown;
+                match picking {
+                    Some((sel, n)) => self.try_theme(if down { (sel + 1).min(n.saturating_sub(1)) } else { sel.saturating_sub(1) }),
+                    None => s.sel = s.sel.step(down),
+                }
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
     fn modal_key(&mut self, k: KeyEvent) {
         // Jump to a hit for what's typed now, not for what was typed last scan.
         if k.code == KeyCode::Enter && self.search_due.is_some() && matches!(self.modal, Some(Modal::Search(_))) {
@@ -1471,6 +1783,10 @@ impl App {
             self.menu_key(m, k);
             return;
         }
+        if matches!(self.modal, Some(Modal::Settings(_))) {
+            self.settings_key(k);
+            return;
+        }
         let Some(modal) = &mut self.modal else { return };
         if k.code == KeyCode::Esc {
             self.modal = None;
@@ -1478,7 +1794,7 @@ impl App {
         }
         match modal {
             // Handled above.
-            Modal::Menu(_) => {}
+            Modal::Menu(_) | Modal::Settings(_) => {}
             Modal::Help => self.modal = None,
             Modal::Search(s) => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1720,6 +2036,10 @@ impl App {
             self.menu_mouse(menu, m);
             return;
         }
+        if matches!(self.modal, Some(Modal::Settings(_))) {
+            self.settings_mouse(m);
+            return;
+        }
         if self.modal.is_some() {
             return;
         }
@@ -1735,6 +2055,11 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(&(_, action)) = self.hits.hints.iter().find(|(r, _)| inside(r)) {
+                    self.run(action, 0);
+                    self.dirty = true;
+                    return;
+                }
                 if let Some(r) = self.hits.new_button
                     && inside(&r)
                 {
@@ -1891,6 +2216,13 @@ fn clone_spec(s: &Spawn) -> Spawn {
         branch_note: s.branch_note.clone(),
         resume: s.resume.clone(),
     }
+}
+
+/// A folder for one test app's settings, which nothing else uses.
+fn test_dir() -> PathBuf {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("trix-test-{}-{n}", std::process::id()))
 }
 
 pub fn tilde(p: &Path) -> String {
@@ -2812,5 +3144,148 @@ mod tests {
         custom.set_state(State::Idle, true);
         assert!(!broadcast_reaches(&custom, BroadcastTarget::All), "a custom command may be bash or ssh: skipped");
         assert!(!broadcast_reaches(&custom, BroadcastTarget::Waiting));
+    }
+
+    fn alt(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
+    }
+    fn tap(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    fn settings_of(app: &App) -> Option<&Settings> {
+        match &app.modal {
+            Some(Modal::Settings(s)) => Some(s),
+            _ => None,
+        }
+    }
+    fn picked(app: &App) -> Option<(String, usize)> {
+        let p = settings_of(app)?.picker.as_ref()?;
+        Some((p.choices[p.sel].name.clone(), p.current))
+    }
+
+    #[test]
+    fn settings_change_the_config_and_keep_the_rest() {
+        let mut app = test_app();
+        let path = app.config_path.clone();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# mine\n[notify]\nbell = true # loud\n").unwrap();
+        alt(&mut app, ',');
+        assert_eq!(settings_of(&app).map(|s| s.sel), Some(Row::Theme), "alt+, opens them, on the theme");
+        // Down to the bell, off with enter.
+        while settings_of(&app).is_some_and(|s| s.sel != Row::Bell) {
+            tap(&mut app, KeyCode::Down);
+        }
+        tap(&mut app, KeyCode::Enter);
+        assert!(!app.config.notify.bell, "in use now, not a second later");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\n[notify]\nbell = false # loud\n");
+        assert!(app.toast.is_none(), "{:?}", app.toast.as_ref().map(|t| &t.text));
+        // Done off: notify.on keeps the other.
+        app.change_setting(Row::NotifyDone, true);
+        assert!(app.config.notify.needs_you && !app.config.notify.done);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("on = [\"needs-you\"]"));
+        // Round the sounds: done is the chime, then off.
+        app.change_setting(Row::SoundDone, true);
+        assert_eq!(app.config.sound.done, crate::config::Tone::Off);
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("[sound]\ndone = \"off\"\n"));
+        // The watcher reading it back finds nothing new to say.
+        app.config_stamp = crate::config::stamp_of(&path);
+        app.apply_config(crate::config::parse(&std::fs::read_to_string(&path).unwrap(), Path::new("/")));
+        assert!(app.toast.is_none());
+        alt(&mut app, ',');
+        assert!(app.modal.is_none(), "and alt+, closes them");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_config_with_a_mistake_is_left_alone() {
+        let mut app = test_app();
+        let path = app.config_path.clone();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[notify\nbell = true\n").unwrap();
+        app.open_settings();
+        app.change_setting(Row::Bell, true);
+        assert!(app.config.notify.bell, "unchanged");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[notify\nbell = true\n");
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("fix that first")));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn themes_are_tried_on_and_kept() {
+        let mut app = test_app();
+        let own = app.theme_path.clone();
+        let builtin = app.theme.bg;
+        app.open_settings();
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(picked(&app), Some(("Your terminal's colors".into(), 0)), "no file of trix's own: none in use");
+        tap(&mut app, KeyCode::Down);
+        assert_eq!(picked(&app).map(|p| p.0).as_deref(), Some("Lupine"));
+        assert_eq!(app.theme_source, ThemeSource::File(own.clone()), "tried on: the panes too");
+        assert_ne!(app.theme.bg, builtin);
+        assert!(!own.exists(), "only tried on");
+        tap(&mut app, KeyCode::Esc);
+        assert_eq!((app.theme.bg, &app.theme_source), (builtin, &ThemeSource::Builtin), "esc: as it was");
+        assert!(settings_of(&app).is_some_and(|s| s.picker.is_none()), "back in the settings");
+        // Retro 82, kept.
+        tap(&mut app, KeyCode::Enter);
+        tap(&mut app, KeyCode::Down);
+        tap(&mut app, KeyCode::Down);
+        assert_eq!(picked(&app).map(|p| p.0).as_deref(), Some("Retro 82"));
+        tap(&mut app, KeyCode::Enter);
+        let retro = crate::theme::SHIPPED.iter().find(|s| s.0 == "retro-82").unwrap().2;
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), retro);
+        assert_eq!(app.theme_source, ThemeSource::File(own.clone()));
+        assert!(app.theme_preview.is_none());
+        assert_eq!(settings_of(&app).map(|s| s.theme.as_str()), Some("Retro 82"));
+        // Opened again it's the one in use; closing mid-try goes back to it.
+        tap(&mut app, KeyCode::Enter);
+        assert_eq!(picked(&app), Some(("Retro 82".into(), 2)));
+        let kept = app.theme.bg;
+        tap(&mut app, KeyCode::Up);
+        assert_ne!(app.theme.bg, kept);
+        alt(&mut app, ',');
+        assert!(app.modal.is_none());
+        assert_eq!(app.theme.bg, kept);
+        // None of trix's own: the file goes.
+        app.open_settings();
+        app.change_setting(Row::Theme, true);
+        app.try_theme(0);
+        app.keep_theme();
+        assert!(!own.exists());
+        assert_eq!(app.theme_source, ThemeSource::Builtin);
+        let _ = std::fs::remove_dir_all(own.parent().unwrap());
+    }
+
+    #[test]
+    fn a_theme_list_closed_some_other_way_puts_the_theme_back() {
+        let mut app = test_app();
+        app.open_settings();
+        app.change_setting(Row::Theme, true);
+        app.try_theme(3);
+        assert_ne!(app.theme_source, ThemeSource::Builtin);
+        app.modal = None;
+        app.slow_tick();
+        assert_eq!(app.theme_source, ThemeSource::Builtin);
+    }
+
+    #[test]
+    fn the_bottom_bar_is_buttons() {
+        let mut app = test_app();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let &(r, _) = app.hits.hints.iter().find(|(_, a)| *a == Action::Settings).expect("a settings button");
+        let buf = term.backend().buffer();
+        let said: String = (r.x..r.right()).map(|x| buf[(x, r.y)].symbol().to_string()).collect();
+        assert_eq!(said, " alt+,  settings ", "the key and its word");
+        click(&mut app, MouseButton::Left, r.x + 3, r.y);
+        assert!(settings_of(&app).is_some());
+        // In them, a click on a setting changes it, and a click away closes.
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let &(row, _) = app.hits.settings_rows.iter().find(|&&(_, i)| Row::ALL[i] == Row::SidebarMini).unwrap();
+        click(&mut app, MouseButton::Left, row.x + 4, row.y);
+        assert!(app.sidebar_mini);
+        click(&mut app, MouseButton::Left, 0, 0);
+        assert!(app.modal.is_none());
+        let _ = std::fs::remove_dir_all(app.config_path.parent().unwrap());
     }
 }

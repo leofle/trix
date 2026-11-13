@@ -284,11 +284,12 @@ pub enum Action {
     Menu,
     Detach,
     Help,
+    Settings,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 18] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -305,6 +306,7 @@ impl Action {
         Action::Menu,
         Action::Detach,
         Action::Help,
+        Action::Settings,
         Action::Quit,
     ];
 
@@ -326,6 +328,7 @@ impl Action {
             Action::Menu => "menu",
             Action::Detach => "detach",
             Action::Help => "help",
+            Action::Settings => "settings",
             Action::Quit => "quit",
         }
     }
@@ -348,6 +351,7 @@ impl Action {
             Action::Menu => &["alt+o"],
             Action::Detach => &["alt+d"],
             Action::Help => &["alt+?", "alt+/"],
+            Action::Settings => &["alt+,"],
             Action::Quit => &["alt+q"],
         }
     }
