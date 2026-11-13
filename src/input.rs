@@ -116,6 +116,41 @@ pub fn encode_key(key: &KeyEvent, mode: TermMode) -> Vec<u8> {
     out
 }
 
+/// One notch of the mouse wheel over cell (`col`, `row`) of the pane, from
+/// 0, for a program that asked for mouse reports: SGR (`ESC [ < 64 ; x ; y M`)
+/// when it asked for that, else the classic `ESC [ M` bytes. Those can't name
+/// a cell past 223, so out there nothing is sent.
+pub fn encode_wheel(up: bool, col: u16, row: u16, mods: KeyModifiers, mode: TermMode) -> Vec<u8> {
+    let mut button: u32 = if up { 64 } else { 65 };
+    if mods.contains(KeyModifiers::SHIFT) {
+        button += 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        button += 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        button += 16;
+    }
+    let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return format!("\x1b[<{button};{x};{y}M").into_bytes();
+    }
+    let mut out = b"\x1b[M".to_vec();
+    if mode.contains(TermMode::UTF8_MOUSE) {
+        for n in [button, x, y] {
+            let Some(c) = char::from_u32(32 + n) else { return Vec::new() };
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+        return out;
+    }
+    if x > 223 || y > 223 {
+        return Vec::new();
+    }
+    out.extend([32 + button, 32 + x, 32 + y].map(|n| n as u8));
+    out
+}
+
 pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     if mode.contains(TermMode::BRACKETED_PASTE) {
         // Repeat: removing one marker can join the bytes around it into another.
@@ -215,6 +250,22 @@ mod tests {
         assert_eq!(key(KeyCode::F(10), NONE), b"\x1b[21~");
         assert_eq!(key(KeyCode::F(12), CTRL), b"\x1b[24;5~");
         assert!(key(KeyCode::F(13), NONE).is_empty());
+    }
+
+    #[test]
+    fn wheel_reports_in_the_encoding_asked_for() {
+        let sgr = TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(encode_wheel(true, 0, 0, NONE, sgr), b"\x1b[<64;1;1M");
+        assert_eq!(encode_wheel(false, 9, 4, NONE, sgr), b"\x1b[<65;10;5M");
+        assert_eq!(encode_wheel(true, 300, 2, CTRL | SHIFT, sgr), b"\x1b[<84;301;3M", "SGR has no limit");
+        let classic = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(encode_wheel(true, 0, 0, NONE, classic), [0x1b, b'[', b'M', 96, 33, 33]);
+        assert_eq!(encode_wheel(false, 222, 1, ALT, classic), [0x1b, b'[', b'M', 32 + 65 + 8, 255, 34]);
+        assert!(encode_wheel(true, 223, 0, NONE, classic).is_empty(), "past what one byte can say");
+        let utf8 = TermMode::UTF8_MOUSE | TermMode::MOUSE_REPORT_CLICK;
+        let mut wide = b"\x1b[M`".to_vec();
+        wide.extend("\u{14d}!".as_bytes());
+        assert_eq!(encode_wheel(true, 300, 0, NONE, utf8), wide, "column 301 + 32, as UTF-8");
     }
 
     #[test]

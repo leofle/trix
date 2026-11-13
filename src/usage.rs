@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::Kind;
 use crate::app::AppEvent;
@@ -24,6 +24,8 @@ const STANDARD: u64 = 200_000;
 const LONG: u64 = 1_000_000;
 /// How much of a long log to read the first time: the latest turn is at the end.
 const TAIL: u64 = 4 << 20;
+/// How soon to look again for a log that wasn't there.
+const RELOOK: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Context {
@@ -211,8 +213,10 @@ fn find_codex(root: &Path, thread: &str) -> Option<PathBuf> {
 }
 
 fn locate(t: &Target) -> Option<PathBuf> {
-    if let Some(p) = t.transcript.as_ref().filter(|p| p.is_file()) {
-        return Some(p.clone());
+    // The agent said where its log is (Claude writes it only with the first
+    // message): there's nothing to find anywhere else meanwhile.
+    if let Some(p) = &t.transcript {
+        return p.is_file().then(|| p.clone());
     }
     let s = t.session.as_deref()?;
     match t.kind {
@@ -229,15 +233,28 @@ pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
         let mut learned = crate::state::load_prefs().context_windows;
         let mut logs: HashMap<u32, (Option<String>, Log)> = HashMap::new();
         let mut sent: HashMap<u32, Option<Context>> = HashMap::new();
+        // Logs looked for and not found: what was looked for, and when.
+        let mut missed: HashMap<u32, (Option<String>, Instant)> = HashMap::new();
         loop {
             let list = targets.lock().unwrap().clone();
             logs.retain(|id, _| list.iter().any(|t| t.id == *id));
             sent.retain(|id, _| list.iter().any(|t| t.id == *id));
+            missed.retain(|id, _| list.iter().any(|t| t.id == *id));
             for t in list.iter().filter(|t| matches!(t.kind, Kind::Claude | Kind::Codex)) {
                 let key = t.transcript.as_ref().map(|p| p.display().to_string()).or_else(|| t.session.clone());
                 let stale = logs.get(&t.id).is_none_or(|(k, log)| *k != key || !log.path.is_file());
                 if stale {
-                    let Some(path) = locate(t) else { continue };
+                    // Finding a log by its id reads every Claude project, or
+                    // every day of Codex sessions: not every 2 seconds. (A
+                    // path the agent gave is one look, so that one is.)
+                    if t.transcript.is_none() && missed.get(&t.id).is_some_and(|(k, at)| *k == key && at.elapsed() < RELOOK) {
+                        continue;
+                    }
+                    let Some(path) = locate(t) else {
+                        missed.insert(t.id, (key, Instant::now()));
+                        continue;
+                    };
+                    missed.remove(&t.id);
                     logs.insert(t.id, (key, Log::new(path)));
                 }
                 let (_, log) = logs.get_mut(&t.id).unwrap();
@@ -370,6 +387,18 @@ mod tests {
         std::fs::write(d.join("rollout-2026-11-11T15-19-07-01a1-thread.jsonl"), "").unwrap();
         assert_eq!(find_codex(&root, "01a1-thread"), Some(d.join("rollout-2026-11-11T15-19-07-01a1-thread.jsonl")));
         assert_eq!(find_codex(&root, "thread"), None, "the whole id, not a suffix of it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_log_the_agent_named_is_only_looked_for_there() {
+        let root = tmp();
+        let log = root.join("s1.jsonl");
+        // Unwritten yet, and not searched for by id meanwhile.
+        let t = Target { id: 1, kind: Kind::Claude, transcript: Some(log.clone()), session: Some("s1".into()) };
+        assert_eq!(locate(&t), None);
+        std::fs::write(&log, "").unwrap();
+        assert_eq!(locate(&t), Some(log));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::app::AppEvent;
@@ -123,7 +124,7 @@ pub fn write_claude_settings(exe: &Path) -> anyhow::Result<PathBuf> {
 
 /// What trix hands each agent so it reports back, written once per server
 /// into the runtime dir and removed when the server stops.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Integrations {
     /// Claude Code `--settings` overlay.
     pub claude_settings: Option<PathBuf>,
@@ -136,26 +137,59 @@ pub struct Integrations {
     /// OpenCode takes `--standalone` (2.x). Without it, OpenCode 2 joins a
     /// background server that the first OpenCode started, with that one's
     /// environment: the plugin, the pane and the trix server it reports to.
-    pub opencode_standalone: bool,
+    /// Read with `opencode_standalone()`.
+    pub standalone: Arc<OnceLock<bool>>,
+}
+
+/// Nothing written, and OpenCode taken for 1.x (tests).
+impl Default for Integrations {
+    fn default() -> Self {
+        Integrations::with_standalone(false)
+    }
 }
 
 impl Integrations {
     /// Write them all. One that can't be written is left out, and that agent
     /// falls back to reading its screen.
     pub fn write(exe: &Path) -> Integrations {
+        // Asking OpenCode its version runs it, which takes a moment (up to
+        // 3 s): in the background, so the server answers its first `trix`
+        // without waiting for it. Only an OpenCode starting that soon waits.
+        let standalone = Arc::new(OnceLock::new());
+        let ask = standalone.clone();
+        let _ = std::thread::Builder::new().name("trix-opencode".into()).spawn(move || {
+            ask.get_or_init(opencode_has_standalone);
+        });
         Integrations {
             claude_settings: write_claude_settings(exe).ok(),
             opencode_plugin: write_opencode_plugin(exe).ok(),
             opencode_plugin_dir: write_opencode_plugin_dir(exe).ok(),
             cursor_plugin: write_cursor_plugin(exe).ok(),
-            opencode_standalone: opencode_has_standalone(),
+            standalone,
         }
+    }
+
+    /// Nothing written, and OpenCode's version already known.
+    pub fn with_standalone(standalone: bool) -> Integrations {
+        Integrations {
+            claude_settings: None,
+            opencode_plugin: None,
+            opencode_plugin_dir: None,
+            cursor_plugin: None,
+            standalone: Arc::new(OnceLock::from(standalone)),
+        }
+    }
+
+    /// Does OpenCode take `--standalone` (2.x)? Waits for the answer if it
+    /// is still being asked.
+    pub fn opencode_standalone(&self) -> bool {
+        *self.standalone.get_or_init(opencode_has_standalone)
     }
 
     /// The plugin for the OpenCode installed: OpenCode 2 is the one with
     /// `--standalone`.
     pub fn opencode_plugin_for_version(&self) -> Option<&Path> {
-        if self.opencode_standalone { self.opencode_plugin_dir.as_deref() } else { self.opencode_plugin.as_deref() }
+        if self.opencode_standalone() { self.opencode_plugin_dir.as_deref() } else { self.opencode_plugin.as_deref() }
     }
 
     pub fn remove(&self) {

@@ -264,6 +264,10 @@ pub struct Agent {
 
 pub const SPARK_LEN: usize = 48;
 
+/// How far apart, in µs, two hook reports can arrive out of order: separate
+/// processes, read on separate threads, so milliseconds in practice.
+const HOOK_REORDER_US: u64 = 5_000_000;
+
 /// How long a program may take to exit once hung up on, and then once told
 /// to terminate, before it's made to.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -571,8 +575,11 @@ impl Agent {
         // Hooks are separate processes read on separate threads, so a
         // PostToolUse can land after the Stop that followed it and flip a
         // finished agent back to Working.
+        // The stamps are wall-clock time, though: one far older than the
+        // newest wasn't overtaken, the clock went back (NTP, a resume), and
+        // dropping it would drop every report until the clock caught up.
         if msg.seq != 0 {
-            if msg.seq < self.last_hook_seq {
+            if msg.seq < self.last_hook_seq && self.last_hook_seq - msg.seq < HOOK_REORDER_US {
                 return None;
             }
             self.last_hook_seq = msg.seq;
@@ -1237,7 +1244,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             let theirs = extra.map(split_args).unwrap_or_default();
             // Its own server, with this pane's environment, unless you
             // picked one (see `Integrations::opencode_standalone`).
-            if integrations.opencode_standalone && !theirs.iter().any(|a| a == "--standalone" || a == "--server" || a.starts_with("--server=")) {
+            if integrations.opencode_standalone() && !theirs.iter().any(|a| a == "--standalone" || a == "--server" || a.starts_with("--server=")) {
                 args.push("--standalone".into());
             }
             if let Some(id) = &spec.resume {
@@ -1465,6 +1472,26 @@ mod tests {
         assert_eq!(a.state, State::Working, "newer ones still apply");
         a.on_hook(&claude("Stop", None, None), true);
         assert_eq!(a.state, State::Done, "no stamp: always applied");
+    }
+
+    #[test]
+    fn a_clock_that_went_back_does_not_mute_the_hooks() {
+        let mut a = test_agent(Kind::Claude);
+        let at = |mut m: HookMsg, seq: u64| {
+            m.seq = seq;
+            m
+        };
+        let now = 1_800_000_000_000_000;
+        a.on_hook(&at(claude("UserPromptSubmit", None, None), now), true);
+        // NTP set the clock back a minute: the next turn's reports are older.
+        let back = now - 60_000_000;
+        a.on_hook(&at(claude("Stop", None, None), back), true);
+        assert_eq!(a.state, State::Done, "not overtaken, just stamped by a clock that moved");
+        a.on_hook(&at(claude("UserPromptSubmit", None, None), back + 1_000), true);
+        assert_eq!(a.state, State::Working, "and the ones after it count from there");
+        a.on_hook(&at(claude("Stop", None, None), back + 3_000), true);
+        a.on_hook(&at(claude("PostToolUse", Some("Bash"), None), back + 2_000), true);
+        assert_eq!(a.state, State::Done, "a report overtaken on its way here is still dropped");
     }
 
     #[test]
@@ -1977,12 +2004,15 @@ mod tests {
     }
 
     fn ints() -> Integrations {
+        ints_for(false)
+    }
+    fn ints_for(opencode_standalone: bool) -> Integrations {
         Integrations {
             claude_settings: Some("/run/s.json".into()),
             opencode_plugin: Some("/run/opencode-plugin-1.js".into()),
             opencode_plugin_dir: Some("/run/opencode-plugin-1".into()),
             cursor_plugin: Some("/run/cursor-plugin-1".into()),
-            opencode_standalone: false,
+            ..Integrations::with_standalone(opencode_standalone)
         }
     }
 
@@ -2029,7 +2059,7 @@ mod tests {
 
     #[test]
     fn opencode_2_gets_its_own_server_unless_you_pick_one() {
-        let two = Integrations { opencode_standalone: true, ..ints() };
+        let two = ints_for(true);
         let mut s = spec(Kind::OpenCode);
         s.resume = Some("ses_1".into());
         assert_eq!(command_for(&s, &two, Path::new("/bin/trix"), None).1, ["--standalone", "--session", "ses_1"]);

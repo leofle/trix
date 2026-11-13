@@ -1080,8 +1080,10 @@ impl App {
             AppEvent::Output(id) => {
                 if let Some(i) = self.index_of(id) {
                     self.agents[i].on_output();
-                    // Only redraw for output we can actually see.
-                    if self.view == View::Grid || i == self.focus {
+                    // Only redraw for output we can actually see: the grid
+                    // shows one page of agents, not all of them.
+                    let seen = if self.view == View::Grid { crate::ui::on_grid_page(i, self.focus) } else { i == self.focus };
+                    if seen {
                         self.dirty = true;
                     }
                 }
@@ -1764,11 +1766,16 @@ impl App {
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(m.kind, MouseEventKind::ScrollUp);
-                if let Some(&(_, id)) = self.hits.panes.iter().find(|(r, _)| inside(r)) {
+                if let Some(&(r, id)) = self.hits.panes.iter().find(|(r, _)| inside(r)) {
                     if let Some(i) = self.index_of(id) {
                         let a = &self.agents[i];
                         let mode = *a.term.lock().mode();
-                        if mode.contains(TermMode::ALT_SCREEN) {
+                        if mode.contains(TermMode::ALT_SCREEN) && mode.intersects(TermMode::MOUSE_MODE) {
+                            // A full-screen program that reads the mouse
+                            // (OpenCode, htop, lazygit) scrolls itself: arrow
+                            // keys there would walk its prompt history or list.
+                            a.write(input::encode_wheel(up, x.saturating_sub(r.x), y.saturating_sub(r.y), m.modifiers, mode));
+                        } else if mode.contains(TermMode::ALT_SCREEN) {
                             let seq: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
                                 (true, true) => b"\x1bOA\x1bOA\x1bOA",
                                 (true, false) => b"\x1b[A\x1b[A\x1b[A",
@@ -1990,7 +1997,7 @@ fn spawn_git_watcher(targets: Arc<Mutex<GitTargets>>, tx: Sender<AppEvent>) {
                             let branch = git(dir, &["branch", "--show-current"])
                                 .filter(|b| !b.is_empty())
                                 .or_else(|| git(dir, &["rev-parse", "--short", "HEAD"]));
-                            let diff = branch.as_ref().and_then(|_| Some(parse_shortstat(&git(dir, &["diff", "HEAD", "--shortstat"])?)));
+                            let diff = branch.as_ref().and_then(|_| Some(parse_shortstat(&git(dir, DIFF_STAT)?)));
                             (branch, diff)
                         })
                         .clone();
@@ -2006,6 +2013,14 @@ fn spawn_git_watcher(targets: Arc<Mutex<GitTargets>>, tx: Sender<AppEvent>) {
         })
         .ok();
 }
+
+/// The diff against HEAD, as `git diff HEAD --shortstat` counts it (renames
+/// too), but read-only. `git diff` rewrites the index whenever files were
+/// touched, so every few seconds it would hold `index.lock`, and an agent's
+/// own `git add` or `git commit` landing then fails with "index.lock: File
+/// exists". `GIT_OPTIONAL_LOCKS=0` doesn't stop it (git 2.56); plumbing
+/// never writes the index.
+const DIFF_STAT: &[&str] = &["diff-index", "-M", "--shortstat", "HEAD"];
 
 fn parse_shortstat(s: &str) -> (u32, u32, u32) {
     let mut r = (0, 0, 0);
@@ -2366,6 +2381,33 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_reaches_a_full_screen_program_that_reads_the_mouse() {
+        let mut app = test_app();
+        // Full screen, mouse reports in SGR, then show the first report it gets.
+        let script = std::env::temp_dir().join(format!("trix-test-wheel-{}.sh", std::process::id()));
+        std::fs::write(&script, "printf '\\033[?1049h\\033[?1000h\\033[?1006h'\nstty raw -echo\nprintf 'ready\\r\\n'\nhead -c 10 | od -An -c\nsleep 5\n").unwrap();
+        let command = format!("exec /bin/sh {}", script.display());
+        let spec = Spawn { kind: Kind::Custom, name: "mouse".into(), cwd: std::env::temp_dir(), command: Some(command), prompt: None, branch_note: None, resume: None };
+        let id = app.spawn_quiet(spec).unwrap();
+        let i = app.index_of(id).unwrap();
+        let screen = |app: &App| crate::search::tail(&app.agents[i].term.lock(), 10).concat().split_whitespace().collect::<String>();
+        let wait_for = |app: &App, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !screen(app).contains(what) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_for(&app, "ready");
+        assert!(app.agents[i].term.lock().mode().contains(TermMode::ALT_SCREEN | TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE));
+        app.hits.panes = vec![(Rect::new(10, 5, 80, 24), id)];
+        app.on_mouse(MouseEvent { kind: MouseEventKind::ScrollUp, column: 12, row: 6, modifiers: KeyModifiers::NONE });
+        wait_for(&app, "033[<64;3;2M");
+        assert!(screen(&app).contains("033[<64;3;2M"), "a wheel report for the cell under the pointer, not arrow keys: {}", screen(&app));
+        app.agents[i].shutdown();
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
     fn kind_letters_pick_their_kind() {
         let mut app = test_app();
         for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('s', Kind::Shell)] {
@@ -2653,6 +2695,45 @@ mod tests {
         assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+)"), (1, 1, 0));
         assert_eq!(parse_shortstat(" 1 file changed, 4 deletions(-)"), (1, 0, 4));
         assert_eq!(parse_shortstat(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_diff_stat_counts_like_git_diff_but_never_writes_the_index() {
+        let dir = std::env::temp_dir().join(format!("trix-test-diffstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        for f in ["touched", "edited", "moved"] {
+            std::fs::write(dir.join(f), "1\n2\n3\n").unwrap();
+        }
+        run(&["add", "."]);
+        run(&["commit", "-q", "--no-verify", "-m", "init"]);
+        // What an agent at work leaves: a file rewritten as it was (only its
+        // stat differs, which is what makes `git diff` refresh the index),
+        // one edited, one renamed.
+        let later = std::time::SystemTime::now() + Duration::from_secs(10);
+        std::fs::File::options().write(true).open(dir.join("touched")).unwrap().set_modified(later).unwrap();
+        std::fs::write(dir.join("edited"), "1\n2\n3\n4\n").unwrap();
+        run(&["mv", "moved", "renamed"]);
+        let index = dir.join(".git/index");
+        let before = std::fs::metadata(&index).and_then(|m| m.modified()).unwrap();
+
+        let stat = git(&dir, DIFF_STAT).expect("diff-index runs");
+        assert_eq!(parse_shortstat(&stat), (2, 1, 0), "the edit, and the rename as one file: {stat}");
+        assert_eq!(std::fs::metadata(&index).and_then(|m| m.modified()).unwrap(), before, "the index is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

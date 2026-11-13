@@ -680,7 +680,12 @@ fn attention_strip(f: &mut Frame, app: &mut App, pane: Rect, t: &Theme) {
 }
 
 /// Agents per grid page: more than that and each gets too small to read.
-const GRID_PAGE: usize = 4;
+pub const GRID_PAGE: usize = 4;
+
+/// Is agent `i` on the grid page that's on screen (the focused agent's)?
+pub fn on_grid_page(i: usize, focus: usize) -> bool {
+    i / GRID_PAGE == focus / GRID_PAGE
+}
 
 /// Where each agent shown in the grid goes, and which page of how many
 /// this is. A page holds up to four, two to a row; an odd one out gets its
@@ -1793,6 +1798,11 @@ mod tests {
         assert_eq!((page, tiles.len()), (3, 2));
         assert_eq!((tiles[0].0, tiles[1].0, tiles[0].4), (8, 9, 46));
         assert_eq!(grid_tiles(0, 0, area).0.len(), 0);
+        // Output redraws for exactly the agents on screen (see `on_grid_page`).
+        for (n, focus) in [(10, 0), (10, 5), (10, 9), (3, 2), (8, 7)] {
+            let shown: Vec<usize> = grid_tiles(n, focus, area).0.iter().map(|t| t.0).collect();
+            assert_eq!(shown, (0..n).filter(|&i| on_grid_page(i, focus)).collect::<Vec<_>>(), "{n} agents, focus {focus}");
+        }
     }
 
     #[test]
