@@ -137,6 +137,7 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let mut spans = vec![
         Span::styled(" ◆ ", Style::new().fg(t.accent)),
         Span::styled("trix", Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
+        Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), Style::new().fg(t.muted)),
     ];
     if !crate::session::is_default() {
         spans.push(Span::styled(" · ", Style::new().fg(t.muted)));
@@ -1037,6 +1038,7 @@ fn empty_state(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect { x: area.x, y, width: area.width, height: 1 });
     };
     center(f, y0 + 3, TLine::from(Span::styled("a workspace where agents live", Style::new().fg(t.dim))));
+    center(f, y0 + 4, TLine::from(Span::styled(concat!("v", env!("CARGO_PKG_VERSION")), Style::new().fg(t.muted))));
     let rows = [
         ("enter".to_string(), "spawn your first agent"),
         (app.key(Action::New), "new agent anytime"),
