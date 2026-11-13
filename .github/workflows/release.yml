@@ -1,0 +1,76 @@
+name: Release
+
+# Pushing a tag like v1.0.1 builds trix for four platforms and attaches
+# the archives to that tag's GitHub release, making the release first if
+# there isn't one. Run it by hand with a tag to add them to an existing
+# release, such as v1.0.0.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and attach archives to (e.g. v1.0.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG doesn't match Cargo.toml's version $version"
+            exit 1
+          fi
+      - name: Make the release if there isn't one
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --verify-tag --title "trix ${TAG#v}" --generate-notes
+
+  build:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 links against an older glibc than ubuntu-latest,
+          # so the Linux builds run on more distributions.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name=trix-${{ matrix.target }}
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/trix LICENSE README.md "$name"/
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+      - name: Attach to the release
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber

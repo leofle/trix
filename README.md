@@ -40,11 +40,25 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 
 ## Use
 
-Install from a clone with [Rust](https://rustup.rs) (on a Mac, see [macOS](#macos) first):
+Download the latest release for Linux or macOS (x86_64 or ARM) into `~/.local/bin`:
+
+```sh
+os=$([ "$(uname)" = Darwin ] && echo apple-darwin || echo unknown-linux-gnu)
+target=$(uname -m | sed 's/arm64/aarch64/')-$os
+curl -fsSL https://github.com/leofle/trix/releases/latest/download/trix-$target.tar.gz | tar -xz
+mkdir -p ~/.local/bin && mv trix-$target/trix ~/.local/bin/ && rm -r trix-$target
+```
+
+Each archive on the [releases page](https://github.com/leofle/trix/releases) has a `.sha256` next to it. Or build from a clone with [Rust](https://rustup.rs) (on a Mac, see [macOS](#macos) first):
 
 ```sh
 git clone https://github.com/leofle/trix.git && cd trix
 cargo install --path .
+```
+
+Then:
+
+```sh
 trix                      # open the workspace (or attach to the running one)
 trix claude codex shell   # …and start these agents in the current folder
                           # (also grok, opencode, cursor, copilot, muse)
@@ -265,6 +279,8 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 trix runs on Linux and macOS. macOS support is new: if something doesn't work, please [open an issue](https://github.com/leofle/trix/issues) and include `$TMPDIR/trix-$(id -u)/server.log` (`server-<name>.log` for a named session).
 
 ### Install
+
+The [download above](#use) works on a Mac too. A copy downloaded with a browser instead of `curl` is quarantined by macOS; clear it with `xattr -d com.apple.quarantine trix`. To build it yourself:
 
 ```sh
 xcode-select --install          # Apple's compiler and linker (skip it if git already works)
