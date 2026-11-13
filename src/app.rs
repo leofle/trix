@@ -422,12 +422,20 @@ impl App {
         app
     }
 
+    /// The panes are in the theme's colors: it's trix's own, and the config
+    /// doesn't leave the panes to the terminal (`[theme] panes = false`).
+    pub fn paints_panes(&self) -> bool {
+        self.theme_source.paints_panes() && self.config.theme.panes
+    }
+
     /// Color `index` of agent `i`'s terminal, for a program that asks: one
     /// it set itself, else the theme's when the panes are in it. `None`
     /// leaves the question unanswered, as a terminal that won't say.
     pub(crate) fn pane_color(&self, i: usize, index: usize) -> Option<Rgb> {
         let set = self.agents[i].term.lock().colors()[index];
-        let theme = || self.theme_source.knows_pane_colors().then(|| self.theme.terminal_color(index)).flatten();
+        // trix paints them, or Omarchy themes the terminal.
+        let knows = self.paints_panes() || self.theme_source == ThemeSource::Omarchy;
+        let theme = || knows.then(|| self.theme.terminal_color(index)).flatten();
         set.or_else(|| theme().map(|(r, g, b)| Rgb { r, g, b }))
     }
 
@@ -438,8 +446,8 @@ impl App {
     /// Agents read these as they start, so one started or restarted from
     /// now on gets them; running ones keep theirs.
     fn sync_agent_themes(&mut self) {
-        self.integrations.themed = self.theme_source.paints_panes();
-        let want = crate::theme::claude_theme(&self.theme_source, &self.theme);
+        self.integrations.themed = self.paints_panes();
+        let want = crate::theme::claude_theme(self.paints_panes(), &self.theme);
         if want == self.claude_theme {
             return;
         }
@@ -471,6 +479,7 @@ impl App {
             }
             Ok(c) => {
                 self.config = c;
+                self.sync_agent_themes();
                 self.toast("config reloaded", ToastKind::Good);
             }
             Err(e) => self.toast(format!("config: {e} — kept the previous settings"), ToastKind::Bad),
@@ -499,7 +508,14 @@ impl App {
         self.last_title.clear();
         self.update_title();
         if self.pending_restore.is_some() && self.modal.is_none() {
-            self.modal = Some(Modal::Restore);
+            match self.config.workspace.restore {
+                crate::config::Restore::Ask => self.modal = Some(Modal::Restore),
+                crate::config::Restore::Always => self.restore_saved(),
+                crate::config::Restore::Never => {
+                    self.pending_restore = None;
+                    self.toast("starting fresh, as your settings say", ToastKind::Info);
+                }
+            }
         }
         self.dirty = true;
     }
@@ -869,14 +885,16 @@ impl App {
             .focused()
             .map(|a| a.live_cwd())
             .unwrap_or_else(|| self.start_dir.clone());
+        let new = self.config.new;
+        let kind = new.agent.or_else(|| state::load_prefs().last_agent.and_then(|k| Kind::from_label(&k))).unwrap_or(Kind::Claude);
         let mut f = NewForm {
-            kind: 0,
+            kind: Kind::ALL.iter().position(|&k| k == kind).unwrap_or(0),
             field: 0,
             name: TextInput::default(),
             name_touched: false,
             dir: TextInput::new(&tilde(&dir)),
             prompt: TextInput::default(),
-            worktree: false,
+            worktree: new.worktree,
             args: TextInput::default(),
             error: None,
         };
@@ -989,8 +1007,21 @@ impl App {
             resume: None,
         };
         self.modal = None;
-        if let Err(e) = self.spawn(spec) {
-            self.toast(format!("could not start: {e}"), ToastKind::Bad);
+        match self.spawn(spec) {
+            Ok(_) => self.remember_agent(kind),
+            Err(e) => self.toast(format!("could not start: {e}"), ToastKind::Bad),
+        }
+    }
+
+    /// For `[new] agent = "last"`: the kind alt+n started last.
+    fn remember_agent(&mut self, kind: Kind) {
+        let mut prefs = state::load_prefs();
+        if prefs.last_agent.as_deref() == Some(kind.label()) {
+            return;
+        }
+        prefs.last_agent = Some(kind.label().into());
+        if let Err(e) = state::store_prefs(&prefs) {
+            self.toast(format!("couldn't remember the agent you started: {e}"), ToastKind::Bad);
         }
     }
 
@@ -1520,7 +1551,8 @@ impl App {
             _ => None,
         };
         let files = [file(&self.config.sound.needs_you), file(&self.config.sound.done)];
-        self.modal = Some(Modal::Settings(Settings { sel: Row::Theme, theme: self.theme_name(), files, picker: None }));
+        let strip = self.config.strip.color;
+        self.modal = Some(Modal::Settings(Settings { sel: Row::Theme, theme: self.theme_name(), files, strip, picker: None }));
         self.dirty = true;
     }
 
@@ -1555,6 +1587,30 @@ impl App {
         let n = self.config.notify.clone();
         match row {
             Row::Theme => self.open_picker(),
+            Row::ThemePanes => {
+                let on = !self.config.theme.panes;
+                self.set_config("theme", "panes", on.into(), on);
+            }
+            Row::Strip => {
+                use crate::config::Paint;
+                let Some(Modal::Settings(s)) = &self.modal else { return };
+                let red = Some(Paint::Theme("red"));
+                let next = crate::settings::cycle(&crate::settings::strip_colors(s.strip), &self.config.strip.color.or(red), forward);
+                self.set_config("strip", "color", crate::settings::paint_text(next).into(), next == red);
+            }
+            Row::NewAgent => {
+                let next = crate::settings::cycle(&crate::settings::start_as(), &self.config.new.agent, forward);
+                self.set_config("new", "agent", crate::settings::start_as_text(next).into(), next == Some(Kind::Claude));
+            }
+            Row::NewWorktree => {
+                let on = !self.config.new.worktree;
+                self.set_config("new", "worktree", on.into(), !on);
+            }
+            Row::Restore => {
+                use crate::config::Restore;
+                let next = crate::settings::cycle(&Restore::ALL, &self.config.workspace.restore, forward);
+                self.set_config("workspace", "restore", next.name().into(), next == Restore::Ask);
+            }
             Row::SidebarMini => self.set_sidebar_mini(!self.sidebar_mini),
             Row::SidebarCompact => self.set_sidebar_compact(!self.sidebar_compact),
             Row::NotifyNeedsYou | Row::NotifyDone => {
@@ -1621,6 +1677,7 @@ impl App {
         self.config = config;
         self.config_failed = false;
         self.config_stamp = crate::config::stamp_of(&path);
+        self.sync_agent_themes();
         true
     }
 
@@ -3287,5 +3344,80 @@ mod tests {
         click(&mut app, MouseButton::Left, 0, 0);
         assert!(app.modal.is_none());
         let _ = std::fs::remove_dir_all(app.config_path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_new_settings_write_their_lines() {
+        use crate::config::{Paint, Restore};
+        let mut app = test_app();
+        let path = app.config_path.clone();
+        app.open_settings();
+        let file = || std::fs::read_to_string(&path).unwrap_or_default();
+        app.change_setting(Row::ThemePanes, true);
+        assert!(!app.config.theme.panes && file().contains("[theme]\npanes = false\n"));
+        app.change_setting(Row::Strip, true);
+        assert_eq!(app.config.strip.color, Some(Paint::Theme("orange")), "on from the theme's red");
+        assert!(file().contains("[strip]\ncolor = \"orange\"\n"));
+        app.change_setting(Row::Strip, false);
+        app.change_setting(Row::NewAgent, true);
+        assert_eq!(app.config.new.agent, Some(Kind::Codex));
+        app.change_setting(Row::NewAgent, false);
+        app.change_setting(Row::NewAgent, false);
+        assert_eq!(app.config.new.agent, None, "back past claude: the one started last");
+        assert!(file().contains("agent = \"last\""));
+        app.change_setting(Row::NewWorktree, true);
+        app.change_setting(Row::Restore, true);
+        assert_eq!(app.config.workspace.restore, Restore::Always);
+        let c = crate::config::parse(&file(), Path::new("/")).unwrap();
+        assert_eq!((c.new.worktree, c.workspace.restore, c.strip.color), (true, Restore::Always, Some(Paint::Theme("red"))), "{}", file());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn new_agents_start_as_the_settings_say() {
+        let mut app = test_app();
+        let form = |app: &App| match &app.modal {
+            Some(Modal::New(f)) => (Kind::ALL[f.kind], f.worktree),
+            _ => panic!("no form"),
+        };
+        app.open_new();
+        assert_eq!(form(&app), (Kind::Claude, false));
+        app.config.new = crate::config::NewAgent { agent: Some(Kind::Grok), worktree: true };
+        app.open_new();
+        assert_eq!(form(&app), (Kind::Grok, true));
+        app.config.new.agent = None;
+        app.open_new();
+        assert_eq!(form(&app).0, Kind::Claude, "none started yet: claude");
+    }
+
+    #[test]
+    fn a_saved_workspace_and_the_restore_setting() {
+        use crate::config::Restore;
+        let mut app = test_app();
+        let saved = || Some(crate::state::Saved::new(0, Vec::new()));
+        app.pending_restore = saved();
+        app.on_attach(PathBuf::from("/"));
+        assert!(matches!(app.modal, Some(Modal::Restore)), "ask, by default");
+        app.modal = None;
+        app.config.workspace.restore = Restore::Never;
+        app.on_attach(PathBuf::from("/"));
+        assert!(app.modal.is_none() && app.pending_restore.is_none(), "never: dropped");
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("starting fresh")));
+        app.pending_restore = saved();
+        app.config.workspace.restore = Restore::Always;
+        app.on_attach(PathBuf::from("/"));
+        assert!(app.modal.is_none() && app.pending_restore.is_none(), "always: brought back");
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.starts_with("restored")));
+    }
+
+    #[test]
+    fn panes_left_to_the_terminal_leave_the_agents_their_themes() {
+        let mut app = test_app();
+        app.theme_source = ThemeSource::File("/x/colors.toml".into());
+        app.sync_agent_themes();
+        assert!(app.integrations.themed);
+        app.apply_config(crate::config::parse("[theme]\npanes = false\n", Path::new("/")));
+        assert!(!app.paints_panes() && !app.integrations.themed, "Grok and OpenCode as they are");
+        assert_eq!(crate::theme::claude_theme(app.paints_panes(), &app.theme), None, "and Claude");
     }
 }

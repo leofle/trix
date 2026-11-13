@@ -78,7 +78,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits = Default::default();
     // Painting the panes, paint the space around them too: nothing is left
     // in the terminal's own colors.
-    if app.theme_source.paints_panes() {
+    if app.paints_panes() {
         f.buffer_mut().set_style(area, Style::new().fg(t.fg).bg(t.bg));
     }
 
@@ -615,7 +615,7 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     }
     let a = &app.agents[app.focus];
     app.hits.panes.push((inner, a.id));
-    let cur = render_term(f.buffer_mut(), inner, a, t, app.theme_source.paints_panes().then_some(t), app.term_focused);
+    let cur = render_term(f.buffer_mut(), inner, a, t, app.paints_panes().then_some(t), app.term_focused);
     pane_overlays(f, a, area, inner, &app.key(Action::Close), t);
     attention_strip(f, app, area, t);
     cur
@@ -749,7 +749,7 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
         app.agents[i].resize(inner.width, inner.height);
         let a = &app.agents[i];
         app.hits.panes.push((inner, a.id));
-        let cur = render_term(f.buffer_mut(), inner, a, t, app.theme_source.paints_panes().then_some(t), focused && app.term_focused);
+        let cur = render_term(f.buffer_mut(), inner, a, t, app.paints_panes().then_some(t), focused && app.term_focused);
         if focused {
             cursor = cur;
         } else {
@@ -1444,16 +1444,26 @@ fn settings(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     app.hits.settings_rows = rows;
 }
 
-/// What a setting is now, and in what color.
-fn setting_value(app: &App, s: &Settings, row: Row, t: &Theme) -> (String, Color) {
+/// What a setting is now, and in what color, flush right on its row.
+fn setting_value(app: &App, s: &Settings, row: Row, t: &Theme) -> Vec<Span<'static>> {
     use crate::config::Tone;
-    let toggle = |on: bool| if on { ("on".to_string(), t.green) } else { ("off".to_string(), t.dim) };
-    let tone = |tone: &Tone| (crate::settings::tone_label(tone), if *tone == Tone::Off { t.dim } else { t.fg });
+    let text = |v: String, c: Color| vec![Span::styled(v, Style::new().fg(c))];
+    let toggle = |on: bool| if on { text("on".into(), t.green) } else { text("off".into(), t.dim) };
+    let tone = |tone: &Tone| text(crate::settings::tone_label(tone), if *tone == Tone::Off { t.dim } else { t.fg });
     let n = &app.config.notify;
     match row {
-        Row::Theme => (format!("{} ›", s.theme), t.accent),
-        Row::SidebarMini => ((if app.sidebar_mini { "narrow" } else { "wide" }).to_string(), t.fg),
-        Row::SidebarCompact => ((if app.sidebar_compact { "compact" } else { "full" }).to_string(), t.fg),
+        Row::Theme => text(format!("{} ›", s.theme), t.accent),
+        Row::ThemePanes => toggle(app.config.theme.panes),
+        Row::Strip => {
+            let (bar, words) = strip_colors(app, t);
+            let name = crate::settings::paint_text(app.config.strip.color);
+            vec![Span::styled(format!("{name} "), Style::new().fg(t.fg)), Span::styled(" ▲ ", Style::new().fg(words).bg(bar))]
+        }
+        Row::SidebarMini => text((if app.sidebar_mini { "narrow" } else { "wide" }).into(), t.fg),
+        Row::SidebarCompact => text((if app.sidebar_compact { "compact" } else { "full" }).into(), t.fg),
+        Row::NewAgent => text(crate::settings::start_as_text(app.config.new.agent).into(), t.fg),
+        Row::NewWorktree => toggle(app.config.new.worktree),
+        Row::Restore => text(crate::settings::restore_label(app.config.workspace.restore).into(), t.fg),
         Row::NotifyNeedsYou => toggle(n.needs_you),
         Row::NotifyDone => toggle(n.done),
         Row::Desktop => toggle(n.desktop),
@@ -1498,39 +1508,69 @@ fn panel_foot(f: &mut Frame, r: Rect, keys: TLine<'static>, note: String, t: &Th
     f.render_widget(Paragraph::new(Span::styled(trunc(&note, width), Style::new().fg(t.muted))), Rect { y: foot.y + 1, ..foot });
 }
 
+/// A line of the settings list: a heading, the gap before one, or a row
+/// (its number in `Row::ALL`).
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsLine {
+    Gap,
+    Heading(&'static str),
+    Row(usize),
+}
+
+fn settings_lines() -> Vec<SettingsLine> {
+    let mut lines = Vec::new();
+    for (i, row) in Row::ALL.iter().enumerate() {
+        if let Some(h) = row.heading() {
+            if i > 0 {
+                lines.push(SettingsLine::Gap);
+            }
+            lines.push(SettingsLine::Heading(h));
+        }
+        lines.push(SettingsLine::Row(i));
+    }
+    lines
+}
+
+/// The first of `n` lines to show in room for `fit`, keeping line `at` on
+/// screen, in the middle once they don't all fit.
+fn window(at: usize, n: usize, fit: usize) -> usize {
+    if n <= fit { 0 } else { at.saturating_sub(fit / 2).min(n - fit) }
+}
+
 fn settings_list(f: &mut Frame, app: &App, s: &Settings, area: Rect, t: &Theme, rows: &mut Vec<(Rect, usize)>) -> Rect {
-    let headings = Row::ALL.iter().filter(|r| r.heading().is_some()).count() as u16;
-    // Borders, a line above, the headings with a gap before all but the
-    // first, the rows, a gap, and two lines at the foot.
-    let h = 2 + 1 + (headings * 2 - 1) + Row::ALL.len() as u16 + 1 + 2;
-    let r = centered(area, 66, h);
+    let lines = settings_lines();
+    // Borders, a line above and below the list, two lines at the foot.
+    let r = centered(area, 66, lines.len() as u16 + 6);
     f.render_widget(Clear, r);
     let block = modal_block("Settings", t);
     let inner = block.inner(r);
     f.render_widget(block, r);
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
-    // Leave the foot to the foot.
-    let last = r.bottom().saturating_sub(4);
-    // Notifications that never come have no way to come.
+    let fit = (inner.height as usize).saturating_sub(4);
+    let sel = Row::ALL.iter().position(|&r| r == s.sel).unwrap_or(0);
+    let at = lines.iter().position(|&l| l == SettingsLine::Row(sel)).unwrap_or(0);
+    // Up to the heading over the first one, so the list starts with it.
+    let start = match window(at, lines.len(), fit) {
+        1 if matches!(lines[0], SettingsLine::Heading(_)) => 0,
+        n => n,
+    };
+    // Notifications that never come have no way to come; a theme that's
+    // not trix's own has no panes to paint.
     let quiet = !app.config.notify.needs_you && !app.config.notify.done;
-    let mut y = inner.y + 1;
-    for (i, &row) in Row::ALL.iter().enumerate() {
-        if let Some(head) = row.heading() {
-            if i > 0 {
-                y += 1;
-            }
-            if y < last {
-                let l = Rect { y, height: 1, ..inner };
+    let unpainted = !app.theme_source.paints_panes();
+    for (k, line) in lines.iter().skip(start).take(fit).enumerate() {
+        let l = Rect { y: inner.y + 1 + k as u16, height: 1, ..inner };
+        let i = match *line {
+            SettingsLine::Gap => continue,
+            SettingsLine::Heading(head) => {
                 f.render_widget(Paragraph::new(Span::styled(format!("   {head}"), Style::new().fg(t.dim).add_modifier(Modifier::BOLD))), l);
+                continue;
             }
-            y += 1;
-        }
-        if y >= last {
-            break;
-        }
-        let l = Rect { y, height: 1, ..inner };
+            SettingsLine::Row(i) => i,
+        };
+        let row = Row::ALL[i];
         let selected = row == s.sel;
-        let off = quiet && matches!(row, Row::Desktop | Row::Bell);
+        let off = (quiet && matches!(row, Row::Desktop | Row::Bell)) || (unpainted && row == Row::ThemePanes);
         let label = Style::new().fg(if off { t.muted } else if selected { t.fg_bright } else { t.fg });
         let mut left = vec![Span::styled(row.label(), if selected { label.add_modifier(Modifier::BOLD) } else { label })];
         let key = match row {
@@ -1541,16 +1581,35 @@ fn settings_list(f: &mut Frame, app: &App, s: &Settings, area: Rect, t: &Theme, 
         if let Some(k) = key {
             left.push(Span::styled(format!("  {k}"), Style::new().fg(t.muted)));
         }
-        let (value, color) = setting_value(app, s, row, t);
-        let bold = if selected { Modifier::BOLD } else { Modifier::empty() };
-        let value = Span::styled(value, Style::new().fg(if off { t.muted } else { color }).add_modifier(bold));
-        list_row(f, l, selected, left, vec![value], t);
+        let mut value = setting_value(app, s, row, t);
+        for v in &mut value {
+            if off {
+                v.style = v.style.fg(t.muted);
+            }
+            if selected {
+                v.style = v.style.add_modifier(Modifier::BOLD);
+            }
+        }
+        list_row(f, l, selected, left, value, t);
         rows.push((l, i));
-        y += 1;
     }
+    more_marks(f, inner, start, fit, lines.len(), t);
     let keys = key_help(&[("↑↓", "choose"), ("enter ←→", "change"), ("esc", "close")], t);
     panel_foot(f, r, keys, format!("Keys, mutes, a notify command: {}", tilde(&app.config_path)), t);
     r
+}
+
+/// "▲ more" and "▼ more" over and under a list that goes on.
+fn more_marks(f: &mut Frame, inner: Rect, start: usize, fit: usize, n: usize, t: &Theme) {
+    let more = |f: &mut Frame, y: u16, s: &'static str| {
+        f.render_widget(Paragraph::new(Span::styled(s, Style::new().fg(t.muted))).alignment(Alignment::Right), Rect { y, height: 1, width: inner.width.saturating_sub(1), ..inner });
+    };
+    if start > 0 {
+        more(f, inner.y, "▲ more");
+    }
+    if start + fit < n {
+        more(f, inner.y + 1 + fit as u16, "▼ more");
+    }
 }
 
 /// The list of themes: each with its colors, the one in use marked.
@@ -1565,8 +1624,7 @@ fn theme_list(f: &mut Frame, p: &Picker, area: Rect, t: &Theme, rows: &mut Vec<(
     f.render_widget(block, r);
     let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
     let fit = (inner.height as usize).saturating_sub(4);
-    // The one picked in the middle, once the list is longer than the room.
-    let start = if n <= fit { 0 } else { p.sel.saturating_sub(fit / 2).min(n - fit) };
+    let start = window(p.sel, n, fit);
     for (k, (i, c)) in p.choices.iter().enumerate().skip(start).take(fit).enumerate() {
         let l = Rect { y: inner.y + 1 + k as u16, height: 1, ..inner };
         let selected = i == p.sel;
@@ -1578,16 +1636,7 @@ fn theme_list(f: &mut Frame, p: &Picker, area: Rect, t: &Theme, rows: &mut Vec<(
         list_row(f, l, selected, left, swatch(c), t);
         rows.push((l, i));
     }
-    // More above or below.
-    let more = |f: &mut Frame, y: u16, s: &'static str| {
-        f.render_widget(Paragraph::new(Span::styled(s, Style::new().fg(t.muted))).alignment(Alignment::Right), Rect { y, height: 1, width: inner.width.saturating_sub(1), ..inner });
-    };
-    if start > 0 {
-        more(f, inner.y, "▲ more");
-    }
-    if start + fit < n {
-        more(f, inner.y + 1 + fit as u16, "▼ more");
-    }
+    more_marks(f, inner, start, fit, n, t);
     let keys = key_help(&[("↑↓", "try one"), ("enter", "keep it"), ("esc", "back")], t);
     panel_foot(f, r, keys, "Agents running now may need a restart to match.".into(), t);
     r
@@ -1726,11 +1775,12 @@ mod tests {
             Modal::Broadcast(TextInput::new("hello"), BroadcastTarget::All),
             Modal::Rename(id, TextInput::new("web")),
             Modal::Help,
-            Modal::Settings(Settings { sel: Row::Bell, theme: "Ristretto".into(), files: [None, None], picker: None }),
+            Modal::Settings(Settings { sel: Row::Bell, theme: "Ristretto".into(), files: [None, None], strip: None, picker: None }),
             Modal::Settings(Settings {
                 sel: Row::Theme,
                 theme: "Ristretto".into(),
                 files: [None, None],
+                strip: None,
                 picker: Some(Picker { choices: crate::theme::choices_here(std::path::Path::new("/nonexistent")).0, sel: 3, current: 0 }),
             }),
         ];
@@ -1780,6 +1830,9 @@ mod tests {
         assert_eq!(cells(&mut app, "zplain"), ((t.fg, t.bg), t.bg), "default text, and the space around it");
         assert_eq!(cells(&mut app, "zred").0, (t.ansi[1], t.bg), "the theme's red");
         assert_eq!(cells(&mut app, "zexact").0.0, Color::Rgb(1, 2, 3), "an exact color stays");
+        app.config.theme.panes = false;
+        assert_eq!(cells(&mut app, "zplain"), ((Color::Reset, Color::Reset), Color::Reset), "[theme] panes = false: the terminal's");
+        assert_eq!(cells(&mut app, "zred").0.0, Color::Red);
         for a in &app.agents {
             a.shutdown();
         }

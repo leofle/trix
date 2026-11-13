@@ -134,6 +134,9 @@ pub struct Prefs {
     /// alt+c: one-line sidebar cards.
     #[serde(default)]
     pub sidebar_compact: bool,
+    /// The kind of agent started last from alt+n, for `[new] agent = "last"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent: Option<String>,
     /// Claude context windows learned per model (see usage.rs).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context_windows: std::collections::BTreeMap<String, u64>,
@@ -144,6 +147,10 @@ fn prefs_path() -> PathBuf {
 }
 
 pub fn load_prefs() -> Prefs {
+    // Nor read them: tests start from the defaults, whatever this machine has.
+    if cfg!(test) {
+        return Prefs::default();
+    }
     load_prefs_from(&prefs_path())
 }
 
