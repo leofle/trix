@@ -74,3 +74,35 @@ jobs:
           echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
       - name: Attach to the release
         run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+
+  # Point the Homebrew formula in leofle/homebrew-trix at this release.
+  # Pushing to another repo needs a token of its own: a fine-grained one
+  # with Contents read and write on homebrew-trix, saved in this repo as
+  # the HOMEBREW_TAP_TOKEN secret. Without it, this job only says so.
+  homebrew:
+    needs: build
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Say if there's no token
+        if: env.TAP_TOKEN == ''
+        run: echo "::warning::HOMEBREW_TAP_TOKEN isn't set, so the Homebrew formula still points at the last release"
+      - uses: actions/checkout@v4
+        if: env.TAP_TOKEN != ''
+      - name: Update the formula
+        if: env.TAP_TOKEN != ''
+        run: |
+          gh release download "$TAG" --pattern '*.sha256' --dir sums
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/leofle/homebrew-trix.git" tap
+          packaging/homebrew-formula.sh "${TAG#v}" sums > tap/Formula/trix.rb
+          cd tap
+          if git diff --quiet; then
+            echo "The formula is already at $TAG"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "trix ${TAG#v}"
+          git push
