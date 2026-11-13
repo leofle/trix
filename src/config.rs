@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(kinds("[new]\nkinds = [\"copilot\", \" grok \"]\n").unwrap(), [Kind::Copilot, Kind::Grok], "in your order");
         assert_eq!(kinds("[new]\nkinds = []\n").unwrap(), [], "all of them under more");
         let e = kinds("[new]\nkinds = [\"claude\", \"gpt\"]\n").unwrap_err();
-        assert_eq!(e, "new.kinds: 'gpt' is not an agent (claude, codex, grok, opencode, cursor, copilot, shell, custom)");
+        assert_eq!(e, "new.kinds: 'gpt' is not an agent (claude, codex, grok, opencode, cursor, copilot, muse, shell, custom)");
         assert_eq!(kinds("[new]\nkinds = [\"codex\", \"codex\"]\n").unwrap_err(), "new.kinds: 'codex' is named twice");
         assert!(kinds("[new]\nkinds = \"claude\"\n").unwrap_err().starts_with("line 2:"), "a list, not one name");
     }

@@ -499,6 +499,7 @@ fn kind_color(t: &Theme, k: Kind) -> Color {
         Kind::OpenCode => t.accent,
         Kind::Cursor => mix(t.cyan, t.magenta, 0.5),
         Kind::Copilot => t.green,
+        Kind::Muse => mix(t.magenta, t.orange, 0.5),
         Kind::Shell => t.dim,
         Kind::Custom => t.magenta,
     }
@@ -2034,7 +2035,7 @@ mod tests {
         let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
         f.kind = Kind::Grok;
         f.more = true;
-        assert_eq!(kind_row(&mut app).0, "‹ grok   opencode   cursor   copilot", "open, in place");
+        assert_eq!(kind_row(&mut app).0, "‹ grok   opencode   cursor   copilot   muse", "open, in place");
         let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
         f.more = false;
         f.kind = Kind::Copilot;

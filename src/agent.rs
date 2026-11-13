@@ -31,12 +31,14 @@ pub enum Kind {
     Cursor,
     /// GitHub Copilot CLI (`copilot`).
     Copilot,
+    /// Meta's Muse Code (`muse`).
+    Muse,
     Shell,
     Custom,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Shell, Kind::Custom];
+    pub const ALL: [Kind; 9] = [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Shell, Kind::Custom];
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -45,6 +47,7 @@ impl Kind {
             Kind::OpenCode => "opencode",
             Kind::Cursor => "cursor",
             Kind::Copilot => "copilot",
+            Kind::Muse => "muse",
             Kind::Shell => "shell",
             Kind::Custom => "custom",
         }
@@ -58,7 +61,7 @@ impl Kind {
     /// A known coding agent, so typing a prompt into it is safe. A custom
     /// command may be anything (bash, ssh, psql), so it is not.
     pub fn takes_prompts(self) -> bool {
-        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot)
+        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse)
     }
     /// It can be started again in the conversation it was in.
     pub fn resumes(self) -> bool {
@@ -85,6 +88,7 @@ impl Kind {
             Kind::OpenCode => Some('o'),
             Kind::Cursor => Some('u'),
             Kind::Copilot => Some('p'),
+            Kind::Muse => Some('m'),
             Kind::Shell => Some('s'),
             Kind::Custom => None,
         }
@@ -308,6 +312,14 @@ impl Agent {
         integrations: &Integrations,
         exe: &std::path::Path,
     ) -> anyhow::Result<Agent> {
+        // Your own managed Muse hooks stay yours (`muse_user_managed_hooks`).
+        let without_muse_hooks;
+        let integrations = if spec.kind == Kind::Muse && integrations.muse_hooks.is_some() && muse_user_managed_hooks() {
+            without_muse_hooks = Integrations { muse_hooks: None, ..integrations.clone() };
+            &without_muse_hooks
+        } else {
+            integrations
+        };
         // Grok and Copilot take the id of a new conversation from their
         // caller, so trix knows what to resume without asking them.
         let fresh = new_conversation(&spec);
@@ -615,8 +627,9 @@ impl Agent {
             // Codex's lifecycle hooks, which it runs once they're trusted.
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
-            // trix's own plugin (OpenCode, Copilot) or the user's hooks (Grok).
-            "opencode" | "grok" | "copilot" => self.hooked = true,
+            // trix's own plugin (OpenCode, Copilot), its managed hooks (Muse)
+            // or the user's hooks (Grok).
+            "opencode" | "grok" | "copilot" | "muse" => self.hooked = true,
             // Cursor runs only `sessionStart` and the tool hooks from trix's
             // plugin (cursor-agent 2026.11.11): no prompt, no turn end. Its
             // screen says when a turn starts and ends; its hooks add what it
@@ -630,6 +643,11 @@ impl Agent {
             _ => tool.clone(),
         };
         match msg.event.as_str() {
+            // Muse runs `SessionStart`'s hooks only as its first turn begins,
+            // alongside that turn's own (1.4.18), so it may land after the
+            // turn ended: it names the conversation, and the state is the
+            // turn's. Until then, the screen says.
+            "SessionStart" if msg.source == "muse" => None,
             "SessionStart" => {
                 self.activity = "ready".into();
                 self.set_state(State::Idle, focused)
@@ -667,9 +685,10 @@ impl Agent {
                 self.activity = hooks::one_line(msg.detail.as_deref().unwrap_or_default(), 60);
                 self.set_state(State::Blocked, focused)
             }
-            // Copilot's permission prompt comes as a notification naming no
-            // tool: the tool it was about to run is what it asks about.
-            "PermissionRequest" if msg.source == "copilot" => {
+            // Copilot's and Muse's permission prompts come as a notification
+            // naming no tool: the tool it was about to run is what it asks
+            // about.
+            "PermissionRequest" if matches!(msg.source.as_str(), "copilot" | "muse") => {
                 self.activity = match (&self.pending_tool, msg.detail.as_deref().filter(|d| !d.is_empty())) {
                     (Some(t), _) => format!("approve {t}"),
                     (None, Some(m)) => hooks::one_line(m, 60),
@@ -700,7 +719,7 @@ impl Agent {
             }
             // OpenCode reports its session idle at start too, and the new
             // agents' turn ends mean nothing before a turn began.
-            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot") && !self.turn_seen => None,
+            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse") && !self.turn_seen => None,
             "Stop" | "agent-turn-complete" => {
                 self.pending_tool = None;
                 self.activity = match self.tools_used {
@@ -730,11 +749,12 @@ impl Agent {
                 }
                 None
             }
-            // Copilot's `ask_user` is on screen already (its `PreToolUse`
-            // named the question): its dialog's notification adds nothing.
-            "Question" if msg.source == "copilot" && self.state == State::Blocked => None,
+            // Copilot's `ask_user` and Muse's `request_user_input` are on
+            // screen already (their `PreToolUse` named the question): the
+            // dialog's notification adds nothing.
+            "Question" if matches!(msg.source.as_str(), "copilot" | "muse") && self.state == State::Blocked => None,
             // The agent asks the human something (OpenCode's question tool,
-            // a Copilot dialog).
+            // a Copilot dialog, Muse's question prompt).
             "Question" => {
                 self.activity = msg.detail.clone().unwrap_or_else(|| "has a question".into());
                 self.set_state(State::Blocked, focused)
@@ -792,6 +812,12 @@ impl Agent {
         // Right after a turn, Grok names the conversation and redraws, which
         // would otherwise read as a new turn and undo its Done.
         let mut title_idle = false;
+        // Muse's title is its folder, after a braille spinner while it
+        // works (1.4.18). Without the spinner, output is a redraw (it
+        // starting up, resuming), not a turn.
+        if self.kind == Kind::Muse {
+            title_idle = self.title.as_deref().is_some_and(|t| !braille_spinner(t.split(' ').next().unwrap_or_default()));
+        }
         if self.kind == Kind::Grok {
             // Its own question or approval UI on screen outranks the title,
             // which keeps spinning (so the screen is never quiet) while it
@@ -919,8 +945,9 @@ impl Agent {
                 self.set_state(State::Idle, focused)
             }
             State::Idle | State::Done if busy && !title_idle => {
-                // Cursor's title names the conversation, not what it does.
-                self.activity = self.title.clone().filter(|_| self.kind != Kind::Cursor).unwrap_or_else(|| "working".into());
+                // Cursor's title names the conversation and Muse's the
+                // folder, not what they do.
+                self.activity = self.title.clone().filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse)).unwrap_or_else(|| "working".into());
                 self.set_state(State::Working, focused)
             }
             State::Idle | State::Done if quiet > Duration::from_millis(800) && self.kind.is_agent() => {
@@ -1132,7 +1159,8 @@ fn needs_input(screen: &str) -> bool {
 /// (`xai-grok-pager`), OpenCode's permission prompt
 /// (`packages/tui/src/routes/session/permission.tsx`), Cursor CLI's
 /// approval prompts and workspace-trust screen, Copilot CLI's folder trust
-/// and approval prompt, and Codex's folder-trust
+/// and approval prompt, Muse Code's workspace trust, approval choices and
+/// question dialog, and Codex's folder-trust
 /// and hooks-review dialogs (as Codex 0.167.2 draws them).
 fn kind_prompt(kind: Kind, screen: &str) -> bool {
     let t = screen.to_lowercase();
@@ -1151,6 +1179,28 @@ fn kind_prompt(kind: Kind, screen: &str) -> bool {
         // the way out of its approval prompt (as `copilot help permissions`
         // words it).
         Kind::Copilot => any(&["confirm folder trust", "do you trust the files in this folder", "no, and tell copilot what to do differently"]),
+        // Muse Code 1.4.18: workspace trust and the review of new hooks at
+        // start (as it draws them), its approval choices (as its
+        // permissions docs and the binary word them: "Allow once",
+        // "Always allow in this workspace", "Reject"…) and its question
+        // dialog's keys. "Allow once" counts as a choice only: a line of
+        // its own, after the marker and number Muse draws before each.
+        Kind::Muse => {
+            let choice = |label: &str| {
+                t.lines().any(|l| l.trim_start_matches(|c: char| c.is_whitespace() || c.is_ascii_digit() || "⟩❯›>│•*-.)".contains(c)).starts_with(label))
+            };
+            any(&[
+                "do you trust this workspace?",
+                "use up/down or 1/2, then enter. esc quits.",
+                "enter / a: trust this hook",
+                "esc continues without trusting",
+                "always allow in this workspace",
+                "always allow outside the sandbox",
+                "yes, don't ask again this session",
+                "to switch question",
+                "submit row to continue",
+            ]) || (choice("allow once") && (choice("reject") || choice("always allow") || choice("allow for this session")))
+        }
         // Codex 0.167's start-up dialogs: trusting the folder, then
         // trix's hooks (and any of yours) once they're new or changed.
         Kind::Codex => any(&["trust and continue", "your trust decision will be saved", "hooks need review", "need review before they can run", "continue without trusting"]),
@@ -1183,15 +1233,18 @@ fn grok_title(title: Option<&str>, attention: bool) -> Option<TitleSignal> {
         return Some(TitleSignal::Attention);
     }
     let parts: Vec<&str> = title.split(" - ").map(str::trim).collect();
-    let spinner = |p: &str| {
-        let mut cs = p.chars();
-        matches!((cs.next(), cs.next()), (Some('\u{2801}'..='\u{28ff}'), None))
-    };
-    if let Some(i) = parts.iter().position(|p| spinner(p)) {
+    if let Some(i) = parts.iter().position(|p| braille_spinner(p)) {
         let what = parts.get(i + 1).filter(|p| **p != "grok").map(|p| hooks::one_line(p, 60));
         return Some(TitleSignal::Busy(what));
     }
     (parts.last() == Some(&"grok")).then_some(TitleSignal::Idle)
+}
+
+/// One frame of a braille spinner, as Grok's and Muse's titles show while
+/// they work.
+fn braille_spinner(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!((cs.next(), cs.next()), (Some('\u{2801}'..='\u{28ff}'), None))
 }
 
 /// A random (version 4) UUID, for a new Grok conversation.
@@ -1232,6 +1285,31 @@ fn copilot_picks_session(extra: Option<&str>) -> bool {
         let flag = a.split('=').next().unwrap_or(a);
         matches!(flag, "--continue" | "-r" | "--resume" | "--session-id" | "--connect")
     })
+}
+
+/// Do the user's extra Muse flags set its managed hooks (`-c
+/// managed_hooks_path=…`, `--config=managed_hooks_env_vars=…`)?
+fn muse_sets_hooks(extra: &[String]) -> bool {
+    extra.iter().any(|a| {
+        let setting = a.strip_prefix("--config=").or_else(|| a.strip_prefix("-c")).unwrap_or(a);
+        matches!(setting.split('=').next(), Some("managed_hooks_path" | "managed_hooks_env_vars"))
+    })
+}
+
+/// Do Muse's user settings (`$XDG_CONFIG_HOME/muse/settings.json`, else
+/// `~/.config/muse/`) name managed hooks of their own? trix's `-c
+/// managed_hooks_path=` would take their place for that run: trix leaves
+/// them be, and reads that Muse's screen instead.
+fn muse_user_managed_hooks() -> bool {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    config.and_then(|c| std::fs::read_to_string(c.join("muse/settings.json")).ok()).is_some_and(|s| muse_settings_manage_hooks(&s))
+}
+
+fn muse_settings_manage_hooks(settings: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(settings).is_ok_and(|v| v.get("managed_hooks_path").is_some_and(|p| !p.is_null()))
 }
 
 fn window_size((cols, lines): (u16, u16)) -> WindowSize {
@@ -1361,6 +1439,29 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
                 args.push(format!("--interactive={p}"));
             }
             ("copilot".into(), args)
+        }
+        // `muse [PROMPT]`, or `muse resume <id>`, which takes no prompt.
+        // trix's hooks ride on `-c`: its managed hooks file, and the two
+        // variables `trix hook` needs, which Muse otherwise clears from a
+        // hook's environment. Muse refuses a run that sets one setting
+        // twice, so extra args that set either leave trix's out.
+        Kind::Muse => {
+            let theirs = extra.map(split_args).unwrap_or_default();
+            if let Some(file) = &integrations.muse_hooks
+                && !muse_sets_hooks(&theirs)
+            {
+                // `-c` values are JSON.
+                let path = serde_json::to_string(&file.display().to_string()).unwrap_or_default();
+                args.extend(["-c".into(), format!("managed_hooks_path={path}")]);
+                args.extend(["-c".into(), r#"managed_hooks_env_vars=["TRIX_SOCKET","TRIX_AGENT_ID"]"#.into()]);
+            }
+            args.extend(theirs);
+            if let Some(id) = &spec.resume {
+                args.extend(["resume".into(), id.clone()]);
+            } else if let Some(p) = prompt {
+                push_prompt(&mut args, p);
+            }
+            ("muse".into(), args)
         }
         Kind::Claude => {
             if let Some(s) = &integrations.claude_settings {
@@ -2112,6 +2213,7 @@ mod tests {
             opencode_plugin_dir: Some("/run/opencode-plugin-1".into()),
             cursor_plugin: Some("/run/cursor-plugin-1".into()),
             copilot_plugin: Some("/run/copilot-plugin-1".into()),
+            muse_hooks: Some("/run/muse hooks-1.json".into()),
             ..Integrations::with_standalone(opencode_standalone)
         }
     }
@@ -2258,6 +2360,12 @@ mod tests {
         // words the approval prompt's way out.
         assert!(kind_prompt(Kind::Copilot, "│ Confirm folder trust │\n│ Do you trust the files in this folder? │\n│ ❯ 1. Yes │"));
         assert!(kind_prompt(Kind::Copilot, "Run cargo test?\n❯ 1. Yes\n  2. Yes, and don't ask again for cargo in this repo\n  3. No, and tell Copilot what to do differently (Esc)"));
+        // As Muse Code 1.4.18 draws its workspace trust, and the choices of
+        // its approvals and its question dialog's keys, as it words them.
+        assert!(kind_prompt(Kind::Muse, "Do you trust this workspace?\nWorkspace:\n/home/u/code/api\n\n⟩ 1  Trust and continue\n  2  Quit\n\nUse Up/Down or 1/2, then Enter. Esc quits."));
+        assert!(kind_prompt(Kind::Muse, "bash cargo test\n⟩ Allow once\n  Always allow in this workspace\n  Reject"));
+        assert!(kind_prompt(Kind::Muse, "curl api.example.com:443\n⟩ Yes, don't ask again this session\n  Allow once\n  Reject"));
+        assert!(kind_prompt(Kind::Muse, "Which database?\n⟩ Postgres (Recommended)\n  SQLite\nEnter to select · ↑/↓ to move · ←/→ to switch question · Tab for an option"));
         // Prose that only the generic patterns would catch, or another agent's prompt.
         let prose = "Would you like to add tests? I can run them (y/n) next.\nDo you want to proceed?";
         for k in Kind::ALL {
@@ -2266,6 +2374,8 @@ mod tests {
         assert!(!kind_prompt(Kind::Grok, "Run this command?\n Run (once) (y)\n Skip (esc or n)"));
         assert!(!kind_prompt(Kind::Claude, "△ Permission required\nAllow once Allow always"));
         assert!(!kind_prompt(Kind::Cursor, "I ran the command and skipped the lint step."));
+        assert!(!kind_prompt(Kind::Muse, "I'll allow once more retries, then reject the build."));
+        assert!(!kind_prompt(Kind::Muse, "Trust and continue\nYour trust decision will be saved."), "Codex's");
     }
 
     /// Output the way an agent redraws while it works: a burst, none of it
@@ -2674,7 +2784,7 @@ mod tests {
             s.resume = Some("x".into());
             assert_eq!(new_conversation(&s), None, "{k:?}: resumed");
         }
-        for k in [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Cursor, Kind::Shell, Kind::Custom] {
+        for k in [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Cursor, Kind::Muse, Kind::Shell, Kind::Custom] {
             assert_eq!(new_conversation(&spec(k)), None, "{k:?}");
         }
     }
@@ -2741,6 +2851,178 @@ mod tests {
         a.on_hook(&copilot("UserPromptSubmit", None, None), false);
         a.on_hook(&copilot("PermissionRequest", None, Some("needs permission")), false);
         assert_eq!(a.activity, "needs permission");
+        a.shutdown();
+    }
+
+    #[test]
+    fn muse_has_its_own_letter() {
+        assert_eq!(Kind::Muse.shortcut(), Some('m'));
+        assert_eq!(Kind::from_shortcut('m'), Some(Kind::Muse));
+        assert_eq!(Kind::from_label("muse"), Some(Kind::Muse));
+        assert!(Kind::Muse.takes_prompts() && Kind::Muse.resumes() && !Kind::Muse.prompts_only_on_screen());
+    }
+
+    #[test]
+    fn muse_argv_passes_the_hooks_and_resumes() {
+        let hooks = [
+            "-c".to_string(),
+            r#"managed_hooks_path="/run/muse hooks-1.json""#.into(),
+            "-c".into(),
+            r#"managed_hooks_env_vars=["TRIX_SOCKET","TRIX_AGENT_ID"]"#.into(),
+        ];
+        let mut s = spec(Kind::Muse);
+        s.prompt = Some("fix it".into());
+        let (program, args) = command_for(&s, &ints(), Path::new("/bin/trix"), None);
+        assert_eq!(program, "muse");
+        assert_eq!(args, [&hooks[..], &["fix it".to_string()]].concat());
+        // A prompt starting with `-` goes after `--`.
+        s.prompt = Some("- go on".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1[4..], ["--", "- go on"]);
+        // Restored: `muse resume <id>`, which takes no prompt; extra flags before it.
+        s.resume = Some("01a1d56b-360c-7da2-9db2-8aac7b3bfe0f".into());
+        s.command = Some("--model muse-spark-1.2".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1[4..], ["--model", "muse-spark-1.2", "resume", "01a1d56b-360c-7da2-9db2-8aac7b3bfe0f"]);
+        // Nothing to pass, nothing asked: just muse.
+        assert!(command_for(&spec(Kind::Muse), &Integrations::default(), Path::new("/bin/trix"), None).1.is_empty());
+        // Muse refuses a setting given twice: extra args that set the hooks leave trix's out.
+        s.resume = None;
+        s.prompt = None;
+        s.command = Some("-c managed_hooks_path=\"/etc/hooks.json\"".into());
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["-c", "managed_hooks_path=/etc/hooks.json"]);
+    }
+
+    #[test]
+    fn muse_flags_that_set_the_hooks() {
+        let set = |a: &str| muse_sets_hooks(&split_args(a));
+        assert!(!set("--model muse-spark-1.2 -c session_retention_days=7"));
+        for a in [
+            "-c managed_hooks_path=\"/x\"",
+            "-cmanaged_hooks_path=\"/x\"",
+            "--config managed_hooks_env_vars=[]",
+            "--config=managed_hooks_path=\"/x\"",
+        ] {
+            assert!(set(a), "{a}");
+        }
+    }
+
+    #[test]
+    fn muse_settings_with_managed_hooks_keep_them() {
+        assert!(!muse_settings_manage_hooks(r#"{"schema_version":1,"tui":{"foreign_context_notice_shown":true}}"#));
+        assert!(!muse_settings_manage_hooks(r#"{"schema_version":1,"hooks":{"Stop":[]}}"#), "your own hooks run beside trix's");
+        assert!(!muse_settings_manage_hooks(r#"{"schema_version":1,"managed_hooks_path":null}"#));
+        assert!(!muse_settings_manage_hooks("not json"));
+        assert!(muse_settings_manage_hooks(r#"{"schema_version":1,"managed_hooks_path":"/etc/muse/hooks.json"}"#));
+    }
+
+    fn muse(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        hook("muse", event, tool, detail)
+    }
+
+    #[test]
+    fn muse_turn_from_its_hooks() {
+        let mut a = test_agent(Kind::Muse);
+        a.set_state(State::Idle, false);
+        // A turn's end before any turn means nothing.
+        assert_eq!(a.on_hook(&muse("Stop", None, None), false), None);
+        assert_eq!(a.state, State::Idle);
+        a.on_hook(&muse("SessionStart", None, None), false);
+        assert!(a.hooked);
+        a.on_hook(&muse("UserPromptSubmit", None, Some("fix the login")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.last_prompt.as_deref()), (State::Working, "thinking", Some("fix the login")));
+        a.on_hook(&muse("PreToolUse", Some("bash"), Some("cargo test")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "bash cargo test"));
+        // Its approval: a notification naming no tool.
+        a.on_hook(&muse("PermissionRequest", None, Some("Muse Code needs approval")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "approve bash cargo test"));
+        a.on_hook(&muse("PostToolUse", Some("bash"), None), false);
+        assert_eq!(a.state, State::Working);
+        // No tool waiting: Muse's own words.
+        a.on_hook(&muse("PermissionRequest", None, Some("Muse Code needs approval")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Muse Code needs approval"));
+        a.on_hook(&muse("PostToolUse", Some("read_file"), None), false);
+        a.on_hook(&muse("Stop", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 1 tool"));
+        a.shutdown();
+    }
+
+    /// Muse 1.4.18 runs `SessionStart`'s hooks as its first turn begins, at
+    /// the same time as the turn's own: it may land after the turn ended.
+    #[test]
+    fn muse_session_start_only_names_the_conversation() {
+        let mut a = test_agent(Kind::Muse);
+        a.set_state(State::Idle, false);
+        a.on_hook(&muse("UserPromptSubmit", None, Some("hi")), false);
+        assert_eq!(a.on_hook(&muse("SessionStart", None, None), false), None);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "thinking"));
+        a.on_hook(&muse("Stop", None, None), false);
+        let mut start = muse("SessionStart", None, None);
+        start.session = Some("01a1d57f-a829-74b2-8df2-b945cb8a9d91".into());
+        assert_eq!(a.on_hook(&start, false), None);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "replied"), "a late start doesn't undo the turn");
+        assert_eq!(a.session.as_deref(), Some("01a1d57f-a829-74b2-8df2-b945cb8a9d91"));
+        // Other agents' start is a fresh session, whatever came before.
+        let mut c = test_agent(Kind::Claude);
+        c.on_hook(&claude("UserPromptSubmit", None, None), false);
+        c.on_hook(&claude("SessionStart", None, None), false);
+        assert_eq!(c.state, State::Idle);
+        a.shutdown();
+        c.shutdown();
+    }
+
+    /// Muse 1.4.18's title: its folder, after a braille spinner while it works.
+    #[test]
+    fn muse_title_tells_a_redraw_from_a_turn() {
+        let mut a = test_agent(Kind::Muse);
+        a.set_state(State::Idle, false);
+        a.on_title("api".into());
+        redraw(&mut a);
+        assert_eq!(a.heuristics(false), None, "a redraw: it is starting up, or resuming");
+        assert_eq!(a.state, State::Idle);
+        a.on_title("⠹ api".into());
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "working"), "its folder isn't what it does");
+        a.shutdown();
+    }
+
+    #[test]
+    fn muse_question_needs_you() {
+        let mut a = test_agent(Kind::Muse);
+        a.set_state(State::Idle, false);
+        a.on_hook(&muse("UserPromptSubmit", None, Some("set it up")), false);
+        a.on_hook(&muse("PreToolUse", Some("AskUserQuestion"), Some("Which database?")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which database?"));
+        // Its question prompt's notification keeps the question.
+        a.on_hook(&muse("Question", None, Some("Muse Code needs your input")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which database?"));
+        a.on_hook(&muse("PostToolUse", Some("AskUserQuestion"), None), false);
+        assert_eq!(a.state, State::Working);
+        // A question no tool announced still needs you.
+        a.on_hook(&muse("Question", None, Some("Muse Code needs your input")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Muse Code needs your input"));
+        a.shutdown();
+    }
+
+    /// Muse asks whether you trust the workspace as it starts, as 1.4.18
+    /// draws it, before any hook runs: that start-up needs you, and once
+    /// answered it's idle, not a finished turn.
+    #[test]
+    fn muse_workspace_trust_at_start_needs_you() {
+        let mut a = test_agent(Kind::Muse);
+        show(&a, "Do you trust this workspace?\nWorkspace:\n/home/u/code/api\n\nTrusting allows project-local skills, rules, hooks, and plugin config to load before the model runs.\n⟩ 1  Trust and continue\n  2  Quit\n\nUse Up/Down or 1/2, then Enter. Esc quits.\n");
+        a.on_output();
+        a.created = ago(Duration::from_secs(2));
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "waiting for an answer"));
+        // Trusted: its prompt, drawn, then quiet.
+        a.user_input(b"\r".to_vec());
+        show(&a, "\x1b[2J\x1b[H  Muse Code 1.4.18\n❯\n  echo · ~/code/api · Auto-review\n");
+        a.on_title("api".into());
+        a.on_output();
+        a.last_output = ago(Duration::from_secs(3));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "idle"));
         a.shutdown();
     }
 }
