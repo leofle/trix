@@ -391,7 +391,7 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     if mini {
         // " 1 ⠹ name •": everything that tells agents apart and says who needs you.
         let dot = a.unseen && a.state != State::Blocked;
-        let name_max = (r.width as usize).saturating_sub(5 + if dot { 2 } else { 0 });
+        let name_max = (r.width as usize).saturating_sub(5 + if dot { 2 } else { 0 } + if a.pinned { 2 } else { 0 });
         let mut line = vec![
             Span::raw(" "),
             Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
@@ -400,6 +400,9 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
             Span::raw(" "),
             Span::styled(trunc(&a.name, name_max), name_style),
         ];
+        if a.pinned {
+            line.extend([Span::raw(" "), pin_span(app, true)]);
+        }
         if dot {
             line.push(Span::styled(" •", Style::new().fg(sc).add_modifier(Modifier::BOLD)));
         }
@@ -408,7 +411,7 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     }
     let time = fmt_dur(elapsed(a));
     let w = r.width as usize;
-    let name_max = w.saturating_sub(7 + time.len() + 2);
+    let name_max = w.saturating_sub(7 + time.len() + 2 + if a.pinned { 2 } else { 0 });
     let mut line1 = vec![
         Span::raw("  "),
         Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
@@ -417,6 +420,9 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
         Span::raw(" "),
         Span::styled(trunc(&a.name, name_max), name_style),
     ];
+    if a.pinned {
+        line1.extend([Span::raw(" "), pin_span(app, true)]);
+    }
     if a.unseen && a.state != State::Blocked {
         line1.push(Span::styled(" •", Style::new().fg(sc).add_modifier(Modifier::BOLD)));
     }
@@ -544,6 +550,24 @@ fn trunc(s: &str, max: usize) -> String {
 
 // ───────────────────────────── panes ─────────────────────────────
 
+/// The pin is this red in every theme.
+pub const PIN_RED: Color = Color::Rgb(0xe5, 0x1c, 0x23);
+/// A flat pushpin: a round head on a stem, one cell wide, in any font.
+const PIN: &str = "⚲";
+/// The Nerd Font pin (nf-oct-pin), for `[ui] nerd_font = true`.
+const PIN_NERD: &str = "\u{f435}";
+
+/// Where a pane's pin is: on its title, right after the corner and "─ ".
+fn pin_rect(pane: Rect) -> Rect {
+    Rect { x: pane.x + 3, y: pane.y, width: 1.min(pane.width.saturating_sub(3)), height: 1 }
+}
+
+fn pin_span(app: &App, pinned: bool) -> Span<'static> {
+    let style = Style::new().fg(PIN_RED);
+    let glyph = if app.config.ui.nerd_font { PIN_NERD } else { PIN };
+    Span::styled(glyph, if pinned { style.add_modifier(Modifier::BOLD) } else { style })
+}
+
 fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme) -> Block<'a> {
     let sc = state_color(t, a.state);
     let border = if a.state == State::Blocked {
@@ -556,6 +580,8 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme)
     let (g, gs) = glyph(app, a.state);
     let mut left = vec![
         Span::styled("─ ", Style::new().fg(border)),
+        pin_span(app, a.pinned),
+        Span::styled(if a.pinned { " pinned " } else { " " }, Style::new().fg(PIN_RED)),
         Span::styled(g, gs),
         Span::raw(" "),
         Span::styled(a.name.clone(), Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
@@ -609,6 +635,7 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hits.titles.push((Rect { height: 1, ..area }, app.agents[app.focus].id));
+    app.hits.pins.push((pin_rect(area), app.agents[app.focus].id));
     app.pane_size = (inner.width, inner.height);
     // Keep every agent sized to the main pane so switching is instant.
     for a in app.agents.iter_mut() {
@@ -747,6 +774,7 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
         let inner = block.inner(c);
         f.render_widget(block, c);
         app.hits.titles.push((Rect { height: 1, ..c }, app.agents[i].id));
+        app.hits.pins.push((pin_rect(c), app.agents[i].id));
         app.agents[i].resize(inner.width, inner.height);
         let a = &app.agents[i];
         app.hits.panes.push((inner, a.id));
@@ -1492,6 +1520,12 @@ fn setting_value(app: &App, s: &Settings, row: Row, t: &Theme) -> Vec<Span<'stat
         }
         Row::SidebarMini => text((if app.sidebar_mini { "narrow" } else { "wide" }).into(), t.fg),
         Row::SidebarCompact => text((if app.sidebar_compact { "compact" } else { "full" }).into(), t.fg),
+        Row::NerdFont => {
+            let mut v = toggle(app.config.ui.nerd_font);
+            v.insert(0, pin_span(app, true));
+            v.insert(1, Span::raw("  "));
+            v
+        }
         Row::NewAgent => text(crate::settings::start_as_text(app.config.new.agent).into(), t.fg),
         Row::NewWorktree => toggle(app.config.new.worktree),
         Row::Restore => text(crate::settings::restore_label(app.config.workspace.restore).into(), t.fg),

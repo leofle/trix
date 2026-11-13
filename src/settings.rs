@@ -19,6 +19,7 @@ pub enum Row {
     Strip,
     SidebarMini,
     SidebarCompact,
+    NerdFont,
     NewAgent,
     NewWorktree,
     Restore,
@@ -31,12 +32,13 @@ pub enum Row {
 }
 
 impl Row {
-    pub const ALL: [Row; 14] = [
+    pub const ALL: [Row; 15] = [
         Row::Theme,
         Row::ThemePanes,
         Row::Strip,
         Row::SidebarMini,
         Row::SidebarCompact,
+        Row::NerdFont,
         Row::NewAgent,
         Row::NewWorktree,
         Row::Restore,
@@ -66,6 +68,7 @@ impl Row {
             Row::Strip => "Needs-you strip",
             Row::SidebarMini => "Sidebar",
             Row::SidebarCompact => "Sidebar cards",
+            Row::NerdFont => "Nerd Font icons",
             Row::NewAgent => "New ones start as",
             Row::NewWorktree => "New ones in a worktree",
             Row::Restore => "Bring back the last workspace",

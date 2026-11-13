@@ -248,6 +248,8 @@ pub struct Agent {
     pub turn_seen: bool,
     /// The agent that started or last prompted this one through `trix`.
     pub managed_by: Option<String>,
+    /// Pinned to the top of the list (the pin on its pane's title).
+    pub pinned: bool,
     /// When the newest hook applied had fired (`HookMsg::seq`), so a report
     /// that was overtaken on its way here is dropped, not applied late.
     last_hook_seq: u64,
@@ -419,6 +421,7 @@ impl Agent {
             prompted: first_prompt.then(Instant::now),
             turn_seen: false,
             managed_by: None,
+            pinned: false,
             last_hook_seq: 0,
             title_attention: None,
             changes: Vec::new(),
