@@ -2171,7 +2171,7 @@ mod tests {
             s.picker = Some(Picker { choices, sel: 2, current });
         }
         let shown = text(&mut app);
-        for want in ["Theme", "Your terminal's colors  in use", "› Retro 82", "Tokyo Night", " Aa ", "enter keep it"] {
+        for want in ["Theme", "Your terminal's colors  in use", "› Catppuccin Latte", "Everforest", "▼ more", " Aa ", "enter keep it"] {
             assert!(shown.contains(want), "{want:?} in\n{shown}");
         }
     }

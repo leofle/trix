@@ -3219,27 +3219,27 @@ mod tests {
         tap(&mut app, KeyCode::Enter);
         assert_eq!(picked(&app), Some(("Your terminal's colors".into(), 0)), "no file of trix's own: none in use");
         tap(&mut app, KeyCode::Down);
-        assert_eq!(picked(&app).map(|p| p.0).as_deref(), Some("Lupine"));
+        assert_eq!(picked(&app).map(|p| p.0).as_deref(), Some("Catppuccin"));
         assert_eq!(app.theme_source, ThemeSource::File(own.clone()), "tried on: the panes too");
         assert_ne!(app.theme.bg, builtin);
         assert!(!own.exists(), "only tried on");
         tap(&mut app, KeyCode::Esc);
         assert_eq!((app.theme.bg, &app.theme_source), (builtin, &ThemeSource::Builtin), "esc: as it was");
         assert!(settings_of(&app).is_some_and(|s| s.picker.is_none()), "back in the settings");
-        // Retro 82, kept.
+        // The second, a light one, kept.
         tap(&mut app, KeyCode::Enter);
         tap(&mut app, KeyCode::Down);
         tap(&mut app, KeyCode::Down);
-        assert_eq!(picked(&app).map(|p| p.0).as_deref(), Some("Retro 82"));
+        assert_eq!(picked(&app).map(|p| p.0).as_deref(), Some("Catppuccin Latte"));
         tap(&mut app, KeyCode::Enter);
-        let retro = crate::theme::SHIPPED.iter().find(|s| s.0 == "retro-82").unwrap().2;
-        assert_eq!(std::fs::read_to_string(&own).unwrap(), retro);
+        let latte = crate::theme::SHIPPED.iter().find(|s| s.0 == "catppuccin-latte").unwrap().2;
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), latte);
         assert_eq!(app.theme_source, ThemeSource::File(own.clone()));
         assert!(app.theme_preview.is_none());
-        assert_eq!(settings_of(&app).map(|s| s.theme.as_str()), Some("Retro 82"));
+        assert_eq!(settings_of(&app).map(|s| s.theme.as_str()), Some("Catppuccin Latte"));
         // Opened again it's the one in use; closing mid-try goes back to it.
         tap(&mut app, KeyCode::Enter);
-        assert_eq!(picked(&app), Some(("Retro 82".into(), 2)));
+        assert_eq!(picked(&app), Some(("Catppuccin Latte".into(), 2)));
         let kept = app.theme.bg;
         tap(&mut app, KeyCode::Up);
         assert_ne!(app.theme.bg, kept);

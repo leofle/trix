@@ -34,7 +34,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
 - **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude, Codex, Grok, OpenCode and Cursor resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`, …), and shells reopen in the folder they were in.
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
-- **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own colors, which Omarchy themes too. Without Omarchy it falls back to Tokyo Night. Or pick a theme in the settings: one of the four trix ships, or with Omarchy any of its themes, tried on live before you keep it. A theme you pick colors the agents' panes, Claude, Grok and OpenCode as well (see [Themes](#themes)).
+- **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own colors, which Omarchy themes too. Without Omarchy it falls back to Tokyo Night. Or pick a theme in the settings: any of Omarchy's 23, which trix ships so a Mac has them too, tried on live before you keep it. A theme you pick colors the agents' panes, Claude, Grok and OpenCode as well (see [Themes](#themes)).
 - **Settings.** `alt+,`, or *settings* in the bottom bar, changes the theme, the sidebar, notifications and sounds in place. Each change is written to your config files with your comments kept, so the files and the screen always agree (see [Settings](#settings)).
 
 ## Use
@@ -133,7 +133,7 @@ trix layout rm work-layout
 
 `alt+,`, or a click on *settings* in the bottom bar, opens the settings:
 
-- **Theme** opens a list of themes. At the top is no theme of trix's own: Omarchy's, followed as it changes, or without Omarchy your terminal's colors. Then come the four themes trix ships and, with Omarchy, every theme it has. Moving through the list tries each one on, panes included. `enter` keeps it, and `esc` goes back to the theme you had. A theme you keep is written to `~/.config/trix/colors.toml` (see [Themes](#themes)).
+- **Theme** opens a list of themes. At the top is no theme of trix's own: Omarchy's, followed as it changes, or without Omarchy your terminal's colors. Then come the 23 themes trix ships, all of Omarchy's, and with Omarchy any other theme it has. Moving through the list tries each one on, panes included. `enter` keeps it, and `esc` goes back to the theme you had. A theme you keep is written to `~/.config/trix/colors.toml` (see [Themes](#themes)).
 - **Sidebar** (wide or narrow) and **sidebar cards** (full or compact) do the same as `alt+m` and `alt+c`, and are remembered the same way.
 - **Notify me** sets whether you hear about an agent you're not looking at when it needs you and when it's done, and whether that comes as a desktop notification, with the terminal bell, or both.
 - **Sounds** sets the sound for the same two events: the chime, off, or the sound file your config names.
@@ -259,7 +259,7 @@ Then set your terminal's Option key to send Alt (below), and run `trix claude` i
 
 ### Themes
 
-A Mac has no Omarchy theme for trix to follow, so trix ships four of Omarchy's, built into the binary and in `themes/`: Ristretto, Tokyo Night (the default), Retro 82 and Lupine, a light one. To pick one, open the [settings](#settings) (`alt+,`) and choose **Theme**. Moving through the list tries each theme on, and `enter` keeps it. On Linux with Omarchy, the list has all of Omarchy's themes too.
+A Mac has no Omarchy theme for trix to follow, so trix ships all 23 of Omarchy's, built into the binary and in `themes/`, from Catppuccin to White. Tokyo Night is the default. Catppuccin Latte, Flexoki Light, Lupine, Rose Pine and White are light. To pick one, open the [settings](#settings) (`alt+,`) and choose **Theme**. Moving through the list tries each theme on, and `enter` keeps it. On Linux with Omarchy, the list also has any theme you added to Omarchy.
 
 From a shell, `install-theme.sh` does the same with a theme's name, run from your trix clone:
 
@@ -269,7 +269,7 @@ From a shell, `install-theme.sh` does the same with a theme's name, run from you
 
 It copies the theme to `~/.config/trix/colors.toml` (`$XDG_CONFIG_HOME` if set), next to `config.toml`, and every running trix restyles within a second, with no restart. Run it again with another name to switch, or with `tokyo-night` to go back to the default. Run it with no name to list the themes.
 
-It also installs an Omarchy theme folder or any `colors.toml` by path, such as `./install-theme.sh ~/Downloads/some-theme`. If the `colors.toml` it replaces isn't one of the shipped themes, because you made or edited it, it saves that file next to it as `colors.toml.<date>.bak` first. The settings do the same with a file you made: choosing another theme keeps yours as a `.bak` first. Installing by hand is the same thing: `mkdir -p ~/.config/trix && cp themes/ristretto/colors.toml ~/.config/trix/colors.toml`. Removing the file, or choosing the top of the list in the settings, goes back to Omarchy's theme or, without Omarchy, to the default.
+It also installs an Omarchy theme folder or any `colors.toml` by path, such as `./install-theme.sh ~/Downloads/some-theme`. If the `colors.toml` it replaces isn't one of the shipped themes, because you made or edited it, it saves that file next to it as `colors.toml.<date>.bak` first. Only the colors count, not comments, so Omarchy's own copy of a theme counts as that theme. The settings do the same with a file you made: choosing another theme keeps yours as a `.bak` first. Installing by hand is the same thing: `mkdir -p ~/.config/trix && cp themes/ristretto/colors.toml ~/.config/trix/colors.toml`. Removing the file, or choosing the top of the list in the settings, goes back to Omarchy's theme or, without Omarchy, to the default.
 
 A theme picked or installed this way colors the panes too, not only trix's bars, sidebar and cards. trix draws each pane's background, plain text and 16 terminal colors from it, mapped the way Omarchy builds a terminal's palette. It also answers a program that asks the terminal for its colors (OSC 10, 11 and 4) with the theme's. Agents that draw their own colors are asked for their themes that use the terminal's instead: Claude Code's ANSI-only theme (`dark-ansi`, or `light-ansi` for a light theme like Lupine, in the settings file trix hands Claude), Grok's `terminal` theme (`GROK_THEME=terminal`) and OpenCode's `system` theme (`OPENCODE_CLI_CONFIG_CONTENT`). Your own settings for them don't change, and a `GROK_THEME` or `OPENCODE_CLI_CONFIG_CONTENT` you set yourself wins. Agents take this when they start, so one that was already open keeps its colors until you restart it (`alt+o` › restart). After a theme switch, whatever comes from the 16 colors changes right away. Restart an agent if the rest still looks off, as Claude needs after a switch between a dark and a light theme. A color a program sets exactly (24-bit) stays its own. Because trix paints the background, your terminal's window transparency doesn't show through it. When trix follows Omarchy's theme it leaves the panes to your terminal, which Omarchy themes for you, and answers color questions with Omarchy's colors. With no theme at all, the panes are your terminal's as before.
 
@@ -369,7 +369,7 @@ src/ui.rs      all rendering
 src/input.rs   key → xterm byte encoding
 src/theme.rs   theme loading (TRIX_THEME, ~/.config/trix/colors.toml, Omarchy) / live reload / the themes the settings offer, built in
 src/platform.rs Linux / macOS differences: process liveness and folders, foreground job, notifications, sound, clipboard
-themes/        Omarchy themes to use without Omarchy (macOS): Ristretto, Tokyo Night, Retro 82, Lupine
+themes/        Omarchy's 23 themes, to use without Omarchy (macOS)
 install-theme.sh copies one of them, or any colors.toml, to ~/.config/trix/colors.toml
 ```
 
