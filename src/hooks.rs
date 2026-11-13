@@ -106,6 +106,15 @@ pub fn serve(path: &Path, tx: Sender<AppEvent>) -> anyhow::Result<()> {
 
 /// Claude Code settings overlay, passed with `claude --settings <file>`.
 pub fn write_claude_settings(exe: &Path) -> anyhow::Result<PathBuf> {
+    let path = runtime_dir().join(format!("claude-settings-{}.json", std::process::id()));
+    write_claude_settings_to(&path, exe, None)?;
+    Ok(path)
+}
+
+/// The overlay at `path`: trix's hooks and, with `theme`, Claude's theme,
+/// which wins over the user's own for that Claude (it reads it as it starts).
+/// Written through a rename, since a Claude may be starting and reading it.
+pub fn write_claude_settings_to(path: &Path, exe: &Path, theme: Option<&str>) -> anyhow::Result<()> {
     let quoted = exe.display().to_string().replace('\'', r"'\''");
     let cmd = format!("'{quoted}' hook claude");
     let handler = serde_json::json!([{ "type": "command", "command": cmd, "timeout": 5 }]);
@@ -116,10 +125,12 @@ pub fn write_claude_settings(exe: &Path) -> anyhow::Result<PathBuf> {
     for ev in ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd"] {
         hooks.insert(ev.into(), serde_json::json!([{ "hooks": handler }]));
     }
-    let settings = serde_json::json!({ "hooks": hooks });
-    let path = runtime_dir().join(format!("claude-settings-{}.json", std::process::id()));
-    std::fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
-    Ok(path)
+    let mut settings = serde_json::json!({ "hooks": hooks });
+    if let Some(t) = theme {
+        settings["theme"] = t.into();
+    }
+    crate::state::write_atomic(path, &serde_json::to_vec_pretty(&settings)?)?;
+    Ok(())
 }
 
 /// What trix hands each agent so it reports back, written once per server
@@ -934,6 +945,20 @@ mod tests {
             assert_eq!(cmd, r"'/opt/it'\''s/trix' hook claude", "{ev}");
         }
         assert_eq!(hooks["PreToolUse"][0]["matcher"], "*");
+        assert!(v.get("theme").is_none(), "Claude keeps the user's theme");
+    }
+
+    #[test]
+    fn claude_settings_carry_a_theme_and_keep_the_hooks() {
+        let path = std::env::temp_dir().join(format!("trix-claude-theme-test-{}.json", std::process::id()));
+        let read = || serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap();
+        write_claude_settings_to(&path, Path::new("/bin/trix"), Some("light-ansi")).unwrap();
+        let v = read();
+        assert_eq!(v["theme"], "light-ansi");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "'/bin/trix' hook claude");
+        write_claude_settings_to(&path, Path::new("/bin/trix"), None).unwrap();
+        assert!(read().get("theme").is_none(), "back to the user's own");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn o(v: Value) -> HookMsg {
