@@ -40,7 +40,13 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 
 ## Use
 
-Download the latest release for Linux or macOS (x86_64 or ARM) into `~/.local/bin`:
+Install with [Homebrew](https://brew.sh), on macOS or Linux:
+
+```sh
+brew install leofle/trix/trix
+```
+
+Or download the latest release for Linux or macOS (x86_64 or ARM) into `~/.local/bin`:
 
 ```sh
 os=$([ "$(uname)" = Darwin ] && echo apple-darwin || echo unknown-linux-gnu)
@@ -280,7 +286,7 @@ trix runs on Linux and macOS. macOS support is new: if something doesn't work, p
 
 ### Install
 
-The [download above](#use) works on a Mac too. A copy downloaded with a browser instead of `curl` is quarantined by macOS; clear it with `xattr -d com.apple.quarantine trix`. To build it yourself:
+`brew install leofle/trix/trix` is the quickest way, and `brew upgrade` keeps it current. The [download above](#use) works on a Mac too. A copy downloaded with a browser instead of `curl` is quarantined by macOS; clear it with `xattr -d com.apple.quarantine trix`. To build it yourself:
 
 ```sh
 xcode-select --install          # Apple's compiler and linker (skip it if git already works)
