@@ -75,6 +75,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let t = app.theme.clone();
     app.hits = Default::default();
+    // Painting the panes, paint the space around them too: nothing is left
+    // in the terminal's own colors.
+    if app.theme_source.paints_panes() {
+        f.buffer_mut().set_style(area, Style::new().fg(t.fg).bg(t.bg));
+    }
 
     let [top, body, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let side_w = if app.sidebar_mini { SIDEBAR_MINI_W } else { SIDEBAR_W };
@@ -586,7 +591,7 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     }
     let a = &app.agents[app.focus];
     app.hits.panes.push((inner, a.id));
-    let cur = render_term(f.buffer_mut(), inner, a, t, app.term_focused);
+    let cur = render_term(f.buffer_mut(), inner, a, t, app.theme_source.paints_panes().then_some(t), app.term_focused);
     pane_overlays(f, a, area, inner, &app.key(Action::Close), t);
     attention_strip(f, app, area, t);
     cur
@@ -720,7 +725,7 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
         app.agents[i].resize(inner.width, inner.height);
         let a = &app.agents[i];
         app.hits.panes.push((inner, a.id));
-        let cur = render_term(f.buffer_mut(), inner, a, t, focused && app.term_focused);
+        let cur = render_term(f.buffer_mut(), inner, a, t, app.theme_source.paints_panes().then_some(t), focused && app.term_focused);
         if focused {
             cursor = cur;
         } else {
@@ -766,26 +771,34 @@ fn pane_overlays(f: &mut Frame, a: &Agent, outer: Rect, inner: Rect, close: &str
     }
 }
 
-fn map_color(c: AColor) -> (Color, bool) {
+/// An emulator color as ratatui's, and whether it's a dim one. With a
+/// palette, the 16 terminal colors and the default ones are the theme's;
+/// without, they're left to the terminal. Exact (24-bit) colors stay.
+fn map_color(c: AColor, palette: Option<&Theme>) -> (Color, bool) {
+    let color = |i: u8| palette.map_or_else(|| ansi(i), |t| t.ansi[i as usize]);
     match c {
         AColor::Spec(rgb) => (Color::Rgb(rgb.r, rgb.g, rgb.b), false),
-        AColor::Indexed(i) if i < 16 => (ansi(i), false),
+        AColor::Indexed(i) if i < 16 => (color(i), false),
         AColor::Indexed(i) => (Color::Indexed(i), false),
         AColor::Named(n) => {
             let v = n as usize;
             if v < 16 {
-                (ansi(v as u8), false)
+                (color(v as u8), false)
             } else {
+                let (fg, bg, bright) = palette.map_or((Color::Reset, Color::Reset, Color::Reset), |t| (t.fg, t.bg, t.fg_bright));
                 match n {
-                    NamedColor::DimBlack => (ansi(0), true),
-                    NamedColor::DimRed => (ansi(1), true),
-                    NamedColor::DimGreen => (ansi(2), true),
-                    NamedColor::DimYellow => (ansi(3), true),
-                    NamedColor::DimBlue => (ansi(4), true),
-                    NamedColor::DimMagenta => (ansi(5), true),
-                    NamedColor::DimCyan => (ansi(6), true),
-                    NamedColor::DimWhite => (ansi(7), true),
-                    NamedColor::DimForeground => (Color::Reset, true),
+                    NamedColor::DimBlack => (color(0), true),
+                    NamedColor::DimRed => (color(1), true),
+                    NamedColor::DimGreen => (color(2), true),
+                    NamedColor::DimYellow => (color(3), true),
+                    NamedColor::DimBlue => (color(4), true),
+                    NamedColor::DimMagenta => (color(5), true),
+                    NamedColor::DimCyan => (color(6), true),
+                    NamedColor::DimWhite => (color(7), true),
+                    NamedColor::Foreground => (fg, false),
+                    NamedColor::Background => (bg, false),
+                    NamedColor::BrightForeground => (bright, false),
+                    NamedColor::DimForeground => (fg, true),
                     _ => (Color::Reset, false),
                 }
             }
@@ -814,9 +827,10 @@ fn ansi(i: u8) -> Color {
     }
 }
 
-/// Blit the emulator grid into the ratatui buffer. Returns the cursor cell
-/// when the child wants a visible cursor.
-fn render_term(buf: &mut Buffer, area: Rect, a: &Agent, t: &Theme, focused: bool) -> Option<(u16, u16)> {
+/// Blit the emulator grid into the ratatui buffer, its terminal colors from
+/// `palette` when trix paints the panes. Returns the cursor cell when the
+/// child wants a visible cursor.
+fn render_term(buf: &mut Buffer, area: Rect, a: &Agent, t: &Theme, palette: Option<&Theme>, focused: bool) -> Option<(u16, u16)> {
     let term = a.term.lock();
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
@@ -834,8 +848,8 @@ fn render_term(buf: &mut Buffer, area: Rect, a: &Agent, t: &Theme, focused: bool
         if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
             continue;
         }
-        let (fg, dim_fg) = map_color(cell.fg);
-        let (bg, _) = map_color(cell.bg);
+        let (fg, dim_fg) = map_color(cell.fg, palette);
+        let (bg, _) = map_color(cell.bg, palette);
         let mut m = Modifier::empty();
         let fl = cell.flags;
         if fl.contains(Flags::BOLD) {
@@ -1526,6 +1540,43 @@ mod tests {
 
     /// The whole screen, drawn into a test terminal: four agents, the second
     /// one needing you, the third with unseen finished work.
+    #[test]
+    fn a_theme_of_trix_own_paints_the_panes() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        let a = crate::agent::test_agent(crate::agent::Kind::Claude);
+        let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        p.advance(&mut *a.term.lock(), b"zplain \x1b[31mzred\x1b[0m \x1b[38;2;1;2;3mzexact\x1b[0m");
+        app.agents.push(a);
+        let t = app.theme.clone();
+        // fg and bg of the first letter of `word`, and of the pane's border left of it.
+        let cells = |app: &mut App, word: &str| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 24)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let b = term.backend().buffer().clone();
+            let (w, h) = (b.area.width, b.area.height);
+            let at = (0..h).flat_map(|y| (0..w).map(move |x| (x, y)));
+            let hit = |&(x, y): &(u16, u16)| word.chars().enumerate().all(|(i, c)| x + (i as u16) < w && b[(x + i as u16, y)].symbol() == c.to_string());
+            let (x, y) = at.clone().find(hit).unwrap_or_else(|| panic!("{word} not on screen"));
+            ((b[(x, y)].fg, b[(x, y)].bg), b[(x - 1, y)].bg)
+        };
+
+        app.theme_source = ThemeSource::Builtin;
+        assert_eq!(cells(&mut app, "zplain"), ((Color::Reset, Color::Reset), Color::Reset), "no file: the terminal's colors");
+        assert_eq!(cells(&mut app, "zred").0.0, Color::Red, "and its palette");
+        app.theme_source = ThemeSource::Omarchy;
+        assert_eq!(cells(&mut app, "zplain"), ((Color::Reset, Color::Reset), Color::Reset), "Omarchy themes the terminal already");
+
+        app.theme_source = ThemeSource::File("/x/colors.toml".into());
+        assert_eq!(cells(&mut app, "zplain"), ((t.fg, t.bg), t.bg), "default text, and the space around it");
+        assert_eq!(cells(&mut app, "zred").0, (t.ansi[1], t.bg), "the theme's red");
+        assert_eq!(cells(&mut app, "zexact").0.0, Color::Rgb(1, 2, 3), "an exact color stays");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
     #[test]
     fn empty_screen_says_where_the_theme_is_from() {
         let (tx, _rx) = std::sync::mpsc::channel();

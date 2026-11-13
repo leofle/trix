@@ -268,6 +268,8 @@ pub struct App {
     pub theme: Theme,
     theme_watch: ThemeWatcher,
     pub theme_source: ThemeSource,
+    /// The theme in Claude's settings overlay now (`None`: the user's own).
+    claude_theme: Option<&'static str>,
     tx: Sender<AppEvent>,
     socket: PathBuf,
     integrations: crate::hooks::Integrations,
@@ -345,6 +347,7 @@ impl App {
             theme,
             theme_watch,
             theme_source,
+            claude_theme: None,
             tx,
             socket,
             integrations,
@@ -387,7 +390,23 @@ impl App {
         if let Some(e) = config_error {
             app.toast(format!("config: {e} — using the defaults (`trix config` checks it)"), ToastKind::Bad);
         }
+        app.sync_claude_theme();
         app
+    }
+
+    /// Keep the theme in Claude's settings overlay in step with trix's (see
+    /// `theme::claude_theme`). Claude reads it as it starts, so a Claude
+    /// started or restarted from now on gets it; running ones keep theirs.
+    fn sync_claude_theme(&mut self) {
+        let want = crate::theme::claude_theme(&self.theme_source, &self.theme);
+        if want == self.claude_theme {
+            return;
+        }
+        if let Some(path) = &self.integrations.claude_settings
+            && crate::hooks::write_claude_settings_to(path, &self.exe, want).is_ok()
+        {
+            self.claude_theme = want;
+        }
     }
 
     /// The config file changed: use it, or say why not and keep the old one.
@@ -1186,6 +1205,7 @@ impl App {
         if let Some((t, source)) = self.theme_watch.poll() {
             self.theme = t;
             self.theme_source = source;
+            self.sync_claude_theme();
             self.dirty = true;
         }
         self.sync_git_targets();

@@ -24,6 +24,11 @@ pub struct Theme {
     pub cyan: Color,
     pub magenta: Color,
     pub orange: Color,
+    /// The 16 terminal colors for the panes trix paints, the way Omarchy
+    /// makes its terminals': black is the background, white the foreground.
+    pub ansi: [Color; 16],
+    /// `mode = "light"`: dark text on a light background.
+    pub light: bool,
 }
 
 impl Default for Theme {
@@ -45,6 +50,11 @@ impl Default for Theme {
             cyan: rgb(0x7dcfff),
             magenta: rgb(0xbb9af7),
             orange: rgb(0xff9e64),
+            ansi: [
+                rgb(0x1a1b26), rgb(0xf7768e), rgb(0x9ece6a), rgb(0xe0af68), rgb(0x7aa2f7), rgb(0xad8ee6), rgb(0x449dab), rgb(0xa9b1d6),
+                rgb(0x414868), rgb(0xff7a93), rgb(0xb9f27c), rgb(0xff9e64), rgb(0x7da6ff), rgb(0xbb9af7), rgb(0x0db9d7), rgb(0xc0caf5),
+            ],
+            light: false,
         }
     }
 }
@@ -122,6 +132,21 @@ pub enum Source {
     File(PathBuf),
 }
 
+impl Source {
+    /// A theme for trix alone, which the terminal doesn't have: trix paints
+    /// the panes with it too. Omarchy themes the terminal already, and with
+    /// no file trix leaves the panes as they always were.
+    pub fn paints_panes(&self) -> bool {
+        matches!(self, Source::File(_))
+    }
+}
+
+/// The Claude Code theme for the panes trix paints: its ANSI-only one, light
+/// or dark to match, so Claude's colors are the theme's too.
+pub fn claude_theme(source: &Source, theme: &Theme) -> Option<&'static str> {
+    source.paints_panes().then_some(if theme.light { "light-ansi" } else { "dark-ansi" })
+}
+
 pub struct ThemeWatcher {
     /// Where a theme may be, best first, and whether it's Omarchy's.
     candidates: Vec<(PathBuf, bool)>,
@@ -131,6 +156,10 @@ pub struct ThemeWatcher {
 
 impl ThemeWatcher {
     pub fn new() -> Self {
+        // Tests draw the same whatever theme this machine has.
+        if cfg!(test) {
+            return Self::with(Vec::new());
+        }
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let mut candidates: Vec<(PathBuf, bool)> = std::env::var_os("TRIX_THEME").map(|p| (PathBuf::from(p), false)).into_iter().collect();
         candidates.push((crate::state::xdg_dir("XDG_CONFIG_HOME", ".config").join("trix/colors.toml"), false));
@@ -181,6 +210,19 @@ fn from_toml(text: &str) -> Theme {
     if let Some(c) = pick(&["bright_cyan", "cyan"]) { t.cyan = c; }
     if let Some(c) = pick(&["bright_magenta", "magenta"]) { t.magenta = c; }
     if let Some(c) = pick(&["orange", "bright_yellow"]) { t.orange = c; }
+    // Omarchy's terminal palette (its alacritty.toml template). A bright
+    // color the theme lacks is the normal one.
+    let ansi: [&[&str]; 16] = [
+        &["background"], &["red"], &["green"], &["yellow"], &["blue"], &["magenta"], &["cyan"], &["foreground"],
+        &["muted", "dark_foreground"], &["bright_red", "red"], &["bright_green", "green"], &["bright_yellow", "yellow"],
+        &["bright_blue", "blue"], &["bright_magenta", "magenta"], &["bright_cyan", "cyan"], &["bright_foreground", "foreground"],
+    ];
+    for (slot, keys) in t.ansi.iter_mut().zip(ansi) {
+        if let Some(c) = pick(keys) {
+            *slot = c;
+        }
+    }
+    t.light = table.get("mode").and_then(|v| v.as_str()) == Some("light");
     t
 }
 
@@ -328,6 +370,32 @@ mod tests {
         write(&omarchy, "#303030");
         assert_eq!(bg(&mut w), Some((rgb(0x303030), Source::Omarchy)), "the new theme folder moved in");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_palette_as_omarchy_makes_it() {
+        let tokyo = from_toml(include_str!("../themes/tokyo-night/colors.toml"));
+        assert_eq!(tokyo.ansi, Theme::default().ansi, "the built-in palette is the shipped Tokyo Night");
+        assert!(!tokyo.light);
+        let lupine = from_toml(include_str!("../themes/lupine/colors.toml"));
+        assert!(lupine.light);
+        let want = [(0, 0xfafafa), (1, 0xc900c4), (7, 0x212121), (8, 0x9e9e9e), (9, 0xf930fb), (15, 0x000000)];
+        for (i, v) in want {
+            assert_eq!(lupine.ansi[i], rgb(v), "lupine color {i}");
+        }
+        let t = from_toml("red = \"#ff0000\"\n");
+        assert_eq!(t.ansi[9], rgb(0xff0000), "no bright_red: the red");
+        assert_eq!(t.ansi[2], Theme::default().ansi[2], "no green: the default's");
+    }
+
+    #[test]
+    fn claude_follows_only_a_theme_of_trix_own() {
+        let (dark, light) = (Theme::default(), from_toml("mode = \"light\"\n"));
+        let file = Source::File("/x/colors.toml".into());
+        assert_eq!(claude_theme(&file, &dark), Some("dark-ansi"));
+        assert_eq!(claude_theme(&file, &light), Some("light-ansi"));
+        assert_eq!(claude_theme(&Source::Omarchy, &dark), None, "Omarchy themes Claude its own way");
+        assert_eq!(claude_theme(&Source::Builtin, &light), None, "no file: Claude as you set it");
     }
 
     #[test]
