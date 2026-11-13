@@ -22,7 +22,6 @@ cat <<FORMULA
 class Trix < Formula
   desc "Terminal workspace where coding agents live"
   homepage "https://github.com/leofle/trix"
-  version "$version"
   license "MIT"
 
   on_macos do
