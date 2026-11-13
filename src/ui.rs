@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
 use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
-use crate::theme::{Theme, contrast, mix};
+use crate::theme::{Source as ThemeSource, Theme, contrast, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SIDEBAR_W: u16 = 36;
@@ -947,7 +947,11 @@ fn empty_state(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         ]);
         center(f, y, line);
     }
-    let theme_note = if app.themed_by_omarchy { "following your omarchy theme" } else { "tokyo night" };
+    let theme_note = match &app.theme_source {
+        ThemeSource::Omarchy => "following your omarchy theme".to_string(),
+        ThemeSource::File(p) => format!("theme from {}", crate::app::tilde(p)),
+        ThemeSource::Builtin => "tokyo night".to_string(),
+    };
     center(f, y0 + 12, TLine::from(Span::styled(theme_note, Style::new().fg(t.muted))));
 }
 
@@ -1517,6 +1521,27 @@ mod tests {
 
     /// The whole screen, drawn into a test terminal: four agents, the second
     /// one needing you, the third with unseen finished work.
+    #[test]
+    fn empty_screen_says_where_the_theme_is_from() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        let own = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".config/trix/colors.toml");
+        for (source, note) in [
+            (ThemeSource::Builtin, "tokyo night"),
+            (ThemeSource::Omarchy, "following your omarchy theme"),
+            (ThemeSource::File(own), "theme from ~/.config/trix/colors.toml"),
+            (ThemeSource::File("/opt/themes/colors.toml".into()), "theme from /opt/themes/colors.toml"),
+        ] {
+            app.theme_source = source;
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let text: Vec<String> = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect();
+            assert!(text.iter().any(|l| l.contains(note)), "{note}:\n{}", text.join("\n"));
+        }
+    }
+
     #[test]
     fn context_label_in_pane_only() {
         use crate::usage::Context;

@@ -19,7 +19,7 @@ use crate::input;
 use crate::search::{self, Hit};
 use crate::session::{Out, SessionEvent};
 use crate::state::{self, Saved, SavedAgent};
-use crate::theme::{Theme, ThemeWatcher};
+use crate::theme::{Source as ThemeSource, Theme, ThemeWatcher};
 
 pub enum AppEvent {
     Key(KeyEvent),
@@ -267,7 +267,7 @@ pub struct App {
     pub modal: Option<Modal>,
     pub theme: Theme,
     theme_watch: ThemeWatcher,
-    pub themed_by_omarchy: bool,
+    pub theme_source: ThemeSource,
     tx: Sender<AppEvent>,
     socket: PathBuf,
     integrations: crate::hooks::Integrations,
@@ -320,8 +320,7 @@ pub struct App {
 impl App {
     pub fn new(tx: Sender<AppEvent>, socket: PathBuf, integrations: crate::hooks::Integrations, exe: PathBuf, out: Out) -> App {
         let mut theme_watch = ThemeWatcher::new();
-        let polled = theme_watch.poll();
-        let themed = polled.is_some();
+        let (theme, theme_source) = theme_watch.poll().unwrap_or((Theme::default(), ThemeSource::Builtin));
         let git_targets = Arc::new(Mutex::new(GitTargets::default()));
         spawn_git_watcher(git_targets.clone(), tx.clone());
         let usage_targets = crate::usage::Targets::default();
@@ -343,9 +342,9 @@ impl App {
             sidebar_compact: prefs.sidebar_compact,
             sidebar_scroll: 0,
             modal: None,
-            theme: polled.unwrap_or_default(),
+            theme,
             theme_watch,
-            themed_by_omarchy: themed,
+            theme_source,
             tx,
             socket,
             integrations,
@@ -1182,9 +1181,9 @@ impl App {
     }
 
     pub fn slow_tick(&mut self) {
-        if let Some(t) = self.theme_watch.poll() {
+        if let Some((t, source)) = self.theme_watch.poll() {
             self.theme = t;
-            self.themed_by_omarchy = true;
+            self.theme_source = source;
             self.dirty = true;
         }
         self.sync_git_targets();
