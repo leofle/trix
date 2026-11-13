@@ -106,3 +106,43 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "trix ${TAG#v}"
           git push
+
+  # Update the trix and trix-bin packages on the AUR to this release.
+  # Pushing there needs an SSH key registered to the maintainer's AUR
+  # account, saved in this repo as the AUR_SSH_KEY secret. Without it,
+  # this job only says so.
+  aur:
+    needs: build
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+    steps:
+      - name: Say if there's no key
+        if: env.AUR_SSH_KEY == ''
+        run: echo "::warning::AUR_SSH_KEY isn't set, so the AUR packages still point at the last release"
+      - uses: actions/checkout@v4
+        if: env.AUR_SSH_KEY != ''
+      - name: Update the AUR packages
+        if: env.AUR_SSH_KEY != ''
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh release download "$TAG" --pattern '*.sha256' --dir sums
+          packaging/aur.sh "${TAG#v}" sums out
+          for pkg in trix trix-bin; do
+            git clone "ssh://aur@aur.archlinux.org/$pkg.git" "aur-$pkg"
+            cp "out/$pkg/PKGBUILD" "out/$pkg/.SRCINFO" "aur-$pkg/"
+            git -C "aur-$pkg" add PKGBUILD .SRCINFO
+            if git -C "aur-$pkg" diff --cached --quiet; then
+              echo "$pkg is already at $TAG"
+            else
+              git -C "aur-$pkg" commit -m "trix ${TAG#v}"
+              git -C "aur-$pkg" push origin HEAD:master
+            fi
+          done

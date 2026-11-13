@@ -46,6 +46,12 @@ Install with [Homebrew](https://brew.sh), on macOS or Linux:
 brew install leofle/trix/trix
 ```
 
+On Arch Linux, install from the AUR with `trix-bin` (prebuilt) or `trix` (built from source):
+
+```sh
+yay -S trix-bin
+```
+
 Or download the latest release for Linux or macOS (x86_64 or ARM) into `~/.local/bin`:
 
 ```sh
