@@ -1,4 +1,5 @@
-//! `~/.config/trix/config.toml`: key bindings, sounds and notifications.
+//! `~/.config/trix/config.toml`: key bindings, sounds, notifications, how
+//! new agents start, the theme in the panes, and restoring the workspace.
 //!
 //! The server reads it when it starts and again whenever the file changes
 //! (checked once a second). A file that doesn't parse leaves the settings as
@@ -20,6 +21,65 @@ pub struct Config {
     pub notify: Notify,
     pub sound: Sound,
     pub strip: Strip,
+    pub new: NewAgent,
+    pub theme: ThemeOpts,
+    pub workspace: Workspace,
+}
+
+/// alt+n's form, as it opens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NewAgent {
+    /// The agent it's on. `None`: the one started last.
+    pub agent: Option<crate::agent::Kind>,
+    /// "Worktree" ticked already.
+    pub worktree: bool,
+}
+
+impl Default for NewAgent {
+    fn default() -> NewAgent {
+        NewAgent { agent: Some(crate::agent::Kind::Claude), worktree: false }
+    }
+}
+
+/// A theme of trix's own, beyond its bars and sidebar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeOpts {
+    /// It paints the panes too, and Claude, Grok and OpenCode are asked for
+    /// their themes that follow. Off, the panes keep the terminal's colors,
+    /// its transparency with them, and the agents their own themes.
+    pub panes: bool,
+}
+
+impl Default for ThemeOpts {
+    fn default() -> ThemeOpts {
+        ThemeOpts { panes: true }
+    }
+}
+
+/// A fresh trix finding the workspace saved last time.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Restore {
+    #[default]
+    Ask,
+    Always,
+    Never,
+}
+
+impl Restore {
+    pub const ALL: [Restore; 3] = [Restore::Ask, Restore::Always, Restore::Never];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Restore::Ask => "ask",
+            Restore::Always => "always",
+            Restore::Never => "never",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Workspace {
+    pub restore: Restore,
 }
 
 /// The attention strip: the bar over your pane that says another agent
@@ -135,6 +195,31 @@ struct File {
     sound: FileSound,
     #[serde(default)]
     strip: FileStrip,
+    #[serde(default)]
+    new: FileNew,
+    #[serde(default)]
+    theme: FileTheme,
+    #[serde(default)]
+    workspace: FileWorkspace,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileNew {
+    agent: Option<String>,
+    worktree: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileTheme {
+    panes: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileWorkspace {
+    restore: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -215,7 +300,24 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         color: f.strip.color.as_deref().map(|s| paint("strip.color", s)).transpose()?,
         text: f.strip.text.as_deref().map(|s| paint("strip.text", s)).transpose()?,
     };
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip })
+    use crate::agent::Kind;
+    let new = NewAgent {
+        agent: match f.new.agent.as_deref().map(str::trim) {
+            None => Some(Kind::Claude),
+            Some("last") => None,
+            Some(s) => {
+                let names: Vec<&str> = Kind::ALL.iter().map(|k| k.label()).collect();
+                Some(Kind::from_label(s).ok_or_else(|| format!("new.agent: '{s}' is not an agent ({}, or last)", names.join(", ")))?)
+            }
+        },
+        worktree: f.new.worktree.unwrap_or(false),
+    };
+    let theme = ThemeOpts { panes: f.theme.panes.unwrap_or(true) };
+    let restore = match f.workspace.restore.as_deref().map(str::trim) {
+        None => Restore::Ask,
+        Some(s) => Restore::ALL.into_iter().find(|r| r.name() == s).ok_or_else(|| format!("workspace.restore: '{s}' is not ask, always or never"))?,
+    };
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, workspace: Workspace { restore } })
 }
 
 fn paint(what: &str, s: &str) -> Result<Paint, String> {
@@ -667,6 +769,20 @@ mod tests {
         for (spec, shown) in [("alt+n", "alt+n"), ("Alt+N", "alt+shift+n"), ("ctrl+alt+x", "ctrl+alt+x"), ("alt++", "alt++"), ("alt+plus", "alt++"), ("alt+space", "alt+space"), ("f12", "f12"), ("alt+pgdn", "alt+pagedown"), ("option+k", "alt+k"), ("ctrl+1..9", "ctrl+1…9"), ("ctrl+1…9", "ctrl+1…9")] {
             assert_eq!(label(&chord(spec).unwrap()), shown, "{spec}");
         }
+    }
+
+    #[test]
+    fn new_agents_the_theme_and_restoring() {
+        use crate::agent::Kind;
+        let read = |text: &str| parse(text, Path::new("/"));
+        let c = read("").unwrap();
+        assert_eq!((c.new.agent, c.new.worktree, c.theme.panes, c.workspace.restore), (Some(Kind::Claude), false, true, Restore::Ask));
+        let c = read("[new]\nagent = \"codex\"\nworktree = true\n[theme]\npanes = false\n[workspace]\nrestore = \"never\"\n").unwrap();
+        assert_eq!((c.new.agent, c.new.worktree, c.theme.panes, c.workspace.restore), (Some(Kind::Codex), true, false, Restore::Never));
+        assert_eq!(read("[new]\nagent = \"last\"\n").unwrap().new.agent, None, "the one started last");
+        assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
+        assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));
+        assert!(read("[theme]\nfile = \"x\"\n").is_err(), "unknown keys are mistakes, as everywhere");
     }
 
     #[test]

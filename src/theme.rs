@@ -140,13 +140,6 @@ impl Source {
     pub fn paints_panes(&self) -> bool {
         matches!(self, Source::File(_))
     }
-
-    /// The panes are in the theme's colors, so trix can tell a program that
-    /// asks (OSC 10, 11, 4): it paints them, or Omarchy themes the terminal.
-    /// With no theme file trix doesn't know the terminal's, and doesn't say.
-    pub fn knows_pane_colors(&self) -> bool {
-        !matches!(self, Source::Builtin)
-    }
 }
 
 impl Theme {
@@ -177,10 +170,10 @@ impl Theme {
     }
 }
 
-/// The Claude Code theme for the panes trix paints: its ANSI-only one, light
-/// or dark to match, so Claude's colors are the theme's too.
-pub fn claude_theme(source: &Source, theme: &Theme) -> Option<&'static str> {
-    source.paints_panes().then_some(if theme.light { "light-ansi" } else { "dark-ansi" })
+/// The Claude Code theme while trix paints the panes: its ANSI-only one,
+/// light or dark to match, so Claude's colors are the theme's too.
+pub fn claude_theme(paints: bool, theme: &Theme) -> Option<&'static str> {
+    paints.then_some(if theme.light { "light-ansi" } else { "dark-ansi" })
 }
 
 /// trix's own theme file, the one the settings write.
@@ -682,18 +675,16 @@ mod tests {
         assert_eq!(t.terminal_color(232), Some((8, 8, 8)), "then the grays");
         assert_eq!(t.terminal_color(255), Some((238, 238, 238)));
         assert_eq!(t.terminal_color(300), None);
-        assert!(Source::File("/x".into()).knows_pane_colors() && Source::Omarchy.knows_pane_colors());
-        assert!(!Source::Builtin.knows_pane_colors(), "no theme file: the terminal's colors, unknown");
     }
 
     #[test]
     fn claude_follows_only_a_theme_of_trix_own() {
         let (dark, light) = (Theme::default(), from_toml("mode = \"light\"\n"));
         let file = Source::File("/x/colors.toml".into());
-        assert_eq!(claude_theme(&file, &dark), Some("dark-ansi"));
-        assert_eq!(claude_theme(&file, &light), Some("light-ansi"));
-        assert_eq!(claude_theme(&Source::Omarchy, &dark), None, "Omarchy themes Claude its own way");
-        assert_eq!(claude_theme(&Source::Builtin, &light), None, "no file: Claude as you set it");
+        assert_eq!(claude_theme(file.paints_panes(), &dark), Some("dark-ansi"));
+        assert_eq!(claude_theme(file.paints_panes(), &light), Some("light-ansi"));
+        assert_eq!(claude_theme(Source::Omarchy.paints_panes(), &dark), None, "Omarchy themes Claude its own way");
+        assert_eq!(claude_theme(Source::Builtin.paints_panes(), &light), None, "no file: Claude as you set it");
     }
 
     #[test]

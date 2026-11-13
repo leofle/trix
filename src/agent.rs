@@ -2084,6 +2084,16 @@ mod tests {
             answers(&mut app),
             [(257, Some("\x1b]11;rgb:1a1a/1b1b/2626\x07".to_string())), (256, Some("\x1b]10;rgb:a9a9/b1b1/d6d6\x1b\\".to_string()))]
         );
+        // Panes left to the terminal (`[theme] panes = false`): its colors,
+        // which trix doesn't know; with Omarchy's theme, Omarchy's.
+        app.config.theme.panes = false;
+        ask(&mut p, &app, b"\x1b]11;?\x07");
+        assert_eq!(answers(&mut app), [(257, None)], "panes in the terminal's colors: unknown");
+        app.theme_source = crate::theme::Source::Omarchy;
+        ask(&mut p, &app, b"\x1b]11;?\x07");
+        assert_eq!(answers(&mut app), [(257, Some("\x1b]11;rgb:1a1a/1b1b/2626\x07".to_string()))], "Omarchy themes the terminal");
+        app.config.theme.panes = true;
+        app.theme_source = crate::theme::Source::File("/x/colors.toml".into());
         ask(&mut p, &app, b"\x1b]4;1;rgb:12/34/56\x07\x1b]4;1;?\x07");
         assert_eq!(answers(&mut app), [(1, Some("\x1b]4;1;rgb:1212/3434/5656\x07".to_string()))], "a color it set itself");
         for a in &app.agents {
