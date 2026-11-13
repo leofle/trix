@@ -144,7 +144,7 @@ trix layout rm work-layout
 
 Use `↑↓` to choose, `enter` or `←→` to change and `esc` or `alt+,` to close. Clicking a setting changes it too. Each change is written where you'd make it by hand, so the files and the settings always agree: the theme goes to `colors.toml`, the sidebar to `prefs.json`, the rest to `config.toml`. Only the line that changed is touched. Your comments and layout stay, and a setting you never moved from its default stays out of the file. If `config.toml` has a mistake, the settings say so and leave the file alone until you fix it. A `config.toml` that is a symlink, into a dotfiles repo for example, is written through the link. Every running trix picks up the change within a second.
 
-Keys, muted agents, a notify command and the strip's text color aren't in the settings; set them in `config.toml`.
+Keys, muted agents, a notify command, the strip's text color and the new-agent form's kind row aren't in the settings; set them in `config.toml`.
 
 ### Config
 
@@ -175,6 +175,7 @@ text = "bg"                       # optional: its text (by default whichever rea
 [new]
 agent = "codex"                   # what alt+n starts on: claude (default), codex, grok, opencode, cursor, copilot, shell, custom, or "last"
 worktree = true                   # the worktree box ticked to begin with (off by default)
+kinds = ["claude", "codex", "opencode", "shell"]  # alt+n's kind row; the rest go under "more ▸"
 
 [theme]
 panes = false                     # keep the panes in the terminal's colors (on by default)
@@ -187,7 +188,7 @@ restore = "always"                # a fresh trix and the saved workspace: "ask" 
 - **Notifications** cover agents you're not looking at, as before. `on` picks the events; `desktop`, `bell` and `command` pick where they go. `command` runs without a shell (as an argv, or a string split like one; `~` works in the program), from your home folder, with the event's JSON on stdin (the same object as `trix events --json`). It also gets `TRIX_NOTIFY_EVENT` (`needs-you` or `done`), `TRIX_NOTIFY_AGENT`, `TRIX_NOTIFY_TITLE`, `TRIX_NOTIFY_BODY` and `TRIX_NOTIFY_SESSION`. For example, `command = ['sh', '-c', 'curl -s -d "$TRIX_NOTIFY_TITLE" ntfy.sh/my-agents']` puts every notification on your phone through [ntfy](https://ntfy.sh).
 - **Sounds** follow their own settings, separate from `on`. A sound file can be anything `pw-play` (wav, flac, ogg) or `afplay` (also mp3, m4a) plays. A relative path is looked up next to `config.toml`. Sounds within two seconds of each other share one sound, done and needs-you separately.
 - **The strip** is the theme's red by default. `color` and `text` take `#rrggbb` (or `#rgb`), or the name of one of the theme's colors (`red`, `yellow`, `green`, `cyan`, `magenta`, `orange`, `accent`, `fg`, `fg_bright`, `bg`), which follows a theme switch. Without `text`, trix picks the theme's dark or light, whichever contrasts more with the strip.
-- **New agents** take `agent` and `worktree` as where `alt+n`'s form starts; you can still change both in it. `"last"` is the kind you started last from the form, remembered in `prefs.json`, or claude before you've started one.
+- **New agents** take `agent` and `worktree` as where `alt+n`'s form starts; you can still change both in it. `"last"` is the kind you started last from the form, remembered in `prefs.json`, or claude before you've started one. `kinds` is the form's kind row, in your order: claude, codex, shell and custom by default. Every other kind, including any trix adds later, waits under *more ▸*, and its letter picks it all the same. A name that isn't a kind, or one named twice, is a mistake.
 - **`[theme] panes = false`** keeps a theme of trix's own to its bars, sidebar and cards (see [Themes](#themes)).
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
@@ -231,7 +232,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 
 | key | action |
 | --- | --- |
-| `alt+n` | new agent (claude · codex · grok · opencode · cursor · copilot · shell · custom command, folder, first prompt, worktree); on the kind row, `c` `x` `g` `o` `u` `p` `s` pick claude, codex, grok, opencode, cursor, copilot, shell |
+| `alt+n` | new agent (kind, folder, first prompt, worktree). The kind row has claude · codex · shell · custom command, then *more ▸*, which opens in place as `→` reaches it: grok · opencode · cursor · copilot. A kind picked from *more* shows in its place. `c` `x` `g` `o` `u` `p` `s` pick claude, codex, grok, opencode, cursor, copilot, shell, under *more* or not. `[new] kinds` sets the row (see [Config](#config)) |
 | `alt+1…9` / `alt+j` `alt+k` | jump / next / previous |
 | `alt+a` | next agent that needs you |
 | `alt+g` | grid ⇄ focus |
@@ -400,7 +401,7 @@ themes/        Omarchy's 23 themes, to use without Omarchy (macOS)
 install-theme.sh copies one of them, or any colors.toml, to ~/.config/trix/colors.toml
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds and their errors), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, theme parsing and lookup, including the themes in `themes/` and `install-theme.sh`, and the settings: what they write to `config.toml` (comments kept, mistakes left alone), trying themes on and keeping one, new agents, restoring and panes left to the terminal as set, and the bottom bar's buttons.
+`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds, the new-agent form's kind row and their errors), the new-agent form (its kind row, *more*, the kind letters, and its width), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, theme parsing and lookup, including the themes in `themes/` and `install-theme.sh`, and the settings: what they write to `config.toml` (comments kept, mistakes left alone), trying themes on and keeping one, new agents, restoring and panes left to the terminal as set, and the bottom bar's buttons.
 
 Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes every sound independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme, ahead of `~/.config/trix/colors.toml`. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 

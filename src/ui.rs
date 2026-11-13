@@ -1049,14 +1049,30 @@ fn input_spans(inp: &TextInput, active: bool, placeholder: &str, t: &Theme, max:
     (vec![Span::styled(shown, Style::new().fg(if active { t.fg_bright } else { t.fg }))], active.then_some(before as u16))
 }
 
+/// The chips `from..to` of a row too long for `room` cells: as many as fit,
+/// scrolled only as far as it takes to keep `sel` in sight.
+fn chip_window(widths: &[usize], sel: usize, room: usize) -> (usize, usize) {
+    let mut from = 0;
+    while from < sel && widths[from..=sel].iter().sum::<usize>() > room {
+        from += 1;
+    }
+    let (mut to, mut used) = (from, 0);
+    while to < widths.len() && used + widths[to] <= room {
+        used += widths[to];
+        to += 1;
+    }
+    (from, to.max(sel + 1))
+}
+
 fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let Some(m) = &app.modal else { return };
     match m {
         Modal::Menu(_) | Modal::Settings(_) => {}
         Modal::Search(s) => search_box(f, app, s, area, t),
         Modal::New(form) => {
-            // Wide enough for every kind on one row.
-            let r = centered(area, 92, 16);
+            // The kind row keeps the main kinds and "more ▸", so new kinds
+            // don't widen it.
+            let r = centered(area, 72, 16);
             f.render_widget(Clear, r);
             let block = modal_block("New agent", t);
             let inner = block.inner(r);
@@ -1074,17 +1090,30 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 );
                 let (spans, cur): (Vec<Span>, Option<u16>) = match i {
                     0 => {
+                        let row = form.kind_row();
+                        // Each chip is " label " and a space.
+                        let widths: Vec<usize> = row.iter().map(|(l, _)| l.width() + 3).collect();
+                        let chosen = row.iter().position(|(_, k)| *k == Some(form.kind)).unwrap_or(0);
+                        // Open, more's kinds follow the main ones: ‹ says so.
+                        let lead = usize::from(form.more);
+                        let (from, to) = if lead + widths.iter().sum::<usize>() <= field_w { (0, row.len()) } else { chip_window(&widths, chosen, field_w.saturating_sub(2)) };
                         let mut v = Vec::new();
-                        for (k, kind) in Kind::ALL.iter().enumerate() {
-                            if k == form.kind {
-                                v.push(Span::styled(
-                                    format!(" {} ", kind.label()),
-                                    Style::new().fg(t.bg).bg(if active { t.accent } else { kind_color(t, *kind) }).add_modifier(Modifier::BOLD),
-                                ));
-                            } else {
-                                v.push(Span::styled(format!(" {} ", kind.label()), Style::new().fg(t.dim)));
-                            }
+                        if form.more || from > 0 {
+                            v.push(Span::styled("‹", Style::new().fg(t.muted)));
+                        }
+                        for (c, (label, kind)) in row.iter().enumerate().take(to).skip(from) {
+                            v.push(match kind {
+                                Some(k) if c == chosen => Span::styled(
+                                    format!(" {label} "),
+                                    Style::new().fg(t.bg).bg(if active { t.accent } else { kind_color(t, *k) }).add_modifier(Modifier::BOLD),
+                                ),
+                                Some(_) => Span::styled(format!(" {label} "), Style::new().fg(t.dim)),
+                                None => Span::styled(format!(" {label} "), Style::new().fg(t.muted)),
+                            });
                             v.push(Span::raw(" "));
+                        }
+                        if to < row.len() {
+                            v.push(Span::styled("›", Style::new().fg(t.muted)));
                         }
                         (v, None)
                     }
@@ -1103,7 +1132,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                         (v, None)
                     }
                     _ => {
-                        let ph = if Kind::ALL[form.kind] == Kind::Custom { "command to run, e.g. aider --model …" } else { "extra flags, e.g. --model opus" };
+                        let ph = if form.kind == Kind::Custom { "command to run, e.g. aider --model …" } else { "extra flags, e.g. --model opus" };
                         input_spans(&form.args, active, ph, t, field_w)
                     }
                 };
@@ -1934,21 +1963,54 @@ mod tests {
     }
 
     #[test]
-    fn the_new_agent_form_shows_every_kind() {
+    fn the_new_agent_form_keeps_its_width_with_more() {
+        use crate::agent::Kind;
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
-        app.open_new();
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = term.backend().buffer();
-        let row = (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
-            .find(|r| r.contains(" claude "))
-            .expect("the kind row");
-        let labels: Vec<&str> = crate::agent::Kind::ALL.iter().map(|k| k.label()).collect();
-        assert!(row.contains(&format!(" {} ", labels.join("   "))), "{row}");
-        assert!(row.contains(" custom   ") || row.trim_end().ends_with("custom"), "nothing cut off: {row}");
+        // The kind row, from the label on, and the dialog's width.
+        let mut kind_row = |app: &mut App| {
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            let lines: Vec<String> = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect();
+            let top = lines.iter().find(|l| l.contains("New agent")).expect("the dialog");
+            let width = top.chars().skip_while(|&c| c != '╭').take_while(|&c| c != '╮').count() + 1;
+            let row = lines.iter().find(|l| l.contains("Agent ")).expect("the kind row");
+            let row = row[row.find("Agent").unwrap() + 5..].trim().trim_end_matches('│').trim_end().to_string();
+            (row, width)
+        };
+        app.open_new();
+        assert_eq!(kind_row(&mut app), ("claude   codex   shell   custom   more ▸".into(), 72));
+        let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+        f.kind = Kind::Grok;
+        f.more = true;
+        assert_eq!(kind_row(&mut app).0, "‹ grok   opencode   cursor   copilot", "open, in place");
+        let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+        f.more = false;
+        f.kind = Kind::Copilot;
+        assert_eq!(kind_row(&mut app).0, "claude   codex   shell   custom   copilot ▸", "chosen, in more's place");
+
+        // Too many for the row: it scrolls to the kind chosen, ‹ › saying what's off it.
+        app.config.new.kinds = Kind::ALL.to_vec();
+        app.config.new.agent = Some(Kind::Claude);
+        app.open_new();
+        let (row, width) = kind_row(&mut app);
+        assert_eq!(width, 72, "no wider for more kinds");
+        assert!(row.starts_with("claude ") && row.ends_with('›') && !row.contains('‹'), "{row}");
+        let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+        f.kind = Kind::Custom;
+        let (row, _) = kind_row(&mut app);
+        assert!(row.starts_with('‹') && row.ends_with("custom") && !row.contains("claude"), "{row}");
+    }
+
+    #[test]
+    fn a_long_chip_row_scrolls_to_the_chosen_one() {
+        let w = [8, 7, 7, 8, 9];
+        assert_eq!(chip_window(&w, 0, 39), (0, 5), "it all fits");
+        assert_eq!(chip_window(&w, 1, 20), (0, 2));
+        assert_eq!(chip_window(&w, 4, 20), (3, 5), "only as far as it takes");
+        assert_eq!(chip_window(&w, 2, 5), (2, 3), "wider than the room: the chosen one, cut off");
     }
 
     #[test]
