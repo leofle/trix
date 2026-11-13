@@ -242,20 +242,21 @@ Then set your terminal's Option key to send Alt (below), and run `trix claude` i
 
 ### Themes
 
-A Mac has no Omarchy theme for trix to follow, so trix ships four of Omarchy's in `themes/`: `ristretto`, `tokyo-night` (the default), `retro-82` and `lupine`, a light one. To use one, copy it to `~/.config/trix/colors.toml` (`$XDG_CONFIG_HOME` if set), next to `config.toml`. From your trix clone:
+A Mac has no Omarchy theme for trix to follow, so trix ships four of Omarchy's in `themes/`: `ristretto`, `tokyo-night` (the default), `retro-82` and `lupine`, a light one. To use one, run `install-theme.sh` with its name, from your trix clone:
 
 ```sh
-mkdir -p ~/.config/trix
-cp themes/ristretto/colors.toml ~/.config/trix/colors.toml
+./install-theme.sh ristretto
 ```
 
-Every running trix restyles within a second, with no restart. Copy another theme over the file to switch again, and copy `tokyo-night` to go back to the default. Removing the file keeps the theme you have until trix restarts.
+It copies the theme to `~/.config/trix/colors.toml` (`$XDG_CONFIG_HOME` if set), next to `config.toml`, and every running trix restyles within a second, with no restart. Run it again with another name to switch, or with `tokyo-night` to go back to the default. Run it with no name to list the themes.
+
+It also installs an Omarchy theme folder or any `colors.toml` by path, such as `./install-theme.sh ~/Downloads/some-theme`. If the `colors.toml` it replaces isn't one of the shipped themes, because you made or edited it, it saves that file next to it as `colors.toml.<date>.bak` first. Installing by hand is the same thing: `mkdir -p ~/.config/trix && cp themes/ristretto/colors.toml ~/.config/trix/colors.toml`. Removing the file keeps the theme you have until trix restarts.
 
 The theme colors trix's own bars, sidebar, cards and borders. The panes, and the space around them, keep your terminal's background and ANSI colors, so give your terminal a matching theme too. This matters most for Lupine: on a dark terminal you get light bars around dark panes.
 
 To make your own theme, edit your copy. It is Omarchy's `colors.toml` format, one `key = "#rrggbb"` per line, and any key you leave out keeps its Tokyo Night color.
 
-trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme. On Linux with Omarchy, the file sets trix's theme apart from the desktop's; remove it to follow Omarchy again. On Linux without Omarchy, it all works as on a Mac.
+trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme. The start screen, with no agents open, says which one is in use. On Linux with Omarchy, the file sets trix's theme apart from the desktop's; remove it to follow Omarchy again. On Linux without Omarchy, it all works as on a Mac.
 
 ## Supported agents
 
@@ -349,9 +350,10 @@ src/input.rs   key → xterm byte encoding
 src/theme.rs   theme loading (TRIX_THEME, ~/.config/trix/colors.toml, Omarchy) / live reload
 src/platform.rs Linux / macOS differences: process liveness and folders, foreground job, notifications, sound, clipboard
 themes/        Omarchy themes to use without Omarchy (macOS): Ristretto, Tokyo Night, Retro 82, Lupine
+install-theme.sh copies one of them, or any colors.toml, to ~/.config/trix/colors.toml
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds and their errors), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing and lookup, including the themes in `themes/`.
+`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds and their errors), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing and lookup, including the themes in `themes/` and `install-theme.sh`.
 
 Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes every sound independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme, ahead of `~/.config/trix/colors.toml`. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
