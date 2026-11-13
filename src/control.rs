@@ -169,7 +169,7 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
             Request::Wait { targets: pos.clone(), all: has(&["--all"]), timeout_secs: number(&["--timeout", "-t"], WAIT_SECS)? }
         }
         "spawn" => {
-            let kind = one("agent kind (claude, codex, grok, opencode, cursor, shell or custom)")?;
+            let kind = one("agent kind (claude, codex, grok, opencode, cursor, copilot, shell or custom)")?;
             let cwd = value(&["--cwd"]).map(|d| absolute(app::expand(&d), &cwd)).unwrap_or(cwd);
             Request::Spawn {
                 kind,
@@ -456,7 +456,7 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
         "cursor-agent" => Some(Kind::Cursor),
         _ => None,
     }) else {
-        return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, shell or custom)"));
+        return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, copilot, shell or custom)"));
     };
     if !cwd.is_dir() {
         return Reply::fail(format!("folder not found: {}", app::tilde(&cwd)));

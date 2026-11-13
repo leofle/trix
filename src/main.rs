@@ -47,7 +47,7 @@ usage:
 agent control (for scripts, and for agents managing other agents):
   trix spawn <kind> [--name N] [--cwd DIR] [--worktree] [--prompt P] [--args A]
                             start claude, codex, grok, opencode, cursor (cursor-agent),
-                            shell or custom; prints its name
+                            copilot, shell or custom; prints its name
   trix send <agent> <prompt…>
                             type a prompt into an agent and submit it (prompt
                             from stdin when omitted). Refuses agents that need
@@ -270,6 +270,7 @@ fn main() -> anyhow::Result<()> {
             "opencode" => Kind::OpenCode,
             // Not `agent`: Grok's installer links that name too.
             "cursor" | "cursor-agent" => Kind::Cursor,
+            "copilot" => Kind::Copilot,
             "shell" | "sh" => Kind::Shell,
             other => {
                 eprintln!("trix: unknown argument '{other}'\n\n{HELP}");

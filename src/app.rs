@@ -2843,7 +2843,7 @@ mod tests {
     #[test]
     fn kind_letters_pick_their_kind() {
         let mut app = test_app();
-        for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('s', Kind::Shell)] {
+        for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('p', Kind::Copilot), ('s', Kind::Shell)] {
             app.open_new();
             app.modal_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
             let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };

@@ -1,6 +1,6 @@
 # trix
 
-A workspace where coding agents live. Run Claude Code, Codex, Grok, OpenCode, Cursor, shells, or any CLI agent side by side. trix tells you, at a glance and without asking, which agent is working, which one needs you, and which one finished while you were looking elsewhere.
+A workspace where coding agents live. Run Claude Code, Codex, Grok, OpenCode, Cursor, GitHub Copilot CLI, shells, or any CLI agent side by side. trix tells you, at a glance and without asking, which agent is working, which one needs you, and which one finished while you were looking elsewhere.
 
 ```
 ◆ trix   ▲ 1 needs you   ⠹ 2 working   ✓ 1 done                              focus · 14:02
@@ -19,7 +19,7 @@ A workspace where coding agents live. Run Claude Code, Codex, Grok, OpenCode, Cu
 
 Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and Rex added agent awareness, but they still treat the agent as just another pane. In trix, the agent comes first:
 
-- **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>`, Codex with `-c` hook overrides, OpenCode with a plugin in `OPENCODE_CONFIG_CONTENT` and Cursor with `--plugin-dir`, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex).) Agents without hooks fall back to output cadence and screen heuristics. See [Supported agents](#supported-agents).
+- **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>`, Codex with `-c` hook overrides, OpenCode with a plugin in `OPENCODE_CONFIG_CONTENT`, and Cursor and Copilot with `--plugin-dir`, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex).) Agents without hooks fall back to output cadence and screen heuristics. See [Supported agents](#supported-agents).
 - **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip drops in over your current pane's title: who, what it's asking and how long it has waited. Click it, or press `alt+a`, to go there. It covers the title rather than taking a row, so your pane never moves. You also get a desktop notification, and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too. Which of these happen, and which sound plays, is up to you: see [Config](#config).
 - **Context at a glance.** Each Claude and Codex agent shows how full its context window is on its pane: `context 31% · ~691k left`, yellow from 70%, red from 85%. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
@@ -32,7 +32,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Layouts on demand.** `trix layout save work` remembers the tabs you have open, with their folders. `trix layout open work` brings them back whenever you want, with fresh conversations, or the old ones with `--resume`. See [Layouts](#layouts).
 - **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
-- **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude, Codex, Grok, OpenCode and Cursor resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`, …), and shells reopen in the folder they were in.
+- **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude, Codex, Grok, OpenCode, Cursor and Copilot resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`, …), and shells reopen in the folder they were in.
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
 - **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own colors, which Omarchy themes too. Without Omarchy it falls back to Tokyo Night. Or pick a theme in the settings: any of Omarchy's 23, which trix ships so a Mac has them too, tried on live before you keep it. A theme you pick colors the agents' panes, Claude, Grok and OpenCode as well (see [Themes](#themes)).
 - **Settings.** `alt+,`, or *settings* in the bottom bar, changes the theme, the needs-you strip, the sidebar, how new agents start, whether the last workspace comes back, notifications and sounds in place. Each change is written to your config files with your comments kept, so the files and the screen always agree (see [Settings](#settings)).
@@ -46,7 +46,7 @@ git clone https://github.com/leofle/trix.git && cd trix
 cargo install --path .
 trix                      # open the workspace (or attach to the running one)
 trix claude codex shell   # …and start these agents in the current folder
-                          # (also grok, opencode, cursor)
+                          # (also grok, opencode, cursor, copilot)
 trix attach               # attach only; fails if nothing is running
 trix view                 # watch read-only from another terminal (q leaves)
 trix ls                   # agents, states and activity, without attaching
@@ -117,7 +117,7 @@ trix layout rm work-layout
 - Layouts live in `~/.config/trix/layouts/<name>.toml` (`$XDG_CONFIG_HOME` if set), one plain TOML file each, meant to be edited by hand or by an agent:
   ```toml
   [[agent]]
-  kind = "claude"            # claude, codex, grok, opencode, cursor, shell or custom
+  kind = "claude"            # claude, codex, grok, opencode, cursor, copilot, shell or custom
   name = "api"
   cwd = "~/code/api"         # a relative folder starts from your home folder
   args = "--model opus"      # optional: extra arguments (for custom, the command)
@@ -126,7 +126,7 @@ trix layout rm work-layout
 - `save` records where each shell is now, even if you `cd`'d since. It won't overwrite an existing layout without `--force`.
 - `open` adds to the workspace you're in and skips tabs that are already open under the same name, so opening twice is harmless. New tabs never steal focus. A tab whose folder is gone is reported and skipped.
 - From a terminal outside trix, `open` starts the workspace if needed and attaches to it, unless a tab failed to start: then it reports why and leaves attaching to you. From inside a pane, it just adds the tabs, so an agent can run it too: "open my work layout". `trix -s <name> layout open …` from a pane starts that session if needed and opens the tabs there.
-- `--resume` only applies to Claude, Codex, Grok, OpenCode and Cursor tabs that have a saved `session`. Everything else starts fresh either way.
+- `--resume` only applies to Claude, Codex, Grok, OpenCode, Cursor and Copilot tabs that have a saved `session`. Everything else starts fresh either way.
 - How this differs from [Restore](#restore): restore brings back whatever was open after a crash or restart, and it's per session and one-shot. A layout stays until you remove it, and you can open it into any session, any number of times.
 
 ### Settings
@@ -137,7 +137,7 @@ trix layout rm work-layout
 - **Theme in agent panes** is on by default: a theme of trix's own paints the panes, and Claude, Grok and OpenCode take it too. Off, trix's bars and sidebar keep the theme, but the panes keep your terminal's colors (and its window transparency), and the agents keep their own themes. It does nothing while trix follows Omarchy's theme, which themes the terminal itself.
 - **Needs-you strip** sets the color of the bar that says another agent needs you: the theme's red, orange, yellow, green, cyan, accent or magenta, so it follows a theme switch, or the `#rrggbb` your config names.
 - **Sidebar** (wide or narrow) and **sidebar cards** (full or compact) do the same as `alt+m` and `alt+c`, and are remembered the same way.
-- **New ones start as** picks the agent `alt+n`'s form starts on: claude (the default), codex, grok, opencode, cursor, shell, or *last*, the one you started last. **New ones in a worktree** ticks the form's worktree box to begin with.
+- **New ones start as** picks the agent `alt+n`'s form starts on: claude (the default), codex, grok, opencode, cursor, copilot, shell, or *last*, the one you started last. **New ones in a worktree** ticks the form's worktree box to begin with.
 - **Bring back the last workspace** is what a fresh trix does with the workspace saved last time: *ask* (the default), *always* bring it back, or *never*, starting fresh (see [Restore](#restore)).
 - **Notify me** sets whether you hear about an agent you're not looking at when it needs you and when it's done, and whether that comes as a desktop notification, with the terminal bell, or both.
 - **Sounds** sets the sound for the same two events: the chime, off, or the sound file your config names.
@@ -173,7 +173,7 @@ color = "#e0af68"                 # the needs-you strip: "#rrggbb", or a theme c
 text = "bg"                       # optional: its text (by default whichever reads best)
 
 [new]
-agent = "codex"                   # what alt+n starts on: claude (default), codex, grok, opencode, cursor, shell, custom, or "last"
+agent = "codex"                   # what alt+n starts on: claude (default), codex, grok, opencode, cursor, copilot, shell, custom, or "last"
 worktree = true                   # the worktree box ticked to begin with (off by default)
 
 [theme]
@@ -217,9 +217,9 @@ Without `-s` you get the default session. `-s <name>` (or `--session <name>`) pi
 
 ### Restore
 
-The layout (kind, name, folder, extra args, and the conversation id each agent reports, or that trix gave Grok) is saved to `$XDG_STATE_HOME/trix/workspace.json` (default `~/.local/state/trix/`; `workspace-<name>.json` for a named session) whenever it changes. When a fresh server finds it, you're asked once:
+The layout (kind, name, folder, extra args, and the conversation id each agent reports, or that trix gave Grok or Copilot) is saved to `$XDG_STATE_HOME/trix/workspace.json` (default `~/.local/state/trix/`; `workspace-<name>.json` for a named session) whenever it changes. When a fresh server finds it, you're asked once:
 
-- `y` restores. Claude, Codex, Grok, OpenCode and Cursor resume their conversation, or start fresh if they never reported one. Shells reopen where they were. Custom commands come back **stopped** (they could do anything when re-run); press enter on one to start it. Agents whose folder is gone, such as a deleted worktree, are skipped.
+- `y` restores. Claude, Codex, Grok, OpenCode, Cursor and Copilot resume their conversation, or start fresh if they never reported one. Shells reopen where they were. Custom commands come back **stopped** (they could do anything when re-run); press enter on one to start it. Agents whose folder is gone, such as a deleted worktree, are skipped.
 - `n` starts fresh and forgets the saved workspace.
 - `esc` decides later. Nothing is lost, and the question comes back on the next attach.
 
@@ -231,7 +231,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 
 | key | action |
 | --- | --- |
-| `alt+n` | new agent (claude · codex · grok · opencode · cursor · shell · custom command, folder, first prompt, worktree); on the kind row, `c` `x` `g` `o` `u` `s` pick claude, codex, grok, opencode, cursor, shell |
+| `alt+n` | new agent (claude · codex · grok · opencode · cursor · copilot · shell · custom command, folder, first prompt, worktree); on the kind row, `c` `x` `g` `o` `u` `p` `s` pick claude, codex, grok, opencode, cursor, copilot, shell |
 | `alt+1…9` / `alt+j` `alt+k` | jump / next / previous |
 | `alt+a` | next agent that needs you |
 | `alt+g` | grid ⇄ focus |
@@ -307,6 +307,7 @@ trix starts each of these agents by name, with an argv (never through a shell), 
 | `grok` | `grok` | terminal title, screen fallback; hooks if you add them (below) | title (`⚠ Action Required`) + Grok's own prompt wording on screen | yes: trix starts it with `--session-id <uuid>`, restores with `--resume <uuid>` |
 | `opencode` | `opencode` (2.x: `opencode --standalone`) | plugin events (`OPENCODE_CONFIG_CONTENT`) | `permission.asked`, and `question.asked` (1.x) or a question form (2.x) | yes, `--session <id>` |
 | `cursor` | `cursor-agent` | output cadence and screen; plugin hooks (`--plugin-dir`) add each tool | screen only: Cursor's approval prompts | yes, `--resume <chatId>` from `sessionStart` |
+| `copilot` | `copilot` | plugin hooks (`--plugin-dir`) | `Notification` hook (`permission_prompt`, `elicitation_dialog`), `ask_user` | yes: trix starts and restores it with `--session-id=<uuid>` |
 
 - **Grok** ([Grok Build](https://docs.x.ai/build)) can't be handed hooks per process: it reads them only from `~/.grok/hooks`, its config and the other files in its [hook locations](https://docs.x.ai/build/features/hooks). So trix reads Grok's terminal title instead: a braille spinner and what it's doing while it works, `⚠ Action Required` while a permission waits, `grok` when idle. Prompts and dialogs the title doesn't cover (folder trust, questions) come from wording only Grok's prompts use (`Ctrl+o:always-approve`, `No, reject (type to add feedback)`, `x:dismiss`). trix names each new conversation with `--session-id`, so restore resumes it, unless your extra args pick one (`-c`, `-r`, `-s`, `--fork-session`). For tool-by-tool detail, you can add trix's hook yourself, as `~/.grok/hooks/trix.json` (`trix hook grok` does nothing outside a trix pane, and Grok runs it only in folders you've trusted):
   ```json
@@ -325,6 +326,12 @@ trix starts each of these agents by name, with an argv (never through a shell), 
   - **A plugin folder.** OpenCode 2 loads a plugin from a folder only, so trix writes its plugin as `opencode-plugin-<pid>/index.js` too.
   - **A new plugin API.** The folder's plugin is `export default { id, setup }`. It follows `ctx.event.subscribe()` (`session.execution.*`, `session.inbox.enqueued`, `permission.asked`, `form.created`, …) and `ctx.tool.hook`, and reports each the way the OpenCode 1 plugin does.
 - **Cursor** gets a plugin directory, `--plugin-dir`, holding only observing hooks: `sessionStart`, `beforeSubmitPrompt`, `postToolUse(Failure)`, `stop`, `sessionEnd`. None of Cursor's permission hooks (`preToolUse`, `beforeShellExecution`, …): their answer decides whether a tool runs, and trix never approves anything. `trix hook cursor` answers `{}` (and `{"continue": true}` before a prompt). cursor-agent 2026.11.11 runs only `sessionStart` and the tool hooks from a plugin, not `beforeSubmitPrompt` or `stop`. So Cursor's screen says when a turn starts and ends: it redraws while it thinks, streams and runs a command, and is silent at its prompt and while an approval waits. The tool hooks add what it ran (`Shell wc -l fruit.txt ✓`), and `sessionStart` names the conversation that restore resumes. Cursor has no hook for its approval prompts either, so trix reads those from the screen: `Run (once)`, `Skip (esc or n)`, `Waiting for approval...`, workspace trust. Only that wording counts, so a question in Cursor's reply doesn't hold the pane on needs-you. If your team's Cursor settings disallow local plugins, the hooks don't run: the state still comes from the screen, but there's no tool detail and restore has no conversation to resume.
+- **Copilot** ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli)) gets a plugin directory too, `--plugin-dir`, with a `plugin.json` and a `hooks.json`. Its hooks use Claude's event names (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse(Failure)`, `Notification`, `Stop`, `SessionEnd`), so Copilot sends them as Claude would: snake_case fields and Claude's tool names (`Bash`, `Read`, `Edit`, `AskUserQuestion` for its `ask_user`). See its [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
+  - **Needs you.** A waiting approval raises `Notification` with type `permission_prompt`, shown as `approve <the tool it was about to run>`; a dialog (`elicitation_dialog`) and `ask_user` show their question. trix doesn't hook `PermissionRequest`: Copilot runs it before its own rules decide, so for tools that never ask you too. Copilot's approval prompt (`No, and tell Copilot what to do differently`) and its start-up folder trust (`Confirm folder trust`) count on screen as well.
+  - **Watching only.** Copilot denies a tool when its `PreToolUse` command fails, so trix's hook is `trix hook copilot || true` and prints nothing: it never decides anything.
+  - **Conversations.** trix names each new one with `--session-id=<uuid>`, unless your extra args pick one (`--continue`, `-r`/`--resume`, `--session-id`, `--connect`). Restore uses the same flag, which resumes that conversation, or starts one under that id if it never had a turn. A first prompt goes in as `--interactive=<prompt>`.
+  - **Folder trust.** Copilot asks whether you trust the folder as it starts, before anything else. The plugin's hooks ran after answering *Yes* in a folder it hadn't seen (Copilot 1.0.110). Tested with Copilot CLI 1.0.110; older ones may lack the notification hook or `--session-id`.
+  - An interrupted turn raises no hook ([none documented](https://docs.github.com/en/copilot/reference/hooks-reference)): like Claude's, it reads as interrupted once the screen goes quiet.
 - **Context gauge** stays Claude and Codex only.
 
 ### Not installed yet
@@ -340,6 +347,7 @@ trix uses the first of these you have:
 | `grok` | `npm:@xai-official/grok` | none (Homebrew's `grok` is another program) | `@xai-official/grok` | |
 | `opencode` | `opencode` | `opencode` | `opencode-ai` | |
 | `cursor` | | cask `cursor-cli` | | `cursor.com/install` |
+| `copilot` | `npm:@github/copilot` | cask `copilot-cli` | `@github/copilot` | `gh.io/copilot-install` |
 
 - **mise** runs `mise use -g <package>`. If mise's shims aren't on trix's `PATH`, the agent runs through `mise x`.
 - **The install scripts** are the vendors' own, fetched with curl and run by bash. They put the agent in `~/.local/bin`, which trix adds to that agent's `PATH` if it's missing.
@@ -363,7 +371,7 @@ Codex shows a startup warning that `-c` overrides run it "without the shared bac
 | glyph | state | source |
 | --- | --- | --- |
 | `⠹` | working | `UserPromptSubmit` / `PreToolUse` hooks, or sustained output |
-| `▲` | needs you | `PermissionRequest`, `AskUserQuestion`, OpenCode `permission.asked` / `question.asked`, Grok's title, or an approval prompt seen on screen |
+| `▲` | needs you | `PermissionRequest`, `AskUserQuestion`, OpenCode `permission.asked` / `question.asked`, Copilot's `permission_prompt` / `elicitation_dialog` notifications, Grok's title, or an approval prompt seen on screen |
 | `✓` | done | `Stop` hook / Codex `agent-turn-complete`, or work that went quiet |
 | `○` | idle | at the prompt, or interrupted (Codex `Interrupt`, OpenCode abort) |
 | `•` | unseen | it finished or asked something while you were elsewhere |
@@ -383,7 +391,7 @@ src/settings.rs the settings (alt+,): their rows, and config.toml edits that kee
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications
 src/agent.rs   PTY + emulator per agent, state machine, heuristics
-src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay, OpenCode / Cursor plugins + payloads
+src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay, OpenCode / Cursor / Copilot plugins + payloads
 src/ui.rs      all rendering
 src/input.rs   key → xterm byte encoding
 src/theme.rs   theme loading (TRIX_THEME, ~/.config/trix/colors.toml, Omarchy) / live reload / the themes the settings offer, built in
