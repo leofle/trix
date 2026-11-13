@@ -29,12 +29,14 @@ pub enum Kind {
     /// Cursor's CLI agent, started as `cursor-agent`: newer installs also
     /// name it `agent`, but Grok's installer claims that name too.
     Cursor,
+    /// GitHub Copilot CLI (`copilot`).
+    Copilot,
     Shell,
     Custom,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 7] = [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Shell, Kind::Custom];
+    pub const ALL: [Kind; 8] = [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Shell, Kind::Custom];
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -42,6 +44,7 @@ impl Kind {
             Kind::Grok => "grok",
             Kind::OpenCode => "opencode",
             Kind::Cursor => "cursor",
+            Kind::Copilot => "copilot",
             Kind::Shell => "shell",
             Kind::Custom => "custom",
         }
@@ -55,7 +58,7 @@ impl Kind {
     /// A known coding agent, so typing a prompt into it is safe. A custom
     /// command may be anything (bash, ssh, psql), so it is not.
     pub fn takes_prompts(self) -> bool {
-        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor)
+        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot)
     }
     /// It can be started again in the conversation it was in.
     pub fn resumes(self) -> bool {
@@ -81,6 +84,7 @@ impl Kind {
             Kind::Grok => Some('g'),
             Kind::OpenCode => Some('o'),
             Kind::Cursor => Some('u'),
+            Kind::Copilot => Some('p'),
             Kind::Shell => Some('s'),
             Kind::Custom => None,
         }
@@ -261,6 +265,10 @@ pub struct Agent {
     /// grok (npm)"). It stays starting until the installer says it's done:
     /// install output isn't the agent at work. See `install`.
     pub installing: Option<String>,
+    /// Copilot: the tool its last `PreToolUse` named, until it ran. Its
+    /// permission prompt comes as a notification with no tool in it, so
+    /// this says what the approval is for.
+    pending_tool: Option<String>,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -298,9 +306,9 @@ impl Agent {
         integrations: &Integrations,
         exe: &std::path::Path,
     ) -> anyhow::Result<Agent> {
-        // Grok takes the id of a new conversation from its caller, so trix
-        // knows what to resume without asking it.
-        let fresh = (spec.kind == Kind::Grok && spec.resume.is_none() && !grok_picks_session(spec.command.as_deref())).then(new_session_id).flatten();
+        // Grok and Copilot take the id of a new conversation from their
+        // caller, so trix knows what to resume without asking them.
+        let fresh = new_conversation(&spec);
         let (program, args) = command_for(&spec, integrations, exe, fresh.as_deref());
         let first_prompt = spec.kind.is_agent() && spec.prompt.as_deref().is_some_and(|p| !p.trim().is_empty());
         let command_line = std::iter::once(program.clone())
@@ -391,7 +399,9 @@ impl Agent {
             last_resize: now,
             activity: installing.clone().or(spec.branch_note).unwrap_or_else(|| "launching".into()),
             last_prompt: spec.prompt,
-            session_named_by_trix: fresh.is_some(),
+            // Copilot is restored with `--session-id`, which resumes the
+            // conversation or starts one under that id: always worth saving.
+            session_named_by_trix: fresh.is_some() && spec.kind == Kind::Grok,
             session: spec.resume.or(fresh),
             title: None,
             exit_code: None,
@@ -413,6 +423,7 @@ impl Agent {
             title_attention: None,
             changes: Vec::new(),
             installing,
+            pending_tool: None,
         })
     }
 
@@ -601,8 +612,8 @@ impl Agent {
             // Codex's lifecycle hooks, which it runs once they're trusted.
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
-            // trix's own plugin (OpenCode) or the user's hooks (Grok).
-            "opencode" | "grok" => self.hooked = true,
+            // trix's own plugin (OpenCode, Copilot) or the user's hooks (Grok).
+            "opencode" | "grok" | "copilot" => self.hooked = true,
             // Cursor runs only `sessionStart` and the tool hooks from trix's
             // plugin (cursor-agent 2026.11.11): no prompt, no turn end. Its
             // screen says when a turn starts and ends; its hooks add what it
@@ -622,6 +633,7 @@ impl Agent {
             }
             "UserPromptSubmit" => {
                 self.turn_seen = true;
+                self.pending_tool = None;
                 if let Some(p) = &msg.detail {
                     self.last_prompt = Some(p.clone());
                 }
@@ -637,9 +649,11 @@ impl Agent {
                     return self.set_state(State::Blocked, focused);
                 }
                 self.activity = described(&msg.detail);
+                self.pending_tool = Some(self.activity.clone());
                 self.set_state(State::Working, focused)
             }
             "PostToolUse" => {
+                self.pending_tool = None;
                 if self.state == State::Blocked {
                     self.activity = format!("{tool} ✓");
                 }
@@ -648,6 +662,16 @@ impl Agent {
             // Grok's permission prompt carries a message, not a tool: show it as is.
             "PermissionRequest" if msg.source == "grok" && msg.detail.as_deref().is_some_and(|d| !d.is_empty()) => {
                 self.activity = hooks::one_line(msg.detail.as_deref().unwrap_or_default(), 60);
+                self.set_state(State::Blocked, focused)
+            }
+            // Copilot's permission prompt comes as a notification naming no
+            // tool: the tool it was about to run is what it asks about.
+            "PermissionRequest" if msg.source == "copilot" => {
+                self.activity = match (&self.pending_tool, msg.detail.as_deref().filter(|d| !d.is_empty())) {
+                    (Some(t), _) => format!("approve {t}"),
+                    (None, Some(m)) => hooks::one_line(m, 60),
+                    (None, None) => "needs your approval".into(),
+                };
                 self.set_state(State::Blocked, focused)
             }
             // Claude asks permission to show its own question: the question
@@ -673,8 +697,9 @@ impl Agent {
             }
             // OpenCode reports its session idle at start too, and the new
             // agents' turn ends mean nothing before a turn began.
-            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok") && !self.turn_seen => None,
+            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot") && !self.turn_seen => None,
             "Stop" | "agent-turn-complete" => {
+                self.pending_tool = None;
                 self.activity = match self.tools_used {
                     0 => "replied".into(),
                     n => format!("finished · {n} tool{}", if n == 1 { "" } else { "s" }),
@@ -702,7 +727,11 @@ impl Agent {
                 }
                 None
             }
-            // The agent asks the human something (OpenCode's question tool).
+            // Copilot's `ask_user` is on screen already (its `PreToolUse`
+            // named the question): its dialog's notification adds nothing.
+            "Question" if msg.source == "copilot" && self.state == State::Blocked => None,
+            // The agent asks the human something (OpenCode's question tool,
+            // a Copilot dialog).
             "Question" => {
                 self.activity = msg.detail.clone().unwrap_or_else(|| "has a question".into());
                 self.set_state(State::Blocked, focused)
@@ -1099,7 +1128,8 @@ fn needs_input(screen: &str) -> bool {
 /// Grok Build's permission footer and question dialog
 /// (`xai-grok-pager`), OpenCode's permission prompt
 /// (`packages/tui/src/routes/session/permission.tsx`), Cursor CLI's
-/// approval prompts and workspace-trust screen, and Codex's folder-trust
+/// approval prompts and workspace-trust screen, Copilot CLI's folder trust
+/// and approval prompt, and Codex's folder-trust
 /// and hooks-review dialogs (as Codex 0.167.2 draws them).
 fn kind_prompt(kind: Kind, screen: &str) -> bool {
     let t = screen.to_lowercase();
@@ -1114,6 +1144,10 @@ fn kind_prompt(kind: Kind, screen: &str) -> bool {
             any(&["skip (esc or n)", "waiting for approval...", "workspace trust required", "do you trust the contents of this directory"])
                 || (t.contains("run (once)") && t.contains("skip"))
         }
+        // Copilot CLI 1.0.110: folder trust at start (as it draws it), and
+        // the way out of its approval prompt (as `copilot help permissions`
+        // words it).
+        Kind::Copilot => any(&["confirm folder trust", "do you trust the files in this folder", "no, and tell copilot what to do differently"]),
         // Codex 0.167's start-up dialogs: trusting the folder, then
         // trix's hooks (and any of yours) once they're new or changed.
         Kind::Codex => any(&["trust and continue", "your trust decision will be saved", "hooks need review", "need review before they can run", "continue without trusting"]),
@@ -1174,6 +1208,26 @@ fn grok_picks_session(extra: Option<&str>) -> bool {
     split_args(extra).iter().any(|a| {
         let flag = a.split('=').next().unwrap_or(a);
         matches!(flag, "-c" | "--continue" | "-r" | "--resume" | "-s" | "--session-id" | "--fork-session")
+    })
+}
+
+/// The id trix picks for a new Grok or Copilot conversation: none when
+/// it resumes one, or the user's extra flags pick it.
+fn new_conversation(spec: &Spawn) -> Option<String> {
+    let picks = match spec.kind {
+        Kind::Grok => grok_picks_session(spec.command.as_deref()),
+        Kind::Copilot => copilot_picks_session(spec.command.as_deref()),
+        _ => return None,
+    };
+    (spec.resume.is_none() && !picks).then(new_session_id).flatten()
+}
+
+/// Do the user's extra Copilot flags pick the conversation themselves?
+fn copilot_picks_session(extra: Option<&str>) -> bool {
+    let Some(extra) = extra else { return false };
+    split_args(extra).iter().any(|a| {
+        let flag = a.split('=').next().unwrap_or(a);
+        matches!(flag, "--continue" | "-r" | "--resume" | "--session-id" | "--connect")
     })
 }
 
@@ -1287,6 +1341,23 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
                 push_prompt(&mut args, p);
             }
             ("cursor-agent".into(), args)
+        }
+        // `copilot [-i PROMPT]`: no positional prompt. trix's plugin rides
+        // on `--plugin-dir`. `--session-id` resumes the conversation with
+        // that id, or starts one under it: both new and restored panes.
+        Kind::Copilot => {
+            if let Some(dir) = &integrations.copilot_plugin {
+                args.extend(["--plugin-dir".into(), dir.display().to_string()]);
+            }
+            if let Some(id) = spec.resume.as_deref().or(new_session) {
+                args.push(format!("--session-id={id}"));
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            if let Some(p) = prompt {
+                // With `=`, a prompt starting with `-` stays the value.
+                args.push(format!("--interactive={p}"));
+            }
+            ("copilot".into(), args)
         }
         Kind::Claude => {
             if let Some(s) = &integrations.claude_settings {
@@ -2037,6 +2108,7 @@ mod tests {
             opencode_plugin: Some("/run/opencode-plugin-1.js".into()),
             opencode_plugin_dir: Some("/run/opencode-plugin-1".into()),
             cursor_plugin: Some("/run/cursor-plugin-1".into()),
+            copilot_plugin: Some("/run/copilot-plugin-1".into()),
             ..Integrations::with_standalone(opencode_standalone)
         }
     }
@@ -2179,6 +2251,10 @@ mod tests {
         assert!(kind_prompt(Kind::OpenCode, "△ Permission required\n  Allow once   Allow always   Reject"));
         assert!(kind_prompt(Kind::Cursor, "Run this command?\n  ls -la\n → Run (once) (y)\n   Skip (esc or n)"));
         assert!(kind_prompt(Kind::Cursor, "⚠ Workspace Trust Required\nDo you trust the contents of this directory?"));
+        // As Copilot CLI 1.0.110 draws its folder trust, and as its help
+        // words the approval prompt's way out.
+        assert!(kind_prompt(Kind::Copilot, "│ Confirm folder trust │\n│ Do you trust the files in this folder? │\n│ ❯ 1. Yes │"));
+        assert!(kind_prompt(Kind::Copilot, "Run cargo test?\n❯ 1. Yes\n  2. Yes, and don't ask again for cargo in this repo\n  3. No, and tell Copilot what to do differently (Esc)"));
         // Prose that only the generic patterns would catch, or another agent's prompt.
         let prose = "Would you like to add tests? I can run them (y/n) next.\nDo you want to proceed?";
         for k in Kind::ALL {
@@ -2547,5 +2623,121 @@ mod tests {
         assert_eq!((b.state, b.activity.as_str()), (State::Blocked, "approve permission"));
         a.shutdown();
         b.shutdown();
+    }
+
+    #[test]
+    fn copilot_has_its_own_letter() {
+        assert_eq!(Kind::Copilot.shortcut(), Some('p'));
+        assert_eq!(Kind::from_shortcut('p'), Some(Kind::Copilot));
+        assert_eq!(Kind::from_label("copilot"), Some(Kind::Copilot));
+        assert!(Kind::Copilot.takes_prompts() && Kind::Copilot.resumes() && !Kind::Copilot.prompts_only_on_screen());
+    }
+
+    #[test]
+    fn copilot_argv_loads_the_plugin_and_names_the_conversation() {
+        let mut s = spec(Kind::Copilot);
+        s.prompt = Some("fix it".into());
+        let id = "0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c";
+        assert_eq!(
+            command_for(&s, &ints(), Path::new("/bin/trix"), Some(id)),
+            ("copilot".into(), vec!["--plugin-dir".into(), "/run/copilot-plugin-1".into(), format!("--session-id={id}"), "--interactive=fix it".into()])
+        );
+        // Restored: the same flag resumes it. A prompt starting with `-` stays a value.
+        s.resume = Some("abc".into());
+        s.command = Some("--model gpt-5".into());
+        s.prompt = Some("- go on".into());
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--session-id=abc", "--model", "gpt-5", "--interactive=- go on"]);
+        // Nothing to name, nothing to load: just copilot.
+        assert!(command_for(&spec(Kind::Copilot), &Integrations::default(), Path::new("/bin/trix"), None).1.is_empty());
+    }
+
+    #[test]
+    fn copilot_leaves_the_conversation_to_flags_that_pick_one() {
+        assert!(!copilot_picks_session(None));
+        assert!(!copilot_picks_session(Some("--model gpt-5 -s")));
+        for f in ["--continue", "-r", "--resume", "--resume=x", "--session-id abc", "--session-id=abc", "--connect"] {
+            assert!(copilot_picks_session(Some(f)), "{f}");
+        }
+    }
+
+    #[test]
+    fn grok_and_copilot_get_a_new_conversation_id() {
+        for k in [Kind::Grok, Kind::Copilot] {
+            let mut s = spec(k);
+            assert!(new_conversation(&s).is_some(), "{k:?}");
+            s.command = Some("--resume=x".into());
+            assert_eq!(new_conversation(&s), None, "{k:?}: the flags pick one");
+            s.command = None;
+            s.resume = Some("x".into());
+            assert_eq!(new_conversation(&s), None, "{k:?}: resumed");
+        }
+        for k in [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Cursor, Kind::Shell, Kind::Custom] {
+            assert_eq!(new_conversation(&spec(k)), None, "{k:?}");
+        }
+    }
+
+    fn copilot(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        hook("copilot", event, tool, detail)
+    }
+
+    #[test]
+    fn copilot_turn_from_its_hooks() {
+        let mut a = test_agent(Kind::Copilot);
+        a.set_state(State::Idle, false);
+        // A turn's end before any turn means nothing.
+        assert_eq!(a.on_hook(&copilot("Stop", None, None), false), None);
+        assert_eq!(a.state, State::Idle);
+        a.on_hook(&copilot("SessionStart", None, None), false);
+        assert!(a.hooked);
+        a.on_hook(&copilot("UserPromptSubmit", None, Some("fix the login")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.last_prompt.as_deref()), (State::Working, "thinking", Some("fix the login")));
+        a.on_hook(&copilot("PreToolUse", Some("Bash"), Some("cargo test")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "Bash cargo test"));
+        // Its permission prompt: a notification naming no tool.
+        a.on_hook(&copilot("PermissionRequest", None, Some("Copilot needs your permission")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "approve Bash cargo test"));
+        a.on_hook(&copilot("PostToolUse", Some("Bash"), None), false);
+        assert_eq!(a.state, State::Working);
+        // No tool waiting: Copilot's own words.
+        a.on_hook(&copilot("PermissionRequest", None, Some("Copilot needs your permission")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Copilot needs your permission"));
+        a.on_hook(&copilot("PostToolUse", Some("Read"), None), false);
+        a.on_hook(&copilot("Stop", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 1 tool"));
+        a.shutdown();
+    }
+
+    #[test]
+    fn copilot_ask_user_needs_you() {
+        let mut a = test_agent(Kind::Copilot);
+        a.set_state(State::Idle, false);
+        a.on_hook(&copilot("UserPromptSubmit", None, Some("set it up")), false);
+        a.on_hook(&copilot("PreToolUse", Some("AskUserQuestion"), Some("Which database?")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which database?"));
+        // Its dialog's notification keeps the question.
+        a.on_hook(&copilot("Question", None, Some("Copilot has a question")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which database?"));
+        a.on_hook(&copilot("PostToolUse", Some("AskUserQuestion"), None), false);
+        assert_eq!(a.state, State::Working);
+        // A dialog no tool announced still needs you.
+        a.on_hook(&copilot("Question", None, Some("Sign in to the MCP server")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Sign in to the MCP server"));
+        a.shutdown();
+    }
+
+    #[test]
+    fn copilot_permission_with_nothing_to_say() {
+        let mut a = test_agent(Kind::Copilot);
+        a.set_state(State::Idle, false);
+        a.on_hook(&copilot("UserPromptSubmit", None, None), false);
+        a.on_hook(&copilot("PermissionRequest", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "needs your approval"));
+        // A finished turn forgets the tool it last ran.
+        a.on_hook(&copilot("PreToolUse", Some("Bash"), Some("ls")), false);
+        a.on_hook(&copilot("Stop", None, None), false);
+        a.on_hook(&copilot("UserPromptSubmit", None, None), false);
+        a.on_hook(&copilot("PermissionRequest", None, Some("needs permission")), false);
+        assert_eq!(a.activity, "needs permission");
+        a.shutdown();
     }
 }

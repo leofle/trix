@@ -2,7 +2,7 @@
 //!
 //! Every pane gets `TRIX_SOCKET` and `TRIX_AGENT_ID` in its environment. Agents
 //! that support lifecycle hooks (Claude Code via `--settings`, Codex via
-//! `notify`, Cursor via a `--plugin-dir` plugin, OpenCode via a plugin named in
+//! `notify`, Cursor and Copilot via a `--plugin-dir` plugin, OpenCode via a plugin named in
 //! `OPENCODE_CONFIG_CONTENT`) call `trix hook <kind>`, which condenses the hook
 //! payload into one small JSON line and writes it to the socket. Nothing in the
 //! user's own agent config is modified: everything is passed per process.
@@ -63,6 +63,7 @@ pub fn sweep_stale() {
             .trim_start_matches("claude-settings-")
             .trim_start_matches("opencode-plugin-")
             .trim_start_matches("cursor-plugin-")
+            .trim_start_matches("copilot-plugin-")
             .split('.')
             .next()
             .and_then(|p| p.parse::<u32>().ok());
@@ -145,6 +146,8 @@ pub struct Integrations {
     pub opencode_plugin_dir: Option<PathBuf>,
     /// Cursor plugin directory, loaded with `cursor-agent --plugin-dir`.
     pub cursor_plugin: Option<PathBuf>,
+    /// Copilot CLI plugin directory, loaded with `copilot --plugin-dir`.
+    pub copilot_plugin: Option<PathBuf>,
     /// OpenCode takes `--standalone` (2.x). Without it, OpenCode 2 joins a
     /// background server that the first OpenCode started, with that one's
     /// environment: the plugin, the pane and the trix server it reports to.
@@ -179,6 +182,7 @@ impl Integrations {
             opencode_plugin: write_opencode_plugin(exe).ok(),
             opencode_plugin_dir: write_opencode_plugin_dir(exe).ok(),
             cursor_plugin: write_cursor_plugin(exe).ok(),
+            copilot_plugin: write_copilot_plugin(exe).ok(),
             standalone,
             themed: false,
         }
@@ -191,6 +195,7 @@ impl Integrations {
             opencode_plugin: None,
             opencode_plugin_dir: None,
             cursor_plugin: None,
+            copilot_plugin: None,
             standalone: Arc::new(OnceLock::from(standalone)),
             themed: false,
         }
@@ -212,7 +217,7 @@ impl Integrations {
         for f in [&self.claude_settings, &self.opencode_plugin].into_iter().flatten() {
             let _ = std::fs::remove_file(f);
         }
-        for d in [&self.cursor_plugin, &self.opencode_plugin_dir].into_iter().flatten() {
+        for d in [&self.cursor_plugin, &self.copilot_plugin, &self.opencode_plugin_dir].into_iter().flatten() {
             let _ = std::fs::remove_dir_all(d);
         }
     }
@@ -531,6 +536,46 @@ pub fn cursor_hooks(exe: &Path) -> Value {
     serde_json::json!({ "version": 1, "hooks": hooks })
 }
 
+/// Copilot CLI events trix listens to, by their Claude-style names: with
+/// those, Copilot sends snake_case fields and Claude's tool names (`Bash`,
+/// `Read`, `AskUserQuestion` for `ask_user`), as Claude's hooks do. Not
+/// `PermissionRequest`: it fires before Copilot's own rules decide, so for
+/// tools that never ask too. A prompt that waits on you raises
+/// `Notification` (`permission_prompt`, `elicitation_dialog`).
+pub const COPILOT_HOOK_EVENTS: [&str; 8] =
+    ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "Stop", "SessionEnd"];
+
+/// A Copilot CLI plugin holding only hooks, for `copilot --plugin-dir`.
+fn write_copilot_plugin(exe: &Path) -> anyhow::Result<PathBuf> {
+    let dir = runtime_dir().join(format!("copilot-plugin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let manifest = serde_json::json!({
+        "name": "trix",
+        "description": "Reports this agent's state to the trix pane it runs in",
+        "version": "1.0.0",
+    });
+    std::fs::write(dir.join("plugin.json"), serde_json::to_vec_pretty(&manifest)?)?;
+    std::fs::write(dir.join("hooks.json"), serde_json::to_vec_pretty(&copilot_hooks(exe))?)?;
+    Ok(dir)
+}
+
+/// Copilot denies a tool when its `PreToolUse` command fails, so the hook
+/// always succeeds, and says nothing: no output is no decision.
+pub fn copilot_hooks(exe: &Path) -> Value {
+    let command = format!("{} || true", hook_command(exe, "copilot"));
+    let hooks: serde_json::Map<String, Value> = COPILOT_HOOK_EVENTS
+        .iter()
+        .map(|e| {
+            let mut h = serde_json::json!({ "type": "command", "bash": command, "timeoutSec": 5 });
+            if e.contains("ToolUse") {
+                h["matcher"] = "*".into();
+            }
+            (e.to_string(), Value::Array(vec![h]))
+        })
+        .collect();
+    serde_json::json!({ "version": 1, "hooks": hooks })
+}
+
 /// `trix hook <source> [payload]` — runs inside the agent's process tree.
 /// Must be fast, silent and never fail loudly: the agent is waiting on it.
 pub fn run_client(source: &str, arg_payload: Option<String>) {
@@ -619,6 +664,7 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         "opencode" => return condense_opencode(agent, v),
         "cursor" => return condense_cursor(agent, v),
         "grok" => return condense_grok(agent, v),
+        "copilot" => return condense_copilot(agent, v),
         _ => {}
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
@@ -754,6 +800,36 @@ fn condense_grok(agent: u32, v: &Value) -> HookMsg {
     m
 }
 
+/// A Copilot CLI hook payload, from the Claude-style events trix's plugin
+/// asks for (`COPILOT_HOOK_EVENTS`): Claude's event, field and tool names.
+/// A subagent's hooks carry `agent_id`: its tools show, its end doesn't end
+/// the pane's turn.
+fn condense_copilot(agent: u32, v: &Value) -> HookMsg {
+    let name = text(v, "hook_event_name").unwrap_or_default();
+    let event = match name.as_str() {
+        "PostToolUseFailure" => "PostToolUse",
+        "Stop" if text(v, "agent_id").is_some() => "unknown",
+        "Notification" => match text(v, "notification_type").as_deref() {
+            Some("permission_prompt") => "PermissionRequest",
+            Some("elicitation_dialog") => "Question",
+            // Background shells and agents finishing: not this pane's turn.
+            _ => "unknown",
+        },
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd" => name.as_str(),
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "copilot", event);
+    m.session = text(v, "session_id");
+    m.tool = text(v, "tool_name");
+    m.detail = match event {
+        "PreToolUse" => v.get("tool_input").and_then(|i| tool_detail(m.tool.as_deref(), i)),
+        "UserPromptSubmit" => text(v, "prompt").map(|p| one_line(&p, 80)),
+        "PermissionRequest" | "Question" => text(v, "message").map(|m| one_line(&m, 80)),
+        _ => None,
+    };
+    m
+}
+
 /// A shell command as a string: Claude sends one; Codex may send an argv,
 /// often `["bash", "-lc", "<script>"]`, where the script is what matters.
 fn shell_command(v: Option<&Value>) -> Option<String> {
@@ -800,11 +876,13 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
         "WebFetch" | "webfetch" | "web_fetch" => g("url").map(|u| one_line(u, 50)),
         "WebSearch" | "websearch" | "web_search" => g("query").map(|q| one_line(q, 50)),
         "Task" | "Agent" | "task" => g("description").map(|d| one_line(d, 50)),
+        // Claude's take a list; Copilot's `ask_user` one question.
         "AskUserQuestion" => input
             .get("questions")
             .and_then(|q| q.get(0))
             .and_then(|q| q.get("question"))
             .and_then(Value::as_str)
+            .or(g("question"))
             .map(|q| one_line(q, 60)),
         _ => None,
     };
@@ -1181,5 +1259,68 @@ process.stdout.write(JSON.stringify(out));"#
         for ev in CURSOR_HOOK_EVENTS {
             assert_eq!(hooks[ev][0]["command"], r"'/opt/it'\''s/trix' hook cursor", "{ev}");
         }
+    }
+
+    /// As Copilot CLI 1.0.110 sent them to a `--plugin-dir` plugin's
+    /// Claude-style hooks (session start, prompt, turn end, exit), and as
+    /// its hooks reference documents the rest.
+    #[test]
+    fn condenses_copilot_hooks() {
+        let c = |v: Value| condense(7, "copilot", &v);
+        let m = c(json!({"hook_event_name":"SessionStart","session_id":"0cb916db-26aa-40f2-86b5-1ba81b225fd2","timestamp":"2026-11-13T11:53:30.371Z","cwd":"/tmp/w","source":"new","initial_prompt":"hello"}));
+        assert_eq!((m.source.as_str(), m.event.as_str(), m.session.as_deref()), ("copilot", "SessionStart", Some("0cb916db-26aa-40f2-86b5-1ba81b225fd2")));
+        let m = c(json!({"hook_event_name":"UserPromptSubmit","session_id":"s1","cwd":"/tmp/w","prompt":"fix\nthe   login"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("UserPromptSubmit", Some("fix the login")));
+        let m = c(json!({"hook_event_name":"Stop","session_id":"s1","transcript_path":"/home/u/.copilot/session-state/s1/events.jsonl","stop_reason":"end_turn","stop_hook_active":false}));
+        assert_eq!((m.event.as_str(), m.session.as_deref(), m.transcript), ("Stop", Some("s1"), None), "its log isn't Claude's: no context gauge");
+        assert_eq!(c(json!({"hook_event_name":"SessionEnd","session_id":"s1","reason":"user_exit"})).event, "SessionEnd");
+        // Claude's tool names, Copilot's arguments.
+        let m = c(json!({"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Bash","tool_input":{"command":"cargo   test","description":"Run tests"}}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PreToolUse", Some("Bash"), Some("cargo test")));
+        let m = c(json!({"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"path":"/w/src/main.rs"}}));
+        assert_eq!(m.detail.as_deref(), Some("main.rs"));
+        let m = c(json!({"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"question":"Which database?","choices":["pg","sqlite"]}}));
+        assert_eq!((m.tool.as_deref(), m.detail.as_deref()), (Some("AskUserQuestion"), Some("Which database?")));
+        assert_eq!(c(json!({"hook_event_name":"PostToolUse","tool_name":"Bash","tool_result":{"result_type":"success"}})).event, "PostToolUse");
+        assert_eq!(c(json!({"hook_event_name":"PostToolUseFailure","tool_name":"Bash","error":"denied"})).event, "PostToolUse");
+        // Waiting on you: an approval, or a dialog.
+        let m = c(json!({"hook_event_name":"Notification","session_id":"s1","message":"Copilot needs your permission","title":"Permission needed","notification_type":"permission_prompt"}));
+        assert_eq!((m.event.as_str(), m.tool, m.detail.as_deref()), ("PermissionRequest", None, Some("Copilot needs your permission")));
+        let m = c(json!({"hook_event_name":"Notification","message":"Copilot has a question","notification_type":"elicitation_dialog"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Question", Some("Copilot has a question")));
+        for t in ["shell_completed", "agent_completed", "agent_idle"] {
+            assert_eq!(c(json!({"hook_event_name":"Notification","message":"permission granted","notification_type":t})).event, "unknown", "{t}");
+        }
+        // A subagent's turn ending isn't the pane's.
+        assert_eq!(c(json!({"hook_event_name":"Stop","agent_id":"sub-1","stop_reason":"end_turn"})).event, "unknown");
+        assert_eq!(c(json!({"hook_event_name":"PermissionRequest","tool_name":"Bash"})).event, "unknown", "fires before Copilot's own rules");
+        assert_eq!(c(json!({"sessionId":"s1","toolName":"bash"})).event, "unknown");
+    }
+
+    #[test]
+    fn copilot_plugin_hooks_only_watch_and_never_fail() {
+        let h = copilot_hooks(Path::new("/opt/it's/trix"));
+        assert_eq!(h["version"], 1);
+        let hooks = h["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), COPILOT_HOOK_EVENTS.len());
+        assert!(!hooks.contains_key("PermissionRequest") && !hooks.contains_key("permissionRequest"));
+        for ev in COPILOT_HOOK_EVENTS {
+            let e = &hooks[ev][0];
+            // A failing PreToolUse command would deny the tool.
+            assert_eq!(e["bash"], r"'/opt/it'\''s/trix' hook copilot || true", "{ev}");
+            assert_eq!((e["type"].as_str(), e["timeoutSec"].as_u64()), (Some("command"), Some(5)), "{ev}");
+            assert_eq!(e.get("matcher").is_some(), ev.contains("ToolUse"), "{ev}");
+        }
+        // Claude-style names, so the payloads come in Claude's terms.
+        assert!(COPILOT_HOOK_EVENTS.iter().all(|e| e.starts_with(char::is_uppercase)));
+    }
+
+    #[test]
+    fn copilot_plugin_is_a_folder_with_a_manifest_and_hooks() {
+        let dir = write_copilot_plugin(Path::new("/bin/trix")).unwrap();
+        let read = |f: &str| serde_json::from_slice::<Value>(&std::fs::read(dir.join(f)).unwrap()).unwrap();
+        assert_eq!(read("plugin.json")["name"], "trix");
+        assert_eq!(read("hooks.json"), copilot_hooks(Path::new("/bin/trix")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

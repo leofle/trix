@@ -63,7 +63,7 @@ pub fn to_toml(name: &str, agents: &[LayoutAgent]) -> String {
     let body = toml::to_string(&LayoutFile { agents: agents.to_vec() }).unwrap_or_default();
     format!(
         "# trix layout '{name}' · `trix layout open {name}` opens these tabs again\n\
-         # kind: claude, codex, grok, opencode, cursor, shell or custom · args: extra arguments (for custom, the command)\n\
+         # kind: claude, codex, grok, opencode, cursor, copilot, shell or custom · args: extra arguments (for custom, the command)\n\
          # cwd: the folder; a relative one starts from your home folder\n\
          # session: the conversation `--resume` picks up; delete the line to always start fresh\n\n{body}"
     )

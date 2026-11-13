@@ -70,6 +70,7 @@ fn ways(kind: Kind) -> &'static [Via] {
         // Homebrew's `grok` is another program (a regex tool).
         Kind::Grok => &[Via::Mise("npm:@xai-official/grok"), Via::Npm("@xai-official/grok")],
         Kind::Cursor => &[Via::BrewCask("cursor-cli"), Via::Script("https://cursor.com/install")],
+        Kind::Copilot => &[Via::Mise("npm:@github/copilot"), Via::BrewCask("copilot-cli"), Via::Npm("@github/copilot"), Via::Script("https://gh.io/copilot-install")],
         Kind::Shell | Kind::Custom => &[],
     }
 }
@@ -251,6 +252,7 @@ mod tests {
         let p = Some(path.as_os_str());
         assert_eq!(pick(Kind::OpenCode, p), Some(Via::Brew("opencode")));
         assert_eq!(pick(Kind::Cursor, p), Some(Via::BrewCask("cursor-cli")));
+        assert_eq!(pick(Kind::Copilot, p), Some(Via::BrewCask("copilot-cli")));
         // Never Homebrew's grok, which is something else.
         assert_eq!(pick(Kind::Grok, p), Some(Via::Npm("@xai-official/grok")));
         assert_eq!(pick(Kind::Shell, p), None);
@@ -261,6 +263,7 @@ mod tests {
         let path = dir.clone().into_os_string();
         assert_eq!(pick(Kind::Grok, Some(&path)), Some(Via::Mise("npm:@xai-official/grok")));
         assert_eq!(pick(Kind::OpenCode, Some(&path)), Some(Via::Mise("opencode")));
+        assert_eq!(pick(Kind::Copilot, Some(&path)), Some(Via::Mise("npm:@github/copilot")));
         // mise has no Cursor of Omarchy's to install.
         assert_eq!(pick(Kind::Cursor, Some(&path)), Some(Via::BrewCask("cursor-cli")));
         let _ = std::fs::remove_dir_all(dir);
@@ -270,6 +273,15 @@ mod tests {
         let path = dir.clone().into_os_string();
         assert_eq!(pick(Kind::Cursor, Some(&path)), None);
         let _ = std::fs::remove_dir_all(dir);
+
+        let dir = bin_dir("pick-npm", &["npm", "curl", "bash"], &[]);
+        let path = dir.clone().into_os_string();
+        assert_eq!(pick(Kind::Copilot, Some(&path)), Some(Via::Npm("@github/copilot")));
+        let _ = std::fs::remove_dir_all(dir);
+        let dir = bin_dir("pick-script", &["curl", "bash"], &[]);
+        let path = dir.clone().into_os_string();
+        assert_eq!(pick(Kind::Copilot, Some(&path)), Some(Via::Script("https://gh.io/copilot-install")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -277,6 +289,7 @@ mod tests {
         assert_eq!(needs(Kind::Grok), "mise or npm");
         assert_eq!(needs(Kind::OpenCode), "mise, brew or npm");
         assert_eq!(needs(Kind::Cursor), "brew or curl");
+        assert_eq!(needs(Kind::Copilot), "mise, brew, npm or curl");
     }
 
     #[test]

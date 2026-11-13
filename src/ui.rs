@@ -492,6 +492,7 @@ fn kind_color(t: &Theme, k: Kind) -> Color {
         Kind::Grok => t.fg_bright,
         Kind::OpenCode => t.accent,
         Kind::Cursor => mix(t.cyan, t.magenta, 0.5),
+        Kind::Copilot => t.green,
         Kind::Shell => t.dim,
         Kind::Custom => t.magenta,
     }
@@ -1054,7 +1055,8 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         Modal::Menu(_) | Modal::Settings(_) => {}
         Modal::Search(s) => search_box(f, app, s, area, t),
         Modal::New(form) => {
-            let r = centered(area, 86, 16);
+            // Wide enough for every kind on one row.
+            let r = centered(area, 92, 16);
             f.render_widget(Clear, r);
             let block = modal_block("New agent", t);
             let inner = block.inner(r);
@@ -1929,6 +1931,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (text, app)
+    }
+
+    #[test]
+    fn the_new_agent_form_shows_every_kind() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.open_new();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .find(|r| r.contains(" claude "))
+            .expect("the kind row");
+        let labels: Vec<&str> = crate::agent::Kind::ALL.iter().map(|k| k.label()).collect();
+        assert!(row.contains(&format!(" {} ", labels.join("   "))), "{row}");
+        assert!(row.contains(" custom   ") || row.trim_end().ends_with("custom"), "nothing cut off: {row}");
     }
 
     #[test]
