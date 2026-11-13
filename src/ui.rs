@@ -709,6 +709,11 @@ fn strip_colors(app: &App, t: &Theme) -> (Color, Color) {
     (bar, text)
 }
 
+/// The strip's rounded ends (Powerline Extra's half circles), for
+/// `[ui] nerd_font = true`.
+const STRIP_CAP_LEFT: &str = "\u{e0b6}";
+const STRIP_CAP_RIGHT: &str = "\u{e0b4}";
+
 /// The bar over the focused pane's title when someone *else* is waiting
 /// on the human. It covers the title rather than taking a row, so nothing
 /// moves and no agent is resized when it comes and goes.
@@ -747,6 +752,18 @@ fn attention_strip(f: &mut Frame, app: &mut App, pane: Rect, t: &Theme) {
     };
     let st = Style::new().fg(text).bg(bg);
     let bold = st.add_modifier(Modifier::BOLD);
+    // With a Nerd Font, round its ends with Powerline's half circles, drawn
+    // in the strip's color over whatever background the title row has.
+    let r = if app.config.ui.nerd_font {
+        for (x, cap) in [(r.x, STRIP_CAP_LEFT), (r.right() - 1, STRIP_CAP_RIGHT)] {
+            if let Some(c) = buf.cell_mut((x, r.y)) {
+                c.set_symbol(cap).set_fg(bg).modifier = Modifier::empty();
+            }
+        }
+        Rect { x: r.x + 1, width: r.width - 2, ..r }
+    } else {
+        r
+    };
     for x in r.x..r.right() {
         if let Some(c) = buf.cell_mut((x, r.y)) {
             c.set_symbol(" ").set_style(st);
