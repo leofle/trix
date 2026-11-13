@@ -925,9 +925,9 @@ impl App {
         }
         // The strip's drop-in, step by step.
         if let Some((_, since)) = self.strip
-            && let Some(&ms) = crate::ui::STRIP_STEPS.iter().find(|&&ms| since.elapsed() < Duration::from_millis(ms))
+            && let Some(step) = crate::ui::next_strip_step(since.elapsed())
         {
-            take(since + Duration::from_millis(ms));
+            take(since + step);
         }
         if let Some(t) = &self.toast {
             let fade = t.at + Duration::from_millis(3200);
