@@ -119,7 +119,11 @@ impl TextInput {
 }
 
 pub struct NewForm {
-    pub kind: usize,
+    pub kind: Kind,
+    /// The kind row's main kinds (`[new] kinds`), as of opening.
+    pub main: Vec<Kind>,
+    /// "more ▸" is open: the row shows the kinds under it.
+    pub more: bool,
     pub field: usize,
     pub name: TextInput,
     pub name_touched: bool,
@@ -131,6 +135,48 @@ pub struct NewForm {
 }
 
 pub const NEW_FIELDS: [&str; 6] = ["Agent", "Folder", "Name", "Prompt", "Worktree", "Args"];
+
+impl NewForm {
+    /// The kinds under "more ▸": every one not on the main row, so a kind
+    /// trix adds later lands here until `[new] kinds` names it.
+    pub fn more_kinds(&self) -> Vec<Kind> {
+        Kind::ALL.into_iter().filter(|k| !self.main.contains(k)).collect()
+    }
+
+    /// ←→ on the kind row: the next kind along the main row and on through
+    /// more's, round at the ends. Moving onto more opens it; moving off it
+    /// folds it away.
+    fn step(&mut self, forward: bool) {
+        let all: Vec<Kind> = self.main.iter().copied().chain(self.more_kinds()).collect();
+        self.kind = crate::settings::cycle(&all, &self.kind, forward);
+        self.more = !self.main.contains(&self.kind);
+    }
+
+    /// A kind's letter picks it wherever it is, with no stop at more. One of
+    /// more's shows in its place; an open more stays open for its own.
+    fn pick(&mut self, kind: Kind) {
+        self.kind = kind;
+        self.more &= !self.main.contains(&kind);
+    }
+
+    /// What the kind row shows, left to right, with the kind each one is:
+    /// the main kinds, then "more ▸", or in its place the kind chosen when
+    /// it's one of more's (`opencode ▸`), so the choice is always in sight.
+    /// With more open, its kinds instead.
+    pub fn kind_row(&self) -> Vec<(String, Option<Kind>)> {
+        let chip = |k: Kind| (k.label().to_string(), Some(k));
+        if self.more {
+            return self.more_kinds().into_iter().map(chip).collect();
+        }
+        let mut row: Vec<_> = self.main.iter().copied().map(chip).collect();
+        if !self.main.contains(&self.kind) {
+            row.push((format!("{} ▸", self.kind.label()), Some(self.kind)));
+        } else if !self.more_kinds().is_empty() {
+            row.push(("more ▸".into(), None));
+        }
+        row
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastTarget {
@@ -885,10 +931,12 @@ impl App {
             .focused()
             .map(|a| a.live_cwd())
             .unwrap_or_else(|| self.start_dir.clone());
-        let new = self.config.new;
+        let new = &self.config.new;
         let kind = new.agent.or_else(|| state::load_prefs().last_agent.and_then(|k| Kind::from_label(&k))).unwrap_or(Kind::Claude);
         let mut f = NewForm {
-            kind: Kind::ALL.iter().position(|&k| k == kind).unwrap_or(0),
+            kind,
+            main: new.kinds.clone(),
+            more: false,
             field: 0,
             name: TextInput::default(),
             name_touched: false,
@@ -945,7 +993,7 @@ impl App {
 
     fn launch_form(&mut self) {
         let Some(Modal::New(f)) = &mut self.modal else { return };
-        let kind = Kind::ALL[f.kind];
+        let kind = f.kind;
         let mut cwd = expand(&f.dir.text);
         if !cwd.is_dir() {
             f.error = Some(format!("folder not found: {}", f.dir.text));
@@ -1952,13 +2000,17 @@ impl App {
                     KeyCode::BackTab | KeyCode::Up => f.field = (f.field + n - 1) % n,
                     _ => {}
                 }
+                // Off the kind row, more folds away, its kind in its place.
+                if f.field != 0 {
+                    f.more = false;
+                }
                 match f.field {
                     0 => match k.code {
-                        KeyCode::Left | KeyCode::Char('h') => f.kind = (f.kind + Kind::ALL.len() - 1) % Kind::ALL.len(),
-                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => f.kind = (f.kind + 1) % Kind::ALL.len(),
+                        KeyCode::Left | KeyCode::Char('h') => f.step(false),
+                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => f.step(true),
                         KeyCode::Char(c) => {
-                            if let Some(i) = Kind::from_shortcut(c).and_then(|k| Kind::ALL.iter().position(|a| *a == k)) {
-                                f.kind = i;
+                            if let Some(kind) = Kind::from_shortcut(c) {
+                                f.pick(kind);
                             }
                         }
                         _ => {}
@@ -2847,9 +2899,23 @@ mod tests {
             app.open_new();
             app.modal_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
             let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
-            assert_eq!(Kind::ALL[f.kind], kind, "{c}");
+            assert_eq!(f.kind, kind, "{c}");
+            // One of more's, straight from the main row: more stays shut, the kind in its place.
+            assert!(!f.more, "{c}");
+            assert!(f.kind_row().contains(&(if f.main.contains(&kind) { kind.label().into() } else { format!("{} ▸", kind.label()) }, Some(kind))), "{c}");
             app.modal = None;
         }
+        // In more, open: a letter moves within it, and one for the main row shuts it.
+        app.open_new();
+        let key = |app: &mut App, code| app.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Char('o'));
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert_eq!((f.kind, f.more), (Kind::OpenCode, true));
+        key(&mut app, KeyCode::Char('x'));
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert_eq!((f.kind, f.more), (Kind::Codex, false));
+        app.modal = None;
         // Letters are unique, and none is a kind-row navigation key.
         let letters: Vec<char> = Kind::ALL.iter().filter_map(|k| k.shortcut()).collect();
         assert_eq!(letters.len(), letters.iter().collect::<HashSet<_>>().len());
@@ -2906,7 +2972,7 @@ mod tests {
         app.agents.push(a);
         let tmp = std::env::temp_dir();
         let form = |name: &str, touched: bool| {
-            let mut f = NewForm { kind: Kind::ALL.iter().position(|k| *k == Kind::Custom).unwrap(), field: 0, name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
+            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
             f.args = TextInput::new("exec sleep 60");
             Modal::New(f)
         };
@@ -3377,17 +3443,82 @@ mod tests {
     fn new_agents_start_as_the_settings_say() {
         let mut app = test_app();
         let form = |app: &App| match &app.modal {
-            Some(Modal::New(f)) => (Kind::ALL[f.kind], f.worktree),
+            Some(Modal::New(f)) => (f.kind, f.worktree),
             _ => panic!("no form"),
         };
         app.open_new();
         assert_eq!(form(&app), (Kind::Claude, false));
-        app.config.new = crate::config::NewAgent { agent: Some(Kind::Grok), worktree: true };
+        app.config.new = crate::config::NewAgent { agent: Some(Kind::Grok), worktree: true, ..Default::default() };
         app.open_new();
         assert_eq!(form(&app), (Kind::Grok, true));
         app.config.new.agent = None;
         app.open_new();
         assert_eq!(form(&app).0, Kind::Claude, "none started yet: claude");
+    }
+
+    #[test]
+    fn the_kind_row_keeps_the_rest_under_more() {
+        let mut app = test_app();
+        let key = |app: &mut App, code| app.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+        let row = |app: &App| match &app.modal {
+            Some(Modal::New(f)) => (f.kind, f.more, f.kind_row().into_iter().map(|(l, _)| l).collect::<Vec<_>>().join(" ")),
+            _ => panic!("no form"),
+        };
+        app.open_new();
+        assert_eq!(row(&app), (Kind::Claude, false, "claude codex shell custom more ▸".into()));
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert_eq!(row(&app), (Kind::Custom, false, "claude codex shell custom more ▸".into()));
+        // Onto more: it opens in place, on its first kind.
+        key(&mut app, KeyCode::Right);
+        assert_eq!(row(&app), (Kind::Grok, true, "grok opencode cursor copilot".into()));
+        key(&mut app, KeyCode::Char('l'));
+        assert_eq!(row(&app).0, Kind::OpenCode);
+        // Off the row, it folds away with the kind chosen in its place.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(row(&app), (Kind::OpenCode, false, "claude codex shell custom opencode ▸".into()));
+        // Back on the row, ←→ carry on from there.
+        key(&mut app, KeyCode::BackTab);
+        key(&mut app, KeyCode::Left);
+        assert_eq!(row(&app), (Kind::Grok, true, "grok opencode cursor copilot".into()));
+        key(&mut app, KeyCode::Char('h'));
+        assert_eq!(row(&app), (Kind::Custom, false, "claude codex shell custom more ▸".into()), "back out of more");
+        // Round at the ends: from claude to more's last, and from it to claude.
+        key(&mut app, KeyCode::Char('c'));
+        key(&mut app, KeyCode::Left);
+        assert_eq!(row(&app), (Kind::Copilot, true, "grok opencode cursor copilot".into()));
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(row(&app), (Kind::Claude, false, "claude codex shell custom more ▸".into()));
+        // Enter launches the kind chosen, one of more's too.
+        let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+        f.kind = Kind::OpenCode;
+        f.dir = TextInput::new("/nonexistent-folder");
+        key(&mut app, KeyCode::Enter);
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert_eq!((f.kind, f.error.as_deref()), (Kind::OpenCode, Some("folder not found: /nonexistent-folder")), "it tried to launch");
+
+        // Opening on one of more's ([new] agent, or the one started last):
+        // in sight from the start.
+        app.config.new.agent = Some(Kind::OpenCode);
+        app.open_new();
+        assert_eq!(row(&app), (Kind::OpenCode, false, "claude codex shell custom opencode ▸".into()));
+
+        // [new] kinds picks the main row, in its order; the rest, any kind
+        // added later among them, are more's.
+        app.config.new = crate::config::parse("[new]\nkinds = [\"claude\", \"codex\", \"opencode\", \"shell\"]\nagent = \"custom\"\n", Path::new("/")).unwrap().new;
+        app.open_new();
+        assert_eq!(row(&app), (Kind::Custom, false, "claude codex opencode shell custom ▸".into()));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(row(&app), (Kind::Claude, false, "claude codex opencode shell more ▸".into()), "custom was more's last");
+        let Some(Modal::New(f)) = &app.modal else { panic!("no form") };
+        assert_eq!(f.more_kinds(), [Kind::Grok, Kind::Cursor, Kind::Copilot, Kind::Custom]);
+        // Every kind on the main row: nothing under more.
+        app.config.new.kinds = Kind::ALL.to_vec();
+        app.open_new();
+        assert_eq!(row(&app), (Kind::Custom, false, "claude codex grok opencode cursor copilot shell custom".into()));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(row(&app), (Kind::Claude, false, "claude codex grok opencode cursor copilot shell custom".into()), "round, with no more to open");
     }
 
     #[test]

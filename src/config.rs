@@ -27,17 +27,20 @@ pub struct Config {
 }
 
 /// alt+n's form, as it opens.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewAgent {
     /// The agent it's on. `None`: the one started last.
     pub agent: Option<crate::agent::Kind>,
     /// "Worktree" ticked already.
     pub worktree: bool,
+    /// The kinds on its main row, in order. The rest wait under "more ▸".
+    pub kinds: Vec<crate::agent::Kind>,
 }
 
 impl Default for NewAgent {
     fn default() -> NewAgent {
-        NewAgent { agent: Some(crate::agent::Kind::Claude), worktree: false }
+        use crate::agent::Kind;
+        NewAgent { agent: Some(Kind::Claude), worktree: false, kinds: vec![Kind::Claude, Kind::Codex, Kind::Shell, Kind::Custom] }
     }
 }
 
@@ -208,6 +211,7 @@ struct File {
 struct FileNew {
     agent: Option<String>,
     worktree: Option<bool>,
+    kinds: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -301,16 +305,28 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         text: f.strip.text.as_deref().map(|s| paint("strip.text", s)).transpose()?,
     };
     use crate::agent::Kind;
+    let names = Kind::ALL.iter().map(|k| k.label()).collect::<Vec<_>>().join(", ");
     let new = NewAgent {
         agent: match f.new.agent.as_deref().map(str::trim) {
             None => Some(Kind::Claude),
             Some("last") => None,
-            Some(s) => {
-                let names: Vec<&str> = Kind::ALL.iter().map(|k| k.label()).collect();
-                Some(Kind::from_label(s).ok_or_else(|| format!("new.agent: '{s}' is not an agent ({}, or last)", names.join(", ")))?)
-            }
+            Some(s) => Some(Kind::from_label(s).ok_or_else(|| format!("new.agent: '{s}' is not an agent ({names}, or last)"))?),
         },
         worktree: f.new.worktree.unwrap_or(false),
+        kinds: match f.new.kinds {
+            None => NewAgent::default().kinds,
+            Some(list) => {
+                let mut kinds = Vec::new();
+                for s in list.iter().map(|s| s.trim()) {
+                    let k = Kind::from_label(s).ok_or_else(|| format!("new.kinds: '{s}' is not an agent ({names})"))?;
+                    if kinds.contains(&k) {
+                        return Err(format!("new.kinds: '{s}' is named twice"));
+                    }
+                    kinds.push(k);
+                }
+                kinds
+            }
+        },
     };
     let theme = ThemeOpts { panes: f.theme.panes.unwrap_or(true) };
     let restore = match f.workspace.restore.as_deref().map(str::trim) {
@@ -783,6 +799,20 @@ mod tests {
         assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
         assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));
         assert!(read("[theme]\nfile = \"x\"\n").is_err(), "unknown keys are mistakes, as everywhere");
+    }
+
+    #[test]
+    fn the_forms_main_row() {
+        use crate::agent::Kind;
+        let kinds = |text: &str| parse(text, Path::new("/")).map(|c| c.new.kinds);
+        assert_eq!(kinds("").unwrap(), [Kind::Claude, Kind::Codex, Kind::Shell, Kind::Custom]);
+        assert_eq!(kinds("[new]\nkinds = [\"claude\", \"codex\", \"opencode\", \"shell\"]\n").unwrap(), [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Shell]);
+        assert_eq!(kinds("[new]\nkinds = [\"copilot\", \" grok \"]\n").unwrap(), [Kind::Copilot, Kind::Grok], "in your order");
+        assert_eq!(kinds("[new]\nkinds = []\n").unwrap(), [], "all of them under more");
+        let e = kinds("[new]\nkinds = [\"claude\", \"gpt\"]\n").unwrap_err();
+        assert_eq!(e, "new.kinds: 'gpt' is not an agent (claude, codex, grok, opencode, cursor, copilot, shell, custom)");
+        assert_eq!(kinds("[new]\nkinds = [\"codex\", \"codex\"]\n").unwrap_err(), "new.kinds: 'codex' is named twice");
+        assert!(kinds("[new]\nkinds = \"claude\"\n").unwrap_err().starts_with("line 2:"), "a list, not one name");
     }
 
     #[test]

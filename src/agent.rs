@@ -75,8 +75,8 @@ impl Kind {
     fn reads_prompts_on_screen(self) -> bool {
         self.prompts_only_on_screen() || self == Kind::OpenCode
     }
-    /// The new-agent dialog's letter for this kind. Not `h` or `l`, which
-    /// step through the kinds.
+    /// The new-agent dialog's letter for this kind, on its main row or under
+    /// "more ▸". Not `h` or `l`, which step through the kinds.
     pub fn shortcut(self) -> Option<char> {
         match self {
             Kind::Claude => Some('c'),
