@@ -12,6 +12,13 @@ on:
       tag:
         description: Tag to build and attach archives to (e.g. v1.0.0)
         required: true
+  # Bump and release runs it after pushing a tag, since a tag pushed by
+  # a workflow doesn't start other workflows on its own.
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
 
 permissions:
   contents: write

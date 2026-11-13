@@ -1,0 +1,73 @@
+name: Bump and release
+
+# One click from the Actions tab: test master, raise the version in
+# Cargo.toml, commit it, tag it, and run the release, which builds the
+# archives and updates Homebrew.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  bump:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Work out the new version
+        id: version
+        run: |
+          old=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          IFS=. read -r major minor patch <<< "$old"
+          case "${{ inputs.bump }}" in
+            major) new="$((major + 1)).0.0" ;;
+            minor) new="$major.$((minor + 1)).0" ;;
+            patch) new="$major.$minor.$((patch + 1))" ;;
+          esac
+          if git ls-remote --exit-code --tags origin "v$new" >/dev/null; then
+            echo "::error::v$new is already tagged"
+            exit 1
+          fi
+          echo "Raising $old to $new"
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+      - name: Commit and tag it
+        env:
+          OLD: ${{ steps.version.outputs.old }}
+          NEW: ${{ steps.version.outputs.new }}
+        run: |
+          sed -i "0,/^version = \"$OLD\"/s//version = \"$NEW\"/" Cargo.toml
+          sed -i "/^name = \"trix\"$/{n;s/^version = \"$OLD\"/version = \"$NEW\"/}" Cargo.lock
+          git diff --stat
+          [ "$(git diff --numstat | wc -l)" = 2 ] || { echo "::error::expected Cargo.toml and Cargo.lock to change"; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Version $NEW"
+          git tag "v$NEW"
+          git push origin HEAD:master "v$NEW"
+
+  release:
+    needs: bump
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+    secrets: inherit
