@@ -166,19 +166,50 @@ fn feed(cmd: &mut Command, input: Vec<u8>) {
     reap(child);
 }
 
-/// A desktop notification. `urgent` ones should stay until seen.
+/// A desktop notification with trix's icon. `urgent` ones should stay until
+/// seen.
 pub fn notify(title: &str, body: &str, urgent: bool) {
-    if cfg!(target_os = "macos") {
-        // Title and body go in as arguments, never into the script's text.
-        let script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
-        if let Ok(c) = quiet(Command::new("osascript").args(["-e", script, title, body])).spawn() {
-            reap(c);
-        }
+    // Tests notify too: never on the desktop of the person running them.
+    if cfg!(test) {
         return;
     }
-    let urgency = if urgent { "critical" } else { "normal" };
-    if let Ok(c) = quiet(Command::new("notify-send").args(["-a", "trix", "-u", urgency, title, body])).spawn() {
-        reap(c);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = urgent;
+        let (title, body) = (title.to_string(), body.to_string());
+        // From trix.app, which may need making first, so off the main thread.
+        std::thread::spawn(move || {
+            if !crate::notifier::post(&title, &body) {
+                osascript_notify(&title, &body);
+            }
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        const ICON: &[u8] = include_bytes!("../assets/trix.png");
+        // notify-send takes the icon as a file: keep one next to the sockets.
+        let icon = crate::hooks::runtime_dir().join("trix.png");
+        if std::fs::metadata(&icon).map(|m| m.len()).ok() != Some(ICON.len() as u64) {
+            let _ = std::fs::write(&icon, ICON);
+        }
+        let mut cmd = Command::new("notify-send");
+        cmd.args(["-a", "trix", "-u", if urgent { "critical" } else { "normal" }]);
+        if icon.is_file() {
+            cmd.arg("-i").arg(&icon);
+        }
+        if let Ok(c) = quiet(cmd.args([title, body])).spawn() {
+            reap(c);
+        }
+    }
+}
+
+/// A notification from Script Editor, when trix.app can't post it.
+#[cfg(target_os = "macos")]
+fn osascript_notify(title: &str, body: &str) {
+    // Title and body go in as arguments, never into the script's text.
+    let script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
+    if let Ok(mut c) = quiet(Command::new("osascript").args(["-e", script, title, body])).spawn() {
+        let _ = c.wait();
     }
 }
 
