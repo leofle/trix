@@ -653,6 +653,24 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
 /// edge first, then the whole bar, flashing bright and settling.
 pub const STRIP_STEPS: [u64; 3] = [90, 180, 270];
 
+/// The strip's background `ms` after it appeared: none while only its
+/// lower edge shows, then `bar`, flashing bright and settling.
+pub fn strip_bg(bar: Color, ms: u64) -> Option<Color> {
+    let white = Color::Rgb(255, 255, 255);
+    match ms {
+        ms if ms < STRIP_STEPS[0] => None,
+        ms if ms < STRIP_STEPS[1] => Some(mix(bar, white, 0.45)),
+        ms if ms < STRIP_STEPS[2] => Some(mix(bar, white, 0.2)),
+        _ => Some(bar),
+    }
+}
+
+/// How long after it appeared the strip, `age` old now, steps next. None
+/// once it has settled.
+pub fn next_strip_step(age: Duration) -> Option<Duration> {
+    STRIP_STEPS.iter().map(|&ms| Duration::from_millis(ms)).find(|&at| age < at)
+}
+
 /// A config color, as this theme has it.
 fn paint(t: &Theme, p: crate::config::Paint) -> Color {
     match p {
@@ -699,9 +717,8 @@ fn attention_strip(f: &mut Frame, app: &mut App, pane: Rect, t: &Theme) {
     app.hits.strip = Some((r, id));
 
     let (bar, text) = strip_colors(app, t);
-    let ms = since.elapsed().as_millis() as u64;
     let buf = f.buffer_mut();
-    if ms < STRIP_STEPS[0] {
+    let Some(bg) = strip_bg(bar, since.elapsed().as_millis() as u64) else {
         // Its lower edge, coming down over the title.
         for x in r.x..r.right() {
             if let Some(c) = buf.cell_mut((x, r.y)) {
@@ -709,9 +726,7 @@ fn attention_strip(f: &mut Frame, app: &mut App, pane: Rect, t: &Theme) {
             }
         }
         return;
-    }
-    let white = Color::Rgb(255, 255, 255);
-    let bg = if ms < STRIP_STEPS[1] { mix(bar, white, 0.45) } else if ms < STRIP_STEPS[2] { mix(bar, white, 0.2) } else { bar };
+    };
     let st = Style::new().fg(text).bg(bg);
     let bold = st.add_modifier(Modifier::BOLD);
     for x in r.x..r.right() {
@@ -2048,6 +2063,21 @@ mod tests {
     }
 
     #[test]
+    fn the_strip_steps_by_its_age() {
+        let (bar, white) = (Color::Rgb(0xf7, 0x76, 0x8e), Color::Rgb(255, 255, 255));
+        assert_eq!((strip_bg(bar, 0), strip_bg(bar, 89)), (None, None), "its lower edge only");
+        for ms in [90, 179] {
+            assert_eq!(strip_bg(bar, ms), Some(mix(bar, white, 0.45)), "{ms}: flashing bright");
+        }
+        for ms in [180, 269] {
+            assert_eq!(strip_bg(bar, ms), Some(mix(bar, white, 0.2)), "{ms}: settling");
+        }
+        assert_eq!((strip_bg(bar, 270), strip_bg(bar, 60_000)), (Some(bar), Some(bar)), "settled");
+        let step = |ms| next_strip_step(Duration::from_millis(ms)).map(|d| d.as_millis());
+        assert_eq!([step(0), step(89), step(90), step(269), step(270), step(5000)], [Some(90), Some(90), Some(180), Some(270), None, None]);
+    }
+
+    #[test]
     fn the_strip_drops_over_the_title_and_moves_nothing() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
@@ -2079,18 +2109,28 @@ mod tests {
         assert_eq!(app.pane_size, size, "the pane keeps its size");
         assert!((r.x..r.right()).all(|x| b[(x, r.y)].symbol() == "▀" && b[(x, r.y)].fg == t.red), "{}", row(&b, r.y));
         assert!(app.next_frame_change().is_some_and(|n| n <= Instant::now() + Duration::from_millis(90)), "the next step is due");
-        // Then the bar, flashing and settling.
+        // Then the bar, flashing: the step for its age as the frame was
+        // drawn, which a slow machine reaches a step later
+        // (`the_strip_steps_by_its_age` has each step's color).
         let since = |ms| Instant::now().checked_sub(Duration::from_millis(ms)).unwrap();
-        app.strip = Some((2, since(120)));
+        let shown = since(120);
+        app.strip = Some((2, shown));
+        let age = || shown.elapsed().as_millis() as u64;
+        let before = age();
         let b = frame(&mut app);
-        assert_eq!(b[(r.x + 1, r.y)].bg, mix(t.red, Color::Rgb(255, 255, 255), 0.45));
-        app.strip = Some((2, since(1000)));
+        let (after, bg) = (age(), b[(r.x + 1, r.y)].bg);
+        assert!((before..=after).any(|ms| strip_bg(t.red, ms) == Some(bg)), "{bg:?} is no step of {before}..={after} ms");
+        // And settled.
+        let shown = since(1000);
+        app.strip = Some((2, shown));
         let b = frame(&mut app);
         let line = row(&b, r.y);
         println!("{}\n{}\n{}", row(&b, 0), line, row(&b, r.y + 1));
         assert!(line.contains("▲ api (2)  approve Bash rm -rf dist · ") && line.contains("alt+a  jump"), "{line}");
         assert_eq!((b[(r.x + 1, r.y)].bg, b[(r.x + 1, r.y)].fg), (t.red, t.bg), "the theme's red, dark text");
-        assert!(app.next_frame_change().is_none_or(|n| n > Instant::now() + Duration::from_millis(200)), "settled: no more steps");
+        // Nothing more for the strip to draw. (The waiting agent's ▲ still
+        // blinks, on the app's own clock.)
+        assert_eq!(next_strip_step(shown.elapsed()), None, "settled: no more steps");
         // A second agent waiting.
         app.agents[2].set_state(State::Blocked, false);
         assert!(row(&frame(&mut app), r.y).contains("+1 more"));
