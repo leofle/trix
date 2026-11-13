@@ -150,6 +150,9 @@ pub struct Integrations {
     /// environment: the plugin, the pane and the trix server it reports to.
     /// Read with `opencode_standalone()`.
     pub standalone: Arc<OnceLock<bool>>,
+    /// trix paints the panes with a theme of its own: Grok and OpenCode are
+    /// started with their themes that take the terminal's colors.
+    pub themed: bool,
 }
 
 /// Nothing written, and OpenCode taken for 1.x (tests).
@@ -177,6 +180,7 @@ impl Integrations {
             opencode_plugin_dir: write_opencode_plugin_dir(exe).ok(),
             cursor_plugin: write_cursor_plugin(exe).ok(),
             standalone,
+            themed: false,
         }
     }
 
@@ -188,6 +192,7 @@ impl Integrations {
             opencode_plugin_dir: None,
             cursor_plugin: None,
             standalone: Arc::new(OnceLock::from(standalone)),
+            themed: false,
         }
     }
 

@@ -128,6 +128,7 @@ impl EventListener for Listener {
             TermEvent::Bell => AppEvent::Bell(self.id),
             TermEvent::ChildExit(status) => AppEvent::Exit(self.id, status.code()),
             TermEvent::ClipboardStore(_, s) => AppEvent::Clipboard(s),
+            TermEvent::ColorRequest(index, f) => AppEvent::ColorRequest(self.id, index, f),
             TermEvent::TextAreaSizeRequest(f) => {
                 // Respond with an approximate cell size; good enough for apps that ask.
                 AppEvent::PtyWriteFn(self.id, f)
@@ -335,6 +336,9 @@ impl Agent {
             if let Some(c) = integrations.opencode_plugin_for_version().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
                 env.insert("OPENCODE_CONFIG_CONTENT".into(), c);
             }
+        }
+        for (k, v) in theme_env(spec.kind, integrations.themed, |k| std::env::var_os(k).is_some()) {
+            env.insert(k.into(), v.into());
         }
 
         let opts = tty::Options {
@@ -1177,6 +1181,21 @@ fn window_size((cols, lines): (u16, u16)) -> WindowSize {
     WindowSize { num_cols: cols, num_lines: lines, cell_width: 9, cell_height: 18 }
 }
 
+/// What an agent is started with while trix paints the panes with a theme
+/// of its own (`themed`): Grok's and OpenCode's themes that take the
+/// terminal's colors, the ones trix paints. Claude's is in its settings
+/// overlay. A variable already `set` in trix's environment is the user's
+/// choice, and stays.
+fn theme_env(kind: Kind, themed: bool, set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    let ask: &[(&'static str, &'static str)] = match (themed, kind) {
+        // The terminal theme is still rolling out: the flag turns it on.
+        (true, Kind::Grok) => &[("GROK_THEME", "terminal"), ("GROK_TERMINAL_THEME", "1")],
+        (true, Kind::OpenCode) => &[("OPENCODE_CLI_CONFIG_CONTENT", r#"{"theme":{"name":"system"}}"#)],
+        _ => &[],
+    };
+    ask.iter().copied().filter(|(k, _)| !set(k)).collect()
+}
+
 /// Split user-typed extra flags the way a shell would, so quoted values like
 /// `--append-system-prompt "be terse"` stay one argument.
 fn split_args(s: &str) -> Vec<String> {
@@ -1329,6 +1348,12 @@ fn push_prompt(args: &mut Vec<String>, prompt: &str) {
 #[cfg(test)]
 pub(crate) fn test_agent(kind: Kind) -> Agent {
     let (tx, _rx) = std::sync::mpsc::channel();
+    test_agent_on(kind, tx)
+}
+
+/// `test_agent`, its events sent to `tx`.
+#[cfg(test)]
+pub(crate) fn test_agent_on(kind: Kind, tx: Sender<AppEvent>) -> Agent {
     let spec = Spawn {
         kind: Kind::Custom,
         name: "t".into(),
@@ -2013,6 +2038,56 @@ mod tests {
             opencode_plugin_dir: Some("/run/opencode-plugin-1".into()),
             cursor_plugin: Some("/run/cursor-plugin-1".into()),
             ..Integrations::with_standalone(opencode_standalone)
+        }
+    }
+
+    #[test]
+    fn grok_and_opencode_take_the_painted_colors() {
+        let none = |_: &str| false;
+        assert_eq!(theme_env(Kind::Grok, true, none), [("GROK_THEME", "terminal"), ("GROK_TERMINAL_THEME", "1")]);
+        assert_eq!(theme_env(Kind::OpenCode, true, none), [("OPENCODE_CLI_CONFIG_CONTENT", r#"{"theme":{"name":"system"}}"#)]);
+        assert!(theme_env(Kind::Claude, true, none).is_empty(), "Claude's is in its settings overlay");
+        assert!(theme_env(Kind::Shell, true, none).is_empty());
+        assert!(theme_env(Kind::Grok, false, none).is_empty(), "no theme of trix's own: their own themes");
+        let theirs = |k: &str| k == "GROK_THEME";
+        assert_eq!(theme_env(Kind::Grok, true, theirs), [("GROK_TERMINAL_THEME", "1")], "the user's GROK_THEME stays");
+    }
+
+    #[test]
+    fn a_program_asking_its_colors_hears_the_theme() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx_agent = tx.clone();
+        let mut app = crate::app::App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        let a = test_agent_on(Kind::OpenCode, tx_agent);
+        let id = a.id;
+        app.agents.push(a);
+        let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        // Ask the background, then set color 1 and ask it: answered from what the program set.
+        let ask = |p: &mut alacritty_terminal::vte::ansi::Processor, app: &crate::app::App, q: &[u8]| p.advance(&mut *app.agents[0].term.lock(), q);
+        let answers = |app: &mut crate::app::App| {
+            let mut out = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let crate::app::AppEvent::ColorRequest(i, index, f) = &ev {
+                    assert_eq!(*i, id);
+                    out.push((*index, app.pane_color(0, *index).map(|c| f(c))));
+                }
+            }
+            out
+        };
+        app.theme_source = crate::theme::Source::Builtin;
+        ask(&mut p, &app, b"\x1b]11;?\x07");
+        assert_eq!(answers(&mut app), [(257, None)], "no theme file: no answer, as before");
+        app.theme_source = crate::theme::Source::File("/x/colors.toml".into());
+        app.theme = crate::theme::Theme::default();
+        ask(&mut p, &app, b"\x1b]11;?\x07\x1b]10;?\x1b\\");
+        assert_eq!(
+            answers(&mut app),
+            [(257, Some("\x1b]11;rgb:1a1a/1b1b/2626\x07".to_string())), (256, Some("\x1b]10;rgb:a9a9/b1b1/d6d6\x1b\\".to_string()))]
+        );
+        ask(&mut p, &app, b"\x1b]4;1;rgb:12/34/56\x07\x1b]4;1;?\x07");
+        assert_eq!(answers(&mut app), [(1, Some("\x1b]4;1;rgb:1212/3434/5656\x07".to_string()))], "a color it set itself");
+        for a in &app.agents {
+            a.shutdown();
         }
     }
 
