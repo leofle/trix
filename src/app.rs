@@ -2977,7 +2977,7 @@ mod tests {
     #[test]
     fn kind_letters_pick_their_kind() {
         let mut app = test_app();
-        for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('p', Kind::Copilot), ('s', Kind::Shell)] {
+        for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('p', Kind::Copilot), ('m', Kind::Muse), ('s', Kind::Shell)] {
             app.open_new();
             app.modal_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
             let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
@@ -3558,7 +3558,7 @@ mod tests {
         assert_eq!(row(&app), (Kind::Custom, false, "claude codex shell custom more ▸".into()));
         // Onto more: it opens in place, on its first kind.
         key(&mut app, KeyCode::Right);
-        assert_eq!(row(&app), (Kind::Grok, true, "grok opencode cursor copilot".into()));
+        assert_eq!(row(&app), (Kind::Grok, true, "grok opencode cursor copilot muse".into()));
         key(&mut app, KeyCode::Char('l'));
         assert_eq!(row(&app).0, Kind::OpenCode);
         // Off the row, it folds away with the kind chosen in its place.
@@ -3567,13 +3567,13 @@ mod tests {
         // Back on the row, ←→ carry on from there.
         key(&mut app, KeyCode::BackTab);
         key(&mut app, KeyCode::Left);
-        assert_eq!(row(&app), (Kind::Grok, true, "grok opencode cursor copilot".into()));
+        assert_eq!(row(&app), (Kind::Grok, true, "grok opencode cursor copilot muse".into()));
         key(&mut app, KeyCode::Char('h'));
         assert_eq!(row(&app), (Kind::Custom, false, "claude codex shell custom more ▸".into()), "back out of more");
         // Round at the ends: from claude to more's last, and from it to claude.
         key(&mut app, KeyCode::Char('c'));
         key(&mut app, KeyCode::Left);
-        assert_eq!(row(&app), (Kind::Copilot, true, "grok opencode cursor copilot".into()));
+        assert_eq!(row(&app), (Kind::Muse, true, "grok opencode cursor copilot muse".into()));
         key(&mut app, KeyCode::Char(' '));
         assert_eq!(row(&app), (Kind::Claude, false, "claude codex shell custom more ▸".into()));
         // Enter launches the kind chosen, one of more's too.
@@ -3598,13 +3598,13 @@ mod tests {
         key(&mut app, KeyCode::Right);
         assert_eq!(row(&app), (Kind::Claude, false, "claude codex opencode shell more ▸".into()), "custom was more's last");
         let Some(Modal::New(f)) = &app.modal else { panic!("no form") };
-        assert_eq!(f.more_kinds(), [Kind::Grok, Kind::Cursor, Kind::Copilot, Kind::Custom]);
+        assert_eq!(f.more_kinds(), [Kind::Grok, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Custom]);
         // Every kind on the main row: nothing under more.
         app.config.new.kinds = Kind::ALL.to_vec();
         app.open_new();
-        assert_eq!(row(&app), (Kind::Custom, false, "claude codex grok opencode cursor copilot shell custom".into()));
+        assert_eq!(row(&app), (Kind::Custom, false, "claude codex grok opencode cursor copilot muse shell custom".into()));
         key(&mut app, KeyCode::Right);
-        assert_eq!(row(&app), (Kind::Claude, false, "claude codex grok opencode cursor copilot shell custom".into()), "round, with no more to open");
+        assert_eq!(row(&app), (Kind::Claude, false, "claude codex grok opencode cursor copilot muse shell custom".into()), "round, with no more to open");
     }
 
     #[test]

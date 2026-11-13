@@ -3,7 +3,8 @@
 //! Every pane gets `TRIX_SOCKET` and `TRIX_AGENT_ID` in its environment. Agents
 //! that support lifecycle hooks (Claude Code via `--settings`, Codex via
 //! `notify`, Cursor and Copilot via a `--plugin-dir` plugin, OpenCode via a plugin named in
-//! `OPENCODE_CONFIG_CONTENT`) call `trix hook <kind>`, which condenses the hook
+//! `OPENCODE_CONFIG_CONTENT`, Muse via a managed hooks file named with `-c`)
+//! call `trix hook <kind>`, which condenses the hook
 //! payload into one small JSON line and writes it to the socket. Nothing in the
 //! user's own agent config is modified: everything is passed per process.
 
@@ -64,6 +65,7 @@ pub fn sweep_stale() {
             .trim_start_matches("opencode-plugin-")
             .trim_start_matches("cursor-plugin-")
             .trim_start_matches("copilot-plugin-")
+            .trim_start_matches("muse-hooks-")
             .split('.')
             .next()
             .and_then(|p| p.parse::<u32>().ok());
@@ -148,6 +150,9 @@ pub struct Integrations {
     pub cursor_plugin: Option<PathBuf>,
     /// Copilot CLI plugin directory, loaded with `copilot --plugin-dir`.
     pub copilot_plugin: Option<PathBuf>,
+    /// Muse Code managed hooks file, named with `muse -c
+    /// managed_hooks_path=…`.
+    pub muse_hooks: Option<PathBuf>,
     /// OpenCode takes `--standalone` (2.x). Without it, OpenCode 2 joins a
     /// background server that the first OpenCode started, with that one's
     /// environment: the plugin, the pane and the trix server it reports to.
@@ -183,6 +188,7 @@ impl Integrations {
             opencode_plugin_dir: write_opencode_plugin_dir(exe).ok(),
             cursor_plugin: write_cursor_plugin(exe).ok(),
             copilot_plugin: write_copilot_plugin(exe).ok(),
+            muse_hooks: write_muse_hooks(exe).ok(),
             standalone,
             themed: false,
         }
@@ -196,6 +202,7 @@ impl Integrations {
             opencode_plugin_dir: None,
             cursor_plugin: None,
             copilot_plugin: None,
+            muse_hooks: None,
             standalone: Arc::new(OnceLock::from(standalone)),
             themed: false,
         }
@@ -214,7 +221,7 @@ impl Integrations {
     }
 
     pub fn remove(&self) {
-        for f in [&self.claude_settings, &self.opencode_plugin].into_iter().flatten() {
+        for f in [&self.claude_settings, &self.opencode_plugin, &self.muse_hooks].into_iter().flatten() {
             let _ = std::fs::remove_file(f);
         }
         for d in [&self.cursor_plugin, &self.copilot_plugin, &self.opencode_plugin_dir].into_iter().flatten() {
@@ -576,6 +583,41 @@ pub fn copilot_hooks(exe: &Path) -> Value {
     serde_json::json!({ "version": 1, "hooks": hooks })
 }
 
+/// Muse Code events trix listens to. Muse names its hooks and their fields
+/// as Claude does, with its own tool names (`bash`, `read_file`,
+/// `request_user_input`…). Not `PermissionRequest`: what waits on you is
+/// the `Notification` Muse raises when it asks you (`permission_prompt`,
+/// "Muse Code needs approval"), and its approval judge, on by default,
+/// settles many calls without asking. Nor `SubagentStart`/`SubagentStop`,
+/// or the model calls: Muse runs reminder subagents after each turn ends.
+pub const MUSE_HOOK_EVENTS: [&str; 9] =
+    ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "Stop", "StopFailure", "SessionEnd"];
+
+/// Muse's managed hooks file, for `muse -c managed_hooks_path=…`: a hook
+/// source of its own, so the hooks in your Muse settings still run.
+fn write_muse_hooks(exe: &Path) -> anyhow::Result<PathBuf> {
+    let path = runtime_dir().join(format!("muse-hooks-{}.json", std::process::id()));
+    std::fs::write(&path, serde_json::to_vec_pretty(&muse_hooks(exe))?)?;
+    Ok(path)
+}
+
+/// In Claude's format, which Muse reads. The hook only watches: it always
+/// succeeds and prints nothing, so it never decides anything.
+pub fn muse_hooks(exe: &Path) -> Value {
+    let command = format!("{} || true", hook_command(exe, "muse"));
+    let hooks: serde_json::Map<String, Value> = MUSE_HOOK_EVENTS
+        .iter()
+        .map(|e| {
+            let mut entry = serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 5 }] });
+            if e.contains("ToolUse") {
+                entry["matcher"] = "*".into();
+            }
+            (e.to_string(), Value::Array(vec![entry]))
+        })
+        .collect();
+    serde_json::json!({ "hooks": hooks })
+}
+
 /// `trix hook <source> [payload]` — runs inside the agent's process tree.
 /// Must be fast, silent and never fail loudly: the agent is waiting on it.
 pub fn run_client(source: &str, arg_payload: Option<String>) {
@@ -665,6 +707,7 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         "cursor" => return condense_cursor(agent, v),
         "grok" => return condense_grok(agent, v),
         "copilot" => return condense_copilot(agent, v),
+        "muse" => return condense_muse(agent, v, std::env::var("MUSE_SESSION_ID").ok().as_deref()),
         _ => {}
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
@@ -830,6 +873,44 @@ fn condense_copilot(agent: u32, v: &Value) -> HookMsg {
     m
 }
 
+/// A Muse Code hook payload, from the events trix's managed hooks ask for
+/// (`MUSE_HOOK_EVENTS`). `pane` is `MUSE_SESSION_ID`, which Muse puts in
+/// every hook's environment: the session the pane is in. A subagent's hook
+/// carries its own `session_id` (Muse Code 1.4.18): its tools aren't the
+/// pane's turn, and Muse runs its reminder subagents once a turn has ended.
+/// Its approvals still wait on you.
+fn condense_muse(agent: u32, v: &Value, pane: Option<&str>) -> HookMsg {
+    let name = text(v, "hook_event_name").unwrap_or_default();
+    let own = text(v, "session_id");
+    let pane = pane.filter(|p| !p.is_empty()).map(str::to_string);
+    let subagent = matches!((&pane, &own), (Some(p), Some(o)) if p != o);
+    let event = match name.as_str() {
+        "Notification" => match text(v, "notification_type").as_deref() {
+            Some("permission_prompt") => "PermissionRequest",
+            Some("question_prompt") => "Question",
+            _ => "unknown",
+        },
+        _ if subagent => "unknown",
+        "PostToolUseFailure" => "PostToolUse",
+        // A turn that ended in a model failure still ended.
+        "StopFailure" => "Stop",
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Stop" | "SessionEnd" => name.as_str(),
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "muse", event);
+    m.session = pane.or(own);
+    // Its question tool asks what Claude's `AskUserQuestion` does, in the
+    // same shape: one to three `questions`, each with its `question`.
+    m.tool = text(v, "tool_name").map(|t| if t == "request_user_input" { "AskUserQuestion".into() } else { t });
+    m.detail = match event {
+        "PreToolUse" => v.get("tool_input").and_then(|i| tool_detail(m.tool.as_deref(), i)),
+        "UserPromptSubmit" => text(v, "prompt").map(|p| one_line(&p, 80)),
+        "PermissionRequest" | "Question" => text(v, "message").map(|m| one_line(&m, 80)),
+        _ => None,
+    };
+    m
+}
+
 /// A shell command as a string: Claude sends one; Codex may send an argv,
 /// often `["bash", "-lc", "<script>"]`, where the script is what matters.
 fn shell_command(v: Option<&Value>) -> Option<String> {
@@ -868,11 +949,12 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             g("file_path").or(g("notebook_path")).or(g("path")).map(base)
         }
-        // OpenCode's file tools, Grok's and Cursor's own.
-        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "search_replace" | "StrReplace" | "Delete" => {
+        // OpenCode's file tools, Grok's, Cursor's and Muse's own.
+        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "edit_file" | "search_replace" | "StrReplace" | "Delete" => {
             g("filePath").or(g("file_path")).or(g("path")).or(g("target_file")).map(base)
         }
-        "Grep" | "Glob" | "grep" | "glob" => g("pattern").map(|p| one_line(p, 40)),
+        // Muse's `search` is ripgrep.
+        "Grep" | "Glob" | "grep" | "glob" | "search" => g("pattern").map(|p| one_line(p, 40)),
         "WebFetch" | "webfetch" | "web_fetch" => g("url").map(|u| one_line(u, 50)),
         "WebSearch" | "websearch" | "web_search" => g("query").map(|q| one_line(q, 50)),
         "Task" | "Agent" | "task" => g("description").map(|d| one_line(d, 50)),
@@ -1322,5 +1404,83 @@ process.stdout.write(JSON.stringify(out));"#
         assert_eq!(read("plugin.json")["name"], "trix");
         assert_eq!(read("hooks.json"), copilot_hooks(Path::new("/bin/trix")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As Muse Code 1.4.18 sent them to trix's managed hooks (start and
+    /// resume, a prompt, a turn's end, a reminder subagent's after it), and
+    /// as its binary words its notifications.
+    #[test]
+    fn condenses_muse_hooks() {
+        let pane = "01a1d56b-360c-7da2-9db2-8aac7b3bfe0f";
+        let c = |v: Value| condense_muse(7, &v, Some(pane));
+        let m = c(json!({"hook_event_name":"SessionStart","source":"startup","session_id":pane,"cwd":"/w","transcript_path":null,"model":"unknown","permission_mode":"default"}));
+        assert_eq!((m.source.as_str(), m.event.as_str(), m.session.as_deref(), m.transcript), ("muse", "SessionStart", Some(pane), None));
+        assert_eq!(c(json!({"hook_event_name":"SessionStart","source":"resume","session_id":pane})).event, "SessionStart");
+        let m = c(json!({"hook_event_name":"UserPromptSubmit","prompt":"fix\nthe   login","session_id":pane,"turn_id":"01a1d56b-5527-7893-8830-2dc128d14c93"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("UserPromptSubmit", Some("fix the login")));
+        let m = c(json!({"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"echo: hello muse","session_id":pane,"turn_id":"t1"}));
+        assert_eq!((m.event.as_str(), m.session.as_deref()), ("Stop", Some(pane)));
+        assert_eq!(c(json!({"hook_event_name":"StopFailure","session_id":pane})).event, "Stop", "a turn that failed ended");
+        assert_eq!(c(json!({"hook_event_name":"SessionEnd","session_id":pane})).event, "SessionEnd");
+        // Its own tool names and arguments.
+        let m = c(json!({"hook_event_name":"PreToolUse","session_id":pane,"tool_name":"bash","tool_input":{"command":"cargo   test"}}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PreToolUse", Some("bash"), Some("cargo test")));
+        for (tool, input, detail) in [
+            ("read_file", json!({"path":"/w/src/main.rs"}), "main.rs"),
+            ("edit_file", json!({"path":"src/app.rs"}), "app.rs"),
+            ("write_file", json!({"path":"notes.md","content":"x"}), "notes.md"),
+            ("search", json!({"pattern":"fn main","paths":["src"]}), "fn main"),
+        ] {
+            assert_eq!(c(json!({"hook_event_name":"PreToolUse","session_id":pane,"tool_name":tool,"tool_input":input})).detail.as_deref(), Some(detail), "{tool}");
+        }
+        // Its question tool asks as Claude's does.
+        let m = c(json!({"hook_event_name":"PreToolUse","session_id":pane,"tool_name":"request_user_input","tool_input":{"questions":[{"id":"db","header":"Database","question":"Which database?","options":[]}]}}));
+        assert_eq!((m.tool.as_deref(), m.detail.as_deref()), (Some("AskUserQuestion"), Some("Which database?")));
+        assert_eq!(c(json!({"hook_event_name":"PostToolUseFailure","session_id":pane,"tool_name":"bash"})).event, "PostToolUse");
+        // Waiting on you: an approval, or a question.
+        let m = c(json!({"hook_event_name":"Notification","session_id":pane,"notification_type":"permission_prompt","message":"Muse Code needs approval"}));
+        assert_eq!((m.event.as_str(), m.tool, m.detail.as_deref()), ("PermissionRequest", None, Some("Muse Code needs approval")));
+        let m = c(json!({"hook_event_name":"Notification","session_id":pane,"notification_type":"question_prompt","message":"Muse Code needs your input"}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Question", Some("Muse Code needs your input")));
+        assert_eq!(c(json!({"hook_event_name":"Notification","notification_type":"task_done","message":"done"})).event, "unknown");
+        // A reminder subagent's, as it checks the turn that just ended: its
+        // own session id. Not the pane's turn, nor its conversation.
+        let child = "01a1d56b-5855-71f2-83f0-e58a9f90e123";
+        for ev in ["PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit", "SessionStart"] {
+            let m = c(json!({"hook_event_name":ev,"session_id":child,"tool_name":"submit_reminder_decision"}));
+            assert_eq!((m.event.as_str(), m.session.as_deref()), ("unknown", Some(pane)), "{ev}");
+        }
+        // A subagent's approval waits on you all the same.
+        assert_eq!(c(json!({"hook_event_name":"Notification","session_id":child,"notification_type":"permission_prompt"})).event, "PermissionRequest");
+        for ev in ["PermissionRequest", "SubagentStart", "SubagentStop", "PreLLMCall", "PostLLMCall"] {
+            assert_eq!(c(json!({"hook_event_name":ev,"session_id":pane})).event, "unknown", "{ev}");
+        }
+        // Without `MUSE_SESSION_ID`: the hook's own session.
+        assert_eq!(condense_muse(7, &json!({"hook_event_name":"Stop","session_id":"s1"}), None).session.as_deref(), Some("s1"));
+        assert_eq!(condense_muse(7, &json!({"hook_event_name":"Stop","session_id":"s1"}), Some("")).event, "Stop");
+    }
+
+    #[test]
+    fn muse_hooks_only_watch_and_never_fail() {
+        let h = muse_hooks(Path::new("/opt/it's/trix"));
+        let hooks = h["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), MUSE_HOOK_EVENTS.len());
+        for ev in ["PermissionRequest", "SubagentStart", "SubagentStop", "PreLLMCall", "PostLLMCall"] {
+            assert!(!hooks.contains_key(ev), "{ev}");
+        }
+        for ev in MUSE_HOOK_EVENTS {
+            let entry = &hooks[ev][0];
+            let h = &entry["hooks"][0];
+            assert_eq!(h["command"], r"'/opt/it'\''s/trix' hook muse || true", "{ev}");
+            assert_eq!((h["type"].as_str(), h["timeout"].as_u64()), (Some("command"), Some(5)), "{ev}");
+            assert_eq!(entry.get("matcher").is_some(), ev.contains("ToolUse"), "{ev}");
+        }
+    }
+
+    #[test]
+    fn muse_hooks_file_holds_the_hooks() {
+        let path = write_muse_hooks(Path::new("/bin/trix")).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(), muse_hooks(Path::new("/bin/trix")));
+        let _ = std::fs::remove_file(&path);
     }
 }
