@@ -10,6 +10,7 @@ mod layout;
 mod platform;
 mod search;
 mod session;
+mod settings;
 mod state;
 mod theme;
 mod ui;

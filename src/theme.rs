@@ -2,10 +2,11 @@
 //! its own `~/.config/trix/colors.toml`, then the live Omarchy theme
 //! (`~/.local/state/omarchy/current/theme/colors.toml`). It looks again once a
 //! second, so editing, adding or swapping the file restyles every running trix.
+//! The settings pick a theme by writing trix's own file (see `install`).
 
 use crate::config::{Stamp, stamp_of};
 use ratatui::style::Color;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -182,11 +183,185 @@ pub fn claude_theme(source: &Source, theme: &Theme) -> Option<&'static str> {
     source.paints_panes().then_some(if theme.light { "light-ansi" } else { "dark-ansi" })
 }
 
+/// trix's own theme file, the one the settings write.
+pub fn own_path() -> PathBuf {
+    crate::state::xdg_dir("XDG_CONFIG_HOME", ".config").join("trix/colors.toml")
+}
+
+/// Omarchy's live theme files, best first.
+fn omarchy_paths() -> [PathBuf; 2] {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    [home.join(".local/state/omarchy/current/theme/colors.toml"), home.join(".config/omarchy/current/theme/colors.toml")]
+}
+
+/// The themes that come with trix, built in so an installed binary has them
+/// too: their folder in `themes/`, their name, their `colors.toml`.
+pub const SHIPPED: [(&str, &str, &str); 4] = [
+    ("lupine", "Lupine", include_str!("../themes/lupine/colors.toml")),
+    ("retro-82", "Retro 82", include_str!("../themes/retro-82/colors.toml")),
+    ("ristretto", "Ristretto", include_str!("../themes/ristretto/colors.toml")),
+    ("tokyo-night", "Tokyo Night", include_str!("../themes/tokyo-night/colors.toml")),
+];
+
+/// A theme the settings offer.
+#[derive(Clone, Debug)]
+pub struct Choice {
+    pub name: String,
+    pub pick: Pick,
+    /// How it looks, and where trix would say it's from: what trying it shows.
+    pub look: Theme,
+    pub source: Source,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pick {
+    /// No file of trix's own: Omarchy's theme, or with no Omarchy the
+    /// built-in one, which leaves the panes in the terminal's colors.
+    Nothing,
+    /// The `colors.toml` there now, which is none of the others: one made
+    /// or edited by hand. Keep it.
+    Yours,
+    /// This `colors.toml`.
+    Colors(String),
+}
+
+/// `retro-82` is "Retro 82".
+fn title_case(slug: &str) -> String {
+    slug.split(['-', '_', ' '])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What there is to pick from on this machine, and which is in use, with
+/// trix's own file at `own`: no theme of trix's own first (Omarchy's, or
+/// the terminal's colors), then your own `colors.toml` if it's none of the
+/// rest, then every theme by name, trix's and the ones Omarchy has here.
+pub fn choices_here(own: &Path) -> (Vec<Choice>, usize) {
+    let mine = std::fs::read_to_string(own).ok();
+    // Tests see trix's themes only, whatever this machine has.
+    if cfg!(test) {
+        return choices(own, mine, None, Vec::new());
+    }
+    let omarchy = omarchy_paths().into_iter().find_map(|p| {
+        let text = std::fs::read_to_string(&p).ok()?;
+        // Omarchy 4 writes the theme's name beside it; before, `current/theme`
+        // was a link to the theme's folder.
+        let dir = p.parent()?;
+        let name = std::fs::read_to_string(dir.with_file_name("theme.name"))
+            .ok()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .or_else(|| std::fs::read_link(dir).ok()?.file_name().map(|n| n.to_string_lossy().into_owned()));
+        Some((name.map(|n| title_case(&n)), text))
+    });
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let mut theirs = Vec::new();
+    for dir in [PathBuf::from("/usr/share/omarchy/themes"), home.join(".config/omarchy/themes"), home.join(".local/share/omarchy/themes")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            if let Ok(text) = std::fs::read_to_string(e.path().join("colors.toml")) {
+                theirs.push((e.file_name().to_string_lossy().into_owned(), text));
+            }
+        }
+    }
+    choices(own, mine, omarchy, theirs)
+}
+
+/// `choices_here` from what it found: trix's own file (at `own`) and its
+/// text, Omarchy's theme now (its name and text), and the themes Omarchy
+/// has (folder, text). A theme trix ships wins over Omarchy's of the same
+/// folder, as `install-theme.sh` installs that one.
+fn choices(own: &Path, mine: Option<String>, omarchy: Option<(Option<String>, String)>, theirs: Vec<(String, String)>) -> (Vec<Choice>, usize) {
+    let file = |text: &str| (from_toml(text), Source::File(own.to_path_buf()));
+    let nothing = match &omarchy {
+        Some((name, text)) => Choice {
+            name: name.as_ref().map_or("Follow Omarchy".into(), |n| format!("Follow Omarchy ({n})")),
+            pick: Pick::Nothing,
+            look: from_toml(text),
+            source: Source::Omarchy,
+        },
+        None => Choice { name: "Your terminal's colors".into(), pick: Pick::Nothing, look: Theme::default(), source: Source::Builtin },
+    };
+    let mut named: Vec<Choice> = SHIPPED
+        .iter()
+        .map(|&(_, name, text)| (name.to_string(), text.to_string()))
+        .chain(theirs.into_iter().filter(|(dir, _)| !SHIPPED.iter().any(|s| s.0 == dir)).map(|(dir, text)| (title_case(&dir), text)))
+        .map(|(name, text)| {
+            let (look, source) = file(&text);
+            Choice { name, pick: Pick::Colors(text), look, source }
+        })
+        .collect();
+    named.sort_by_key(|c| c.name.to_lowercase());
+    named.dedup_by(|a, b| a.name == b.name);
+    let mut list = vec![nothing];
+    let current = match &mine {
+        None => 0,
+        Some(text) => match named.iter().position(|c| c.pick == Pick::Colors(text.clone())) {
+            Some(i) => i + 1,
+            None => {
+                let (look, source) = file(text);
+                list.push(Choice { name: "Your colors.toml".into(), pick: Pick::Yours, look, source });
+                1
+            }
+        },
+    };
+    list.extend(named);
+    (list, current)
+}
+
+/// Make `choice` the theme: write its `colors.toml` to trix's own file at
+/// `own`, or remove that file for `Nothing`. A file there that is none of
+/// `known` was made or edited by hand, so it's kept as
+/// `colors.toml.<date>.bak` first, which is returned.
+pub fn install(choice: &Choice, own: &Path, known: &[Choice]) -> std::io::Result<Option<PathBuf>> {
+    let there = std::fs::read_to_string(own).ok();
+    let theirs = there.as_ref().is_some_and(|t| !known.iter().any(|c| c.pick == Pick::Colors(t.clone())));
+    let keep = |text: &str| -> std::io::Result<Option<PathBuf>> {
+        if !theirs {
+            return Ok(None);
+        }
+        let backup = own.with_file_name(format!("colors.toml.{}.bak", stamp_now()));
+        std::fs::write(&backup, text)?;
+        Ok(Some(backup))
+    };
+    match (&choice.pick, &there) {
+        (Pick::Yours, _) | (Pick::Nothing, None) => Ok(None),
+        (Pick::Colors(text), Some(now)) if text == now => Ok(None),
+        (Pick::Colors(text), _) => {
+            let backup = match &there {
+                Some(t) => keep(t)?,
+                None => None,
+            };
+            crate::state::write_through(own, text.as_bytes())?;
+            Ok(backup)
+        }
+        (Pick::Nothing, Some(t)) => {
+            let backup = keep(t)?;
+            std::fs::remove_file(own)?;
+            Ok(backup)
+        }
+    }
+}
+
+/// Now as `20261112-203000`, for a backup's name.
+fn stamp_now() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut tm) };
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 pub struct ThemeWatcher {
     /// Where a theme may be, best first, and whether it's Omarchy's.
     candidates: Vec<(PathBuf, bool)>,
-    /// The file the theme shown was read from, and its stamp then.
-    loaded: Option<(PathBuf, Stamp)>,
+    /// The file the theme shown was read from, its stamp then, and whether
+    /// it's Omarchy's.
+    loaded: Option<(PathBuf, Stamp, bool)>,
 }
 
 impl ThemeWatcher {
@@ -195,11 +370,9 @@ impl ThemeWatcher {
         if cfg!(test) {
             return Self::with(Vec::new());
         }
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         let mut candidates: Vec<(PathBuf, bool)> = std::env::var_os("TRIX_THEME").map(|p| (PathBuf::from(p), false)).into_iter().collect();
-        candidates.push((crate::state::xdg_dir("XDG_CONFIG_HOME", ".config").join("trix/colors.toml"), false));
-        candidates.push((home.join(".local/state/omarchy/current/theme/colors.toml"), true));
-        candidates.push((home.join(".config/omarchy/current/theme/colors.toml"), true));
+        candidates.push((own_path(), false));
+        candidates.extend(omarchy_paths().map(|p| (p, true)));
         Self::with(candidates)
     }
 
@@ -209,15 +382,21 @@ impl ThemeWatcher {
 
     /// Returns a new theme, and where it's from, when the first file there
     /// is changed since the last call: edited, swapped, or another one
-    /// taking its place. With no file at all it keeps the theme shown,
-    /// because Omarchy switches by removing its theme folder and then
-    /// moving the new one in.
+    /// taking its place. When Omarchy's goes and none is left it keeps the
+    /// theme shown, because Omarchy switches by removing its theme folder
+    /// and then moving the new one in; when trix's own goes, it's the
+    /// built-in theme again.
     pub fn poll(&mut self) -> Option<(Theme, Source)> {
-        let (path, omarchy, stamp) = self.candidates.iter().find_map(|(p, o)| Some((p.as_path(), *o, stamp_of(p)?)))?;
-        if self.loaded.as_ref().is_some_and(|(p, s)| p == path && *s == stamp) {
+        let Some((path, omarchy, stamp)) = self.candidates.iter().find_map(|(p, o)| Some((p.as_path(), *o, stamp_of(p)?))) else {
+            if self.loaded.take_if(|(_, _, omarchy)| !*omarchy).is_some() {
+                return Some((Theme::default(), Source::Builtin));
+            }
+            return None;
+        };
+        if self.loaded.as_ref().is_some_and(|(p, s, _)| p == path && *s == stamp) {
             return None;
         }
-        self.loaded = Some((path.to_path_buf(), stamp));
+        self.loaded = Some((path.to_path_buf(), stamp, omarchy));
         let text = std::fs::read_to_string(path).ok()?;
         Some((from_toml(&text), if omarchy { Source::Omarchy } else { Source::File(path.to_path_buf()) }))
     }
@@ -404,6 +583,13 @@ mod tests {
         assert_eq!(bg(&mut w), None, "none left, as mid Omarchy switch: keep what's shown");
         write(&omarchy, "#303030");
         assert_eq!(bg(&mut w), Some((rgb(0x303030), Source::Omarchy)), "the new theme folder moved in");
+        // No Omarchy: removing trix's own file is the built-in theme again.
+        std::fs::remove_dir_all(omarchy.parent().unwrap()).unwrap();
+        write(&own, "#505050");
+        assert_eq!(bg(&mut w), Some((rgb(0x505050), Source::File(own.clone()))));
+        std::fs::remove_file(&own).unwrap();
+        assert_eq!(bg(&mut w), Some((Theme::default().bg, Source::Builtin)), "trix's own removed, nothing left");
+        assert_eq!(bg(&mut w), None, "and that's that");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -453,5 +639,58 @@ mod tests {
     fn broken_toml_is_the_default_theme() {
         assert_eq!(from_toml("this is = not [toml").bg, Theme::default().bg);
         assert_eq!(from_toml("background = \"nope\"").bg, Theme::default().bg);
+    }
+
+    #[test]
+    fn the_themes_to_pick_from() {
+        let own = Path::new("/x/trix/colors.toml");
+        let names = |l: &[Choice]| l.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        let gruvbox = ("gruvbox".to_string(), "background = \"#282828\"\n".to_string());
+        let tokyo = ("tokyo-night".to_string(), "background = \"#000000\"\n".to_string());
+        let (l, current) = choices(own, None, None, vec![gruvbox.clone(), tokyo]);
+        assert_eq!(names(&l), ["Your terminal's colors", "Gruvbox", "Lupine", "Retro 82", "Ristretto", "Tokyo Night"], "trix's own Tokyo Night, not Omarchy's");
+        assert_eq!((current, &l[0].source), (0, &Source::Builtin));
+        assert_eq!(l[1].source, Source::File(own.to_path_buf()), "a theme picked is trix's own file");
+        assert_eq!(l[5].pick, Pick::Colors(SHIPPED[3].2.to_string()));
+
+        let omarchy = Some((Some("Retro 82".to_string()), SHIPPED[1].2.to_string()));
+        let (l, current) = choices(own, Some(gruvbox.1.clone()), omarchy, vec![gruvbox]);
+        assert_eq!(l[0].name, "Follow Omarchy (Retro 82)");
+        assert_eq!(l[0].source, Source::Omarchy);
+        assert_eq!(l[current].name, "Gruvbox", "the file there now, by what's in it");
+
+        let (l, current) = choices(own, Some("background = \"#123456\"\n".into()), None, Vec::new());
+        assert_eq!((l[1].name.as_str(), &l[1].pick, current), ("Your colors.toml", &Pick::Yours, 1), "made by hand: kept, and in use");
+        assert_eq!(l[1].look.bg, rgb(0x123456));
+        assert_eq!(title_case("catppuccin-latte"), "Catppuccin Latte");
+    }
+
+    #[test]
+    fn installing_keeps_a_file_made_by_hand() {
+        let dir = std::env::temp_dir().join(format!("trix-install-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join("colors.toml");
+        let (l, _) = choices(&own, None, None, Vec::new());
+        let by = |name: &str| l.iter().find(|c| c.name == name).unwrap();
+        let backups = || std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bak")).count();
+
+        assert_eq!(install(by("Ristretto"), &own, &l).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), SHIPPED[2].2);
+        assert_eq!(install(by("Lupine"), &own, &l).unwrap(), None, "one of the list: nothing to keep");
+        assert_eq!(install(&l[0], &own, &l).unwrap(), None);
+        assert!(!own.exists(), "none of trix's own");
+        assert_eq!(install(&l[0], &own, &l).unwrap(), None, "and again: nothing to do");
+
+        std::fs::write(&own, "background = \"#123456\"\n").unwrap();
+        let backup = install(by("Lupine"), &own, &l).unwrap().expect("kept");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "background = \"#123456\"\n");
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), SHIPPED[0].2);
+        std::fs::write(&own, "background = \"#654321\"\n").unwrap();
+        std::fs::remove_file(&backup).unwrap();
+        assert!(install(&l[0], &own, &l).unwrap().is_some(), "removing one made by hand keeps it too");
+        assert!(!own.exists());
+        assert_eq!(backups(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

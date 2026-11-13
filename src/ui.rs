@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
 use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
+use crate::settings::{Picker, Row, Settings};
 use crate::theme::{Source as ThemeSource, Theme, contrast, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -109,11 +110,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             View::Grid => grid_view(f, app, main, &t),
         }
     };
-    bottom_bar(f, app, bottom, &t);
+    app.hits.hints = bottom_bar(f, app, bottom, &t);
 
     if let Some(Modal::Menu(m)) = app.modal {
         // A menu floats over the workspace without dimming it.
         agent_menu(f, app, m, area, &t);
+    } else if let Some(Modal::Settings(s)) = &app.modal {
+        // A theme tried on shows undimmed all round.
+        if s.picker.is_none() {
+            backdrop(f.buffer_mut(), area, &t);
+        }
+        settings(f, app, area, &t);
     } else if app.modal.is_some() {
         backdrop(f.buffer_mut(), area, &t);
         modal(f, app, area, &t);
@@ -201,15 +208,17 @@ fn clock() -> String {
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
-fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
-    let key = |k: String| Span::styled(format!(" {k} "), Style::new().fg(t.fg_bright).bg(t.surface_hi));
+/// The keys to know, each a button for what it does but `jump` (which
+/// agent?): returns where they are.
+fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Action)> {
+    let key = |k: &str| Span::styled(format!(" {k} "), Style::new().fg(t.fg_bright).bg(t.surface_hi));
     let lab = |l: &'static str| Span::styled(format!(" {l}   "), Style::new().fg(t.dim));
     let mut spans = vec![Span::raw(" ")];
-    let hints: Vec<(String, &str)> = if app.modal.is_some() {
-        vec![("esc".into(), "cancel")]
+    let hints: Vec<(String, &str, Option<Action>)> = if app.modal.is_some() {
+        vec![("esc".into(), "cancel", None)]
     } else {
         let shown: &[(Action, &str)] = if app.agents.is_empty() {
-            &[(Action::New, "new agent"), (Action::Help, "keys"), (Action::Quit, "quit")]
+            &[(Action::New, "new agent"), (Action::Help, "keys"), (Action::Settings, "settings"), (Action::Quit, "quit")]
         } else {
             &[
                 (Action::New, "new"),
@@ -218,14 +227,26 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 (Action::Grid, "grid"),
                 (Action::Broadcast, "broadcast"),
                 (Action::Help, "keys"),
+                (Action::Settings, "settings"),
             ]
         };
         // An action with no key has nothing to hint at.
-        shown.iter().filter_map(|&(a, l)| Some((app.config.keys.label(a)?, l))).collect()
+        shown.iter().filter_map(|&(a, l)| Some((app.config.keys.label(a)?, l, Some(a).filter(|&a| a != Action::Jump)))).collect()
     };
-    for (k, l) in hints {
-        spans.push(key(k));
-        spans.push(lab(l));
+    let mut buttons = Vec::new();
+    let mut x = area.x + 1;
+    for (k, l, action) in hints {
+        let (k, l) = (key(&k), lab(l));
+        // The button is the key and its word, not the gap after them.
+        let w = (k.width() + l.width()).saturating_sub(2) as u16;
+        if let Some(a) = action
+            && x < area.right()
+        {
+            buttons.push((Rect { x, y: area.y, width: w.min(area.right() - x), height: 1 }, a));
+        }
+        x = x.saturating_add(w + 2);
+        spans.push(k);
+        spans.push(l);
     }
     f.render_widget(Paragraph::new(TLine::from(spans)), area);
 
@@ -246,7 +267,10 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         let r = Rect { x: area.right().saturating_sub(w), width: w.min(area.width), ..area };
         f.render_widget(Clear, r);
         f.render_widget(Paragraph::new(line), r);
+        // A toast over a button hides it.
+        buttons.retain(|(b, _)| b.right() <= r.x);
     }
+    buttons
 }
 
 fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
@@ -957,12 +981,13 @@ fn empty_state(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         (app.key(Action::New), "new agent anytime"),
         (app.key(Action::Attention), "jump to who needs you"),
         (app.key(Action::Help), "every shortcut"),
+        (app.key(Action::Settings), "theme, sounds, notifications"),
     ];
     let w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0).max(6) + 1;
     for (y, (k, l)) in (y0 + 6..).zip(rows) {
         let line = TLine::from(vec![
             Span::styled(format!(" {k:<w$}"), Style::new().fg(t.accent)),
-            Span::styled(format!("{l:<22}"), Style::new().fg(t.fg)),
+            Span::styled(format!("{l:<29}"), Style::new().fg(t.fg)),
         ]);
         center(f, y, line);
     }
@@ -1026,7 +1051,7 @@ fn input_spans(inp: &TextInput, active: bool, placeholder: &str, t: &Theme, max:
 fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let Some(m) = &app.modal else { return };
     match m {
-        Modal::Menu(_) => {}
+        Modal::Menu(_) | Modal::Settings(_) => {}
         Modal::Search(s) => search_box(f, app, s, area, t),
         Modal::New(form) => {
             let r = centered(area, 86, 16);
@@ -1406,6 +1431,181 @@ fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: 
     }
 }
 
+// ───────────────────────────── settings ─────────────────────────────
+
+fn settings(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
+    let Some(Modal::Settings(s)) = &app.modal else { return };
+    let mut rows = Vec::new();
+    let r = match &s.picker {
+        Some(p) => theme_list(f, p, area, t, &mut rows),
+        None => settings_list(f, app, s, area, t, &mut rows),
+    };
+    app.hits.settings = Some(r);
+    app.hits.settings_rows = rows;
+}
+
+/// What a setting is now, and in what color.
+fn setting_value(app: &App, s: &Settings, row: Row, t: &Theme) -> (String, Color) {
+    use crate::config::Tone;
+    let toggle = |on: bool| if on { ("on".to_string(), t.green) } else { ("off".to_string(), t.dim) };
+    let tone = |tone: &Tone| (crate::settings::tone_label(tone), if *tone == Tone::Off { t.dim } else { t.fg });
+    let n = &app.config.notify;
+    match row {
+        Row::Theme => (format!("{} ›", s.theme), t.accent),
+        Row::SidebarMini => ((if app.sidebar_mini { "narrow" } else { "wide" }).to_string(), t.fg),
+        Row::SidebarCompact => ((if app.sidebar_compact { "compact" } else { "full" }).to_string(), t.fg),
+        Row::NotifyNeedsYou => toggle(n.needs_you),
+        Row::NotifyDone => toggle(n.done),
+        Row::Desktop => toggle(n.desktop),
+        Row::Bell => toggle(n.bell),
+        Row::SoundNeedsYou => tone(&app.config.sound.needs_you),
+        Row::SoundDone => tone(&app.config.sound.done),
+    }
+}
+
+/// One row of a list, `right` flush right: the selected one on a lighter
+/// band, with a marker.
+fn list_row(f: &mut Frame, r: Rect, selected: bool, left: Vec<Span<'static>>, right: Vec<Span<'static>>, t: &Theme) {
+    let band = if selected { Style::new().bg(t.surface_hi) } else { Style::new() };
+    let marker = Span::styled(if selected { " › " } else { "   " }, Style::new().fg(t.accent).add_modifier(Modifier::BOLD));
+    let used = 3 + left.iter().chain(&right).map(|s| s.width()).sum::<usize>() + 1;
+    let gap = Span::raw(" ".repeat((r.width as usize).saturating_sub(used)));
+    let spans: Vec<Span> = std::iter::once(marker).chain(left).chain([gap]).chain(right).chain([Span::raw(" ")]).collect();
+    f.render_widget(Paragraph::new(TLine::from(spans)).style(band), r);
+}
+
+/// Keys and what they do, for the foot of a panel.
+fn key_help(pairs: &[(&str, &str)], t: &Theme) -> TLine<'static> {
+    let mut spans = Vec::new();
+    for (i, (k, what)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(k.to_string(), Style::new().fg(t.accent)));
+        spans.push(Span::styled(format!(" {what}"), Style::new().fg(t.dim)));
+    }
+    TLine::from(spans)
+}
+
+/// The foot of a panel `r`: its keys, and a line under them.
+fn panel_foot(f: &mut Frame, r: Rect, keys: TLine<'static>, note: String, t: &Theme) {
+    let foot = Rect { x: r.x + 3, width: r.width.saturating_sub(6), y: r.bottom().saturating_sub(3), height: 1 };
+    if r.height < 6 {
+        return;
+    }
+    f.render_widget(Paragraph::new(keys), foot);
+    let width = foot.width as usize;
+    f.render_widget(Paragraph::new(Span::styled(trunc(&note, width), Style::new().fg(t.muted))), Rect { y: foot.y + 1, ..foot });
+}
+
+fn settings_list(f: &mut Frame, app: &App, s: &Settings, area: Rect, t: &Theme, rows: &mut Vec<(Rect, usize)>) -> Rect {
+    let headings = Row::ALL.iter().filter(|r| r.heading().is_some()).count() as u16;
+    // Borders, a line above, the headings with a gap before all but the
+    // first, the rows, a gap, and two lines at the foot.
+    let h = 2 + 1 + (headings * 2 - 1) + Row::ALL.len() as u16 + 1 + 2;
+    let r = centered(area, 66, h);
+    f.render_widget(Clear, r);
+    let block = modal_block("Settings", t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    // Leave the foot to the foot.
+    let last = r.bottom().saturating_sub(4);
+    // Notifications that never come have no way to come.
+    let quiet = !app.config.notify.needs_you && !app.config.notify.done;
+    let mut y = inner.y + 1;
+    for (i, &row) in Row::ALL.iter().enumerate() {
+        if let Some(head) = row.heading() {
+            if i > 0 {
+                y += 1;
+            }
+            if y < last {
+                let l = Rect { y, height: 1, ..inner };
+                f.render_widget(Paragraph::new(Span::styled(format!("   {head}"), Style::new().fg(t.dim).add_modifier(Modifier::BOLD))), l);
+            }
+            y += 1;
+        }
+        if y >= last {
+            break;
+        }
+        let l = Rect { y, height: 1, ..inner };
+        let selected = row == s.sel;
+        let off = quiet && matches!(row, Row::Desktop | Row::Bell);
+        let label = Style::new().fg(if off { t.muted } else if selected { t.fg_bright } else { t.fg });
+        let mut left = vec![Span::styled(row.label(), if selected { label.add_modifier(Modifier::BOLD) } else { label })];
+        let key = match row {
+            Row::SidebarMini => app.config.keys.label(Action::MiniSidebar),
+            Row::SidebarCompact => app.config.keys.label(Action::Compact),
+            _ => None,
+        };
+        if let Some(k) = key {
+            left.push(Span::styled(format!("  {k}"), Style::new().fg(t.muted)));
+        }
+        let (value, color) = setting_value(app, s, row, t);
+        let bold = if selected { Modifier::BOLD } else { Modifier::empty() };
+        let value = Span::styled(value, Style::new().fg(if off { t.muted } else { color }).add_modifier(bold));
+        list_row(f, l, selected, left, vec![value], t);
+        rows.push((l, i));
+        y += 1;
+    }
+    let keys = key_help(&[("↑↓", "choose"), ("enter ←→", "change"), ("esc", "close")], t);
+    panel_foot(f, r, keys, format!("Keys, mutes, a notify command: {}", tilde(&app.config_path)), t);
+    r
+}
+
+/// The list of themes: each with its colors, the one in use marked.
+fn theme_list(f: &mut Frame, p: &Picker, area: Rect, t: &Theme, rows: &mut Vec<(Rect, usize)>) -> Rect {
+    let n = p.choices.len();
+    // Borders, a line above and below the list, two lines at the foot.
+    let h = (n as u16).saturating_add(2 + 2 + 2);
+    let r = centered(area, 60, h);
+    f.render_widget(Clear, r);
+    let block = modal_block("Theme", t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    let fit = (inner.height as usize).saturating_sub(4);
+    // The one picked in the middle, once the list is longer than the room.
+    let start = if n <= fit { 0 } else { p.sel.saturating_sub(fit / 2).min(n - fit) };
+    for (k, (i, c)) in p.choices.iter().enumerate().skip(start).take(fit).enumerate() {
+        let l = Rect { y: inner.y + 1 + k as u16, height: 1, ..inner };
+        let selected = i == p.sel;
+        let name = Style::new().fg(if selected { t.fg_bright } else { t.fg });
+        let mut left = vec![Span::styled(c.name.clone(), if selected { name.add_modifier(Modifier::BOLD) } else { name })];
+        if i == p.current {
+            left.push(Span::styled("  in use", Style::new().fg(t.green)));
+        }
+        list_row(f, l, selected, left, swatch(c), t);
+        rows.push((l, i));
+    }
+    // More above or below.
+    let more = |f: &mut Frame, y: u16, s: &'static str| {
+        f.render_widget(Paragraph::new(Span::styled(s, Style::new().fg(t.muted))).alignment(Alignment::Right), Rect { y, height: 1, width: inner.width.saturating_sub(1), ..inner });
+    };
+    if start > 0 {
+        more(f, inner.y, "▲ more");
+    }
+    if start + fit < n {
+        more(f, inner.y + 1 + fit as u16, "▼ more");
+    }
+    let keys = key_help(&[("↑↓", "try one"), ("enter", "keep it"), ("esc", "back")], t);
+    panel_foot(f, r, keys, "Agents running now may need a restart to match.".into(), t);
+    r
+}
+
+/// A theme's colors at a glance: its text on its background, then its
+/// red, yellow, green, cyan, accent and magenta. None for the terminal's
+/// own, which trix doesn't know.
+fn swatch(c: &crate::theme::Choice) -> Vec<Span<'static>> {
+    if c.source == ThemeSource::Builtin {
+        return Vec::new();
+    }
+    let l = &c.look;
+    let mut v = vec![Span::styled(" Aa ", Style::new().fg(l.fg).bg(l.bg))];
+    v.extend([l.red, l.yellow, l.green, l.cyan, l.accent, l.magenta].map(|c| Span::styled("  ", Style::new().bg(c))));
+    v
+}
+
 /// Two actions' keys as one label: `alt+j / k` when they share a prefix.
 fn key_pair(a: &str, b: &str) -> String {
     match (a.rsplit_once('+'), b.rsplit_once('+')) {
@@ -1444,6 +1644,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ("wheel".into(), "scroll · click focus"),
         ("drag".into(), "select & copy"),
         ("shift+enter".into(), "newline to agent"),
+        (k(Action::Settings), "settings · theme, sounds"),
         (k(Action::Detach), "detach · keeps running"),
         (k(Action::Quit), "quit · stops agents"),
     ];
@@ -1525,6 +1726,13 @@ mod tests {
             Modal::Broadcast(TextInput::new("hello"), BroadcastTarget::All),
             Modal::Rename(id, TextInput::new("web")),
             Modal::Help,
+            Modal::Settings(Settings { sel: Row::Bell, theme: "Ristretto".into(), files: [None, None], picker: None }),
+            Modal::Settings(Settings {
+                sel: Row::Theme,
+                theme: "Ristretto".into(),
+                files: [None, None],
+                picker: Some(Picker { choices: crate::theme::choices_here(std::path::Path::new("/nonexistent")).0, sel: 3, current: 0 }),
+            }),
         ];
         for (w, h) in [(1, 1), (2, 2), (6, 2), (8, 3), (12, 4), (3, 18)] {
             for m in modals() {
@@ -1937,6 +2145,34 @@ mod tests {
             for s in ["hello world", "日本語テキスト", "a日b本c語"] {
                 assert!(trunc(s, max).width() <= max.max(1), "{s:?} at {max}: {:?}", trunc(s, max));
             }
+        }
+    }
+
+    #[test]
+    fn the_settings_and_the_theme_list_on_screen() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        let text = |app: &mut App| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        };
+        app.config.notify.bell = false;
+        app.open_settings();
+        let shown = text(&mut app);
+        for want in ["Settings", "LOOK", "Theme", "Your terminal's colors ›", "Sidebar  alt+m", "wide", "With the terminal bell", "off", "When one is done", "chime", "Keys, mutes, a notify command"] {
+            assert!(shown.contains(want), "{want:?} in\n{shown}");
+        }
+        assert_eq!(app.hits.settings_rows.len(), Row::ALL.len(), "every row on screen, each one a button");
+        if let Some(Modal::Settings(s)) = &mut app.modal {
+            let (choices, current) = crate::theme::choices_here(std::path::Path::new("/nonexistent"));
+            s.picker = Some(Picker { choices, sel: 2, current });
+        }
+        let shown = text(&mut app);
+        for want in ["Theme", "Your terminal's colors  in use", "› Retro 82", "Tokyo Night", " Aa ", "enter keep it"] {
+            assert!(shown.contains(want), "{want:?} in\n{shown}");
         }
     }
 }

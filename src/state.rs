@@ -80,6 +80,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     res
 }
 
+/// `write_atomic` through a symlink: a config file linked from a dotfiles
+/// checkout stays linked, and the checkout gets the change.
+pub fn write_through(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let linked = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let real = if linked { std::fs::canonicalize(path)? } else { path.to_path_buf() };
+    write_atomic(&real, bytes)
+}
+
 /// One file per session; the default one keeps the original name.
 pub fn path() -> PathBuf {
     if crate::session::is_default() {
@@ -144,6 +152,10 @@ fn load_prefs_from(path: &Path) -> Prefs {
 }
 
 pub fn store_prefs(prefs: &Prefs) -> std::io::Result<()> {
+    // Tests that flip the sidebar leave the developer's own alone.
+    if cfg!(test) {
+        return Ok(());
+    }
     store_prefs_at(&prefs_path(), prefs)
 }
 
