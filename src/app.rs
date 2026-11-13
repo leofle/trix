@@ -3,6 +3,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vte::ansi::Rgb;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +32,9 @@ pub enum AppEvent {
     Output(u32),
     PtyWrite(u32, String),
     PtyWriteFn(u32, Arc<dyn Fn(WindowSize) -> String + Send + Sync>),
+    /// A program asks a color (OSC 4, 10, 11, 12): its index, and the answer
+    /// to write back for an RGB value.
+    ColorRequest(u32, usize, Arc<dyn Fn(Rgb) -> String + Send + Sync>),
     Title(u32, String),
     Bell(u32),
     Exit(u32, Option<i32>),
@@ -390,14 +394,27 @@ impl App {
         if let Some(e) = config_error {
             app.toast(format!("config: {e} — using the defaults (`trix config` checks it)"), ToastKind::Bad);
         }
-        app.sync_claude_theme();
+        app.sync_agent_themes();
         app
     }
 
-    /// Keep the theme in Claude's settings overlay in step with trix's (see
-    /// `theme::claude_theme`). Claude reads it as it starts, so a Claude
-    /// started or restarted from now on gets it; running ones keep theirs.
-    fn sync_claude_theme(&mut self) {
+    /// Color `index` of agent `i`'s terminal, for a program that asks: one
+    /// it set itself, else the theme's when the panes are in it. `None`
+    /// leaves the question unanswered, as a terminal that won't say.
+    pub(crate) fn pane_color(&self, i: usize, index: usize) -> Option<Rgb> {
+        let set = self.agents[i].term.lock().colors()[index];
+        let theme = || self.theme_source.knows_pane_colors().then(|| self.theme.terminal_color(index)).flatten();
+        set.or_else(|| theme().map(|(r, g, b)| Rgb { r, g, b }))
+    }
+
+    /// Keep what agents are started with in step with trix's theme. With a
+    /// theme of its own, Grok and OpenCode are asked for their themes that
+    /// take the terminal's colors, which trix paints from it, and the theme
+    /// in Claude's settings overlay follows (see `theme::claude_theme`).
+    /// Agents read these as they start, so one started or restarted from
+    /// now on gets them; running ones keep theirs.
+    fn sync_agent_themes(&mut self) {
+        self.integrations.themed = self.theme_source.paints_panes();
         let want = crate::theme::claude_theme(&self.theme_source, &self.theme);
         if want == self.claude_theme {
             return;
@@ -1119,6 +1136,13 @@ impl App {
                     self.agents[i].write(f(ws).into_bytes());
                 }
             }
+            AppEvent::ColorRequest(id, index, f) => {
+                if let Some(i) = self.index_of(id)
+                    && let Some(c) = self.pane_color(i, index)
+                {
+                    self.agents[i].write(f(c).into_bytes());
+                }
+            }
             AppEvent::Title(id, t) => {
                 if let Some(i) = self.index_of(id) {
                     self.agents[i].on_title(t);
@@ -1205,7 +1229,7 @@ impl App {
         if let Some((t, source)) = self.theme_watch.poll() {
             self.theme = t;
             self.theme_source = source;
-            self.sync_claude_theme();
+            self.sync_agent_themes();
             self.dirty = true;
         }
         self.sync_git_targets();

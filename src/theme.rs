@@ -139,6 +139,41 @@ impl Source {
     pub fn paints_panes(&self) -> bool {
         matches!(self, Source::File(_))
     }
+
+    /// The panes are in the theme's colors, so trix can tell a program that
+    /// asks (OSC 10, 11, 4): it paints them, or Omarchy themes the terminal.
+    /// With no theme file trix doesn't know the terminal's, and doesn't say.
+    pub fn knows_pane_colors(&self) -> bool {
+        !matches!(self, Source::Builtin)
+    }
+}
+
+impl Theme {
+    /// Terminal color `index` as the panes show it, for a program that asks:
+    /// the 16 colors, xterm's standard 240 above them, then the foreground
+    /// (256), background (257) and cursor (258).
+    pub fn terminal_color(&self, index: usize) -> Option<(u8, u8, u8)> {
+        let c = match index {
+            0..16 => self.ansi[index],
+            16..232 => {
+                let level = |x: usize| (if x == 0 { 0 } else { 55 + 40 * x }) as u8;
+                let v = index - 16;
+                return Some((level(v / 36), level(v / 6 % 6), level(v % 6)));
+            }
+            232..256 => {
+                let g = (8 + 10 * (index - 232)) as u8;
+                return Some((g, g, g));
+            }
+            256 => self.fg,
+            257 => self.bg,
+            258 => self.fg_bright,
+            _ => return None,
+        };
+        match c {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            _ => None,
+        }
+    }
 }
 
 /// The Claude Code theme for the panes trix paints: its ANSI-only one, light
@@ -386,6 +421,22 @@ mod tests {
         let t = from_toml("red = \"#ff0000\"\n");
         assert_eq!(t.ansi[9], rgb(0xff0000), "no bright_red: the red");
         assert_eq!(t.ansi[2], Theme::default().ansi[2], "no green: the default's");
+    }
+
+    #[test]
+    fn terminal_colors_for_a_program_that_asks() {
+        let t = from_toml(include_str!("../themes/lupine/colors.toml"));
+        assert_eq!(t.terminal_color(257), Some((0xfa, 0xfa, 0xfa)), "OSC 11: the background");
+        assert_eq!(t.terminal_color(256), Some((0x21, 0x21, 0x21)), "OSC 10: the foreground");
+        assert_eq!(t.terminal_color(1), Some((0xc9, 0x00, 0xc4)), "OSC 4;1: the theme's red");
+        assert_eq!(t.terminal_color(16), Some((0, 0, 0)), "xterm's cube starts black");
+        assert_eq!(t.terminal_color(196), Some((255, 0, 0)), "and has its red");
+        assert_eq!(t.terminal_color(231), Some((255, 255, 255)));
+        assert_eq!(t.terminal_color(232), Some((8, 8, 8)), "then the grays");
+        assert_eq!(t.terminal_color(255), Some((238, 238, 238)));
+        assert_eq!(t.terminal_color(300), None);
+        assert!(Source::File("/x".into()).knows_pane_colors() && Source::Omarchy.knows_pane_colors());
+        assert!(!Source::Builtin.knows_pane_colors(), "no theme file: the terminal's colors, unknown");
     }
 
     #[test]

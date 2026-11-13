@@ -90,7 +90,7 @@ mkdir -p "$(dirname "$dest")"
 cp "$src" "$dest"
 echo "Installed $name: $(show "$dest")"
 echo "Every running trix restyles within a second, its panes too."
-echo "Claude takes the theme when it starts: restart a Claude pane (alt+o, restart) whose colors don't match."
+echo "Agents take it when they start: restart one (alt+o, restart) whose colors don't match."
 if [ -n "${TRIX_THEME:-}" ]; then
     echo "Note: TRIX_THEME is set ($(show "$TRIX_THEME")), and a trix started with it uses that file instead."
     echo "Remove it from your shell profile, then run 'trix kill' and start trix again."
