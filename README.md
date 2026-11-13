@@ -34,7 +34,7 @@ Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and 
 - **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
 - **Survives restarts too.** The workspace is saved continuously. After `trix kill`, alt+q, a crash or a reboot, the next `trix` offers to bring it back: Claude, Codex, Grok, OpenCode and Cursor resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`, …), and shells reopen in the folder they were in.
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
-- **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own ANSI palette. Without Omarchy it falls back to Tokyo Night, or you can point `TRIX_THEME` at a colors.toml.
+- **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own ANSI palette. Without Omarchy it falls back to Tokyo Night, or you copy one of the four themes in `themes/` to `~/.config/trix/colors.toml` (see [Themes](#themes)).
 
 ## Use
 
@@ -130,7 +130,7 @@ trix layout rm work-layout
 
 ### Config
 
-`~/.config/trix/config.toml` (`$XDG_CONFIG_HOME` if set) changes keys, sounds and notifications. Every setting is optional, and without the file trix works as described above. trix reloads the file within a second of each save and says so in a toast. If the file has a mistake, the toast names the line and trix keeps the previous settings, then tells you when it's fixed. `trix config` checks the file from the command line.
+`~/.config/trix/config.toml` (`$XDG_CONFIG_HOME` if set) changes keys, sounds and notifications. Every setting is optional, and without the file trix works as described above. trix reloads the file within a second of each save and says so in a toast. If the file has a mistake, the toast names the line and trix keeps the previous settings, then tells you when it's fixed. `trix config` checks the file from the command line. A `colors.toml` next to it sets the theme (see [Themes](#themes)).
 
 ```toml
 [keys]
@@ -238,7 +238,24 @@ Then set your terminal's Option key to send Alt (below), and run `trix claude` i
 - **Make Option send Alt.** Every trix key is `alt+…`, and macOS terminals type `˜` for Option-N unless told otherwise. In Ghostty, set `macos-option-as-alt = true`. In iTerm2, go to Settings › Profiles › Keys and set Left Option to `Esc+`. In Terminal.app, go to Settings › Profiles › Keyboard and turn on "Use Option as Meta key". In kitty, set `macos_option_as_alt yes`.
 - **Notifications** go through `osascript`. They appear as coming from Script Editor; allow it once in System Settings › Notifications.
 - **The chime** plays through `afplay`. **Copying** goes through OSC 52, plus `pbcopy` for terminals that ignore it (Terminal.app).
-- **Files:** sockets and logs live under `$TMPDIR/trix-<uid>`, where `<uid>` is your user ID (`id -u`), because there's no `XDG_RUNTIME_DIR`. The saved workspace lives in `~/.local/state/trix`. Without Omarchy, the theme is Tokyo Night, or whatever `TRIX_THEME` points at.
+- **Files:** sockets and logs live under `$TMPDIR/trix-<uid>`, where `<uid>` is your user ID (`id -u`), because there's no `XDG_RUNTIME_DIR`. The saved workspace lives in `~/.local/state/trix`. Without Omarchy, the theme is Tokyo Night until you pick one (see [Themes](#themes)).
+
+### Themes
+
+A Mac has no Omarchy theme for trix to follow, so trix ships four of Omarchy's in `themes/`: `ristretto`, `tokyo-night` (the default), `retro-82` and `lupine`, a light one. To use one, copy it to `~/.config/trix/colors.toml` (`$XDG_CONFIG_HOME` if set), next to `config.toml`. From your trix clone:
+
+```sh
+mkdir -p ~/.config/trix
+cp themes/ristretto/colors.toml ~/.config/trix/colors.toml
+```
+
+Every running trix restyles within a second, with no restart. Copy another theme over the file to switch again, and copy `tokyo-night` to go back to the default. Removing the file keeps the theme you have until trix restarts.
+
+The theme colors trix's own bars, sidebar, cards and borders. The panes, and the space around them, keep your terminal's background and ANSI colors, so give your terminal a matching theme too. This matters most for Lupine: on a dark terminal you get light bars around dark panes.
+
+To make your own theme, edit your copy. It is Omarchy's `colors.toml` format, one `key = "#rrggbb"` per line, and any key you leave out keeps its Tokyo Night color.
+
+trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme. On Linux with Omarchy, the file sets trix's theme apart from the desktop's; remove it to follow Omarchy again. On Linux without Omarchy, it all works as on a Mac.
 
 ## Supported agents
 
@@ -329,13 +346,14 @@ src/agent.rs   PTY + emulator per agent, state machine, heuristics
 src/hooks.rs   unix socket + `trix hook` reporter + Claude settings overlay, OpenCode / Cursor plugins + payloads
 src/ui.rs      all rendering
 src/input.rs   key → xterm byte encoding
-src/theme.rs   Omarchy theme loading / live reload
+src/theme.rs   theme loading (TRIX_THEME, ~/.config/trix/colors.toml, Omarchy) / live reload
 src/platform.rs Linux / macOS differences: process liveness and folders, foreground job, notifications, sound, clipboard
+themes/        Omarchy themes to use without Omarchy (macOS): Ristretto, Tokyo Night, Retro 82, Lupine
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds and their errors), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing.
+`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds and their errors), scrollback search (on a real emulator fed real output), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, the saved workspace, and theme parsing and lookup, including the themes in `themes/`.
 
-Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes every sound independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
+Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes every sound independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme, ahead of `~/.config/trix/colors.toml`. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
 
 ## Next
 

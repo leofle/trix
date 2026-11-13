@@ -116,7 +116,8 @@ pub fn stamp() -> Option<Stamp> {
     stamp_of(&path())
 }
 
-fn stamp_of(p: &Path) -> Option<Stamp> {
+/// Any file's `Stamp`, the same way (the theme watcher uses it too).
+pub fn stamp_of(p: &Path) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(p).ok()?;
     let link = std::fs::symlink_metadata(p).ok()?;
