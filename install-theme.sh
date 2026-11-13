@@ -22,6 +22,15 @@ show() {
     esac
 }
 
+# A colors.toml's colors: its lines but for comments and blank ones, so
+# Omarchy's copy of a theme here, without our first line, is that theme.
+colors() {
+    grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+same() {
+    [ "$(colors "$1")" = "$(colors "$2")" ]
+}
+
 usage() {
     echo "usage: $0 <theme>"
     echo
@@ -65,7 +74,7 @@ if ! grep -q '^[[:space:]]*background[[:space:]]*=' "$src"; then
     exit 1
 fi
 
-if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+if [ -f "$dest" ] && same "$src" "$dest"; then
     echo "$name is already installed: $(show "$dest")"
     exit 0
 fi
@@ -74,7 +83,7 @@ fi
 if [ -f "$dest" ]; then
     ours=no
     for f in "$themes"/*/colors.toml; do
-        if cmp -s "$f" "$dest"; then
+        if same "$f" "$dest"; then
             ours=yes
             break
         fi

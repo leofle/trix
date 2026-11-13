@@ -195,12 +195,32 @@ fn omarchy_paths() -> [PathBuf; 2] {
 }
 
 /// The themes that come with trix, built in so an installed binary has them
-/// too: their folder in `themes/`, their name, their `colors.toml`.
-pub const SHIPPED: [(&str, &str, &str); 4] = [
+/// too: Omarchy's, from its folders in `themes/`, with their name and
+/// `colors.toml`.
+pub const SHIPPED: [(&str, &str, &str); 23] = [
+    ("catppuccin", "Catppuccin", include_str!("../themes/catppuccin/colors.toml")),
+    ("catppuccin-latte", "Catppuccin Latte", include_str!("../themes/catppuccin-latte/colors.toml")),
+    ("ethereal", "Ethereal", include_str!("../themes/ethereal/colors.toml")),
+    ("everforest", "Everforest", include_str!("../themes/everforest/colors.toml")),
+    ("flexoki-light", "Flexoki Light", include_str!("../themes/flexoki-light/colors.toml")),
+    ("gruvbox", "Gruvbox", include_str!("../themes/gruvbox/colors.toml")),
+    ("hackerman", "Hackerman", include_str!("../themes/hackerman/colors.toml")),
+    ("jade-horse", "Jade Horse", include_str!("../themes/jade-horse/colors.toml")),
+    ("kanagawa", "Kanagawa", include_str!("../themes/kanagawa/colors.toml")),
+    ("last-horizon", "Last Horizon", include_str!("../themes/last-horizon/colors.toml")),
+    ("lumon", "Lumon", include_str!("../themes/lumon/colors.toml")),
     ("lupine", "Lupine", include_str!("../themes/lupine/colors.toml")),
+    ("matte-black", "Matte Black", include_str!("../themes/matte-black/colors.toml")),
+    ("miasma", "Miasma", include_str!("../themes/miasma/colors.toml")),
+    ("nord", "Nord", include_str!("../themes/nord/colors.toml")),
     ("retro-82", "Retro 82", include_str!("../themes/retro-82/colors.toml")),
     ("ristretto", "Ristretto", include_str!("../themes/ristretto/colors.toml")),
+    ("rose-pine", "Rose Pine", include_str!("../themes/rose-pine/colors.toml")),
+    ("solitude", "Solitude", include_str!("../themes/solitude/colors.toml")),
+    ("starship", "Starship", include_str!("../themes/starship/colors.toml")),
     ("tokyo-night", "Tokyo Night", include_str!("../themes/tokyo-night/colors.toml")),
+    ("vantablack", "Vantablack", include_str!("../themes/vantablack/colors.toml")),
+    ("white", "White", include_str!("../themes/white/colors.toml")),
 ];
 
 /// A theme the settings offer.
@@ -223,6 +243,23 @@ pub enum Pick {
     Yours,
     /// This `colors.toml`.
     Colors(String),
+}
+
+/// Whether two `colors.toml` are the same theme: the same lines but for
+/// comments and blank ones. Omarchy's copy of a theme trix ships has no
+/// first line saying where it's from, and is that theme all the same.
+fn same_colors(a: &str, b: &str) -> bool {
+    fn lines(t: &str) -> impl Iterator<Item = &str> {
+        t.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+    }
+    lines(a).eq(lines(b))
+}
+
+impl Pick {
+    /// Whether this is the theme in `text`, a `colors.toml`.
+    fn is(&self, text: &str) -> bool {
+        matches!(self, Pick::Colors(t) if same_colors(t, text))
+    }
 }
 
 /// `retro-82` is "Retro 82".
@@ -301,7 +338,7 @@ fn choices(own: &Path, mine: Option<String>, omarchy: Option<(Option<String>, St
     let mut list = vec![nothing];
     let current = match &mine {
         None => 0,
-        Some(text) => match named.iter().position(|c| c.pick == Pick::Colors(text.clone())) {
+        Some(text) => match named.iter().position(|c| c.pick.is(text)) {
             Some(i) => i + 1,
             None => {
                 let (look, source) = file(text);
@@ -320,7 +357,7 @@ fn choices(own: &Path, mine: Option<String>, omarchy: Option<(Option<String>, St
 /// `colors.toml.<date>.bak` first, which is returned.
 pub fn install(choice: &Choice, own: &Path, known: &[Choice]) -> std::io::Result<Option<PathBuf>> {
     let there = std::fs::read_to_string(own).ok();
-    let theirs = there.as_ref().is_some_and(|t| !known.iter().any(|c| c.pick == Pick::Colors(t.clone())));
+    let theirs = there.as_ref().is_some_and(|t| !known.iter().any(|c| c.pick.is(t)));
     let keep = |text: &str| -> std::io::Result<Option<PathBuf>> {
         if !theirs {
             return Ok(None);
@@ -331,7 +368,7 @@ pub fn install(choice: &Choice, own: &Path, known: &[Choice]) -> std::io::Result
     };
     match (&choice.pick, &there) {
         (Pick::Yours, _) | (Pick::Nothing, None) => Ok(None),
-        (Pick::Colors(text), Some(now)) if text == now => Ok(None),
+        (pick, Some(now)) if pick.is(now) => Ok(None),
         (Pick::Colors(text), _) => {
             let backup = match &there {
                 Some(t) => keep(t)?,
@@ -445,6 +482,11 @@ fn from_toml(text: &str) -> Theme {
 mod tests {
     use super::*;
 
+    /// The `colors.toml` trix ships in `themes/<dir>`.
+    fn shipped(dir: &str) -> &'static str {
+        SHIPPED.iter().find(|s| s.0 == dir).unwrap().2
+    }
+
     #[test]
     fn hex_parsing_never_cuts_a_character() {
         assert_eq!(parse_hex("#12345é"), None);
@@ -487,28 +529,41 @@ mod tests {
 
     #[test]
     fn shipped_themes_set_every_color() {
-        // themes/: for a Mac, copied to ~/.config/trix/colors.toml.
-        let shipped = [
-            ("ristretto", include_str!("../themes/ristretto/colors.toml")),
-            ("tokyo-night", include_str!("../themes/tokyo-night/colors.toml")),
-            ("retro-82", include_str!("../themes/retro-82/colors.toml")),
-            ("lupine", include_str!("../themes/lupine/colors.toml")),
+        // themes/: built in, and for install-theme.sh to copy.
+        // The keys from_toml looks for, for each color: none falls back to
+        // Tokyo Night's. Last Horizon, Solitude and White have no orange.
+        let keys: [&[&str]; 15] = [
+            &["background"], &["dark_background"], &["lighter_background"], &["selection"], &["foreground"],
+            &["bright_foreground"], &["dark_foreground"], &["muted"], &["accent"], &["red"], &["yellow"], &["green"],
+            &["bright_cyan"], &["bright_magenta"], &["orange", "bright_yellow"],
         ];
-        // The first key from_toml looks for, for each color: none falls back.
-        let keys = [
-            "background", "dark_background", "lighter_background", "selection", "foreground",
-            "bright_foreground", "dark_foreground", "muted", "accent", "red", "yellow", "green",
-            "bright_cyan", "bright_magenta", "orange",
-        ];
-        for (name, text) in shipped {
-            let table: toml::Table = text.parse().unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (dir, name, text) in SHIPPED {
+            let table: toml::Table = text.parse().unwrap_or_else(|e| panic!("{dir}: {e}"));
             for k in keys {
-                let v = table.get(k).and_then(|v| v.as_str());
-                assert!(v.and_then(parse_hex).is_some(), "{name}: {k} is {v:?}");
+                let v = k.iter().find_map(|k| table.get(*k)).and_then(|v| v.as_str());
+                assert!(v.and_then(parse_hex).is_some(), "{dir}: {k:?} is {v:?}");
             }
             let t = from_toml(text);
-            assert!(contrast(t.fg, t.bg) >= 4.5, "{name}: text must read on its background");
+            assert!(contrast(t.fg, t.bg) >= 4.5, "{dir}: text must read on its background");
+            assert_eq!(text.lines().next(), Some(format!("# {name}, from Omarchy 4.5 (https://github.com/omacom/omarchy, MIT license).").as_str()));
         }
+        assert!(SHIPPED.windows(2).all(|w| w[0].0 < w[1].0), "in order, once each");
+        // Every folder is built in, so the settings offer what install-theme.sh does.
+        let dirs = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/themes")).unwrap();
+        let mut dirs = dirs.map(|e| e.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+        dirs.sort();
+        assert_eq!(dirs, SHIPPED.map(|s| s.0));
+    }
+
+    #[test]
+    fn omarchy_copy_of_a_shipped_theme_is_that_theme() {
+        let ours = shipped("hackerman");
+        let omarchys = ours.split_once("\n\n").unwrap().1;
+        assert!(same_colors(ours, omarchys) && !same_colors(ours, shipped("lupine")));
+        let own = Path::new("/x/trix/colors.toml");
+        let (l, current) = choices(own, Some(omarchys.to_string()), None, Vec::new());
+        assert_eq!(l[current].name, "Hackerman", "not \"Your colors.toml\"");
+        assert!(l.iter().all(|c| c.pick != Pick::Yours));
     }
 
     #[test]
@@ -544,6 +599,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "background = \"#123456\"\n");
         assert!(run("ristretto").status.success());
         assert_eq!(backups().len(), 1, "a shipped theme isn't backed up");
+        // Omarchy's copy of one trix ships, without the first line.
+        std::fs::write(&installed, shipped("hackerman").split_once("\n\n").unwrap().1).unwrap();
+        let out = run("hackerman");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("already installed"), "the same colors: that theme");
+        assert!(run("ristretto").status.success());
+        assert_eq!(backups().len(), 1, "nor Omarchy's copy of one");
         assert_eq!(run("nope").status.code(), Some(1));
         assert_eq!(read(), include_str!("../themes/ristretto/colors.toml"), "an unknown name changes nothing");
         let _ = std::fs::remove_dir_all(&home);
@@ -645,19 +706,26 @@ mod tests {
     fn the_themes_to_pick_from() {
         let own = Path::new("/x/trix/colors.toml");
         let names = |l: &[Choice]| l.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
-        let gruvbox = ("gruvbox".to_string(), "background = \"#282828\"\n".to_string());
+        // Omarchy's: one trix doesn't ship, and its own Tokyo Night.
+        let osaka = ("osaka-jade".to_string(), "background = \"#111c18\"\n".to_string());
         let tokyo = ("tokyo-night".to_string(), "background = \"#000000\"\n".to_string());
-        let (l, current) = choices(own, None, None, vec![gruvbox.clone(), tokyo]);
-        assert_eq!(names(&l), ["Your terminal's colors", "Gruvbox", "Lupine", "Retro 82", "Ristretto", "Tokyo Night"], "trix's own Tokyo Night, not Omarchy's");
+        let (l, current) = choices(own, None, None, vec![osaka.clone(), tokyo]);
+        let mut want = SHIPPED.map(|s| s.1.to_string()).to_vec();
+        want.push("Osaka Jade".into());
+        want.sort_by_key(|n| n.to_lowercase());
+        want.insert(0, "Your terminal's colors".into());
+        assert_eq!(names(&l), want, "every theme by name, once");
         assert_eq!((current, &l[0].source), (0, &Source::Builtin));
         assert_eq!(l[1].source, Source::File(own.to_path_buf()), "a theme picked is trix's own file");
-        assert_eq!(l[5].pick, Pick::Colors(SHIPPED[3].2.to_string()));
+        let by = |name: &str| &l.iter().find(|c| c.name == name).unwrap().pick;
+        assert_eq!(by("Tokyo Night"), &Pick::Colors(shipped("tokyo-night").into()), "trix's own Tokyo Night, not Omarchy's");
+        assert_eq!(by("Osaka Jade"), &Pick::Colors(osaka.1.clone()));
 
-        let omarchy = Some((Some("Retro 82".to_string()), SHIPPED[1].2.to_string()));
-        let (l, current) = choices(own, Some(gruvbox.1.clone()), omarchy, vec![gruvbox]);
+        let omarchy = Some((Some("Retro 82".to_string()), shipped("retro-82").to_string()));
+        let (l, current) = choices(own, Some(osaka.1.clone()), omarchy, vec![osaka]);
         assert_eq!(l[0].name, "Follow Omarchy (Retro 82)");
         assert_eq!(l[0].source, Source::Omarchy);
-        assert_eq!(l[current].name, "Gruvbox", "the file there now, by what's in it");
+        assert_eq!(l[current].name, "Osaka Jade", "the file there now, by what's in it");
 
         let (l, current) = choices(own, Some("background = \"#123456\"\n".into()), None, Vec::new());
         assert_eq!((l[1].name.as_str(), &l[1].pick, current), ("Your colors.toml", &Pick::Yours, 1), "made by hand: kept, and in use");
@@ -676,7 +744,7 @@ mod tests {
         let backups = || std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bak")).count();
 
         assert_eq!(install(by("Ristretto"), &own, &l).unwrap(), None);
-        assert_eq!(std::fs::read_to_string(&own).unwrap(), SHIPPED[2].2);
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), shipped("ristretto"));
         assert_eq!(install(by("Lupine"), &own, &l).unwrap(), None, "one of the list: nothing to keep");
         assert_eq!(install(&l[0], &own, &l).unwrap(), None);
         assert!(!own.exists(), "none of trix's own");
@@ -685,7 +753,13 @@ mod tests {
         std::fs::write(&own, "background = \"#123456\"\n").unwrap();
         let backup = install(by("Lupine"), &own, &l).unwrap().expect("kept");
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "background = \"#123456\"\n");
-        assert_eq!(std::fs::read_to_string(&own).unwrap(), SHIPPED[0].2);
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), shipped("lupine"));
+        // Omarchy's copy of one trix ships, as picked before trix had it.
+        let omarchys = shipped("hackerman").split_once("\n\n").unwrap().1;
+        std::fs::write(&own, omarchys).unwrap();
+        assert_eq!(install(by("Hackerman"), &own, &l).unwrap(), None, "the theme already");
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), omarchys, "left as it is");
+        assert_eq!(install(by("Nord"), &own, &l).unwrap(), None, "one of the list: nothing to keep");
         std::fs::write(&own, "background = \"#654321\"\n").unwrap();
         std::fs::remove_file(&backup).unwrap();
         assert!(install(&l[0], &own, &l).unwrap().is_some(), "removing one made by hand keeps it too");
