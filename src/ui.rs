@@ -294,23 +294,40 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let per = if compact { 1 } else { 4 };
     // A full card is 3 rows and a gap; the last needs no gap.
     let fit = if compact { list.height as usize } else { (list.height as usize + 1) / 4 };
-    let first = sidebar_window(app.sidebar_scroll, app.focus, n, fit);
-    app.sidebar_scroll = first;
-    let shown = fit.min(n - first.min(n));
-    for (k, i) in (first..first + shown).enumerate() {
-        let y = list.y + (k * per) as u16;
-        let r = Rect { x: list.x, y, width: list.width, height: if compact { 1 } else { 3 } };
+    // Pinned agents (the first ones) hold still at the top while the rest
+    // scroll under them. Between the two, a row says what's scrolled out of
+    // view: a full card's gap row, or one a one-line list gives up for it.
+    let pins = app.agents.iter().take_while(|a| a.pinned).count();
+    let gap = usize::from(compact);
+    // Unless it all fits, or holding them leaves no room for the rest.
+    let held = if n > fit && fit > pins + gap { pins } else { 0 };
+    let gap = if held > 0 { gap } else { 0 };
+    let room = fit - held - gap;
+    let height = if compact { 1 } else { 3 };
+    for i in 0..held {
+        let r = Rect { x: list.x, y: list.y + (i * per) as u16, width: list.width, height };
         card(f, app, i, r, compact, mini, t);
         app.hits.cards.push((r, app.agents[i].id));
     }
-    // What's out of view, in the free rows above and below the list.
+    let top = list.y + (held * per + gap) as u16;
+    let rest = n - held;
+    // A held card in focus is already in view: the rest stay where they were.
+    let first = sidebar_window(app.sidebar_scroll, app.focus.checked_sub(held), rest, room);
+    app.sidebar_scroll = first;
+    let shown = room.min(rest - first.min(rest));
+    for (k, i) in (held + first..held + first + shown).enumerate() {
+        let r = Rect { x: list.x, y: top + (k * per) as u16, width: list.width, height };
+        card(f, app, i, r, compact, mini, t);
+        app.hits.cards.push((r, app.agents[i].id));
+    }
+    // What's out of view, in the free rows above and below the scrolling part.
     let more = |k: usize, arrow: &str| if mini { format!(" {arrow} {k}") } else { format!("  {arrow} {k} more") };
     if first > 0 {
-        f.render_widget(Paragraph::new(Span::styled(more(first, "↑"), Style::new().fg(t.muted))), Rect { y: inner.y + 1, height: 1, ..inner });
+        f.render_widget(Paragraph::new(Span::styled(more(first, "↑"), Style::new().fg(t.muted))), Rect { y: top - 1, height: 1, ..inner });
     }
     // Right under the last card shown: its gap row, or the next row.
-    let below = n - first.min(n) - shown;
-    let y = list.y + (shown.saturating_sub(1) * per) as u16 + if compact { 1 } else { 3 };
+    let below = rest - first.min(rest) - shown;
+    let y = top + (shown.saturating_sub(1) * per) as u16 + if compact { 1 } else { 3 };
     if below > 0 && shown > 0 && y < area.bottom().saturating_sub(2) {
         f.render_widget(Paragraph::new(Span::styled(more(below, "↓"), Style::new().fg(t.muted))), Rect { y, height: 1, ..inner });
     }
@@ -333,18 +350,17 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
 }
 
 /// The first of `n` cards to show when `fit` fit: where the list was, moved
-/// just enough to show the focused card, and never past the end.
-fn sidebar_window(was: usize, focus: usize, n: usize, fit: usize) -> usize {
+/// just enough to show the focused card (if it's one of these), and never
+/// past the end.
+fn sidebar_window(was: usize, focus: Option<usize>, n: usize, fit: usize) -> usize {
     if fit == 0 || n <= fit {
         return 0;
     }
     let first = was.min(n - fit);
-    if focus < first {
-        focus
-    } else if focus >= first + fit {
-        focus + 1 - fit
-    } else {
-        first
+    match focus {
+        Some(f) if f < first => f,
+        Some(f) if f >= first + fit => f + 1 - fit,
+        _ => first,
     }
 }
 
@@ -2235,15 +2251,74 @@ mod tests {
     #[test]
     fn the_sidebar_window_follows_the_focus() {
         // Everything fits: no scrolling, wherever it was.
-        assert_eq!(sidebar_window(5, 3, 4, 10), 0);
+        assert_eq!(sidebar_window(5, Some(3), 4, 10), 0);
         // Focus in view: the list stays put.
-        assert_eq!(sidebar_window(2, 4, 20, 5), 2);
+        assert_eq!(sidebar_window(2, Some(4), 20, 5), 2);
         // Focus below or above: just enough to show it.
-        assert_eq!(sidebar_window(2, 9, 20, 5), 5);
-        assert_eq!(sidebar_window(6, 1, 20, 5), 1);
+        assert_eq!(sidebar_window(2, Some(9), 20, 5), 5);
+        assert_eq!(sidebar_window(6, Some(1), 20, 5), 1);
         // Agents closed since: never past the end.
-        assert_eq!(sidebar_window(18, 7, 8, 5), 3);
-        assert_eq!(sidebar_window(3, 0, 20, 0), 0, "no room at all");
+        assert_eq!(sidebar_window(18, Some(7), 8, 5), 3);
+        assert_eq!(sidebar_window(3, Some(0), 20, 0), 0, "no room at all");
+        // The focus elsewhere (on a pinned card): the list stays put.
+        assert_eq!(sidebar_window(9, None, 20, 5), 9);
+        assert_eq!(sidebar_window(18, None, 8, 5), 3);
+    }
+
+    #[test]
+    fn pinned_cards_hold_still_while_the_rest_scroll() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.sidebar_mini = false;
+        app.sidebar_compact = false;
+        let n = 40;
+        for k in 0..n {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.id = k + 1;
+            a.name = format!("agent-{}", k + 1);
+            a.pinned = k < 2;
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        let mut frame = |app: &mut App| {
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>()
+        };
+        let ids = |app: &App| app.hits.cards.iter().map(|(_, id)| *id).collect::<Vec<u32>>();
+        for compact in [false, true] {
+            app.sidebar_compact = compact;
+            app.focus = 0;
+            app.sidebar_scroll = 0;
+            frame(&mut app);
+            let pins: Vec<Rect> = app.hits.cards[..2].iter().map(|(r, _)| *r).collect();
+            assert_eq!(ids(&app)[..3], [1, 2, 3], "compact: {compact}");
+            // The last agent: the rest scroll to it, the pinned ones stay.
+            app.focus = n as usize - 1;
+            let lines = frame(&mut app);
+            let shown = ids(&app);
+            assert_eq!((shown[0], shown[1], *shown.last().unwrap()), (1, 2, n), "compact: {compact}: {shown:?}");
+            assert_eq!(app.hits.cards[..2].iter().map(|(r, _)| *r).collect::<Vec<_>>(), pins, "in the same place");
+            // Right under them, what's scrolled out of view between.
+            let hidden = n as usize - shown.len();
+            let row = &lines[pins[1].bottom() as usize];
+            assert!(row.contains(&format!("↑ {hidden} more")), "compact: {compact}:\n{}", lines.join("\n"));
+            assert!(app.hits.cards[2].0.y > pins[1].bottom(), "the rest start below that row");
+            // A pinned agent in focus: nothing moves.
+            app.focus = 1;
+            frame(&mut app);
+            assert_eq!(ids(&app), shown, "compact: {compact}");
+            // The first one after the pins: the rest scroll back up.
+            app.focus = 2;
+            let lines = frame(&mut app);
+            assert_eq!(ids(&app)[..3], [1, 2, 3], "compact: {compact}");
+            assert!(!lines.join("\n").contains('↑'));
+        }
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
