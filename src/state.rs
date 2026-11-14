@@ -137,6 +137,9 @@ pub struct Prefs {
     /// alt+m: the narrow sidebar.
     #[serde(default)]
     pub sidebar_mini: bool,
+    /// alt+m once more: narrower still, only each agent's number and state.
+    #[serde(default)]
+    pub sidebar_icons: bool,
     /// alt+c: one-line sidebar cards.
     #[serde(default)]
     pub sidebar_compact: bool,

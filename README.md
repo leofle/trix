@@ -157,7 +157,7 @@ trix layout rm work-layout
 - **Theme** opens a list of themes. At the top is no theme of trix's own: Omarchy's, followed as it changes, or without Omarchy your terminal's colors. Then come the 23 themes trix ships, all of Omarchy's, and with Omarchy any other theme it has. Moving through the list tries each one on, panes included. `enter` keeps it, and `esc` goes back to the theme you had. A theme you keep is written to `~/.config/trix/colors.toml` (see [Themes](#themes)).
 - **Theme in agent panes** is on by default: a theme of trix's own paints the panes, and Claude, Grok and OpenCode take it too. Off, trix's bars and sidebar keep the theme, but the panes keep your terminal's colors (and its window transparency), and the agents keep their own themes. It does nothing while trix follows Omarchy's theme, which themes the terminal itself.
 - **Needs-you strip** sets the color of the bar that says another agent needs you: the theme's red, orange, yellow, green, cyan, accent or magenta, so it follows a theme switch, or the `#rrggbb` your config names.
-- **Sidebar** (wide or narrow) and **sidebar cards** (full or compact) do the same as `alt+m` and `alt+c`, and are remembered the same way.
+- **Sidebar** (wide, narrow or icons) and **sidebar cards** (full or compact) do the same as `alt+m` and `alt+c`, and are remembered the same way.
 - **Nerd Font icons** is off by default. On, the pane pin comes from a Nerd Font. The row shows the pin as it will look, so if it shows as a box, your font isn't a Nerd Font: leave it off.
 - **New ones start as** picks the agent `alt+n`'s form starts on: claude (the default), codex, grok, opencode, cursor, copilot, muse, shell, or *last*, the one you started last. **New ones in a worktree** ticks the form's worktree box to begin with.
 - **Bring back the last workspace** is what a fresh trix does with the workspace saved last time: *ask* (the default), *always* bring it back, or *never*, starting fresh (see [Restore](#restore)).
@@ -268,7 +268,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 | `alt+o`, right-click | an agent's menu: rename, restart, copy folder path, close |
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
-| `alt+m` | mini sidebar: one line per agent, half the width (remembered) |
+| `alt+m` | sidebar size, in turn: narrow (one line per agent, half the width), icons (only each agent's number and state), wide again (remembered) |
 | `alt+c` | compact sidebar: one-line cards instead of full ones that scroll (remembered) |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |

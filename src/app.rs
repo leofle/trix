@@ -54,6 +54,35 @@ pub enum View {
     Grid,
 }
 
+/// How wide the sidebar is: alt+m steps through these.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum SidebarSize {
+    /// Full cards: activity, sparkline, branch, diff.
+    Wide,
+    /// One line per agent: number, state, name.
+    Narrow,
+    /// Only each agent's number and state glyph.
+    Icons,
+}
+
+impl SidebarSize {
+    const ALL: [SidebarSize; 3] = [SidebarSize::Wide, SidebarSize::Narrow, SidebarSize::Icons];
+
+    pub fn cycle(self, forward: bool) -> SidebarSize {
+        let i = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        let n = Self::ALL.len();
+        Self::ALL[if forward { (i + 1) % n } else { (i + n - 1) % n }]
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            SidebarSize::Wide => "wide",
+            SidebarSize::Narrow => "narrow",
+            SidebarSize::Icons => "icons",
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct TextInput {
     pub text: String,
@@ -326,6 +355,9 @@ pub struct App {
     pub sidebar: bool,
     /// alt+m: a narrow sidebar, one line per agent.
     pub sidebar_mini: bool,
+    /// alt+m again, from narrow: only each agent's number and state glyph.
+    /// Only means something with `sidebar_mini`.
+    pub sidebar_icons: bool,
     /// alt+c: one-line cards, so more fit. Otherwise cards keep their size
     /// and the list scrolls.
     pub sidebar_compact: bool,
@@ -424,6 +456,7 @@ impl App {
             view: View::Focus,
             sidebar: true,
             sidebar_mini: prefs.sidebar_mini,
+            sidebar_icons: prefs.sidebar_icons,
             sidebar_compact: prefs.sidebar_compact,
             sidebar_scroll: 0,
             modal: None,
@@ -559,6 +592,7 @@ impl App {
         // Another session may have changed them since this one started.
         let prefs = state::load_prefs();
         self.sidebar_mini = prefs.sidebar_mini;
+        self.sidebar_icons = prefs.sidebar_icons;
         self.sidebar_compact = prefs.sidebar_compact;
         self.term_focused = true;
         if let Some(a) = self.agents.get_mut(self.focus) {
@@ -1506,8 +1540,12 @@ impl App {
             Action::Attention => self.next_attention(),
             Action::Grid => self.view = if self.view == View::Grid { View::Focus } else { View::Grid },
             Action::Sidebar => self.sidebar = !self.sidebar,
-            // From hidden, it brings the sidebar back small.
-            Action::MiniSidebar => self.set_sidebar_mini(!self.sidebar || !self.sidebar_mini),
+            // wide → narrow → icons → wide. From hidden, it brings the
+            // sidebar back small, as narrow as it was.
+            Action::MiniSidebar => {
+                let size = if self.sidebar { self.sidebar_size().cycle(true) } else { self.sidebar_size().max(SidebarSize::Narrow) };
+                self.set_sidebar_size(size);
+            }
             Action::Compact => {
                 let on = !self.sidebar_compact;
                 self.toast(if on { "sidebar: compact cards" } else { "sidebar: full cards, scrolling" }, ToastKind::Info);
@@ -1551,13 +1589,23 @@ impl App {
         }
     }
 
-    /// alt+m, or the settings: the narrow sidebar, remembered.
-    fn set_sidebar_mini(&mut self, on: bool) {
-        self.sidebar_mini = on;
+    pub fn sidebar_size(&self) -> SidebarSize {
+        match (self.sidebar_mini, self.sidebar_icons) {
+            (false, _) => SidebarSize::Wide,
+            (true, false) => SidebarSize::Narrow,
+            (true, true) => SidebarSize::Icons,
+        }
+    }
+
+    /// alt+m, or the settings: the sidebar's width, remembered.
+    fn set_sidebar_size(&mut self, size: SidebarSize) {
+        self.sidebar_mini = size != SidebarSize::Wide;
+        self.sidebar_icons = size == SidebarSize::Icons;
         self.sidebar = true;
         // Load first: change only this, whatever else prefs.json holds.
         let mut prefs = state::load_prefs();
-        prefs.sidebar_mini = on;
+        prefs.sidebar_mini = self.sidebar_mini;
+        prefs.sidebar_icons = self.sidebar_icons;
         if let Err(e) = state::store_prefs(&prefs) {
             self.toast(format!("couldn't remember the sidebar size: {e}"), ToastKind::Bad);
         }
@@ -1717,7 +1765,7 @@ impl App {
                 let next = crate::settings::cycle(&Restore::ALL, &self.config.workspace.restore, forward);
                 self.set_config("workspace", "restore", next.name().into(), next == Restore::Ask);
             }
-            Row::SidebarMini => self.set_sidebar_mini(!self.sidebar_mini),
+            Row::SidebarMini => self.set_sidebar_size(self.sidebar_size().cycle(forward)),
             Row::SidebarCompact => self.set_sidebar_compact(!self.sidebar_compact),
             Row::NerdFont => {
                 let on = !self.config.ui.nerd_font;
