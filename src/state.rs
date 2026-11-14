@@ -32,11 +32,14 @@ pub struct Saved {
     #[serde(default)]
     pub focus: usize,
     pub agents: Vec<SavedAgent>,
+    /// The grid was on (alt+g), so it comes back on with the agents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grid: bool,
 }
 
 impl Saved {
     pub fn new(focus: usize, agents: Vec<SavedAgent>) -> Saved {
-        Saved { version: VERSION, focus, agents }
+        Saved { version: VERSION, focus, agents, grid: false }
     }
 
     /// One line for the restore prompt, e.g. "3 agents · 2 conversations resume".
@@ -208,7 +211,11 @@ mod tests {
         let path = dir.join("nested/workspace.json");
         let mut custom = agent("custom", "dev", None);
         custom.command = Some("npm run dev".into());
-        let saved = Saved::new(1, vec![agent("claude", "web", Some("abc")), custom]);
+        let mut saved = Saved::new(1, vec![agent("claude", "web", Some("abc")), custom]);
+        store_at(&path, &saved).unwrap();
+        assert_eq!(load_from(&path), Some(saved.clone()));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("grid"), "focus view: left out");
+        saved.grid = true;
         store_at(&path, &saved).unwrap();
         assert_eq!(load_from(&path), Some(saved));
         // Written atomically: no temp file left next to it.
@@ -294,6 +301,7 @@ mod tests {
         std::fs::write(&path, r#"{"version":1,"agents":[{"kind":"shell","name":"s","cwd":"/"}]}"#).unwrap();
         let saved = load_from(&path).unwrap();
         assert_eq!(saved.focus, 0);
+        assert!(!saved.grid, "a file from before the grid was saved");
         assert_eq!(saved.agents[0].command, None);
         assert_eq!(saved.agents[0].session, None);
         let _ = std::fs::remove_dir_all(dir);
