@@ -73,6 +73,7 @@ fn install() -> std::io::Result<PathBuf> {
     let plist = info_plist(&stamp(&me));
     let exe = app.join("Contents/MacOS/trix");
     if is_current(&app, &plist) {
+        register(&app);
         return Ok(exe);
     }
     let parent = app.parent().expect("trix.app has a parent");
@@ -87,7 +88,21 @@ fn install() -> std::io::Result<PathBuf> {
     if built.is_err() && !is_current(&app, &plist) {
         built?;
     }
+    register(&app);
     Ok(exe)
+}
+
+/// Tell Launch Services about the app. macOS only lets an app it knows
+/// about notify, and it may never find one in Application Support by
+/// itself: then every notification falls back to Script Editor's.
+fn register(app: &Path) {
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+    let _ = Command::new(LSREGISTER)
+        .arg("-f")
+        .arg(app)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Is the app at `app` this binary's, untouched?
