@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
-use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, TextInput, ToastKind, View, tilde};
+use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, SidebarSize, TextInput, ToastKind, View, tilde};
 use crate::settings::{Picker, Row, Settings};
 use crate::theme::{Source as ThemeSource, Theme, contrast, mix};
 
@@ -22,6 +22,8 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const SIDEBAR_W: u16 = 36;
 /// alt+m: number, state, name and the unseen dot.
 const SIDEBAR_MINI_W: u16 = 18;
+/// alt+m again: the number, the state glyph and the unseen dot, no name.
+const SIDEBAR_ICONS_W: u16 = 7;
 /// The narrowest a grid pane gets while the sidebar shows. Narrower
 /// than this, the sidebar steps aside in grid view.
 const GRID_TILE_MIN: u16 = 30;
@@ -86,7 +88,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let [top, body, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let side_w = if app.sidebar_mini { SIDEBAR_MINI_W } else { SIDEBAR_W };
+    let side_w = match app.sidebar_size() {
+        SidebarSize::Wide => SIDEBAR_W,
+        SidebarSize::Narrow => SIDEBAR_MINI_W,
+        SidebarSize::Icons => SIDEBAR_ICONS_W,
+    };
     // The grid puts two panes side by side; give them room to be usable
     // before giving the sidebar any.
     let main_min = if app.view == View::Grid && app.agents.len() > 1 { 2 * GRID_TILE_MIN + 2 } else { 34 };
@@ -296,10 +302,16 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     if inner.height < 4 {
         return;
     }
-    let header = TLine::from(vec![
-        Span::styled(" AGENTS", Style::new().fg(t.dim).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {}", app.agents.len()), Style::new().fg(t.muted)),
-    ]);
+    let icons = app.sidebar_size() == SidebarSize::Icons;
+    let header = if icons {
+        // No room for the word: just how many.
+        TLine::from(Span::styled(format!(" {}", app.agents.len()), Style::new().fg(t.dim).add_modifier(Modifier::BOLD)))
+    } else {
+        TLine::from(vec![
+            Span::styled(" AGENTS", Style::new().fg(t.dim).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {}", app.agents.len()), Style::new().fg(t.muted)),
+        ])
+    };
     f.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
 
     let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), ..inner };
@@ -354,7 +366,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let btn = Rect { x: inner.x, y: by, width: inner.width, height: 1 };
     let line = TLine::from(vec![
         Span::styled(" + ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(if mini { "new" } else { "new agent" }, Style::new().fg(t.fg)),
+        Span::styled(if icons { "" } else if mini { "new" } else { "new agent" }, Style::new().fg(t.fg)),
     ]);
     f.render_widget(Paragraph::new(line), btn);
     if let Some(k) = app.config.keys.label(Action::New).filter(|_| !mini) {
@@ -421,6 +433,21 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     } else {
         Style::new().fg(t.fg)
     };
+    if mini && app.sidebar_icons {
+        // " 1 ⠹•": which agent, and its state. The bar on the left still
+        // marks the focus and who needs you.
+        let mut line = vec![
+            Span::raw(" "),
+            Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
+            Span::raw(" "),
+            Span::styled(g, gs),
+        ];
+        if a.unseen && a.state != State::Blocked {
+            line.push(Span::styled("•", Style::new().fg(sc).add_modifier(Modifier::BOLD)));
+        }
+        f.render_widget(Paragraph::new(TLine::from(line)), Rect { height: 1, ..r });
+        return;
+    }
     if mini {
         // " 1 ⠹ name •": everything that tells agents apart and says who needs you.
         let dot = a.unseen && a.state != State::Blocked;
@@ -1771,7 +1798,7 @@ fn setting_value(app: &App, s: &Settings, row: Row, t: &Theme) -> Vec<Span<'stat
             let name = crate::settings::paint_text(app.config.strip.color);
             vec![Span::styled(format!("{name} "), Style::new().fg(t.fg)), Span::styled(" ▲ ", Style::new().fg(words).bg(bar))]
         }
-        Row::SidebarMini => text((if app.sidebar_mini { "narrow" } else { "wide" }).into(), t.fg),
+        Row::SidebarMini => text(app.sidebar_size().word().into(), t.fg),
         Row::SidebarCompact => text((if app.sidebar_compact { "compact" } else { "full" }).into(), t.fg),
         Row::NerdFont => {
             let mut v = toggle(app.config.ui.nerd_font);
@@ -2603,10 +2630,15 @@ mod tests {
     }
 
     fn screen(mini: bool, width: u16) -> (String, App) {
+        screen_sized(if mini { SidebarSize::Narrow } else { SidebarSize::Wide }, width)
+    }
+
+    fn screen_sized(size: SidebarSize, width: u16) -> (String, App) {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None; // never offer (or save over) the real workspace
-        app.sidebar_mini = mini;
+        app.sidebar_mini = size != SidebarSize::Wide;
+        app.sidebar_icons = size == SidebarSize::Icons;
         for (name, state, unseen) in [("web", State::Working, false), ("api-gateway-v2", State::Blocked, true), ("docs", State::Done, true), ("sh", State::Idle, false)] {
             let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
             a.name = name.into();
@@ -2843,6 +2875,36 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    #[test]
+    fn icons_sidebar_shows_only_numbers_and_states() {
+        let (icons, app) = screen_sized(SidebarSize::Icons, 100);
+        println!("{icons}");
+        let cards = &app.hits.cards;
+        assert_eq!(cards.len(), 4);
+        assert!(cards.iter().all(|(r, _)| r.height == 1 && r.width == SIDEBAR_ICONS_W - 2));
+        let row = |i: usize| icons.lines().nth(cards[i].0.y as usize).unwrap().chars().take(SIDEBAR_ICONS_W as usize).collect::<String>();
+        let (g, _) = glyph(&app, State::Blocked);
+        assert!(row(0).starts_with(" ▌1 "), "focused: accent bar: {}", row(0));
+        assert_eq!(row(1).trim_end(), format!(" ▌2 {g}"), "needs you: red bar and its glyph, no dot");
+        assert!(row(2).trim_end().ends_with('•'), "unseen work keeps its dot: {}", row(2));
+        assert!(row(3).starts_with("  4 "), "nothing to say: no bar: {}", row(3));
+        for name in ["web", "api", "docs", "AGENTS", "new"] {
+            assert!(!icons.lines().any(|l| l.chars().take(SIDEBAR_ICONS_W as usize).collect::<String>().contains(name)), "no {name} in the rail:\n{icons}");
+        }
+        assert!(icons.lines().any(|l| l.trim_end() == "  +" || l.starts_with("  +  ")), "the new button stays, as a +");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn alt_m_steps_wide_narrow_icons() {
+        assert_eq!(SidebarSize::Wide.cycle(true), SidebarSize::Narrow);
+        assert_eq!(SidebarSize::Narrow.cycle(true), SidebarSize::Icons);
+        assert_eq!(SidebarSize::Icons.cycle(true), SidebarSize::Wide);
+        assert_eq!(SidebarSize::Wide.cycle(false), SidebarSize::Icons);
     }
 
     #[test]
