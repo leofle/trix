@@ -22,6 +22,9 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const SIDEBAR_W: u16 = 36;
 /// alt+m: number, state, name and the unseen dot.
 const SIDEBAR_MINI_W: u16 = 18;
+/// The narrowest a grid pane gets while the sidebar shows. Narrower
+/// than this, the sidebar steps aside in grid view.
+const GRID_TILE_MIN: u16 = 30;
 
 pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
@@ -84,7 +87,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let [top, body, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let side_w = if app.sidebar_mini { SIDEBAR_MINI_W } else { SIDEBAR_W };
-    let show_sidebar = app.sidebar && body.width >= side_w + 34;
+    // The grid puts two panes side by side; give them room to be usable
+    // before giving the sidebar any.
+    let main_min = if app.view == View::Grid && app.agents.len() > 1 { 2 * GRID_TILE_MIN + 2 } else { 34 };
+    let show_sidebar = app.sidebar && body.width >= side_w + main_min;
     let (side, main) = if show_sidebar {
         let [s, m] = Layout::horizontal([Constraint::Length(side_w), Constraint::Min(20)]).areas(body);
         (Some(s), m)
@@ -596,7 +602,102 @@ fn pin_span(app: &App, pinned: bool) -> Span<'static> {
     Span::styled(glyph, if pinned { style.add_modifier(Modifier::BOLD) } else { style })
 }
 
-fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme) -> Block<'a> {
+/// How much of a pane's title fits. The parts go in this order as the
+/// pane narrows: what the agent is doing, the folder, the word "pinned",
+/// the kind, the diff, the branch. The name goes last, cut short with an
+/// ellipsis, so every pane still says whose it is.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct TitleFit {
+    activity: bool,
+    cwd: bool,
+    pinned_word: bool,
+    kind: bool,
+    diff: bool,
+    branch: bool,
+    /// The widest the name may be, or None for all of it.
+    name: Option<usize>,
+}
+
+impl TitleFit {
+    /// Every level from all of it to the least, before cutting the name.
+    const LEVELS: [TitleFit; 7] = {
+        let all = TitleFit { activity: true, cwd: true, pinned_word: true, kind: true, diff: true, branch: true, name: None };
+        [
+            all,
+            TitleFit { activity: false, ..all },
+            TitleFit { activity: false, cwd: false, ..all },
+            TitleFit { activity: false, cwd: false, pinned_word: false, ..all },
+            TitleFit { activity: false, cwd: false, pinned_word: false, kind: false, ..all },
+            TitleFit { activity: false, cwd: false, pinned_word: false, kind: false, diff: false, ..all },
+            TitleFit { activity: false, cwd: false, pinned_word: false, kind: false, diff: false, branch: false, name: None },
+        ]
+    };
+}
+
+/// A pane's title, left part and right part, fitted to a pane `width`
+/// wide. `compact` leaves out the activity and folder whatever the width.
+fn pane_title(app: &App, a: &Agent, border: Color, width: u16, compact: bool, t: &Theme) -> (TLine<'static>, TLine<'static>) {
+    let build = |fit: TitleFit| {
+        let (g, gs) = glyph(app, a.state);
+        let name = match fit.name {
+            Some(w) => trunc(&a.name, w),
+            None => a.name.clone(),
+        };
+        let mut left = vec![
+            Span::styled("─ ", Style::new().fg(border)),
+            pin_span(app, a.pinned),
+            Span::styled(if a.pinned && fit.pinned_word { " pinned " } else { " " }, Style::new().fg(PIN_RED)),
+            Span::styled(g, gs),
+            Span::raw(" "),
+            Span::styled(name, Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+        ];
+        if fit.kind {
+            left.push(Span::styled(a.kind.label(), Style::new().fg(kind_color(t, a.kind))));
+            left.push(Span::raw(" "));
+        }
+        if fit.activity && !compact && !a.activity.is_empty() {
+            left.push(Span::styled("· ", Style::new().fg(t.muted)));
+            left.push(Span::styled(
+                trunc(&a.activity, 60),
+                Style::new().fg(if a.state == State::Blocked { t.red } else { t.dim }),
+            ));
+            left.push(Span::raw(" "));
+        }
+        let mut right = vec![];
+        if fit.cwd && !compact {
+            right.push(Span::styled(format!(" {}", tilde(&a.cwd)), Style::new().fg(t.dim)));
+        }
+        if let Some(b) = a.branch.as_ref().filter(|_| fit.branch) {
+            right.push(Span::styled(format!("  {b}"), Style::new().fg(t.magenta)));
+        }
+        if let Some((files, add, del)) = a.diff
+            && files > 0
+            && fit.diff
+        {
+            right.push(Span::styled(format!(" +{add}"), Style::new().fg(t.green)));
+            right.push(Span::styled(format!(" −{del}"), Style::new().fg(t.red)));
+        }
+        right.push(Span::raw(" "));
+        (TLine::from(left), TLine::from(right))
+    };
+    // The corners take a column each.
+    let room = width.saturating_sub(2) as usize;
+    let fits = |(l, r): &(TLine, TLine)| l.width() + r.width() <= room;
+    for fit in TitleFit::LEVELS {
+        let title = build(fit);
+        if fits(&title) {
+            return title;
+        }
+    }
+    // Even the name alone is too wide: cut it to what's left.
+    let least = TitleFit::LEVELS[TitleFit::LEVELS.len() - 1];
+    let (l, r) = build(least);
+    let over = (l.width() + r.width()).saturating_sub(room);
+    build(TitleFit { name: Some(a.name.width().saturating_sub(over).max(1)), ..least })
+}
+
+fn pane_block<'a>(app: &App, a: &Agent, focused: bool, width: u16, compact: bool, t: &Theme) -> Block<'a> {
     let sc = state_color(t, a.state);
     let border = if a.state == State::Blocked {
         t.red
@@ -605,40 +706,7 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme)
     } else {
         mix(t.muted, sc, if a.state == State::Working { 0.35 } else { 0.0 })
     };
-    let (g, gs) = glyph(app, a.state);
-    let mut left = vec![
-        Span::styled("─ ", Style::new().fg(border)),
-        pin_span(app, a.pinned),
-        Span::styled(if a.pinned { " pinned " } else { " " }, Style::new().fg(PIN_RED)),
-        Span::styled(g, gs),
-        Span::raw(" "),
-        Span::styled(a.name.clone(), Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-        Span::styled(a.kind.label(), Style::new().fg(kind_color(t, a.kind))),
-        Span::raw(" "),
-    ];
-    if !compact && !a.activity.is_empty() {
-        left.push(Span::styled("· ", Style::new().fg(t.muted)));
-        left.push(Span::styled(
-            trunc(&a.activity, 60),
-            Style::new().fg(if a.state == State::Blocked { t.red } else { t.dim }),
-        ));
-        left.push(Span::raw(" "));
-    }
-    let mut right = vec![];
-    if !compact {
-        right.push(Span::styled(format!(" {}", tilde(&a.cwd)), Style::new().fg(t.dim)));
-    }
-    if let Some(b) = &a.branch {
-        right.push(Span::styled(format!("  {b}"), Style::new().fg(t.magenta)));
-    }
-    if let Some((files, add, del)) = a.diff
-        && files > 0
-    {
-        right.push(Span::styled(format!(" +{add}"), Style::new().fg(t.green)));
-        right.push(Span::styled(format!(" −{del}"), Style::new().fg(t.red)));
-    }
-    right.push(Span::raw(" "));
+    let (left, right) = pane_title(app, a, border, width, compact, t);
     let mut status = vec![];
     if let Some(c) = a.context.filter(|_| !compact) {
         let color = context_color(t, c.used_frac()).unwrap_or(t.dim);
@@ -653,13 +721,13 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, compact: bool, t: &Theme)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border))
         .padding(Padding::horizontal(1))
-        .title_top(TLine::from(left))
-        .title_top(TLine::from(right).right_aligned())
+        .title_top(left)
+        .title_top(right.right_aligned())
         .title_bottom(status.right_aligned())
 }
 
 fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
-    let block = pane_block(app, &app.agents[app.focus], true, false, t);
+    let block = pane_block(app, &app.agents[app.focus], true, area.width, false, t);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.hits.titles.push((Rect { height: 1, ..area }, app.agents[app.focus].id));
@@ -830,7 +898,7 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
     let mut cursor = None;
     for (i, c) in tiles {
         let focused = i == app.focus;
-        let block = pane_block(app, &app.agents[i], focused, c.width < 70, t);
+        let block = pane_block(app, &app.agents[i], focused, c.width, c.width < 70, t);
         let inner = block.inner(c);
         f.render_widget(block, c);
         app.hits.titles.push((Rect { height: 1, ..c }, app.agents[i].id));
@@ -2922,6 +2990,62 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    /// The grid at `width` x `height`, four Claude agents on branch main
+    /// with a diff, as text, and the app.
+    fn grid_screen(width: u16, height: u16) -> (String, App) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.sidebar_mini = false;
+        app.view = View::Grid;
+        for name in ["claude-1", "claude-2", "codex-1", "shell-1"] {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+            a.name = name.into();
+            a.branch = Some("main".into());
+            a.diff = Some((2, 5, 1));
+            app.agents.push(a);
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let text = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for a in &app.agents {
+            a.shutdown();
+        }
+        (text, app)
+    }
+
+    #[test]
+    fn grid_titles_keep_the_name_last() {
+        // Wide: everything.
+        let (wide, _) = grid_screen(140, 40);
+        for name in ["claude-1", "claude-2", "codex-1", "shell-1"] {
+            assert!(wide.contains(&format!("{name} claude")), "{name} and its kind at 140:\n{wide}");
+        }
+        assert!(wide.contains("main +5 −1"), "branch and diff at 140:\n{wide}");
+        // Narrower: the kind and the branch go, never the name.
+        for (w, h) in [(80, 24), (60, 12), (50, 12)] {
+            let (text, _) = grid_screen(w, h);
+            for name in ["claude-1", "claude-2", "codex-1", "shell-1"] {
+                assert!(text.contains(name), "{name} at {w}x{h}:\n{text}");
+            }
+        }
+        // Too narrow for even the name: it's cut short, not dropped.
+        let (tiny, _) = grid_screen(30, 12);
+        assert!(tiny.contains("claud…") || tiny.contains("clau…") || tiny.contains("cla…"), "cut names at 30:\n{tiny}");
+    }
+
+    #[test]
+    fn the_sidebar_steps_aside_for_a_narrow_grid() {
+        let (text, app) = grid_screen(80, 24);
+        assert!(app.hits.cards.is_empty(), "no sidebar for a 2x2 grid at 80:\n{text}");
+        let (text, app) = grid_screen(140, 40);
+        assert_eq!(app.hits.cards.len(), 4, "the sidebar at 140:\n{text}");
     }
 
     #[test]
