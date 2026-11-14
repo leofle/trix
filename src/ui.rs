@@ -2032,20 +2032,20 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     if hidden > 0 {
         border_note(f, r, false, &format!("▼ {hidden} more: make the window taller"), t);
     }
-    let line = TLine::from(vec![
-        Span::styled("⠹ ", Style::new().fg(t.yellow)),
-        Span::styled("working   ", Style::new().fg(t.dim)),
-        Span::styled("▲ ", Style::new().fg(t.red)),
-        Span::styled("needs you   ", Style::new().fg(t.dim)),
-        Span::styled("✓ ", Style::new().fg(t.green)),
-        Span::styled("done   ", Style::new().fg(t.dim)),
-        Span::styled("○ ", Style::new().fg(t.dim)),
-        Span::styled("idle   ", Style::new().fg(t.dim)),
-        Span::styled("• ", Style::new().fg(t.green)),
-        Span::styled("unseen", Style::new().fg(t.dim)),
-    ]);
     if legend {
-        f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect { y: inner.bottom() - 1, height: 1, ..inner });
+        // Inset like the keys. Narrow, whole items go from the end, so none
+        // is left as a bare mark.
+        let items = [("⠹", t.yellow, "working"), ("▲", t.red, "needs you"), ("✓", t.green, "done"), ("○", t.dim, "idle"), ("•", t.green, "unseen")];
+        let room = inner.width.saturating_sub(4) as usize;
+        let wide = |n: usize| items[..n].iter().map(|(m, _, w)| m.width() + 1 + w.width()).sum::<usize>() + 3 * n.saturating_sub(1);
+        let n = (0..=items.len()).rev().find(|&n| wide(n) <= room).unwrap_or(0);
+        let mut spans = Vec::new();
+        for (i, (mark, c, what)) in items[..n].iter().enumerate() {
+            spans.push(Span::styled(format!("{mark} "), Style::new().fg(*c)));
+            spans.push(Span::styled(if i + 1 < n { format!("{what}   ") } else { what.to_string() }, Style::new().fg(t.dim)));
+        }
+        let row = Rect { x: inner.x + 2, y: inner.bottom() - 1, width: room as u16, height: 1 };
+        f.render_widget(Paragraph::new(TLine::from(spans)).alignment(Alignment::Center), row);
     }
 }
 
@@ -2227,6 +2227,16 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains('…')), "{lines:#?}");
         let row = lines.iter().find(|l| l.contains("next one th")).expect("the attention row");
         assert!(row.contains("next one that needs you") || row.contains('…'), "cut with no ellipsis: {row:?}");
+        // The legend, narrow, drops whole items and keeps clear of the border.
+        for w in 20..100 {
+            let lines = dialog(keys, w, 40);
+            let Some(l) = lines.iter().find(|l| l.contains("working")) else { continue };
+            let inside = l.trim().trim_start_matches('│').trim_end_matches('│');
+            assert!(inside.starts_with("  ") && inside.ends_with("  "), "the legend touches the border at {w} wide: {l:?}");
+            for (mark, what) in [("⠹", "working"), ("▲", "needs you"), ("✓", "done"), ("○", "idle"), ("•", "unseen")] {
+                assert_eq!(l.contains(mark), l.contains(&format!("{mark} {what}")), "half an item at {w} wide: {l:?}");
+            }
+        }
         // At 80 wide, every label is whole.
         let lines = dialog(keys, 80, 40);
         for label in ["next one that needs you", "settings · theme, sounds", "restart an exited agent"] {
