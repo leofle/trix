@@ -585,10 +585,13 @@ impl App {
     fn snapshot(&self) -> Saved {
         let mut agents = self.open_agents();
         let focus = self.agents.get(self.focus).and_then(|f| agents.iter().position(|s| s.name == f.name)).unwrap_or(0);
+        // Not restored yet: what was saved still counts, the grid too.
+        let mut grid = self.view == View::Grid;
         if let Some(p) = &self.pending_restore {
             agents.extend(p.agents.iter().cloned());
+            grid |= p.grid;
         }
-        Saved::new(focus, agents)
+        Saved { grid, ..Saved::new(focus, agents) }
     }
 
     /// The agents open now, as they'd be started again (saved workspace,
@@ -704,6 +707,9 @@ impl App {
         }
         if let Some(f) = focus {
             self.set_focus(f);
+        }
+        if saved.grid && restored > 0 {
+            self.view = View::Grid;
         }
         let mut msg = format!("restored {restored} agent{}", if restored == 1 { "" } else { "s" });
         if resumed > 0 {
@@ -3692,6 +3698,27 @@ mod tests {
         app.on_attach(PathBuf::from("/"));
         assert!(app.modal.is_none() && app.pending_restore.is_none(), "always: brought back");
         assert!(app.toast.as_ref().is_some_and(|t| t.text.starts_with("restored")));
+    }
+
+    #[test]
+    fn the_grid_comes_back_with_the_workspace() {
+        let mut app = test_app();
+        let shell = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned: false };
+        let mut saved = crate::state::Saved::new(1, vec![shell("c"), shell("a"), shell("b")]);
+        saved.grid = true;
+        app.pending_restore = Some(saved);
+        assert!(app.snapshot().grid, "not restored yet: the saved grid is kept");
+        app.config.workspace.restore = crate::config::Restore::Always;
+        app.on_attach(PathBuf::from("/"));
+        assert!(app.view == View::Grid, "back in the grid");
+        assert_eq!(app.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["c", "a", "b"], "in the saved order");
+        assert_eq!(app.focus, 1);
+        assert!(app.snapshot().grid);
+        app.view = View::Focus;
+        assert!(!app.snapshot().grid, "and forgotten once it's off");
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
