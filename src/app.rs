@@ -2008,8 +2008,8 @@ impl App {
                     self.close(id);
                 }
             }
-            Modal::Rename(_, _) | Modal::Broadcast(..) if k.code == KeyCode::Enter && self.dialog_hidden.get() => {
-                self.toast("the window is too short to show what you typed: make it taller", ToastKind::Bad);
+            Modal::Rename(_, _) | Modal::Broadcast(..) | Modal::New(_) if k.code == KeyCode::Enter && self.dialog_hidden.get() => {
+                self.toast("the window is too short to show what you'd send: make it taller", ToastKind::Bad);
             }
             Modal::Rename(id, t) => {
                 if k.code == KeyCode::Enter {
@@ -2662,6 +2662,10 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         assert!(matches!(&app.modal, Some(Modal::Broadcast(i, _)) if i.text == "ship it"), "sent a message it couldn't show");
         assert!(app.toast.take().is_some_and(|t| t.text.contains("too short")), "and says why");
+        app.modal = None;
+        app.open_new();
+        key(&mut app, KeyCode::Enter);
+        assert!(app.agents.is_empty() && matches!(app.modal, Some(Modal::New(_))), "launched what it couldn't show");
         // Esc still closes it.
         key(&mut app, KeyCode::Esc);
         assert!(app.modal.is_none());

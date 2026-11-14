@@ -236,6 +236,25 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
         // An action with no key has nothing to hint at.
         shown.iter().filter_map(|&(a, l)| Some((app.config.keys.label(a)?, l, Some(a).filter(|&a| a != Action::Jump)))).collect()
     };
+    // A toast sits at the right: the hints stop two cells short of it.
+    let toast = app.toast.as_ref().map(|toast| {
+        let (icon, c) = match toast.kind {
+            ToastKind::Good => ("✓", t.green),
+            ToastKind::Bad => ("✕", t.red),
+            ToastKind::Info => ("•", t.accent),
+        };
+        let fade = toast.at.elapsed() > Duration::from_millis(3200);
+        let c = if fade { mix(c, t.bg, 0.5) } else { c };
+        let text = trunc(&toast.text, (area.width as usize).saturating_sub(4));
+        let line = TLine::from(vec![
+            Span::styled(format!("{icon} "), Style::new().fg(c).add_modifier(Modifier::BOLD)),
+            Span::styled(text, Style::new().fg(if fade { t.dim } else { t.fg_bright })),
+            Span::raw(" "),
+        ]);
+        let w = line.width() as u16 + 1;
+        (line, Rect { x: area.right().saturating_sub(w), width: w.min(area.width), ..area })
+    });
+    let right = toast.as_ref().map_or(area.right(), |(_, r)| r.x.saturating_sub(2));
     let mut buttons = Vec::new();
     let mut x = area.x + 1;
     for (k, l, action) in hints {
@@ -244,7 +263,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
         let w = (k.width() + l.width()).saturating_sub(2) as u16;
         // A key without its word says nothing: on a narrow terminal, stop at
         // the last hint that fits whole.
-        if x.saturating_add(w) > area.right() {
+        if x.saturating_add(w) > right {
             break;
         }
         if let Some(a) = action
@@ -258,25 +277,9 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
     }
     f.render_widget(Paragraph::new(TLine::from(spans)), area);
 
-    if let Some(toast) = &app.toast {
-        let (icon, c) = match toast.kind {
-            ToastKind::Good => ("✓", t.green),
-            ToastKind::Bad => ("✕", t.red),
-            ToastKind::Info => ("•", t.accent),
-        };
-        let fade = toast.at.elapsed() > Duration::from_millis(3200);
-        let c = if fade { mix(c, t.bg, 0.5) } else { c };
-        let line = TLine::from(vec![
-            Span::styled(format!("{icon} "), Style::new().fg(c).add_modifier(Modifier::BOLD)),
-            Span::styled(toast.text.clone(), Style::new().fg(if fade { t.dim } else { t.fg_bright })),
-            Span::raw(" "),
-        ]);
-        let w = line.width() as u16 + 1;
-        let r = Rect { x: area.right().saturating_sub(w), width: w.min(area.width), ..area };
+    if let Some((line, r)) = toast {
         f.render_widget(Clear, r);
         f.render_widget(Paragraph::new(line), r);
-        // A toast over a button hides it.
-        buttons.retain(|(b, _)| b.right() <= r.x);
     }
     buttons
 }
@@ -1234,6 +1237,11 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let step = if body >= 2 * n - 1 { 2 } else { 1 };
             let pad = u16::from(body >= (n - 1) * step + 2);
             let fit = (body - pad).div_ceil(step) as usize;
+            // No line for a field: the active one takes the hint's, as
+            // Broadcast's message does, so enter never launches unseen.
+            let on_foot = fit == 0 && rows.foot().is_some();
+            let fit = if on_foot { 1 } else { fit };
+            app.dialog_hidden.set(fit == 0);
             // Scroll only as far as it takes to keep the active field in sight,
             // and never past the last field.
             let mut first = form.top.get().min(NEW_FIELDS.len().saturating_sub(fit));
@@ -1247,7 +1255,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let field_w = rows.area.width.saturating_sub(label_w) as usize;
             let mut cursor = None;
             for (i, name) in NEW_FIELDS.iter().enumerate().skip(first).take(fit) {
-                let Some(row) = rows.at(pad + (i - first) as u16 * step) else { break };
+                let Some(row) = (if on_foot { rows.foot() } else { rows.at(pad + (i - first) as u16 * step) }) else { break };
                 let y = row.y;
                 let active = form.field == i;
                 let lab = Span::styled(
@@ -1326,7 +1334,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 // Short of room, toggle goes first, then agent, then next.
                 fit_hints(&[("tab", "next"), ("←→", "agent"), ("space", "toggle"), ("enter", "launch")], &[2, 1, 0, 3], foot_w, true, t)
             };
-            if let Some(row) = rows.foot() {
+            if let Some(row) = rows.foot().filter(|_| !on_foot) {
                 // One cell nearer the right border than the fields' edge.
                 f.render_widget(Paragraph::new(foot).alignment(Alignment::Right), Rect { x: r.x + 2, width: r.width.saturating_sub(4), ..row });
             }
@@ -1372,16 +1380,28 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             };
             app.dialog_hidden.set(input_row.is_none());
             if let Some(row) = lines[1] {
-                f.render_widget(
-                    Paragraph::new(TLine::from(vec![
-                        Span::styled("To  ", Style::new().fg(t.dim)),
+                // Narrow, the target not chosen goes, then "To", then the
+                // count's spacing: how many it reaches stays to the last.
+                let count = format!("→ {n} agent{}", if n == 1 { "" } else { "s" });
+                let to = Span::styled("To  ", Style::new().fg(t.dim));
+                let chosen = pill(true, if *target == BroadcastTarget::All { "every agent" } else { "idle & done only" });
+                let tries = [
+                    vec![
+                        to.clone(),
                         pill(*target == BroadcastTarget::All, "every agent"),
                         Span::raw(" "),
                         pill(*target == BroadcastTarget::Waiting, "idle & done only"),
-                        Span::styled(format!("   → {n} agent{}", if n == 1 { "" } else { "s" }), Style::new().fg(t.fg)),
-                    ])),
-                    row,
-                );
+                        Span::styled(format!("   {count}"), Style::new().fg(t.fg)),
+                    ],
+                    vec![to, chosen.clone(), Span::styled(format!("   {count}"), Style::new().fg(t.fg))],
+                    vec![chosen, Span::styled(format!(" {count}"), Style::new().fg(t.fg))],
+                ];
+                let line = tries
+                    .into_iter()
+                    .map(TLine::from)
+                    .find(|l| l.width() <= row.width as usize)
+                    .unwrap_or_else(|| TLine::from(Span::styled(trunc(&count, row.width as usize), Style::new().fg(t.fg))));
+                f.render_widget(Paragraph::new(line), row);
             }
             if let (Some(note), Some(Some(row))) = (note, lines.get(5)) {
                 f.render_widget(Paragraph::new(Span::styled(note, Style::new().fg(t.dim))), *row);
@@ -1420,7 +1440,8 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
         Modal::ConfirmClose(id) => {
             let name = app.agents.iter().find(|a| a.id == *id).map(|a| a.name.clone()).unwrap_or_default();
-            confirm(f, area, t, "Close agent", &format!("Stop {name} and close its pane?"), &app.dialog_hidden);
+            // Named in the title too: on a short terminal the question goes.
+            confirm(f, area, t, &format!("Close {name}"), &format!("Stop {name} and close its pane?"), &app.dialog_hidden);
         }
         Modal::ConfirmQuit => {
             let live = app.agents.iter().filter(|a| a.state != State::Exited).count();
@@ -1982,9 +2003,9 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .spacing(2)
         .split(Rect { x: inner.x + 2, y: inner.y + pad, width: inner.width.saturating_sub(4), height: body.saturating_sub(pad) });
-    // The key column is as wide as the longest key and a space, so a narrow
+    // The key column is as wide as the longest key and a gutter, so a narrow
     // window keeps more of each label; a label that still doesn't fit ends in "…".
-    let kw = left.iter().chain(&right).map(|(k, _)| k.width()).max().unwrap_or(0) + 1;
+    let kw = left.iter().chain(&right).map(|(k, _)| k.width()).max().unwrap_or(0) + 2;
     let mut hidden = 0;
     for (col, items) in cols.iter().zip([left, right]) {
         for (i, (k, d)) in items.iter().enumerate() {
@@ -2167,7 +2188,7 @@ mod tests {
         type Open = fn(&mut App);
         // Whatever the height, if the dialog has a line inside its borders,
         // that line is the one you'd act on.
-        for (open, must) in [(broadcast as Open, "› hello"), (rename, "web"), (quit, " y  yes"), (restore, " y  restore")] {
+        for (open, must) in [(broadcast as Open, "› hello"), (rename, "web"), (quit, " y  yes"), (restore, " y  restore"), (App::open_new, "› Agent")] {
             for h in 3..=30 {
                 let lines = dialog(open, 80, h);
                 let Some(top) = lines.iter().position(|l| l.contains('╭')) else { continue };
@@ -2179,7 +2200,7 @@ mod tests {
         }
         // With no line inside at all, the dialog says it's hidden, so its
         // keys do nothing.
-        for (n, (open, h)) in [(broadcast as Open, 3), (quit, 3), (restore, 3), (broadcast, 2), (quit, 1)].into_iter().enumerate() {
+        for (n, (open, h)) in [(broadcast as Open, 3), (quit, 3), (restore, 3), (broadcast, 2), (quit, 1), (App::open_new, 3)].into_iter().enumerate() {
             let (tx, _rx) = std::sync::mpsc::channel();
             let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
             app.pending_restore = None;
@@ -2198,11 +2219,20 @@ mod tests {
         // Keys: a label that doesn't fit ends in "…", never mid-word.
         let lines = dialog(keys, 80, 40);
         assert!(lines.iter().any(|l| l.contains('…')), "{lines:#?}");
-        assert!(lines.iter().any(|l| l.contains("next one that needs you") || l.contains("next one that needs…")), "{lines:#?}");
+        let row = lines.iter().find(|l| l.contains("next one th")).expect("the attention row");
+        assert!(row.contains("next one that needs you") || row.contains('…'), "cut with no ellipsis: {row:?}");
+        // Every key keeps a gap before its label, the longest too.
+        let row = lines.iter().find(|l| l.contains("shift+enter")).expect("shift+enter");
+        assert!(row.contains("shift+enter  "), "{row:?}");
         // Keys that don't fit are counted on the border.
         let lines = dialog(keys, 80, 12);
         assert!(lines.iter().any(|l| l.contains('╰') && l.contains("more: make the window taller")), "{lines:#?}");
         assert!(!dialog(keys, 80, 40).iter().any(|l| l.contains("more:")));
+        // Broadcast: narrow, the count of who gets it stays whole.
+        for w in [30, 40, 50, 60, 80] {
+            let lines = dialog(|app| app.modal = Some(Modal::Broadcast(TextInput::new(""), BroadcastTarget::All)), w, 20);
+            assert!(lines.iter().any(|l| l.contains("→ 0 agents")), "at {w} wide: {lines:#?}");
+        }
         // New agent: fields out of sight are marked on the border.
         let lines = dialog(App::open_new, 80, 9);
         assert!(lines.iter().any(|l| l.contains('╰') && l.contains("▼ more")), "{lines:#?}");
@@ -2267,6 +2297,20 @@ mod tests {
         for w in 1..20 {
             let bar = dialog(keys, w, 12).pop().unwrap();
             assert!(!bar.contains("esc") || bar.contains("esc  close"), "half a hint at {w} wide: {bar:?}");
+        }
+        // With a toast, the hints stop short of it, whole, with a gap.
+        app.modal = None;
+        for w in 20..130 {
+            app.toast("sent to 1 agent", ToastKind::Good);
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 12)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let bar: String = (0..w).map(|x| buf[(x, 11)].symbol().to_string()).collect();
+            let Some(at) = bar.find('✓') else { continue };
+            let before = &bar[..at];
+            assert!(before.trim().is_empty() || before.ends_with("  "), "no gap before the toast at {w} wide: {bar:?}");
+            let last = before.split_whitespace().last().unwrap_or_default();
+            assert!(!last.contains('+'), "a key without its word before the toast at {w} wide: {bar:?}");
         }
         for a in &app.agents {
             a.shutdown();
