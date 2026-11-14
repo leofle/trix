@@ -2994,7 +2994,10 @@ mod tests {
 
     /// The grid at `width` x `height`, four Claude agents on branch main
     /// with a diff, as text, and the app.
-    fn grid_screen(width: u16, height: u16) -> (String, App) {
+    /// Four agents in the grid. Each one is a real terminal, so a test
+    /// makes them once and draws every size from them: a few at a time is
+    /// all CI's macOS hands out (os error 6 once it runs out).
+    fn grid_app() -> App {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
@@ -3007,45 +3010,53 @@ mod tests {
             a.diff = Some((2, 5, 1));
             app.agents.push(a);
         }
+        app
+    }
+
+    fn grid_screen(app: &mut App, width: u16, height: u16) -> String {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
         let buf = term.backend().buffer();
-        let text = (0..buf.area.height)
+        (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
-            .join("\n");
-        for a in &app.agents {
-            a.shutdown();
-        }
-        (text, app)
+            .join("\n")
     }
 
     #[test]
     fn grid_titles_keep_the_name_last() {
+        let mut app = grid_app();
         // Wide: everything.
-        let (wide, _) = grid_screen(140, 40);
+        let wide = grid_screen(&mut app, 140, 40);
         for name in ["claude-1", "claude-2", "codex-1", "shell-1"] {
             assert!(wide.contains(&format!("{name} claude")), "{name} and its kind at 140:\n{wide}");
         }
         assert!(wide.contains("main +5 −1"), "branch and diff at 140:\n{wide}");
         // Narrower: the kind and the branch go, never the name.
         for (w, h) in [(80, 24), (60, 12), (50, 12)] {
-            let (text, _) = grid_screen(w, h);
+            let text = grid_screen(&mut app, w, h);
             for name in ["claude-1", "claude-2", "codex-1", "shell-1"] {
                 assert!(text.contains(name), "{name} at {w}x{h}:\n{text}");
             }
         }
         // Too narrow for even the name: it's cut short, not dropped.
-        let (tiny, _) = grid_screen(30, 12);
+        let tiny = grid_screen(&mut app, 30, 12);
         assert!(tiny.contains("claud…") || tiny.contains("clau…") || tiny.contains("cla…"), "cut names at 30:\n{tiny}");
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
     fn the_sidebar_steps_aside_for_a_narrow_grid() {
-        let (text, app) = grid_screen(80, 24);
+        let mut app = grid_app();
+        let text = grid_screen(&mut app, 80, 24);
         assert!(app.hits.cards.is_empty(), "no sidebar for a 2x2 grid at 80:\n{text}");
-        let (text, app) = grid_screen(140, 40);
+        let text = grid_screen(&mut app, 140, 40);
         assert_eq!(app.hits.cards.len(), 4, "the sidebar at 140:\n{text}");
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
