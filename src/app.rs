@@ -125,6 +125,9 @@ pub struct NewForm {
     /// "more ▸" is open: the row shows the kinds under it.
     pub more: bool,
     pub field: usize,
+    /// The first field on screen when not all fit. Drawing keeps it, so the
+    /// fields scroll only when the active one would leave the screen.
+    pub top: std::cell::Cell<usize>,
     pub name: TextInput,
     pub name_touched: bool,
     pub dir: TextInput,
@@ -952,6 +955,7 @@ impl App {
             main: new.kinds.clone(),
             more: false,
             field: 0,
+            top: Default::default(),
             name: TextInput::default(),
             name_touched: false,
             dir: TextInput::new(&tilde(&dir)),
@@ -3054,7 +3058,7 @@ mod tests {
         app.agents.push(a);
         let tmp = std::env::temp_dir();
         let form = |name: &str, touched: bool| {
-            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
+            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
             f.args = TextInput::new("exec sleep 60");
             Modal::New(f)
         };

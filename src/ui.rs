@@ -244,7 +244,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
         let w = (k.width() + l.width()).saturating_sub(2) as u16;
         // A key without its word says nothing: on a narrow terminal, stop at
         // the last hint that fits whole.
-        if spans.len() > 1 && x.saturating_add(w) > area.right() {
+        if x.saturating_add(w) > area.right() {
             break;
         }
         if let Some(a) = action
@@ -1209,7 +1209,15 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let step = if body >= 2 * n - 1 { 2 } else { 1 };
             let pad = u16::from(body >= (n - 1) * step + 2);
             let fit = (body - pad).div_ceil(step) as usize;
-            let first = form.field.saturating_sub(fit.saturating_sub(1));
+            // Scroll only as far as it takes to keep the active field in sight,
+            // and never past the last field.
+            let mut first = form.top.get().min(NEW_FIELDS.len().saturating_sub(fit));
+            if form.field < first {
+                first = form.field;
+            } else if fit > 0 && form.field >= first + fit {
+                first = form.field + 1 - fit;
+            }
+            form.top.set(first);
             let label_w = 11u16;
             let field_w = rows.area.width.saturating_sub(label_w) as usize;
             let mut cursor = None;
@@ -2053,18 +2061,52 @@ mod tests {
     }
 
     #[test]
+    fn new_agent_fields_scroll_only_to_keep_the_active_one_in_sight() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.open_new();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 9)).unwrap();
+        let mut at = |app: &mut App, field: usize| {
+            let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+            f.field = field;
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            (0..9).map(|y| (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>()
+        };
+        let shows = |lines: &[String], field: &str| lines.iter().any(|l| l.contains(&format!(" {field} ")));
+        // Down to the last field: the window follows it.
+        for i in 0..NEW_FIELDS.len() {
+            at(&mut app, i);
+        }
+        let lines = at(&mut app, NEW_FIELDS.len() - 1);
+        assert!(!shows(&lines, "Agent") && shows(&lines, "Args"), "{lines:#?}");
+        // Up onto a field already in sight: nothing moves.
+        let lines = at(&mut app, NEW_FIELDS.len() - 2);
+        assert!(shows(&lines, "› Worktree") && shows(&lines, "Args"), "{lines:#?}");
+        // Up past the top of the window: it follows again.
+        let lines = at(&mut app, 0);
+        assert!(shows(&lines, "› Agent") && !shows(&lines, "Args"), "{lines:#?}");
+    }
+
+    #[test]
     fn the_bottom_bar_never_ends_on_half_a_hint() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app.agents.push(crate::agent::test_agent(Kind::Claude));
-        for w in 20..130 {
+        for w in 1..130 {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 12)).unwrap();
             term.draw(|f| draw(f, &mut app)).unwrap();
             let buf = term.backend().buffer();
             let bar: String = (0..w).map(|x| buf[(x, 11)].symbol().to_string()).collect();
             let last = bar.split_whitespace().last().unwrap_or_default();
-            assert!(!last.contains('+') || w < 30, "the bar ends on a key without its word at {w} wide: {bar:?}");
+            assert!(!last.contains('+'), "the bar ends on a key without its word at {w} wide: {bar:?}");
+        }
+        // Under a dialog the bar is a single hint: too narrow for it, no hint.
+        for w in 1..20 {
+            let bar = dialog(keys, w, 12).pop().unwrap();
+            assert!(!bar.contains("esc") || bar.contains("esc  close"), "half a hint at {w} wide: {bar:?}");
         }
         for a in &app.agents {
             a.shutdown();
