@@ -2000,14 +2000,20 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     let body = inner.height.saturating_sub(u16::from(legend));
     let gap = u16::from(body > rows);
     let pad = u16::from(body > rows + 1);
-    let cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+    // Each column's keys are as wide as its longest and a gutter, and each
+    // column as wide as its longest row needs, in proportion: a narrow window
+    // keeps more of each label. One that still doesn't fit ends in "…".
+    let kw = |items: &[(String, &str)]| items.iter().map(|(k, _)| k.width()).max().unwrap_or(0) + 2;
+    let need = |items: &[(String, &str)]| items.iter().map(|(_, d)| kw(items) + d.width()).max().unwrap_or(1).max(1) as u32;
+    let (nl, nr) = (need(&left), need(&right));
+    let width = inner.width.saturating_sub(3);
+    let split = (u32::from(width.saturating_sub(2)) * nl / (nl + nr)) as u16;
+    let cols = Layout::horizontal([Constraint::Length(split), Constraint::Fill(1)])
         .spacing(2)
-        .split(Rect { x: inner.x + 2, y: inner.y + pad, width: inner.width.saturating_sub(4), height: body.saturating_sub(pad) });
-    // The key column is as wide as the longest key and a gutter, so a narrow
-    // window keeps more of each label; a label that still doesn't fit ends in "…".
-    let kw = left.iter().chain(&right).map(|(k, _)| k.width()).max().unwrap_or(0) + 2;
+        .split(Rect { x: inner.x + 2, y: inner.y + pad, width, height: body.saturating_sub(pad) });
     let mut hidden = 0;
     for (col, items) in cols.iter().zip([left, right]) {
+        let kw = kw(&items);
         for (i, (k, d)) in items.iter().enumerate() {
             let y = col.y + i as u16 + if i > 0 { gap } else { 0 };
             if y >= col.bottom() {
@@ -2217,10 +2223,15 @@ mod tests {
     #[test]
     fn short_dialogs_say_what_they_left_out() {
         // Keys: a label that doesn't fit ends in "…", never mid-word.
-        let lines = dialog(keys, 80, 40);
+        let lines = dialog(keys, 60, 40);
         assert!(lines.iter().any(|l| l.contains('…')), "{lines:#?}");
         let row = lines.iter().find(|l| l.contains("next one th")).expect("the attention row");
         assert!(row.contains("next one that needs you") || row.contains('…'), "cut with no ellipsis: {row:?}");
+        // At 80 wide, every label is whole.
+        let lines = dialog(keys, 80, 40);
+        for label in ["next one that needs you", "settings · theme, sounds", "restart an exited agent"] {
+            assert!(lines.iter().any(|l| l.contains(label)), "{label:?} cut at 80 wide: {lines:#?}");
+        }
         // Every key keeps a gap before its label, the longest too.
         let row = lines.iter().find(|l| l.contains("shift+enter")).expect("shift+enter");
         assert!(row.contains("shift+enter  "), "{row:?}");
