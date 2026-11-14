@@ -370,6 +370,10 @@ pub struct App {
     /// Saved workspace awaiting the human's restore / start-fresh answer.
     /// Kept in every save until then, so detaching first loses nothing.
     pub pending_restore: Option<Saved>,
+    /// Set by the last draw: the open dialog had no room for the line that
+    /// shows what a key would do (Broadcast's message, Rename's name, the y of
+    /// a confirm). Its Enter and y then do nothing rather than act unseen.
+    pub dialog_hidden: std::cell::Cell<bool>,
     last_saved: Option<Saved>,
     last_completion_sound: Option<Instant>,
     /// Restored custom commands, shown exited until the human starts them.
@@ -456,6 +460,7 @@ impl App {
             codex_hint: false,
             out,
             pending_restore: state::load(),
+            dialog_hidden: std::cell::Cell::new(false),
             last_saved: None,
             last_completion_sound: None,
             parked: HashSet::new(),
@@ -1978,6 +1983,8 @@ impl App {
                     }
                 }
             }
+            // Keys the dialog doesn't show do nothing: no answering unseen.
+            Modal::Restore if self.dialog_hidden.get() => {}
             Modal::Restore => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.modal = None;
@@ -1991,15 +1998,18 @@ impl App {
                 _ => {}
             },
             Modal::ConfirmQuit => match k.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.quit = true,
+                KeyCode::Char('y') | KeyCode::Enter if !self.dialog_hidden.get() => self.quit = true,
                 _ => self.modal = None,
             },
             Modal::ConfirmClose(id) => {
                 let id = *id;
                 self.modal = None;
-                if matches!(k.code, KeyCode::Char('y') | KeyCode::Enter) {
+                if matches!(k.code, KeyCode::Char('y') | KeyCode::Enter) && !self.dialog_hidden.get() {
                     self.close(id);
                 }
+            }
+            Modal::Rename(_, _) | Modal::Broadcast(..) if k.code == KeyCode::Enter && self.dialog_hidden.get() => {
+                self.toast("the window is too short to show what you typed: make it taller", ToastKind::Bad);
             }
             Modal::Rename(id, t) => {
                 if k.code == KeyCode::Enter {
@@ -2032,6 +2042,11 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let (text, target) = (t.text.clone(), *target);
+                    if !text.trim().is_empty() && !self.agents.iter().any(|a| broadcast_reaches(a, target)) {
+                        // Keep the dialog, and what was typed, for when one is free.
+                        self.toast("no agent would get it: nothing was sent", ToastKind::Bad);
+                        return;
+                    }
                     self.modal = None;
                     self.broadcast(&text, target);
                 }
@@ -2628,6 +2643,44 @@ mod tests {
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
+    }
+
+    #[test]
+    fn a_dialog_too_short_to_show_its_keys_does_nothing_with_them() {
+        let mut app = test_app();
+        let key = |app: &mut App, code| app.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+        // The draw found no room for the keys or the input.
+        app.dialog_hidden.set(true);
+        app.modal = Some(Modal::ConfirmQuit);
+        key(&mut app, KeyCode::Char('y'));
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.quit, "quit on a key the dialog didn't show");
+        app.modal = Some(Modal::Restore);
+        key(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.modal, Some(Modal::Restore)), "answered a prompt it couldn't show");
+        app.modal = Some(Modal::Broadcast(TextInput::new("ship it"), BroadcastTarget::All));
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.modal, Some(Modal::Broadcast(i, _)) if i.text == "ship it"), "sent a message it couldn't show");
+        assert!(app.toast.take().is_some_and(|t| t.text.contains("too short")), "and says why");
+        // Esc still closes it.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        // Shown, y quits.
+        app.dialog_hidden.set(false);
+        app.modal = Some(Modal::ConfirmQuit);
+        key(&mut app, KeyCode::Char('y'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_broadcast_nobody_would_get_stays_open() {
+        let mut app = test_app();
+        // No agents: nothing is sent, and the message is still there to keep.
+        app.modal = Some(Modal::Broadcast(TextInput::new("ship it"), BroadcastTarget::All));
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&app.modal, Some(Modal::Broadcast(i, _)) if i.text == "ship it"), "the message was lost");
+        let t = app.toast.take().map(|t| t.text).unwrap_or_default();
+        assert!(t.contains("nothing was sent") && !t.contains("sent to 0"), "{t}");
     }
 
     #[test]
