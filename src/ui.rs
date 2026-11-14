@@ -1094,6 +1094,42 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 3, width: w, height: h }
 }
 
+/// The lines inside a dialog's borders, `inset` cells in from each side. A line
+/// that would land on the foot (the last line, when the dialog has one) or
+/// past the bottom border isn't handed out, so on a short terminal a dialog
+/// loses lines rather than drawing them over its foot, its border or the
+/// screen under it.
+#[derive(Clone, Copy)]
+struct Rows {
+    area: Rect,
+    /// The first line that isn't body: the foot's, or the bottom border's.
+    end: u16,
+    foot: bool,
+}
+
+impl Rows {
+    fn new(inner: Rect, inset: u16, foot: bool) -> Self {
+        let inset = inset.min(inner.width / 2);
+        let area = Rect { x: inner.x + inset, width: inner.width - 2 * inset, ..inner };
+        Rows { area, end: inner.bottom().saturating_sub(u16::from(foot)).max(inner.y), foot }
+    }
+
+    /// How many body lines there are above the foot.
+    fn body(&self) -> u16 {
+        self.end - self.area.y
+    }
+
+    /// Body line `dy`, if the dialog is tall enough to have it.
+    fn at(&self, dy: u16) -> Option<Rect> {
+        (dy < self.body()).then(|| Rect { y: self.area.y + dy, height: 1, ..self.area })
+    }
+
+    /// The foot's line, if there's room for one.
+    fn foot(&self) -> Option<Rect> {
+        (self.foot && self.area.height > 0).then(|| Rect { y: self.area.bottom() - 1, height: 1, ..self.area })
+    }
+}
+
 fn modal_block<'a>(title: &'a str, t: &Theme) -> Block<'a> {
     Block::new()
         .borders(Borders::ALL)
@@ -1166,19 +1202,20 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             // The last row is the foot's. On a short terminal the fields give
             // up the line above them, then the lines between them. If they
             // still don't all fit, the ones around the active field show,
-            // rather than any being drawn over the foot.
-            let foot_y = r.bottom().saturating_sub(2);
+            // and with no room at all, none do.
+            let rows = Rows::new(inner, 2, true);
             let n = NEW_FIELDS.len() as u16;
-            let step = if inner.height >= 2 * n { 2 } else { 1 };
-            let pad = u16::from(inner.height >= (n - 1) * step + 3);
-            let inner = Rect { x: inner.x + 2, y: inner.y + pad, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(pad) };
-            let fit = (foot_y.saturating_sub(inner.y).div_ceil(step) as usize).max(1);
-            let first = form.field.saturating_sub(fit - 1);
+            let body = rows.body();
+            let step = if body >= 2 * n - 1 { 2 } else { 1 };
+            let pad = u16::from(body >= (n - 1) * step + 2);
+            let fit = (body - pad).div_ceil(step) as usize;
+            let first = form.field.saturating_sub(fit.saturating_sub(1));
             let label_w = 11u16;
-            let field_w = inner.width.saturating_sub(label_w) as usize;
+            let field_w = rows.area.width.saturating_sub(label_w) as usize;
             let mut cursor = None;
             for (i, name) in NEW_FIELDS.iter().enumerate().skip(first).take(fit) {
-                let y = inner.y + (i - first) as u16 * step;
+                let Some(row) = rows.at(pad + (i - first) as u16 * step) else { break };
+                let y = row.y;
                 let active = form.field == i;
                 let lab = Span::styled(
                     format!("{}{:<9}", if active { "› " } else { "  " }, name),
@@ -1237,9 +1274,9 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     line.push(Span::raw(" "));
                 }
                 line.extend(spans);
-                f.render_widget(Paragraph::new(TLine::from(line)), Rect { y, height: 1, ..inner });
+                f.render_widget(Paragraph::new(TLine::from(line)), row);
                 if let Some(cx) = cur {
-                    cursor = Some((inner.x + label_w + 1 + cx, y));
+                    cursor = Some((row.x + label_w + 1 + cx, y));
                 }
             }
             let foot = if let Some(e) = &form.error {
@@ -1256,7 +1293,10 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     Span::styled(" launch ", Style::new().fg(t.dim)),
                 ])
             };
-            f.render_widget(Paragraph::new(foot).alignment(Alignment::Right), Rect { x: r.x + 2, y: foot_y, width: r.width.saturating_sub(4), height: 1 });
+            if let Some(row) = rows.foot() {
+                // One cell nearer the right border than the fields' edge.
+                f.render_widget(Paragraph::new(foot).alignment(Alignment::Right), Rect { x: r.x + 2, width: r.width.saturating_sub(4), ..row });
+            }
             if let Some(c) = cursor {
                 f.set_cursor_position(c);
             }
@@ -1267,7 +1307,8 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let block = modal_block("Broadcast", t);
             let inner = block.inner(r);
             f.render_widget(block, r);
-            let inner = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height };
+            // Lines 1, 3 and 5 of the body; the hint is on the last.
+            let rows = Rows::new(inner, 2, true);
             let n = app.agents.iter().filter(|a| crate::app::broadcast_reaches(a, *target)).count();
             let held = app.agents.iter().filter(|a| a.kind.takes_prompts() && matches!(a.state, State::Blocked | State::Starting)).count();
             let pill = |on: bool, s: &'static str| {
@@ -1277,47 +1318,51 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     Span::styled(format!(" {s} "), Style::new().fg(t.dim))
                 }
             };
-            f.render_widget(
-                Paragraph::new(TLine::from(vec![
-                    Span::styled("To  ", Style::new().fg(t.dim)),
-                    pill(*target == BroadcastTarget::All, "every agent"),
-                    Span::raw(" "),
-                    pill(*target == BroadcastTarget::Waiting, "idle & done only"),
-                    Span::styled(format!("   → {n} agent{}", if n == 1 { "" } else { "s" }), Style::new().fg(t.fg)),
-                ])),
-                Rect { height: 1, ..inner },
-            );
-            if held > 0 {
+            if let Some(row) = rows.at(1) {
                 f.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!("skipping {held} on a prompt — answer {} first", if held == 1 { "it" } else { "them" }),
-                        Style::new().fg(t.dim),
-                    )),
-                    Rect { y: inner.y + 4, height: 1, ..inner },
+                    Paragraph::new(TLine::from(vec![
+                        Span::styled("To  ", Style::new().fg(t.dim)),
+                        pill(*target == BroadcastTarget::All, "every agent"),
+                        Span::raw(" "),
+                        pill(*target == BroadcastTarget::Waiting, "idle & done only"),
+                        Span::styled(format!("   → {n} agent{}", if n == 1 { "" } else { "s" }), Style::new().fg(t.fg)),
+                    ])),
+                    row,
                 );
+            }
+            let note = if held > 0 {
+                Some(format!("skipping {held} on a prompt — answer {} first", if held == 1 { "it" } else { "them" }))
             } else if n == 0 {
                 // "→ 0 agents" alone leaves you guessing.
                 let any = app.agents.iter().any(|a| a.kind.takes_prompts() && a.state != State::Exited);
-                let why = if any { "no agent is free to take it right now" } else { "shells and exited agents don't take a broadcast" };
-                f.render_widget(Paragraph::new(Span::styled(why, Style::new().fg(t.dim))), Rect { y: inner.y + 4, height: 1, ..inner });
+                Some(if any { "no agent is free to take it right now" } else { "shells and exited agents don't take a broadcast" }.to_string())
+            } else {
+                None
+            };
+            if let (Some(note), Some(row)) = (note, rows.at(5)) {
+                f.render_widget(Paragraph::new(Span::styled(note, Style::new().fg(t.dim))), row);
             }
-            let (spans, cur) = input_spans(inp, true, "message to send…", t, (inner.width as usize).saturating_sub(2));
-            let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
-            line.extend(spans);
-            f.render_widget(Paragraph::new(TLine::from(line)), Rect { y: inner.y + 2, height: 1, ..inner });
-            if let Some(cx) = cur {
-                f.set_cursor_position((inner.x + 2 + cx, inner.y + 2));
+            if let Some(row) = rows.at(3) {
+                let (spans, cur) = input_spans(inp, true, "message to send…", t, (row.width as usize).saturating_sub(2));
+                let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
+                line.extend(spans);
+                f.render_widget(Paragraph::new(TLine::from(line)), row);
+                if let Some(cx) = cur {
+                    f.set_cursor_position((row.x + 2 + cx, row.y));
+                }
             }
-            f.render_widget(
-                Paragraph::new(TLine::from(vec![
-                    Span::styled("tab", Style::new().fg(t.fg)),
-                    Span::styled(" target   ", Style::new().fg(t.dim)),
-                    Span::styled("enter", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-                    Span::styled(" send", Style::new().fg(t.dim)),
-                ]))
-                .alignment(Alignment::Right),
-                Rect { y: r.bottom().saturating_sub(2), height: 1, ..inner },
-            );
+            if let Some(row) = rows.foot() {
+                f.render_widget(
+                    Paragraph::new(TLine::from(vec![
+                        Span::styled("tab", Style::new().fg(t.fg)),
+                        Span::styled(" target   ", Style::new().fg(t.dim)),
+                        Span::styled("enter", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+                        Span::styled(" send", Style::new().fg(t.dim)),
+                    ]))
+                    .alignment(Alignment::Right),
+                    row,
+                );
+            }
         }
         Modal::Rename(_, inp) => {
             let r = centered(area, 50, 5);
@@ -1325,7 +1370,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let block = modal_block("Rename", t);
             let inner = block.inner(r);
             f.render_widget(block, r);
-            let row = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: 1 };
+            let Some(row) = Rows::new(inner, 2, false).at(1) else { return };
             let (spans, cur) = input_spans(inp, true, "name", t, (row.width as usize).saturating_sub(2));
             let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
             line.extend(spans);
@@ -1357,9 +1402,11 @@ fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str) {
     let block = modal_block("Pick up where you left off?", t);
     let inner = block.inner(r);
     f.render_widget(block, r);
+    // Centered across the whole width; a line with no room isn't drawn.
+    let rows = Rows::new(inner, 0, false);
     f.render_widget(
         Paragraph::new(Span::styled(text.to_string(), Style::new().fg(t.fg))).alignment(Alignment::Center),
-        Rect { y: inner.y + 1, height: 1, ..inner },
+        rows.at(1).unwrap_or_default(),
     );
     f.render_widget(
         Paragraph::new(TLine::from(vec![
@@ -1371,7 +1418,7 @@ fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str) {
             Span::styled(" later", Style::new().fg(t.fg)),
         ]))
         .alignment(Alignment::Center),
-        Rect { y: inner.y + 3, height: 1, ..inner },
+        rows.at(3).unwrap_or_default(),
     );
 }
 
@@ -1381,9 +1428,11 @@ fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str) {
     let block = modal_block(title, t);
     let inner = block.inner(r);
     f.render_widget(block, r);
+    // Centered across the whole width; a line with no room isn't drawn.
+    let rows = Rows::new(inner, 0, false);
     f.render_widget(
         Paragraph::new(Span::styled(text.to_string(), Style::new().fg(t.fg))).alignment(Alignment::Center),
-        Rect { y: inner.y + 1, height: 1, ..inner },
+        rows.at(1).unwrap_or_default(),
     );
     f.render_widget(
         Paragraph::new(TLine::from(vec![
@@ -1393,7 +1442,7 @@ fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str) {
             Span::styled(" keep", Style::new().fg(t.fg)),
         ]))
         .alignment(Alignment::Center),
-        Rect { y: inner.y + 3, height: 1, ..inner },
+        rows.at(3).unwrap_or_default(),
     );
 }
 
@@ -1952,6 +2001,55 @@ mod tests {
         let lines = dialog(last, 60, 8);
         assert!(lines.iter().any(|l| l.contains("› Args")), "{lines:#?}");
         assert!(!lines.iter().any(|l| l.contains("Agent ")), "{lines:#?}");
+    }
+
+    #[test]
+    fn no_dialog_line_lands_on_its_foot_or_border_however_short() {
+        fn broadcast(app: &mut App) {
+            app.modal = Some(Modal::Broadcast(TextInput::new(""), BroadcastTarget::All));
+        }
+        fn rename(app: &mut App) {
+            app.modal = Some(Modal::Rename(0, TextInput::new("")));
+        }
+        fn quit(app: &mut App) {
+            app.modal = Some(Modal::ConfirmQuit);
+        }
+        fn restore(app: &mut App) {
+            app.modal = Some(Modal::Restore);
+        }
+        type Open = fn(&mut App);
+        // What each dialog draws above its foot, and its foot.
+        let cases = [
+            (keys as Open, &["next / previous", "quit ·"][..], None),
+            (App::open_new as Open, &["Agent", "Folder", "Args"][..], Some("enter launch")),
+            (broadcast as Open, &["To ", "message to send", "don't take a broadcast"][..], Some("enter send")),
+            (rename as Open, &["› name"][..], None),
+            (quit as Open, &["still running", " keep"][..], None),
+            (restore as Open, &["start fresh"][..], None),
+        ];
+        for h in (3..=30).rev() {
+            for (open, body, foot) in cases {
+                let lines = dialog(open, 80, h);
+                let Some(top) = lines.iter().position(|l| l.contains('╭')) else { continue };
+                let Some(bottom) = lines.iter().rposition(|l| l.contains('╰')) else { continue };
+                let (dialog, below) = (&lines[top..=bottom], &lines[bottom + 1..]);
+                for l in [&dialog[0], &dialog[dialog.len() - 1]] {
+                    // Corner to corner: the screen behind shows either side.
+                    let edge: String =
+                        l.chars().skip_while(|c| !"╭╰".contains(*c)).take_while(|c| !"╮╯".contains(*c)).filter(|c| !"╭╰─ ✦".contains(*c)).collect();
+                    assert!(["", "Keys", "Newagent", "Broadcast", "Rename", "Quittrix", "Pickupwhereyouleftoff?"].contains(&edge.as_str()), "a border is written over at {h} rows: {lines:#?}");
+                }
+                for word in body.iter().chain(foot.as_slice()) {
+                    assert!(!below.iter().any(|l| l.contains(word)), "{word:?} under the dialog at {h} rows: {lines:#?}");
+                }
+                // The foot's line is the foot's alone.
+                if let Some(l) = foot.and_then(|foot| dialog.iter().find(|l| l.contains(foot))) {
+                    assert!(!body.iter().any(|w| l.contains(w)) && !l.contains('›'), "a line drawn over the foot at {h} rows: {l:?}");
+                }
+            }
+        }
+        // Tall enough, the broadcast says why nobody gets it.
+        assert!(dialog(broadcast, 80, 16).iter().any(|l| l.contains("don't take a broadcast")));
     }
 
     #[test]
