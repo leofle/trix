@@ -216,7 +216,9 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
     let lab = |l: &'static str| Span::styled(format!(" {l}   "), Style::new().fg(t.dim));
     let mut spans = vec![Span::raw(" ")];
     let hints: Vec<(String, &str, Option<Action>)> = if app.modal.is_some() {
-        vec![("esc".into(), "cancel", None)]
+        // A list or a page of help has nothing to cancel.
+        let leaves = matches!(app.modal, Some(Modal::Help | Modal::Settings(_) | Modal::Search(_) | Modal::Menu(_)));
+        vec![("esc".into(), if leaves { "close" } else { "cancel" }, None)]
     } else {
         let shown: &[(Action, &str)] = if app.agents.is_empty() {
             &[(Action::New, "new agent"), (Action::Help, "keys"), (Action::Settings, "settings"), (Action::Quit, "quit")]
@@ -240,6 +242,11 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
         let (k, l) = (key(&k), lab(l));
         // The button is the key and its word, not the gap after them.
         let w = (k.width() + l.width()).saturating_sub(2) as u16;
+        // A key without its word says nothing: on a narrow terminal, stop at
+        // the last hint that fits whole.
+        if spans.len() > 1 && x.saturating_add(w) > area.right() {
+            break;
+        }
         if let Some(a) = action
             && x < area.right()
         {
@@ -1156,12 +1163,22 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let block = modal_block("New agent", t);
             let inner = block.inner(r);
             f.render_widget(block, r);
-            let inner = Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(1) };
+            // The last row is the foot's. On a short terminal the fields give
+            // up the line above them, then the lines between them. If they
+            // still don't all fit, the ones around the active field show,
+            // rather than any being drawn over the foot.
+            let foot_y = r.bottom().saturating_sub(2);
+            let n = NEW_FIELDS.len() as u16;
+            let step = if inner.height >= 2 * n { 2 } else { 1 };
+            let pad = u16::from(inner.height >= (n - 1) * step + 3);
+            let inner = Rect { x: inner.x + 2, y: inner.y + pad, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(pad) };
+            let fit = (foot_y.saturating_sub(inner.y).div_ceil(step) as usize).max(1);
+            let first = form.field.saturating_sub(fit - 1);
             let label_w = 11u16;
             let field_w = inner.width.saturating_sub(label_w) as usize;
             let mut cursor = None;
-            for (i, name) in NEW_FIELDS.iter().enumerate() {
-                let y = inner.y + i as u16 * 2;
+            for (i, name) in NEW_FIELDS.iter().enumerate().skip(first).take(fit) {
+                let y = inner.y + (i - first) as u16 * step;
                 let active = form.field == i;
                 let lab = Span::styled(
                     format!("{}{:<9}", if active { "› " } else { "  " }, name),
@@ -1225,7 +1242,6 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     cursor = Some((inner.x + label_w + 1 + cx, y));
                 }
             }
-            let foot_y = r.bottom().saturating_sub(2);
             let foot = if let Some(e) = &form.error {
                 TLine::from(Span::styled(format!("✕ {e}"), Style::new().fg(t.red)))
             } else {
@@ -1279,6 +1295,11 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     )),
                     Rect { y: inner.y + 4, height: 1, ..inner },
                 );
+            } else if n == 0 {
+                // "→ 0 agents" alone leaves you guessing.
+                let any = app.agents.iter().any(|a| a.kind.takes_prompts() && a.state != State::Exited);
+                let why = if any { "no agent is free to take it right now" } else { "shells and exited agents don't take a broadcast" };
+                f.render_widget(Paragraph::new(Span::styled(why, Style::new().fg(t.dim))), Rect { y: inner.y + 4, height: 1, ..inner });
             }
             let (spans, cur) = input_spans(inp, true, "message to send…", t, (inner.width as usize).saturating_sub(2));
             let mut line = vec![Span::styled("› ", Style::new().fg(t.accent))];
@@ -1780,7 +1801,7 @@ fn key_pair(a: &str, b: &str) -> String {
 }
 
 fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
-    let r = centered(area, 78, 19);
+    let r = centered(area, 82, 19);
     f.render_widget(Clear, r);
     let block = modal_block("Keys", t);
     let inner = block.inner(r);
@@ -1813,18 +1834,32 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Detach), "detach · keeps running"),
         (k(Action::Quit), "quit · stops agents"),
     ];
-    let cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(Rect { x: inner.x + 2, y: inner.y + 1, width: inner.width.saturating_sub(4), height: inner.height.saturating_sub(1) });
+    // On a short terminal the legend goes first, then the line above the
+    // keys, then the one under the headings. Keys that still don't fit are
+    // left out rather than drawn past the border.
+    let rows = left.len().max(right.len()) as u16;
+    let legend = inner.height > rows + 2;
+    let body = inner.height.saturating_sub(u16::from(legend));
+    let gap = u16::from(body > rows);
+    let pad = u16::from(body > rows + 1);
+    let cols = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .spacing(2)
+        .split(Rect { x: inner.x + 2, y: inner.y + pad, width: inner.width.saturating_sub(4), height: body.saturating_sub(pad) });
     for (col, items) in cols.iter().zip([left, right]) {
         for (i, (k, d)) in items.iter().enumerate() {
+            let y = col.y + i as u16 + if i > 0 { gap } else { 0 };
+            if y >= col.bottom() {
+                break;
+            }
             let line = if k.is_empty() {
                 TLine::from(Span::styled(*d, Style::new().fg(t.dim).add_modifier(Modifier::BOLD)))
             } else {
                 TLine::from(vec![Span::styled(format!("{k:<12} "), Style::new().fg(t.accent)), Span::styled(*d, Style::new().fg(t.fg))])
             };
-            f.render_widget(Paragraph::new(line), Rect { y: col.y + i as u16 + if i > 0 { 1 } else { 0 }, height: 1, ..*col });
+            f.render_widget(Paragraph::new(line), Rect { y, height: 1, ..*col });
         }
     }
-    let legend = TLine::from(vec![
+    let line = TLine::from(vec![
         Span::styled("⠹ ", Style::new().fg(t.yellow)),
         Span::styled("working   ", Style::new().fg(t.dim)),
         Span::styled("▲ ", Style::new().fg(t.red)),
@@ -1836,12 +1871,122 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         Span::styled("• ", Style::new().fg(t.green)),
         Span::styled("unseen", Style::new().fg(t.dim)),
     ]);
-    f.render_widget(Paragraph::new(legend).alignment(Alignment::Center), Rect { y: r.bottom().saturating_sub(2), height: 1, x: r.x, width: r.width });
-    let _ = Instant::now();
+    if legend {
+        f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect { y: inner.bottom() - 1, height: 1, ..inner });
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A dialog, drawn over an empty workspace of this size, as lines of text.
+    fn dialog(open: impl FnOnce(&mut App), w: u16, h: u16) -> Vec<String> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        open(&mut app);
+        assert!(app.modal.is_some(), "a dialog is open");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect()
+    }
+
+    fn keys(app: &mut App) {
+        app.modal = Some(Modal::Help);
+    }
+
+    /// The rows from a dialog's top border to its bottom one, and the rest.
+    fn boxed(lines: &[String]) -> (&[String], &[String]) {
+        let top = lines.iter().position(|l| l.contains('╭')).expect("a top border");
+        let bottom = lines.iter().rposition(|l| l.contains('╰')).expect("a bottom border");
+        (&lines[top..=bottom], &lines[bottom + 1..])
+    }
+
+    #[test]
+    fn the_keys_columns_never_touch() {
+        for w in [160, 100, 84, 70, 60] {
+            let lines = dialog(keys, w, 40);
+            let row = lines.iter().find(|l| l.contains("grid ⇄ focus")).expect("the first row of keys");
+            let (left, right) = row.split_at(row.find("alt+g").expect("the right column"));
+            assert!(left.ends_with("  "), "a gutter before the right column at {w} wide: {row:?}");
+            assert!(right.contains("grid"), "{row:?}");
+        }
+        let lines = dialog(keys, 160, 40);
+        let longest = lines.iter().find(|l| l.contains("next one that needs you")).unwrap();
+        assert!(longest.contains("next one that needs you  "), "the longest description keeps clear of the next key: {longest:?}");
+    }
+
+    #[test]
+    fn dialogs_stay_inside_their_borders_on_a_short_terminal() {
+        for h in [30, 20, 16, 14, 12, 10, 8, 6] {
+            type Open = fn(&mut App);
+            for (open, inside) in [(keys as Open, "alt+"), (App::open_new as Open, "Agent")] {
+                let lines = dialog(open, 60, h);
+                let (dialog, below) = boxed(&lines);
+                assert!(dialog[1..dialog.len() - 1].iter().any(|l| l.contains(inside)), "{inside} shows at {h} rows: {lines:#?}");
+                // The borders are whole: nothing was written across them.
+                for l in [&dialog[0], &dialog[dialog.len() - 1]] {
+                    let edge: String = l.trim().chars().filter(|c| !"╭╮╰╯─ ✦".contains(*c)).collect();
+                    assert!(edge.is_empty() || edge == "Keys" || edge == "Newagent", "a border is written over at {h} rows: {l:?}");
+                }
+                // And nothing of the dialog's lands under it, on the bottom bar.
+                for word in ["detach", "quit ·", "Args", "restart"] {
+                    assert!(!below.iter().any(|l| l.contains(word)), "{word} under the dialog at {h} rows: {lines:#?}");
+                }
+            }
+        }
+        // With room for one line each, every field is there, and the hint
+        // has its own line.
+        let lines = dialog(App::open_new, 60, 14);
+        for field in NEW_FIELDS {
+            assert_eq!(lines.iter().filter(|l| l.contains(field)).count(), 1, "{field}: {lines:#?}");
+        }
+        let hint = lines.iter().find(|l| l.contains("enter launch")).expect("the hint");
+        assert!(!hint.contains("Worktree") && !hint.contains("Args"), "{hint:?}");
+        // With room for fewer, the field being filled in is one of them.
+        let last = |app: &mut App| {
+            app.open_new();
+            let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+            f.field = NEW_FIELDS.len() - 1;
+        };
+        let lines = dialog(last, 60, 8);
+        assert!(lines.iter().any(|l| l.contains("› Args")), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("Agent ")), "{lines:#?}");
+    }
+
+    #[test]
+    fn the_bottom_bar_never_ends_on_half_a_hint() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.agents.push(crate::agent::test_agent(Kind::Claude));
+        for w in 20..130 {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 12)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let bar: String = (0..w).map(|x| buf[(x, 11)].symbol().to_string()).collect();
+            let last = bar.split_whitespace().last().unwrap_or_default();
+            assert!(!last.contains('+') || w < 30, "the bar ends on a key without its word at {w} wide: {bar:?}");
+        }
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn esc_closes_what_has_nothing_to_cancel() {
+        let bar = |m: fn() -> Modal| dialog(|app| app.modal = Some(m()), 100, 30).pop().unwrap();
+        assert!(bar(|| Modal::Help).contains("esc  close"), "{:?}", bar(|| Modal::Help));
+        assert!(bar(|| Modal::ConfirmQuit).contains("esc  cancel"), "{:?}", bar(|| Modal::ConfirmQuit));
+    }
+
+    #[test]
+    fn a_broadcast_that_reaches_nobody_says_why() {
+        let lines = dialog(|app| app.modal = Some(Modal::Broadcast(TextInput::new(""), BroadcastTarget::All)), 100, 30);
+        assert!(lines.iter().any(|l| l.contains("→ 0 agents")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.contains("don't take a broadcast")), "{lines:#?}");
+    }
+
     #[test]
     fn wide_text_in_an_input_stays_inside_it() {
         let t = Theme::default();
