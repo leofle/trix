@@ -1,6 +1,6 @@
 name: Bump and release
 
-# One click from the Actions tab: test master, raise the version in
+# One click from the Actions tab: test main, raise the version in
 # Cargo.toml, commit it, tag it, and run the release, which builds the
 # archives and updates Homebrew.
 on:
@@ -63,7 +63,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "Version $NEW"
           git tag "v$NEW"
-          git push origin HEAD:master "v$NEW"
+          git push origin HEAD:main "v$NEW"
 
   release:
     needs: bump
