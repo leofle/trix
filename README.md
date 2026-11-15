@@ -327,6 +327,25 @@ To make your own theme, edit your copy. It is Omarchy's `colors.toml` format, on
 
 trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme. The start screen, with no agents open, and the settings' **Theme** row say which one is in use. While `TRIX_THEME` is set, the settings can't change the theme. On Linux with Omarchy, the file sets trix's theme apart from the desktop's. To follow Omarchy again, choose **Follow Omarchy** at the top of the list, or remove the file. On Linux without Omarchy, it all works as on a Mac.
 
+### Agent workspace discovery
+
+Trix supplies workspace discovery instructions to Claude through
+`--append-system-prompt` and Codex through `-c developer_instructions=…`.
+New sessions are instructed to run `trix ls --json`, identify their own pane,
+and use Trix commands for authorized coordination. Claude's custom append
+prompt is combined with these instructions. So are the `developer_instructions`
+in your Codex `config.toml` (the active profile's, else the top level's), which
+`-c` would otherwise replace. A `-c developer_instructions=…` in your own Codex
+args comes last and replaces both.
+
+OpenCode receives a runtime instruction file through its session configuration;
+Copilot receives the same file through `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`,
+appended to existing directories. Muse receives context from its own
+`SessionStart` hook (when Trix’s managed hooks are enabled). Grok and Cursor
+do not yet receive this context.
+Existing conversations may retain their original instructions; start a new
+conversation after updating Trix. No user configuration files are modified.
+
 ## Supported agents
 
 trix starts each of these agents by name, with an argv (never through a shell), and installs nothing into your agent configs: everything it adds is passed to that one process and lives in `$XDG_RUNTIME_DIR/trix` until the server stops. An agent that isn't installed yet installs first, in its own pane ([below](#not-installed-yet)). Log in to each agent yourself the first time it runs.
@@ -370,7 +389,7 @@ trix starts each of these agents by name, with an argv (never through a shell), 
   - **Start-up.** Muse runs `SessionStart`'s hooks only as its first turn begins, at the same time as that turn's own, so trix takes from it only the conversation id, never the state. Until the first prompt, the screen says: Muse's workspace trust needs you, and once it's answered the pane is idle, not done. Muse's title is its folder, with a braille spinner in front while it works, so its redraws as it starts or resumes don't read as work.
   - **Conversations.** Muse takes no session id for an interactive session, so trix learns it from the hooks and restores with `muse resume <id>`, which takes no first prompt. A first prompt goes in as `muse <prompt>`.
   - **Your managed hooks win.** Muse refuses a run that sets one setting twice, and trix's `-c` would replace a `managed_hooks_path` in your Muse settings for that run. So when your extra args or Muse's `settings.json` set its managed hooks, trix passes none, and that Muse's state comes from its screen.
-  - **Watching only.** trix's hook is `trix hook muse || true` and prints nothing: it never decides anything.
+  - **Watching only.** trix's hook is `trix hook muse || true`. It adds workspace discovery context at session startup; it never decides approvals.
   - An interrupted turn raises no hook: it reads as interrupted once the screen goes quiet. Tested with Muse Code 1.4.18 and its offline `echo` provider (`muse --provider echo`): start-up, workspace trust, first prompts, turn ends, interrupts, reminder subagents, resume, and your own managed hooks. The echo provider calls no tools, so the tool and approval hooks follow Muse's documented events and the wording in its binary.
 - **Context gauge** stays Claude and Codex only.
 

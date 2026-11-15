@@ -356,8 +356,16 @@ impl Agent {
         if spec.kind == Kind::OpenCode {
             let theirs = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
             if let Some(c) = integrations.opencode_plugin_for_version().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
+                let c = integrations.workspace_instructions.as_deref()
+                    .and_then(|dir| hooks::opencode_instructions(&c, dir)).unwrap_or(c);
                 env.insert("OPENCODE_CONFIG_CONTENT".into(), c);
             }
+        }
+        if spec.kind == Kind::Copilot
+            && let Some(dir) = &integrations.workspace_instructions
+        {
+            let theirs = std::env::var("COPILOT_CUSTOM_INSTRUCTIONS_DIRS").ok();
+            env.insert("COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(), hooks::copilot_instruction_dirs(theirs.as_deref(), dir));
         }
         for (k, v) in theme_env(spec.kind, integrations.themed, |k| std::env::var_os(k).is_some()) {
             env.insert(k.into(), v.into());
@@ -1337,14 +1345,39 @@ fn split_args(s: &str) -> Vec<String> {
     shell_words::split(s).unwrap_or_else(|_| s.split_whitespace().map(String::from).collect())
 }
 
+/// Codex's config folder: `CODEX_HOME`, else `~/.codex`.
+pub(crate) fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+}
+
+fn codex_user_config(home: &Path) -> Option<toml::Table> {
+    std::fs::read_to_string(home.join("config.toml")).ok()?.parse().ok()
+}
+
+/// The user's own Codex `developer_instructions`, which our `-c
+/// developer_instructions=` would otherwise replace: the profile's (`-p` or
+/// `--profile` in their args, else the config's `profile`), else the top
+/// level's. Read at each start, so an edit counts for the next pane.
+fn codex_user_instructions(home: &Path, theirs: &[String]) -> Option<String> {
+    let table = codex_user_config(home)?;
+    let own = |t: &toml::Table| t.get("developer_instructions").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).map(String::from);
+    let named = theirs.iter().enumerate().find_map(|(i, a)| match a.as_str() {
+        "-p" | "--profile" => theirs.get(i + 1).cloned(),
+        _ => a.strip_prefix("--profile=").map(String::from),
+    });
+    let profile = named.or_else(|| table.get("profile").and_then(|v| v.as_str()).map(String::from));
+    profile
+        .and_then(|p| own(table.get("profiles")?.as_table()?.get(&p)?.as_table()?))
+        .or_else(|| own(&table))
+}
+
 /// The user's own Codex `notify` command (JSON array), so `trix hook codex`
 /// can call it after reporting — our `-c notify=` would otherwise replace it.
 fn codex_user_notify() -> Option<String> {
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
-    let text = std::fs::read_to_string(home.join("config.toml")).ok()?;
-    let table: toml::Table = text.parse().ok()?;
+    let table = codex_user_config(&codex_home()?)?;
     let argv: Vec<String> = table
         .get("notify")?
         .as_array()?
@@ -1373,6 +1406,9 @@ fn codex_hooks(exe: &Path) -> String {
     let events: Vec<String> = CODEX_HOOK_EVENTS.iter().map(|e| format!("{e}={handler}")).collect();
     format!("hooks={{{}}}", events.join(","))
 }
+
+/// Workspace discovery belongs in startup context, not a submitted user task.
+pub(crate) const WORKSPACE_INSTRUCTIONS: &str = "You are running inside a Trix workspace alongside other agents. At the start of a session, run `trix ls --json` to discover peers and identify yourself (the entry with `you: true`). Trix peers are separate from your built-in subagent registry. Use `trix read <agent> -n 60` to inspect recent output and `trix wait <agent> -t 30` to wait. When the user requests coordination, use `trix send <agent> <prompt>` to communicate. Do not start, interrupt, close, or assign work to peers unless the task authorizes it. Never use --force to bypass a permission prompt. If no workspace is reachable, report that limitation rather than assuming no peers exist.";
 
 fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path, new_session: Option<&str>) -> (String, Vec<String>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
@@ -1472,9 +1508,25 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
                 args.push("--resume".into());
                 args.push(id.clone());
             }
-            if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
-                args.extend(split_args(extra));
+            let mut theirs = extra.map(split_args).unwrap_or_default();
+            // Claude accepts one append prompt; combine ours with the user's.
+            let mut instructions = WORKSPACE_INSTRUCTIONS.to_string();
+            let mut i = 0;
+            while i < theirs.len() {
+                if theirs[i] == "--append-system-prompt" && i + 1 < theirs.len() {
+                    theirs.remove(i);
+                    instructions.push_str("\n\n");
+                    instructions.push_str(&theirs.remove(i));
+                } else if let Some(value) = theirs[i].strip_prefix("--append-system-prompt=") {
+                    instructions.push_str("\n\n");
+                    instructions.push_str(value);
+                    theirs.remove(i);
+                } else {
+                    i += 1;
+                }
             }
+            args.extend(["--append-system-prompt".into(), instructions]);
+            args.extend(theirs);
             if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
                 push_prompt(&mut args, p);
             }
@@ -1497,9 +1549,17 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             // so they can still say otherwise.
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
-            if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
-                args.extend(split_args(extra));
+            // `-c` replaces the config's own `developer_instructions`: theirs
+            // go after ours, as Claude's append prompt does. A `-c
+            // developer_instructions=` in their args still replaces both.
+            let theirs = extra.map(split_args).unwrap_or_default();
+            let mut instructions = WORKSPACE_INSTRUCTIONS.to_string();
+            if let Some(own) = integrations.codex_home.as_deref().and_then(|h| codex_user_instructions(h, &theirs)) {
+                instructions.push_str("\n\n");
+                instructions.push_str(&own);
             }
+            args.extend(["-c".into(), format!("developer_instructions={}", serde_json::to_string(&instructions).unwrap_or_default())]);
+            args.extend(theirs);
             if let Some(id) = &spec.resume {
                 args.push(id.clone());
             } else if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
@@ -2114,19 +2174,19 @@ mod tests {
         s.prompt = Some("fix it".into());
         let (prog, args) = command_for(&s, &Integrations { claude_settings: Some("/run/s.json".into()), ..Default::default() }, Path::new("/bin/trix"), None);
         assert_eq!(prog, "claude");
-        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--model", "opus", "--append-system-prompt", "be terse", "fix it"]);
+        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--append-system-prompt", &format!("{WORKSPACE_INSTRUCTIONS}\n\nbe terse"), "--model", "opus", "fix it"]);
 
         let mut s = spec(Kind::Claude);
         s.command = Some("   ".into());
         s.prompt = Some(String::new());
-        assert!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1.is_empty());
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--append-system-prompt", WORKSPACE_INSTRUCTIONS]);
 
         let mut s = spec(Kind::Claude);
         s.prompt = Some("- fix lint\n- run tests".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--", "- fix lint\n- run tests"], "not an option");
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--append-system-prompt", WORKSPACE_INSTRUCTIONS, "--", "- fix lint\n- run tests"], "not an option");
         let mut s = spec(Kind::Codex);
         s.prompt = Some("--help is broken".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[6..], ["--", "--help is broken"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[8..], ["--", "--help is broken"]);
     }
 
     #[test]
@@ -2138,12 +2198,44 @@ mod tests {
         let (prog, args) = command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None);
         assert_eq!(prog, "codex");
         let net = "sandbox_workspace_write.network_access=true";
-        assert_eq!(args, ["-c", notify, "-c", &hooks, "-c", net, "hi"]);
+        let instructions = format!("developer_instructions={}", serde_json::to_string(WORKSPACE_INSTRUCTIONS).unwrap());
+        assert_eq!(args, ["-c", notify, "-c", &hooks, "-c", net, "-c", &instructions, "hi"]);
 
         // Resuming: the id goes last and a first prompt makes no sense.
         s.resume = Some("t-1".into());
         s.command = Some("--full-auto".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "-c", net, "--full-auto", "t-1"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "-c", net, "-c", &instructions, "--full-auto", "t-1"]);
+    }
+
+    #[test]
+    fn codex_keeps_your_own_developer_instructions() {
+        let home = std::env::temp_dir().join(format!("trix-codex-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let ints = Integrations { codex_home: Some(home.clone()), ..Default::default() };
+        let value = |command: Option<&str>| {
+            let mut s = spec(Kind::Codex);
+            s.command = command.map(String::from);
+            let args = command_for(&s, &ints, Path::new("/bin/trix"), None).1;
+            let arg = args.iter().find_map(|a| a.strip_prefix("developer_instructions=")).unwrap().to_string();
+            // What Codex reads: the value is TOML.
+            format!("v={arg}").parse::<toml::Table>().unwrap()["v"].as_str().unwrap().to_string()
+        };
+        // No config, or one that says nothing: ours alone.
+        assert_eq!(value(None), WORKSPACE_INSTRUCTIONS);
+        std::fs::write(home.join("config.toml"), "model = \"gpt-5\"\ndeveloper_instructions = \"  \"\n").unwrap();
+        assert_eq!(value(None), WORKSPACE_INSTRUCTIONS);
+
+        let config = "developer_instructions = \"be \\\"terse\\\"\\nalways\"\n[profiles.work]\ndeveloper_instructions = \"work rules\"\n[profiles.bare]\nmodel = \"x\"\n";
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        assert_eq!(value(None), format!("{WORKSPACE_INSTRUCTIONS}\n\nbe \"terse\"\nalways"));
+        // The profile's own win over the top level's; one without any falls back.
+        for theirs in ["-p work", "--profile work", "--profile=work"] {
+            assert_eq!(value(Some(theirs)), format!("{WORKSPACE_INSTRUCTIONS}\n\nwork rules"), "{theirs}");
+        }
+        assert_eq!(value(Some("-p bare")), format!("{WORKSPACE_INSTRUCTIONS}\n\nbe \"terse\"\nalways"));
+        std::fs::write(home.join("config.toml"), format!("profile = \"work\"\n{config}")).unwrap();
+        assert_eq!(value(None), format!("{WORKSPACE_INSTRUCTIONS}\n\nwork rules"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2353,7 +2445,7 @@ mod tests {
     #[test]
     fn claude_and_codex_argv_ignore_the_new_integrations() {
         let s = spec(Kind::Claude);
-        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--settings", "/run/s.json"]);
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--settings", "/run/s.json", "--append-system-prompt", WORKSPACE_INSTRUCTIONS]);
         let c = command_for(&spec(Kind::Codex), &ints(), Path::new("/bin/trix"), Some("x")).1;
         assert!(!c.iter().any(|a| a.contains("plugin") || a == "x"));
     }
