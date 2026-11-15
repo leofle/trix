@@ -340,6 +340,9 @@ pub struct HitMap {
     pub menu_items: Vec<(Rect, MenuItem)>,
     /// The bottom bar's hints, each a button for its action.
     pub hints: Vec<(Rect, Action)>,
+    /// The bottom bar's esc while a dialog, menu or the settings are open:
+    /// clicking it is pressing esc.
+    pub esc: Option<Rect>,
     /// The settings: all of them, and each row (a setting, or a theme in
     /// the theme list) by its number.
     pub settings: Option<Rect>,
@@ -2602,6 +2605,18 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if self.modal.is_some()
+            && m.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(r) = self.hits.esc
+            && m.column >= r.x
+            && m.column < r.x + r.width
+            && m.row >= r.y
+            && m.row < r.y + r.height
+        {
+            self.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            self.dirty = true;
+            return;
+        }
         if let Some(Modal::Menu(menu)) = self.modal {
             self.menu_mouse(menu, m);
             return;

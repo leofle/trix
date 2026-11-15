@@ -122,7 +122,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             View::Grid => grid_view(f, app, main, &t),
         }
     };
-    app.hits.hints = bottom_bar(f, app, bottom, &t);
+    (app.hits.hints, app.hits.esc) = bottom_bar(f, app, bottom, &t);
 
     if let Some(Modal::Menu(m)) = app.modal {
         // A menu floats over the workspace without dimming it.
@@ -243,8 +243,9 @@ fn clock() -> String {
 }
 
 /// The keys to know, each a button for what it does but `jump` (which
-/// agent?): returns where they are.
-fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Action)> {
+/// agent?): returns where they are, and where esc is while something is
+/// open over the workspace.
+fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> (Vec<(Rect, Action)>, Option<Rect>) {
     let key = |k: &str| Span::styled(format!(" {k} "), Style::new().fg(t.fg_bright).bg(t.surface_hi));
     let lab = |l: &str| Span::styled(format!(" {l}   "), Style::new().fg(t.dim));
     let mut spans = vec![Span::raw(" ")];
@@ -303,6 +304,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
     });
     let right = toast.as_ref().map_or(area.right(), |(_, r)| r.x.saturating_sub(2));
     let mut buttons = Vec::new();
+    let mut esc = None;
     let mut x = area.x + 1;
     for (k, l, action) in hints {
         let (k, l) = (key(&k), lab(&l));
@@ -313,10 +315,14 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
         if x.saturating_add(w) > right {
             break;
         }
-        if let Some(a) = action
-            && x < area.right()
-        {
-            buttons.push((Rect { x, y: area.y, width: w.min(area.right() - x), height: 1 }, a));
+        if x < area.right() {
+            let r = Rect { x, y: area.y, width: w.min(area.right() - x), height: 1 };
+            match action {
+                Some(a) => buttons.push((r, a)),
+                // With something open, the only hint is its esc.
+                None if app.modal.is_some() => esc = Some(r),
+                None => {}
+            }
         }
         x = x.saturating_add(w + 2);
         spans.push(k);
@@ -328,7 +334,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
         f.render_widget(Clear, r);
         f.render_widget(Paragraph::new(line), r);
     }
-    buttons
+    (buttons, esc)
 }
 
 fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
@@ -1845,18 +1851,20 @@ fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme, hits:
         }
     }
 
-    f.render_widget(
-        Paragraph::new(TLine::from(vec![
-            Span::styled("↑↓", Style::new().fg(t.fg)),
-            Span::styled(" select   ", Style::new().fg(t.dim)),
-            Span::styled("enter", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" jump   ", Style::new().fg(t.dim)),
-            Span::styled("esc", Style::new().fg(t.fg)),
-            Span::styled(" close", Style::new().fg(t.dim)),
-        ]))
-        .alignment(Alignment::Right),
-        Rect { y: r.bottom().saturating_sub(2), height: 1, ..inner },
-    );
+    // The gaps are spans of their own, so a click on one presses nothing.
+    let foot = TLine::from(vec![
+        Span::styled("↑↓", Style::new().fg(t.fg)),
+        Span::styled(" select", Style::new().fg(t.dim)),
+        Span::raw("   "),
+        Span::styled("enter", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" jump", Style::new().fg(t.dim)),
+        Span::raw("   "),
+        Span::styled("esc", Style::new().fg(t.fg)),
+        Span::styled(" close", Style::new().fg(t.dim)),
+    ]);
+    let row = Rect { y: r.bottom().saturating_sub(2), height: 1, ..inner };
+    hint_hits(&foot, row, hits);
+    f.render_widget(Paragraph::new(foot).alignment(Alignment::Right), row);
 }
 
 /// The key shown beside a menu item: its workspace key, if it has one and
@@ -3683,5 +3691,59 @@ mod tests {
         click_on(&mut app, "beta line");
         assert!(app.modal.is_none(), "the click went there");
         assert_eq!(app.toast.take().map(|t| t.text).as_deref(), Some("that agent is gone"), "the one clicked, not the one selected");
+    }
+
+    #[test]
+    fn the_bottom_bars_esc_closes_whatever_is_open() {
+        let mut app = clickable_app();
+        frame(&mut app);
+        assert_eq!(app.hits.esc, None, "nothing open, no esc");
+        type Open = fn(&mut App);
+        let opens: [(&str, Open); 7] = [
+            ("search", |app| app.modal = Some(Modal::Search(Search::default()))),
+            ("close", |app| app.modal = Some(Modal::ConfirmClose(2, 0))),
+            ("quit", |app| app.modal = Some(Modal::ConfirmQuit(0))),
+            ("broadcast", |app| app.modal = Some(Modal::Broadcast(TextInput::default(), BroadcastTarget::All))),
+            ("help", |app| app.modal = Some(Modal::Help)),
+            ("menu", |app| app.open_menu(2, None)),
+            ("settings", |app| app.open_settings()),
+        ];
+        for (what, open) in opens {
+            open(&mut app);
+            frame(&mut app);
+            let r = app.hits.esc.unwrap_or_else(|| panic!("{what}: an esc to click"));
+            app.handle(AppEvent::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: r.x + r.width / 2, row: r.y, modifiers: KeyModifiers::NONE }));
+            assert!(app.modal.is_none(), "{what}: the click was esc");
+            assert!(app.agents.len() == 2 && !app.quit, "{what}: esc never says yes");
+        }
+    }
+
+    #[test]
+    fn the_search_hints_press_their_keys() {
+        let mut app = clickable_app();
+        let search = || {
+            let mut s = Search { input: TextInput::new("beta"), ..Default::default() };
+            s.hits = vec![crate::search::Hit {
+                agent: 99,
+                start: Point::new(Line(0), Column(0)),
+                end: Point::new(Line(0), Column(3)),
+                text: "beta line".into(),
+                at: 0,
+                len: 4,
+                from_bottom: 0,
+                history: 0,
+            }];
+            s.agents = 1;
+            Modal::Search(s)
+        };
+        app.modal = Some(search());
+        click_on(&mut app, "select");
+        assert!(matches!(app.modal, Some(Modal::Search(_))), "↑↓ isn't a key a click can press");
+        click_on(&mut app, "esc close");
+        assert!(app.modal.is_none() && app.toast.take().is_none(), "the esc hint closes it");
+        app.modal = Some(search());
+        click_on(&mut app, "enter jump");
+        assert!(app.modal.is_none(), "the enter hint jumps");
+        assert_eq!(app.toast.take().map(|t| t.text).as_deref(), Some("that agent is gone"), "to the selected hit");
     }
 }
