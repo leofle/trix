@@ -356,8 +356,16 @@ impl Agent {
         if spec.kind == Kind::OpenCode {
             let theirs = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
             if let Some(c) = integrations.opencode_plugin_for_version().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
+                let c = integrations.workspace_instructions.as_deref()
+                    .and_then(|dir| hooks::opencode_instructions(&c, dir)).unwrap_or(c);
                 env.insert("OPENCODE_CONFIG_CONTENT".into(), c);
             }
+        }
+        if spec.kind == Kind::Copilot
+            && let Some(dir) = &integrations.workspace_instructions
+        {
+            let theirs = std::env::var("COPILOT_CUSTOM_INSTRUCTIONS_DIRS").ok();
+            env.insert("COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(), hooks::copilot_instruction_dirs(theirs.as_deref(), dir));
         }
         for (k, v) in theme_env(spec.kind, integrations.themed, |k| std::env::var_os(k).is_some()) {
             env.insert(k.into(), v.into());
@@ -1374,6 +1382,9 @@ fn codex_hooks(exe: &Path) -> String {
     format!("hooks={{{}}}", events.join(","))
 }
 
+/// Workspace discovery belongs in startup context, not a submitted user task.
+pub(crate) const WORKSPACE_INSTRUCTIONS: &str = "You are running inside a Trix workspace alongside other agents. At the start of a session, run `trix ls --json` to discover peers and identify yourself (the entry with `you: true`). Trix peers are separate from your built-in subagent registry. Use `trix read <agent> -n 60` to inspect recent output and `trix wait <agent> -t 30` to wait. When the user requests coordination, use `trix send <agent> <prompt>` to communicate. Do not start, interrupt, close, or assign work to peers unless the task authorizes it. Never use --force to bypass a permission prompt. If no workspace is reachable, report that limitation rather than assuming no peers exist.";
+
 fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path, new_session: Option<&str>) -> (String, Vec<String>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut args = Vec::new();
@@ -1472,9 +1483,25 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
                 args.push("--resume".into());
                 args.push(id.clone());
             }
-            if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
-                args.extend(split_args(extra));
+            let mut theirs = extra.map(split_args).unwrap_or_default();
+            // Claude accepts one append prompt; combine ours with the user's.
+            let mut instructions = WORKSPACE_INSTRUCTIONS.to_string();
+            let mut i = 0;
+            while i < theirs.len() {
+                if theirs[i] == "--append-system-prompt" && i + 1 < theirs.len() {
+                    theirs.remove(i);
+                    instructions.push_str("\n\n");
+                    instructions.push_str(&theirs.remove(i));
+                } else if let Some(value) = theirs[i].strip_prefix("--append-system-prompt=") {
+                    instructions.push_str("\n\n");
+                    instructions.push_str(value);
+                    theirs.remove(i);
+                } else {
+                    i += 1;
+                }
             }
+            args.extend(["--append-system-prompt".into(), instructions]);
+            args.extend(theirs);
             if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
                 push_prompt(&mut args, p);
             }
@@ -1497,6 +1524,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             // so they can still say otherwise.
             args.push("-c".into());
             args.push("sandbox_workspace_write.network_access=true".into());
+            args.extend(["-c".into(), format!("developer_instructions={}", serde_json::to_string(WORKSPACE_INSTRUCTIONS).unwrap())]);
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
                 args.extend(split_args(extra));
             }
@@ -2114,19 +2142,19 @@ mod tests {
         s.prompt = Some("fix it".into());
         let (prog, args) = command_for(&s, &Integrations { claude_settings: Some("/run/s.json".into()), ..Default::default() }, Path::new("/bin/trix"), None);
         assert_eq!(prog, "claude");
-        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--model", "opus", "--append-system-prompt", "be terse", "fix it"]);
+        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--append-system-prompt", &format!("{WORKSPACE_INSTRUCTIONS}\n\nbe terse"), "--model", "opus", "fix it"]);
 
         let mut s = spec(Kind::Claude);
         s.command = Some("   ".into());
         s.prompt = Some(String::new());
-        assert!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1.is_empty());
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--append-system-prompt", WORKSPACE_INSTRUCTIONS]);
 
         let mut s = spec(Kind::Claude);
         s.prompt = Some("- fix lint\n- run tests".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--", "- fix lint\n- run tests"], "not an option");
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--append-system-prompt", WORKSPACE_INSTRUCTIONS, "--", "- fix lint\n- run tests"], "not an option");
         let mut s = spec(Kind::Codex);
         s.prompt = Some("--help is broken".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[6..], ["--", "--help is broken"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[8..], ["--", "--help is broken"]);
     }
 
     #[test]
@@ -2138,12 +2166,13 @@ mod tests {
         let (prog, args) = command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None);
         assert_eq!(prog, "codex");
         let net = "sandbox_workspace_write.network_access=true";
-        assert_eq!(args, ["-c", notify, "-c", &hooks, "-c", net, "hi"]);
+        let instructions = format!("developer_instructions={}", serde_json::to_string(WORKSPACE_INSTRUCTIONS).unwrap());
+        assert_eq!(args, ["-c", notify, "-c", &hooks, "-c", net, "-c", &instructions, "hi"]);
 
         // Resuming: the id goes last and a first prompt makes no sense.
         s.resume = Some("t-1".into());
         s.command = Some("--full-auto".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "-c", net, "--full-auto", "t-1"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "-c", net, "-c", &instructions, "--full-auto", "t-1"]);
     }
 
     #[test]
@@ -2353,7 +2382,7 @@ mod tests {
     #[test]
     fn claude_and_codex_argv_ignore_the_new_integrations() {
         let s = spec(Kind::Claude);
-        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--settings", "/run/s.json"]);
+        assert_eq!(command_for(&s, &ints(), Path::new("/bin/trix"), None).1, ["--settings", "/run/s.json", "--append-system-prompt", WORKSPACE_INSTRUCTIONS]);
         let c = command_for(&spec(Kind::Codex), &ints(), Path::new("/bin/trix"), Some("x")).1;
         assert!(!c.iter().any(|a| a.contains("plugin") || a == "x"));
     }

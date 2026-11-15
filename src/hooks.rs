@@ -140,6 +140,8 @@ pub fn write_claude_settings_to(path: &Path, exe: &Path, theme: Option<&str>) ->
 /// into the runtime dir and removed when the server stops.
 #[derive(Debug, Clone)]
 pub struct Integrations {
+    /// Session-only instruction directory shared by OpenCode and Copilot.
+    pub workspace_instructions: Option<PathBuf>,
     /// Claude Code `--settings` overlay.
     pub claude_settings: Option<PathBuf>,
     /// OpenCode plugin, loaded through `OPENCODE_CONFIG_CONTENT`: a file for
@@ -183,6 +185,7 @@ impl Integrations {
             ask.get_or_init(opencode_has_standalone);
         });
         Integrations {
+            workspace_instructions: write_workspace_instructions().ok(),
             claude_settings: write_claude_settings(exe).ok(),
             opencode_plugin: write_opencode_plugin(exe).ok(),
             opencode_plugin_dir: write_opencode_plugin_dir(exe).ok(),
@@ -197,6 +200,7 @@ impl Integrations {
     /// Nothing written, and OpenCode's version already known.
     pub fn with_standalone(standalone: bool) -> Integrations {
         Integrations {
+            workspace_instructions: None,
             claude_settings: None,
             opencode_plugin: None,
             opencode_plugin_dir: None,
@@ -224,10 +228,48 @@ impl Integrations {
         for f in [&self.claude_settings, &self.opencode_plugin, &self.muse_hooks].into_iter().flatten() {
             let _ = std::fs::remove_file(f);
         }
-        for d in [&self.cursor_plugin, &self.copilot_plugin, &self.opencode_plugin_dir].into_iter().flatten() {
+        for d in [&self.workspace_instructions, &self.cursor_plugin, &self.copilot_plugin, &self.opencode_plugin_dir].into_iter().flatten() {
             let _ = std::fs::remove_dir_all(d);
         }
     }
+}
+
+fn write_workspace_instructions() -> anyhow::Result<PathBuf> {
+    let dir = runtime_dir().join(format!("workspace-instructions-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("AGENTS.md"), crate::agent::WORKSPACE_INSTRUCTIONS)?;
+    Ok(dir)
+}
+
+/// Merge a session instruction path without discarding user configuration.
+pub fn opencode_instructions(existing: &str, dir: &Path) -> Option<String> {
+    let mut config: Value = serde_json::from_str(existing).ok()?;
+    let list = config.as_object_mut()?.entry("instructions").or_insert_with(|| Value::Array(Vec::new()));
+    list.as_array_mut()?.push(Value::String(dir.join("AGENTS.md").display().to_string()));
+    serde_json::to_string(&config).ok()
+}
+
+pub fn copilot_instruction_dirs(existing: Option<&str>, dir: &Path) -> String {
+    match existing.filter(|s| !s.trim().is_empty()) {
+        Some(s) => format!("{s},{}", dir.display()),
+        None => dir.display().to_string(),
+    }
+}
+
+/// Only the pane's own startup gets workspace context, never observer subagents.
+fn workspace_hook_context(source: &str, payload: &Value, pane: Option<&str>) -> Option<Value> {
+    if source != "muse" || payload.get("hook_event_name")?.as_str()? != "SessionStart" {
+        return None;
+    }
+    if let Some(pane) = pane
+        && payload.get("session_id").and_then(Value::as_str) != Some(pane)
+    {
+        return None;
+    }
+    Some(serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": crate::agent::WORKSPACE_INSTRUCTIONS
+    }}))
 }
 
 /// Does the OpenCode on `PATH` know `--standalone`? One that isn't installed
@@ -662,6 +704,9 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
         }
     };
     let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    if let Some(context) = workspace_hook_context(source, &v, std::env::var("MUSE_SESSION_ID").ok().as_deref()) {
+        println!("{context}");
+    }
     report(source, &v, Some(seq));
 }
 
@@ -1200,6 +1245,30 @@ mod tests {
         assert_eq!(d("webfetch", json!({"url":"https://x.ai"})).as_deref(), Some("https://x.ai"));
         // Claude's own stay as they were.
         assert_eq!(d("Read", json!({"file_path":"/a/z.rs"})).as_deref(), Some("z.rs"));
+    }
+
+    #[test]
+    fn workspace_instruction_merges_preserve_user_sources() {
+        let dir = Path::new("/runtime/with spaces");
+        let c = opencode_instructions(r#"{"instructions":["mine.md"],"model":"x"}"#, dir).unwrap();
+        let c: Value = serde_json::from_str(&c).unwrap();
+        assert_eq!(c["instructions"], json!(["mine.md", "/runtime/with spaces/AGENTS.md"]));
+        assert_eq!(c["model"], "x");
+        assert!(opencode_instructions(r#"{"instructions":"mine.md"}"#, dir).is_none());
+        assert!(opencode_instructions("invalid", dir).is_none());
+        assert_eq!(copilot_instruction_dirs(Some("/mine,/other"), dir), "/mine,/other,/runtime/with spaces");
+        assert_eq!(copilot_instruction_dirs(None, dir), "/runtime/with spaces");
+    }
+
+    #[test]
+    fn muse_workspace_context_only_goes_to_the_pane_startup() {
+        let start = json!({"hook_event_name":"SessionStart", "session_id":"pane"});
+        let context = workspace_hook_context("muse", &start, Some("pane")).unwrap();
+        assert_eq!(context["hookSpecificOutput"]["additionalContext"], crate::agent::WORKSPACE_INSTRUCTIONS);
+        assert!(context.get("decision").is_none());
+        assert!(workspace_hook_context("muse", &start, Some("observer")).is_none());
+        assert!(workspace_hook_context("copilot", &start, None).is_none());
+        assert!(workspace_hook_context("muse", &json!({"hook_event_name":"PermissionRequest"}), None).is_none());
     }
 
     #[test]
