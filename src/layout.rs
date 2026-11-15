@@ -337,7 +337,7 @@ fn drop_from_restore(app: &mut App, agents: &[LayoutAgent]) {
     p.focus = focused.and_then(|f| p.agents.iter().position(|s| s.name == f)).unwrap_or(0);
     if p.agents.is_empty() {
         app.pending_restore = None;
-        if matches!(app.modal, Some(app::Modal::Restore)) {
+        if matches!(app.modal, Some(app::Modal::Restore(_))) {
             app.modal = None;
         }
     }
@@ -477,7 +477,7 @@ mod tests {
         let tmp = std::env::temp_dir();
         let saved = |name: &str| SavedAgent { kind: "claude".into(), name: name.into(), cwd: tmp.clone(), command: None, session: Some(format!("s-{name}")), pinned: false };
         app.pending_restore = Some(crate::state::Saved::new(2, vec![saved("web"), saved("api"), saved("docs")]));
-        app.modal = Some(app::Modal::Restore);
+        app.modal = Some(app::Modal::Restore(0));
         let mut job = entry("custom", "web", &tmp.display().to_string());
         job.args = Some("exec sleep 60".into());
         let gone = entry("shell", "api", "/no/such/dir");
