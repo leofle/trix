@@ -1490,6 +1490,13 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             args.push(format!("notify={notify}"));
             args.push("-c".into());
             args.push(codex_hooks(exe));
+            // Codex's sandbox blocks every socket while its network is off,
+            // trix's own included, so the `trix` commands Codex runs (`trix
+            // ls`, `trix send`, …) would find no workspace. This is the one
+            // setting that lets them through. Your own args come after it,
+            // so they can still say otherwise.
+            args.push("-c".into());
+            args.push("sandbox_workspace_write.network_access=true".into());
             if let Some(extra) = spec.command.as_deref().filter(|c| !c.trim().is_empty()) {
                 args.extend(split_args(extra));
             }
@@ -2119,7 +2126,7 @@ mod tests {
         assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["--", "- fix lint\n- run tests"], "not an option");
         let mut s = spec(Kind::Codex);
         s.prompt = Some("--help is broken".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[4..], ["--", "--help is broken"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1[6..], ["--", "--help is broken"]);
     }
 
     #[test]
@@ -2130,12 +2137,13 @@ mod tests {
         s.prompt = Some("hi".into());
         let (prog, args) = command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None);
         assert_eq!(prog, "codex");
-        assert_eq!(args, ["-c", notify, "-c", &hooks, "hi"]);
+        let net = "sandbox_workspace_write.network_access=true";
+        assert_eq!(args, ["-c", notify, "-c", &hooks, "-c", net, "hi"]);
 
         // Resuming: the id goes last and a first prompt makes no sense.
         s.resume = Some("t-1".into());
         s.command = Some("--full-auto".into());
-        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "--full-auto", "t-1"]);
+        assert_eq!(command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1, ["resume", "-c", notify, "-c", &hooks, "-c", net, "--full-auto", "t-1"]);
     }
 
     #[test]

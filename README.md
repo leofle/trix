@@ -405,6 +405,8 @@ From then on, Codex panes show live detail like Claude's: `exec_command cargo te
 
 Until the hooks are trusted, Codex skips them and trix falls back to Codex's `notify`, which only reports finished turns. Screen heuristics cover the rest, and the first finished turn shows a one-time reminder. Codex records trust against the hook's exact definition, which includes the path to trix. If you run trix from another path, such as `target/release/trix` while developing, Codex asks you to trust its hooks again.
 
+Codex panes can drive the workspace like any other agent: `trix ls`, `trix send`, `trix spawn` and the rest. Codex's sandbox blocks every socket while its network is off, trix's own included, so trix also passes `-c sandbox_workspace_write.network_access=true`. Without it, those commands say `no workspace running`. That setting also lets the commands Codex runs reach the network, as they would in a plain shell. To keep it off, start Codex with `-c sandbox_workspace_write.network_access=false` in its command (your own args come after trix's, so they win). In read-only mode (`--sandbox read-only`, or a folder you haven't trusted), Codex can't reach trix either way.
+
 Codex shows a startup warning that `-c` overrides run it "without the shared background server". That's been true of every Codex pane in trix, because trix has always passed `-c notify=…`.
 
 ## States
