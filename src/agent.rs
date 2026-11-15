@@ -304,6 +304,9 @@ pub struct Agent {
     /// grok (npm)"). It stays starting until the installer says it's done:
     /// install output isn't the agent at work. See `install`.
     pub installing: Option<String>,
+    /// Amp: when its welcome screen was last on screen. It repaints in
+    /// frames, so one tick can catch a frame without the text.
+    amp_welcome_at: Option<Instant>,
     /// Copilot: the tool its last `PreToolUse` named, until it ran. Its
     /// permission prompt comes as a notification with no tool in it, so
     /// this says what the approval is for.
@@ -482,6 +485,7 @@ impl Agent {
             title_attention: None,
             changes: Vec::new(),
             installing,
+            amp_welcome_at: None,
             pending_tool: None,
         })
     }
@@ -849,7 +853,11 @@ impl Agent {
             if self.installing.is_some() {
                 return None;
             }
-            if self.created.elapsed() > Duration::from_millis(1500) && quiet > Duration::from_millis(600) {
+            // Amp's welcome screen animates for as long as it is open (~30
+            // frames a second), so its output never goes quiet: its empty
+            // input box says it is ready.
+            let amp_ready = self.kind == Kind::Amp && self.created.elapsed() > Duration::from_millis(1500) && amp_ready(&self.screen_bottom());
+            if amp_ready || (self.created.elapsed() > Duration::from_millis(1500) && quiet > Duration::from_millis(600)) {
                 if self.kind.is_agent() && self.screen_needs_input() {
                     self.activity = "waiting for an answer".into();
                     return self.set_state(State::Blocked, focused);
@@ -873,6 +881,14 @@ impl Agent {
         // starting up, resuming), not a turn.
         if self.kind == Kind::Muse {
             title_idle = self.title.as_deref().is_some_and(|t| !braille_spinner(t.split(' ').next().unwrap_or_default()));
+        }
+        // Amp's welcome screen animates until the first prompt: output now
+        // is that, not a turn.
+        if self.kind == Kind::Amp && matches!(self.state, State::Idle | State::Done) {
+            if amp_welcome(&self.screen_text()) {
+                self.amp_welcome_at = Some(now);
+            }
+            title_idle = self.amp_welcome_at.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1));
         }
         if self.kind == Kind::Grok {
             // Its own question or approval UI on screen outranks the title,
@@ -1215,6 +1231,26 @@ impl Drop for Agent {
 }
 
 /// Does this screen text show an approval prompt or a question?
+/// Is this Amp's screen ready for a prompt? Its input box is framed
+/// (`╭─ … ─ opus 5.5 ─╮` over `╰─ ~/dir (main) ─╯`) and shows only once Amp is
+/// up and signed in: its loading and sign-in screens have no such box. A
+/// screen that mentions signing in doesn't count either way.
+fn amp_ready(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let top = lines.iter().rposition(|l| l.starts_with('╭') && l.ends_with('╮'));
+    let bottom = lines.iter().rposition(|l| l.starts_with('╰') && l.ends_with('╯'));
+    let lower = screen.to_lowercase();
+    matches!((top, bottom), (Some(t), Some(b)) if t < b)
+        && !["sign in", "log in", "login", "api key", "authenticate"].iter().any(|w| lower.contains(w))
+}
+
+/// Amp's welcome screen, which a thread's first message replaces. Its
+/// headline varies ("Welcome to Amp", "Welcome to your Agent"); the hint
+/// under it doesn't.
+fn amp_welcome(screen: &str) -> bool {
+    screen.contains("ctrl+o for commands")
+}
+
 fn needs_input(screen: &str) -> bool {
     let t = screen.to_lowercase();
     // Only phrasings of actual prompts — a bare word like "approve" shows
@@ -3657,6 +3693,54 @@ mod tests {
         assert_eq!((a.state, a.activity.as_str()), (State::Done, "replied"));
         assert_eq!(a.session.as_deref(), Some("T-0b1c"));
         a.shutdown();
+    }
+
+    /// Amp repaints its welcome screen ~30 times a second for as long as it
+    /// is open, so output never goes quiet: the empty input box is what says
+    /// it's ready. Its loading and sign-in screens have no such box.
+    #[test]
+    fn amp_welcome_screen_leaves_starting_while_it_keeps_repainting() {
+        let welcome = "\n  Welcome to Amp\n\n  ctrl+o for commands · ? for shortcuts\n\n\
+╭──────────────────────────────── $···· ─ opus 5.5 ─╮\n│                                                   │\n│                                                   │\n\
+╰────────────────────────── ~/Projects/trix (main) ─╯";
+        assert!(amp_ready(welcome));
+        assert!(!amp_ready("Welcome to Amp\n\nLoading…"));
+        assert!(!amp_ready("Welcome to Amp\n\nPress Enter to sign in to Amp"));
+        assert!(!amp_ready(&format!("Please log in first\n{welcome}")), "a sign-in screen");
+        assert!(!amp_ready("╭─ opus 5.5 ─╮\n│ typing"), "a box still being drawn");
+
+        let mut a = test_agent(Kind::Amp);
+        show(&a, "Welcome to Amp\n\nLoading…");
+        a.created = ago(Duration::from_secs(5));
+        a.on_output();
+        assert_eq!(a.heuristics(true), None, "still loading, and busy painting");
+        show(&a, "\x1b[2J\x1b[H");
+        show(&a, welcome);
+        a.on_output();
+        assert_eq!(a.heuristics(true), Some(State::Starting), "painting right now, ready all the same");
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "ready"));
+        // Its repainting isn't a turn, but real work after the welcome is.
+        a.last_input = ago(Duration::from_secs(5));
+        a.last_resize = ago(Duration::from_secs(5));
+        for _ in 0..8 {
+            a.on_output();
+        }
+        assert_eq!(a.heuristics(true), None);
+        assert_eq!(a.state, State::Idle, "the welcome screen's animation");
+        show(&a, "\x1b[2J\x1b[H> fix the login\n\nReading src/login.rs");
+        a.amp_welcome_at = Some(ago(Duration::from_secs(2)));
+        for _ in 0..8 {
+            a.on_output();
+        }
+        a.heuristics(true);
+        assert_eq!(a.state, State::Working);
+        a.shutdown();
+        // Too soon after launch, even with the box up.
+        let mut b = test_agent(Kind::Amp);
+        show(&b, welcome);
+        b.on_output();
+        assert_eq!(b.heuristics(true), None);
+        b.shutdown();
     }
 
     /// Without the plugin: output cadence, as for any agent trix has no
