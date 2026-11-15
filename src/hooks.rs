@@ -262,12 +262,16 @@ pub fn copilot_instruction_dirs(existing: Option<&str>, dir: &Path) -> String {
 }
 
 /// Only the pane's own startup gets workspace context, never observer subagents.
+/// Muse's from trix's managed hooks; Gemini's from the hooks you added
+/// (Gemini 0.68 puts `additionalContext` in the conversation as a
+/// `<hook_context>` turn; its subagents run no `SessionStart`).
 fn workspace_hook_context(source: &str, payload: &Value, pane: Option<&str>) -> Option<Value> {
-    if source != "muse" || payload.get("hook_event_name")?.as_str()? != "SessionStart" {
+    if !matches!(source, "muse" | "gemini") || payload.get("hook_event_name")?.as_str()? != "SessionStart" {
         return None;
     }
     // An empty `MUSE_SESSION_ID` names no pane, as in `condense_muse`.
-    if let Some(pane) = pane.filter(|p| !p.is_empty())
+    if source == "muse"
+        && let Some(pane) = pane.filter(|p| !p.is_empty())
         && payload.get("session_id").and_then(Value::as_str) != Some(pane)
     {
         return None;
@@ -759,6 +763,7 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         "grok" => return condense_grok(agent, v),
         "copilot" => return condense_copilot(agent, v),
         "muse" => return condense_muse(agent, v, std::env::var("MUSE_SESSION_ID").ok().as_deref()),
+        "gemini" => return condense_gemini(agent, v),
         _ => {}
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
@@ -962,6 +967,50 @@ fn condense_muse(agent: u32, v: &Value, pane: Option<&str>) -> HookMsg {
     m
 }
 
+/// A Gemini CLI hook payload, from hooks the user added themselves (trix
+/// can't pass Gemini hooks per process: it reads system settings only from
+/// root-owned folders), put in Claude's terms. Gemini 0.68 asks you
+/// about a tool after its `BeforeTool`: `Notification` says it is asking,
+/// and `details.type` what about (`ask_user` is its question tool).
+fn condense_gemini(agent: u32, v: &Value) -> HookMsg {
+    let name = text(v, "hook_event_name").unwrap_or_default();
+    let asks = v.get("details").and_then(|d| d.get("type")).and_then(Value::as_str);
+    let event = match name.as_str() {
+        "BeforeAgent" => "UserPromptSubmit",
+        "BeforeTool" => "PreToolUse",
+        "AfterTool" => "PostToolUse",
+        "AfterAgent" => "Stop",
+        "Notification" if text(v, "notification_type").as_deref() != Some("ToolPermission") => "unknown",
+        "Notification" if asks == Some("ask_user") => "Question",
+        "Notification" => "PermissionRequest",
+        "SessionStart" | "SessionEnd" => name.as_str(),
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "gemini", event);
+    m.session = text(v, "session_id");
+    // Its question tool asks what Claude's `AskUserQuestion` does, in the
+    // same shape: `questions`, each with its `question`.
+    m.tool = text(v, "tool_name").map(|t| if t == "ask_user" { "AskUserQuestion".into() } else { t });
+    m.detail = match event {
+        "PreToolUse" => v.get("tool_input").and_then(|i| tool_detail(m.tool.as_deref(), i)),
+        // Headless (`-p`), Gemini puts `SessionStart`'s context before the
+        // prompt itself: the prompt is what's after it.
+        "UserPromptSubmit" => text(v, "prompt").map(|p| {
+            let own = p.trim_start().strip_prefix("<hook_context>").and_then(|r| r.split_once("</hook_context>")).map_or(p.as_str(), |(_, r)| r);
+            one_line(own, 80)
+        }),
+        // "Tool Confirm Shell Command requires execution": what it asks
+        // about, should no `BeforeTool` have named it.
+        "PermissionRequest" => v
+            .get("details")
+            .and_then(|d| text(d, "command").or_else(|| text(d, "fileName")).or_else(|| text(d, "toolName")))
+            .or_else(|| text(v, "message"))
+            .map(|m| one_line(&m, 80)),
+        _ => None,
+    };
+    m
+}
+
 /// A shell command as a string: Claude sends one; Codex may send an argv,
 /// often `["bash", "-lc", "<script>"]`, where the script is what matters.
 fn shell_command(v: Option<&Value>) -> Option<String> {
@@ -993,21 +1042,22 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
     let g = |k: &str| input.get(k).and_then(Value::as_str);
     let base = |p: &str| Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.into());
     let d = match tool.unwrap_or("") {
-        "Bash" | "exec_command" | "shell" | "local_shell" | "Shell" | "bash" | "run_terminal_command" => {
+        "Bash" | "exec_command" | "shell" | "local_shell" | "Shell" | "bash" | "run_terminal_command" | "run_shell_command" => {
             shell_command(input.get("command").or_else(|| input.get("cmd"))).map(|c| one_line(&c, 60))
         }
         "apply_patch" => g("command").or(g("input")).or(g("patch")).and_then(patch_files),
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             g("file_path").or(g("notebook_path")).or(g("path")).map(base)
         }
-        // OpenCode's file tools, Grok's, Cursor's and Muse's own.
-        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "edit_file" | "search_replace" | "StrReplace" | "Delete" => {
+        // OpenCode's file tools, Grok's, Cursor's, Muse's and Gemini's own.
+        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "edit_file" | "search_replace" | "StrReplace" | "Delete" | "replace" => {
             g("filePath").or(g("file_path")).or(g("path")).or(g("target_file")).map(base)
         }
-        // Muse's `search` is ripgrep.
-        "Grep" | "Glob" | "grep" | "glob" | "search" => g("pattern").map(|p| one_line(p, 40)),
+        // Muse's `search` is ripgrep, Gemini's `grep_search`.
+        "Grep" | "Glob" | "grep" | "glob" | "search" | "grep_search" => g("pattern").map(|p| one_line(p, 40)),
+        "list_directory" => g("dir_path").or(g("path")).map(base),
         "WebFetch" | "webfetch" | "web_fetch" => g("url").map(|u| one_line(u, 50)),
-        "WebSearch" | "websearch" | "web_search" => g("query").map(|q| one_line(q, 50)),
+        "WebSearch" | "websearch" | "web_search" | "google_web_search" => g("query").map(|q| one_line(q, 50)),
         "Task" | "Agent" | "task" => g("description").map(|d| one_line(d, 50)),
         // Claude's take a list; Copilot's `ask_user` one question.
         "AskUserQuestion" => input
@@ -1276,6 +1326,10 @@ mod tests {
         assert!(workspace_hook_context("muse", &start, Some("")).is_some());
         assert!(workspace_hook_context("muse", &start, None).is_some());
         assert!(workspace_hook_context("copilot", &start, None).is_none());
+        // Gemini's, from the hooks you add; Muse's pane id means nothing to it.
+        let gemini = json!({"hook_event_name":"SessionStart","session_id":"g-1","source":"startup"});
+        assert_eq!(workspace_hook_context("gemini", &gemini, Some("pane")), Some(context.clone()));
+        assert!(workspace_hook_context("gemini", &json!({"hook_event_name":"BeforeAgent"}), None).is_none(), "startup only, never a turn's");
         assert!(workspace_hook_context("muse", &json!({"hook_event_name":"PermissionRequest"}), None).is_none());
     }
 
@@ -1559,5 +1613,53 @@ process.stdout.write(JSON.stringify(out));"#
         let path = write_muse_hooks(Path::new("/bin/trix")).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(), muse_hooks(Path::new("/bin/trix")));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn g(v: Value) -> HookMsg {
+        condense(3, "gemini", &v)
+    }
+
+    #[test]
+    fn gemini_payloads_in_claude_terms() {
+        let base = |event: &str| json!({"session_id": "6f1c-s", "transcript_path": "/t.json", "cwd": "/w", "hook_event_name": event, "timestamp": "2026-11-14T10:00:00Z"});
+        let with = |event: &str, extra: Value| {
+            let mut v = base(event);
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let m = g(with("SessionStart", json!({"source": "startup"})));
+        assert_eq!((m.source.as_str(), m.event.as_str(), m.session.as_deref(), m.transcript.as_deref()), ("gemini", "SessionStart", Some("6f1c-s"), None));
+        let m = g(with("BeforeAgent", json!({"prompt": "fix\n the   login"})));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("UserPromptSubmit", Some("fix the login")));
+        let m = g(with("BeforeAgent", json!({"prompt": "<hook_context>You are running inside a Trix workspace…</hook_context>\n\nsay hi"})));
+        assert_eq!(m.detail.as_deref(), Some("say hi"), "headless: the workspace context, then the prompt");
+        let m = g(with("BeforeTool", json!({"tool_name": "run_shell_command", "tool_input": {"command": "cargo test", "description": "Run the tests"}})));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PreToolUse", Some("run_shell_command"), Some("cargo test")));
+        let m = g(with("BeforeTool", json!({"tool_name": "replace", "tool_input": {"file_path": "/w/src/app.rs", "old_string": "a", "new_string": "b"}})));
+        assert_eq!(m.detail.as_deref(), Some("app.rs"));
+        let m = g(with("BeforeTool", json!({"tool_name": "grep_search", "tool_input": {"pattern": "fn main"}})));
+        assert_eq!(m.detail.as_deref(), Some("fn main"));
+        // Its question tool is Claude's.
+        let m = g(with("BeforeTool", json!({"tool_name": "ask_user", "tool_input": {"questions": [{"question": "Which database?", "header": "DB"}]}})));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PreToolUse", Some("AskUserQuestion"), Some("Which database?")));
+        let m = g(with("AfterTool", json!({"tool_name": "run_shell_command", "tool_input": {}, "tool_response": {"llmContent": "ok"}})));
+        assert_eq!(m.event, "PostToolUse");
+        // Asking you: about a tool, or its questions.
+        let m = g(with("Notification", json!({"notification_type": "ToolPermission", "message": "Tool Confirm Shell Command requires execution",
+            "details": {"type": "exec", "title": "Confirm Shell Command", "command": "rm -rf dist", "rootCommand": "rm"}})));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("PermissionRequest", Some("rm -rf dist")));
+        let m = g(with("Notification", json!({"notification_type": "ToolPermission", "message": "Tool Confirm Edit: app.rs requires editing",
+            "details": {"type": "edit", "title": "Confirm Edit: app.rs", "fileName": "app.rs", "filePath": "/w/app.rs"}})));
+        assert_eq!(m.detail.as_deref(), Some("app.rs"));
+        let m = g(with("Notification", json!({"notification_type": "ToolPermission", "message": "Tool requires confirmation", "details": {"type": "info"}})));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("PermissionRequest", Some("Tool requires confirmation")));
+        let m = g(with("Notification", json!({"notification_type": "ToolPermission", "message": "Tool requires confirmation", "details": {"type": "ask_user", "title": "Ask User"}})));
+        assert_eq!(m.event, "Question");
+        let m = g(with("Notification", json!({"notification_type": "SomethingElse", "message": "hi"})));
+        assert_eq!(m.event, "unknown");
+        let m = g(with("AfterAgent", json!({"prompt": "fix it", "prompt_response": "Done.", "stop_hook_active": false})));
+        assert_eq!(m.event, "Stop");
+        assert_eq!(g(with("SessionEnd", json!({"reason": "exit"}))).event, "SessionEnd");
+        assert_eq!(g(base("BeforeModel")).event, "unknown");
     }
 }

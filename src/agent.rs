@@ -33,12 +33,15 @@ pub enum Kind {
     Copilot,
     /// Meta's Muse Code (`muse`).
     Muse,
+    /// Google's Gemini CLI (`gemini`).
+    Gemini,
     Shell,
     Custom,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Shell, Kind::Custom];
+    pub const ALL: [Kind; 10] =
+        [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Gemini, Kind::Shell, Kind::Custom];
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -48,6 +51,7 @@ impl Kind {
             Kind::Cursor => "cursor",
             Kind::Copilot => "copilot",
             Kind::Muse => "muse",
+            Kind::Gemini => "gemini",
             Kind::Shell => "shell",
             Kind::Custom => "custom",
         }
@@ -61,7 +65,7 @@ impl Kind {
     /// A known coding agent, so typing a prompt into it is safe. A custom
     /// command may be anything (bash, ssh, psql), so it is not.
     pub fn takes_prompts(self) -> bool {
-        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse)
+        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse | Kind::Gemini)
     }
     /// It can be started again in the conversation it was in.
     pub fn resumes(self) -> bool {
@@ -89,6 +93,8 @@ impl Kind {
             Kind::Cursor => Some('u'),
             Kind::Copilot => Some('p'),
             Kind::Muse => Some('m'),
+            // gem-i-ni: `g` is Grok's.
+            Kind::Gemini => Some('i'),
             Kind::Shell => Some('s'),
             Kind::Custom => None,
         }
@@ -320,7 +326,7 @@ impl Agent {
         } else {
             integrations
         };
-        // Grok and Copilot take the id of a new conversation from their
+        // Grok, Copilot and Gemini take the id of a new conversation from their
         // caller, so trix knows what to resume without asking them.
         let fresh = new_conversation(&spec);
         let (program, args) = command_for(&spec, integrations, exe, fresh.as_deref());
@@ -636,8 +642,8 @@ impl Agent {
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
             // trix's own plugin (OpenCode, Copilot), its managed hooks (Muse)
-            // or the user's hooks (Grok).
-            "opencode" | "grok" | "copilot" | "muse" => self.hooked = true,
+            // or the user's hooks (Grok, Gemini).
+            "opencode" | "grok" | "copilot" | "muse" | "gemini" => self.hooked = true,
             // Cursor runs only `sessionStart` and the tool hooks from trix's
             // plugin (cursor-agent 2026.11.11): no prompt, no turn end. Its
             // screen says when a turn starts and ends; its hooks add what it
@@ -693,10 +699,10 @@ impl Agent {
                 self.activity = hooks::one_line(msg.detail.as_deref().unwrap_or_default(), 60);
                 self.set_state(State::Blocked, focused)
             }
-            // Copilot's and Muse's permission prompts come as a notification
-            // naming no tool: the tool it was about to run is what it asks
-            // about.
-            "PermissionRequest" if matches!(msg.source.as_str(), "copilot" | "muse") => {
+            // Copilot's, Muse's and Gemini's permission prompts come as a
+            // notification naming no tool: the tool it was about to run is
+            // what it asks about.
+            "PermissionRequest" if matches!(msg.source.as_str(), "copilot" | "muse" | "gemini") => {
                 self.activity = match (&self.pending_tool, msg.detail.as_deref().filter(|d| !d.is_empty())) {
                     (Some(t), _) => format!("approve {t}"),
                     (None, Some(m)) => hooks::one_line(m, 60),
@@ -727,7 +733,7 @@ impl Agent {
             }
             // OpenCode reports its session idle at start too, and the new
             // agents' turn ends mean nothing before a turn began.
-            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse") && !self.turn_seen => None,
+            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse" | "gemini") && !self.turn_seen => None,
             "Stop" | "agent-turn-complete" => {
                 self.pending_tool = None;
                 self.activity = match self.tools_used {
@@ -757,10 +763,10 @@ impl Agent {
                 }
                 None
             }
-            // Copilot's `ask_user` and Muse's `request_user_input` are on
-            // screen already (their `PreToolUse` named the question): the
-            // dialog's notification adds nothing.
-            "Question" if matches!(msg.source.as_str(), "copilot" | "muse") && self.state == State::Blocked => None,
+            // Copilot's and Gemini's `ask_user` and Muse's
+            // `request_user_input` are on screen already (their `PreToolUse`
+            // named the question): the dialog's notification adds nothing.
+            "Question" if matches!(msg.source.as_str(), "copilot" | "muse" | "gemini") && self.state == State::Blocked => None,
             // The agent asks the human something (OpenCode's question tool,
             // a Copilot dialog, Muse's question prompt).
             "Question" => {
@@ -845,9 +851,14 @@ impl Agent {
         let latched = self
             .title_attention
             .is_some_and(|t| t.elapsed() < GROK_BLINK && (self.state == State::Blocked || t > self.state_since));
-        if self.kind == Kind::Grok
-            && let Some(sig) = grok_title(self.title.as_deref(), latched)
-        {
+        // Gemini's title says it all as well (`ui.dynamicWindowTitle`, on by
+        // default): ready, working, or an approval waiting.
+        let sig = match self.kind {
+            Kind::Grok => grok_title(self.title.as_deref(), latched),
+            Kind::Gemini => gemini_title(self.title.as_deref()),
+            _ => None,
+        };
+        if let Some(sig) = sig {
             title_idle = sig == TitleSignal::Idle;
             if let Some(s) = self.apply_title(sig, quiet, focused) {
                 return s;
@@ -954,8 +965,8 @@ impl Agent {
             }
             State::Idle | State::Done if busy && !title_idle => {
                 // Cursor's title names the conversation and Muse's the
-                // folder, not what they do.
-                self.activity = self.title.clone().filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse)).unwrap_or_else(|| "working".into());
+                // folder, not what they do. Gemini's is read above.
+                self.activity = self.title.clone().filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse | Kind::Gemini)).unwrap_or_else(|| "working".into());
                 self.set_state(State::Working, focused)
             }
             State::Idle | State::Done if quiet > Duration::from_millis(800) && self.kind.is_agent() => {
@@ -1003,13 +1014,13 @@ impl Agent {
     /// A new terminal title. Grok's says when it's busy and when it waits
     /// on an approval.
     pub fn on_title(&mut self, t: String) {
-        if self.kind == Kind::Grok && t.contains(GROK_ATTENTION) {
+        if matches!(self.kind, Kind::Grok | Kind::Gemini) && t.contains(GROK_ATTENTION) {
             self.title_attention = Some(Instant::now());
         }
         self.title = Some(t);
     }
 
-    /// Apply what Grok's title says. `None`: it doesn't say, carry on with
+    /// Apply what Grok's or Gemini's title says. `None`: it doesn't say, carry on with
     /// the other signals.
     fn apply_title(&mut self, sig: TitleSignal, quiet: Duration, focused: bool) -> Option<Option<State>> {
         match sig {
@@ -1030,8 +1041,14 @@ impl Agent {
                 // Idle again: the turn ended with (or right after) the answer.
                 Some(self.end_turn(focused))
             }
-            // The user's own Grok hooks report the turn: the title only adds
-            // approvals.
+            // Gemini fires no hook for a turn you stopped (esc): its title
+            // going back to ready, and staying there, is the sign.
+            TitleSignal::Idle if self.hooked && self.kind == Kind::Gemini && self.state == State::Working && quiet > Duration::from_secs(2) => {
+                self.activity = "interrupted".into();
+                Some(self.set_state(State::Idle, focused))
+            }
+            // The user's own Grok or Gemini hooks report the turn: the title
+            // only adds approvals.
             _ if self.hooked => None,
             TitleSignal::Busy(what) => {
                 self.turn_seen = true;
@@ -1168,7 +1185,8 @@ fn needs_input(screen: &str) -> bool {
 /// (`packages/tui/src/routes/session/permission.tsx`), Cursor CLI's
 /// approval prompts and workspace-trust screen, Copilot CLI's folder trust
 /// and approval prompt, Muse Code's workspace trust, approval choices and
-/// question dialog, and Codex's folder-trust
+/// question dialog, Gemini CLI's folder trust and approval prompt, and
+/// Codex's folder-trust
 /// and hooks-review dialogs (as Codex 0.167.2 draws them).
 fn kind_prompt(kind: Kind, screen: &str) -> bool {
     let t = screen.to_lowercase();
@@ -1209,6 +1227,9 @@ fn kind_prompt(kind: Kind, screen: &str) -> bool {
                 "submit row to continue",
             ]) || (choice("allow once") && (choice("reject") || choice("always allow") || choice("allow for this session")))
         }
+        // Gemini CLI 0.68: its folder trust at start, and its approval
+        // prompt's way out, as it words them.
+        Kind::Gemini => any(&["do you trust the files in this folder?", "do you trust the following folders being added", "no, suggest changes (esc)"]),
         // Codex 0.167's start-up dialogs: trusting the folder, then
         // trix's hooks (and any of yours) once they're new or changed.
         Kind::Codex => any(&["trust and continue", "your trust decision will be saved", "hooks need review", "need review before they can run", "continue without trusting"]),
@@ -1248,6 +1269,25 @@ fn grok_title(title: Option<&str>, attention: bool) -> Option<TitleSignal> {
     (parts.last() == Some(&"grok")).then_some(TitleSignal::Idle)
 }
 
+/// What Gemini CLI's title says (`computeTerminalTitle`, 0.68): "◇  Ready",
+/// "✋  Action Required", "✦  Working…" (or the model's thought, with
+/// `ui.showStatusInTitle`) or "⏲  Working…", each followed by
+/// " (<folder>)" and padded to 80 columns.
+fn gemini_title(title: Option<&str>) -> Option<TitleSignal> {
+    let title = title?.trim();
+    let (icon, rest) = title.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    // The folder in parentheses goes: what it does is what's left. The
+    // folder's name may hold parentheses of its own, so from the first.
+    let what = rest.split_once(" (").filter(|_| rest.ends_with(')')).map_or(rest, |(w, _)| w).trim();
+    match icon {
+        "\u{25C7}" => Some(TitleSignal::Idle),
+        "\u{270B}" => Some(TitleSignal::Attention),
+        "\u{2726}" | "\u{23F2}" => Some(TitleSignal::Busy((!what.is_empty() && what != "Working\u{2026}").then(|| hooks::one_line(what, 60)))),
+        _ => None,
+    }
+}
+
 /// One frame of a braille spinner, as Grok's and Muse's titles show while
 /// they work.
 fn braille_spinner(s: &str) -> bool {
@@ -1275,12 +1315,13 @@ fn grok_picks_session(extra: Option<&str>) -> bool {
     })
 }
 
-/// The id trix picks for a new Grok or Copilot conversation: none when
+/// The id trix picks for a new Grok, Copilot or Gemini conversation: none when
 /// it resumes one, or the user's extra flags pick it.
 fn new_conversation(spec: &Spawn) -> Option<String> {
     let picks = match spec.kind {
         Kind::Grok => grok_picks_session(spec.command.as_deref()),
         Kind::Copilot => copilot_picks_session(spec.command.as_deref()),
+        Kind::Gemini => gemini_picks_session(spec.command.as_deref()),
         _ => return None,
     };
     (spec.resume.is_none() && !picks).then(new_session_id).flatten()
@@ -1292,6 +1333,16 @@ fn copilot_picks_session(extra: Option<&str>) -> bool {
     split_args(extra).iter().any(|a| {
         let flag = a.split('=').next().unwrap_or(a);
         matches!(flag, "--continue" | "-r" | "--resume" | "--session-id" | "--connect")
+    })
+}
+
+/// Do the user's extra Gemini flags pick the conversation themselves? It
+/// refuses more than one of `--resume`, `--session-id` and `--session-file`.
+fn gemini_picks_session(extra: Option<&str>) -> bool {
+    let Some(extra) = extra else { return false };
+    split_args(extra).iter().any(|a| {
+        let flag = a.split('=').next().unwrap_or(a);
+        matches!(flag, "-r" | "--resume" | "--session-id" | "--session-file")
     })
 }
 
@@ -1498,6 +1549,23 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
                 push_prompt(&mut args, p);
             }
             ("muse".into(), args)
+        }
+        // `gemini [-i PROMPT]`: older Gemini CLIs run a positional prompt
+        // headless and exit, `-i` stays in the session in all of them.
+        // `--resume <id>` takes the conversation back, `--session-id`
+        // names a new one, so restore needs no hook.
+        Kind::Gemini => {
+            if let Some(id) = &spec.resume {
+                args.extend(["--resume".into(), id.clone()]);
+            } else if let Some(id) = new_session {
+                args.extend(["--session-id".into(), id.into()]);
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            if let Some(p) = prompt {
+                // With `=`, a prompt starting with `-` stays the value.
+                args.push(format!("--prompt-interactive={p}"));
+            }
+            ("gemini".into(), args)
         }
         Kind::Claude => {
             if let Some(s) = &integrations.claude_settings {
@@ -3124,5 +3192,146 @@ mod tests {
         a.heuristics(false);
         assert_eq!((a.state, a.activity.as_str()), (State::Idle, "idle"));
         a.shutdown();
+    }
+
+    #[test]
+    fn gemini_has_its_own_letter() {
+        assert_eq!(Kind::Gemini.shortcut(), Some('i'));
+        assert_eq!(Kind::from_shortcut('i'), Some(Kind::Gemini));
+        assert_eq!(Kind::from_label("gemini"), Some(Kind::Gemini));
+        assert!(Kind::Gemini.takes_prompts() && Kind::Gemini.resumes() && !Kind::Gemini.prompts_only_on_screen());
+    }
+
+    #[test]
+    fn gemini_command_line() {
+        let ints = ints();
+        // New: trix names the conversation; the first prompt keeps the session open.
+        let mut s = spec(Kind::Gemini);
+        s.prompt = Some("- fix the login".into());
+        let (program, args) = command_for(&s, &ints, Path::new("/bin/trix"), Some("6f1c"));
+        assert_eq!(program, "gemini");
+        assert_eq!(args, ["--session-id", "6f1c", "--prompt-interactive=- fix the login"]);
+        // Restored: back in its conversation; extra flags after.
+        s.prompt = None;
+        s.resume = Some("6f1c".into());
+        s.command = Some("--model gemini-3-pro".into());
+        assert_eq!(command_for(&s, &ints, Path::new("/bin/trix"), None).1, ["--resume", "6f1c", "--model", "gemini-3-pro"]);
+        // Nothing asked: just gemini.
+        assert!(command_for(&spec(Kind::Gemini), &ints, Path::new("/bin/trix"), None).1.is_empty());
+        // Gemini refuses two of --resume, --session-id and --session-file: yours win.
+        let mut s = spec(Kind::Gemini);
+        assert!(new_conversation(&s).is_some());
+        for picks in ["--resume latest", "-r 3", "--session-id=mine", "--session-file /tmp/s.json"] {
+            s.command = Some(picks.into());
+            assert_eq!(new_conversation(&s), None, "{picks}");
+        }
+        s.command = Some("--model gemini-3-pro -y".into());
+        assert!(new_conversation(&s).is_some());
+    }
+
+    fn gemini(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        hook("gemini", event, tool, detail)
+    }
+
+    #[test]
+    fn gemini_turn_from_its_hooks() {
+        let mut a = test_agent(Kind::Gemini);
+        a.set_state(State::Idle, false);
+        assert_eq!(a.on_hook(&gemini("Stop", None, None), false), None, "no turn yet");
+        a.on_hook(&gemini("SessionStart", None, None), false);
+        assert!(a.hooked);
+        a.on_hook(&gemini("UserPromptSubmit", None, Some("clean up dist")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.last_prompt.as_deref()), (State::Working, "thinking", Some("clean up dist")));
+        // Gemini runs `BeforeTool`, then asks you about it.
+        a.on_hook(&gemini("PreToolUse", Some("run_shell_command"), Some("rm -rf dist")), false);
+        a.on_hook(&gemini("PermissionRequest", None, Some("rm -rf dist")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "approve run_shell_command rm -rf dist"));
+        a.on_hook(&gemini("PostToolUse", Some("run_shell_command"), None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "run_shell_command ✓"));
+        // Its question: the tool names it, its notification adds nothing.
+        a.on_hook(&gemini("PreToolUse", Some("AskUserQuestion"), Some("Which database?")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which database?"));
+        a.on_hook(&gemini("Question", None, None), false);
+        assert_eq!(a.activity, "Which database?");
+        a.on_hook(&gemini("PostToolUse", Some("AskUserQuestion"), None), false);
+        a.on_hook(&gemini("Stop", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 2 tools"));
+        a.shutdown();
+    }
+
+    /// Gemini CLI 0.68's titles (`ui.dynamicWindowTitle`, on by default).
+    #[test]
+    fn gemini_titles() {
+        let pad = |t: &str| format!("{t:<80}");
+        assert_eq!(gemini_title(Some(&pad("◇  Ready (api)"))), Some(TitleSignal::Idle));
+        assert_eq!(gemini_title(Some(&pad("✋  Action Required (api)"))), Some(TitleSignal::Attention));
+        assert_eq!(gemini_title(Some(&pad("✦  Working… (api)"))), Some(TitleSignal::Busy(None)));
+        assert_eq!(gemini_title(Some(&pad("⏲  Working… (my (odd) folder)"))), Some(TitleSignal::Busy(None)));
+        assert_eq!(gemini_title(Some("✦  Planning the migration (api)")), Some(TitleSignal::Busy(Some("Planning the migration".into()))));
+        // Its titles without `dynamicWindowTitle`, and anyone else's.
+        assert_eq!(gemini_title(Some(&pad("Gemini CLI (api)"))), None);
+        assert_eq!(gemini_title(Some("vim")), None);
+        assert_eq!(gemini_title(None), None);
+    }
+
+    /// Without hooks (trix can't pass them; you add them, and a folder you
+    /// haven't trusted runs none), Gemini's title says when it works, waits
+    /// on you and is done.
+    #[test]
+    fn gemini_title_without_hooks() {
+        let mut a = test_agent(Kind::Gemini);
+        a.set_state(State::Idle, false);
+        a.on_title("◇  Ready (api)".into());
+        // Redraws at the prompt aren't a turn.
+        for _ in 0..8 {
+            a.on_output();
+        }
+        assert_eq!(a.heuristics(false), None);
+        assert_eq!(a.state, State::Idle);
+        a.on_title("✦  Working… (api)".into());
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "working"));
+        a.on_title("✋  Action Required (api)".into());
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "needs your approval"));
+        a.on_title("✦  Working… (api)".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working, "answered");
+        a.work_started = Some(ago(Duration::from_secs(10)));
+        a.on_title("◇  Ready (api)".into());
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Done);
+        a.shutdown();
+    }
+
+    /// Gemini runs no hook for a turn stopped with esc: its title going back
+    /// to ready says so.
+    #[test]
+    fn gemini_stopped_turn_from_its_title() {
+        let mut a = test_agent(Kind::Gemini);
+        a.set_state(State::Idle, false);
+        a.on_hook(&gemini("UserPromptSubmit", None, Some("long job")), false);
+        a.on_title("✦  Working… (api)".into());
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working, "hooks say the turn");
+        a.on_title("◇  Ready (api)".into());
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working, "not quiet long enough: its Stop may be on its way");
+        a.last_output = ago(Duration::from_secs(3));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        a.shutdown();
+    }
+
+    #[test]
+    fn gemini_trust_and_approval_need_you() {
+        // As Gemini CLI 0.68 draws its folder trust and approval prompt.
+        assert!(kind_prompt(Kind::Gemini, "Do you trust the files in this folder?\n\n● 1. Trust folder (api)\n  2. Trust parent folder (code)\n  3. Don't trust"));
+        assert!(kind_prompt(Kind::Gemini, "Do you trust the following folders being added to this workspace?\n- /home/u/lib"));
+        assert!(kind_prompt(Kind::Gemini, "rm -rf dist\nAllow execution of: 'rm'?\n● 1. Allow once\n  2. Allow for this session\n  3. No, suggest changes (esc)"));
+        assert!(!kind_prompt(Kind::Gemini, "I can allow once more retry, or suggest changes."));
+        assert!(!kind_prompt(Kind::Codex, "Do you trust the files in this folder?"), "Gemini's own wording");
     }
 }
