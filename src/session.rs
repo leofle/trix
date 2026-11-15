@@ -743,6 +743,26 @@ pub fn connect() -> Option<UnixStream> {
     UnixStream::connect(control_path()).ok()
 }
 
+/// Is this session's socket there, but refused to this process? A sandbox
+/// around an agent's commands does that (Antigravity's, on macOS: `connect`
+/// fails with EPERM), and the workspace is running all the same.
+pub fn blocked() -> bool {
+    matches!(UnixStream::connect(control_path()), Err(e) if e.raw_os_error() == Some(libc::EPERM))
+}
+
+/// Why this session can't be reached, for the error a command ends on. An
+/// agent told its sandbox is in the way can run the command outside it;
+/// told "no workspace running", it believes that.
+pub fn missing() -> String {
+    if blocked() {
+        "the workspace is running, but a sandbox blocks its socket here (Operation not permitted) — run this trix command again outside the sandbox".into()
+    } else if is_default() {
+        "no workspace running".into()
+    } else {
+        format!("no session '{}' running", name())
+    }
+}
+
 fn connect_to(session: &str) -> Option<UnixStream> {
     UnixStream::connect(control_path_for(session)).ok()
 }
@@ -804,7 +824,7 @@ fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
 /// `wait` seconds more than usual for `trix wait` (`Some(0)`: forever).
 pub fn control(msg: &ClientMsg, wait: Option<u64>) -> Result<crate::control::Reply, String> {
     let Some(mut s) = connect() else {
-        return Err(if is_default() { "no workspace running".into() } else { format!("no session '{}' running", name()) });
+        return Err(missing());
     };
     send_msg(&mut s, msg).map_err(|e| format!("talking to the workspace: {e}"))?;
     let timeout = match wait {
@@ -826,7 +846,7 @@ pub fn control(msg: &ClientMsg, wait: Option<u64>) -> Result<crate::control::Rep
 /// Connect and send `msg`, leaving the replies to the caller (`trix events`).
 pub fn open(msg: &ClientMsg) -> Result<UnixStream, String> {
     let Some(mut s) = connect() else {
-        return Err(if is_default() { "no workspace running".into() } else { format!("no session '{}' running", name()) });
+        return Err(missing());
     };
     send_msg(&mut s, msg).map_err(|e| format!("talking to the workspace: {e}"))?;
     Ok(s)
