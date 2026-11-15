@@ -164,7 +164,7 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ]));
     }
     let pills = [
-        (State::Blocked, "needs you", 7),
+        (State::Blocked, "needs you", 8),
         (State::Working, "working", 3),
         (State::Done, "done", 2),
         (State::Idle, "idle", 0),
@@ -202,10 +202,12 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ]));
     }
     right.push((6, vec![Span::styled(view, Style::new().fg(t.dim)), Span::styled("  ·  ", Style::new().fg(t.muted))]));
-    right.push((KEEP, vec![Span::styled(clock(), Style::new().fg(t.fg)), Span::raw(" ")]));
+    // The clock goes just before "needs you", the one that matters.
+    right.push((7, vec![Span::styled(clock(), Style::new().fg(t.fg)), Span::raw(" ")]));
 
     let width = |items: &[(u8, Vec<Span>)]| items.iter().flat_map(|(_, s)| s).map(|s| s.width()).sum::<usize>();
-    while width(&left) + 3 + width(&right) > area.width as usize {
+    let gap = |right: &[(u8, Vec<Span>)]| if right.is_empty() { 0 } else { 3 };
+    while width(&left) + gap(&right) + width(&right) > area.width as usize {
         let lowest = |items: &[(u8, Vec<Span>)]| items.iter().enumerate().filter(|(_, (r, _))| *r != KEEP).min_by_key(|(_, (r, _))| *r).map(|(i, (r, _))| (*r, i));
         match (lowest(&left), lowest(&right)) {
             (Some(l), Some(r)) if r.0 < l.0 => drop(right.remove(r.1)),
@@ -3059,7 +3061,7 @@ mod tests {
             for word in left.split_whitespace().chain(right.split_whitespace()) {
                 assert!(["◆", "trix", version, "▲", "○", "1", "11", "needs", "you", "idle", "focus", "·"].contains(&word) || word.contains(':'), "{w} cols, cut word {word:?}: {top:?}");
             }
-            assert!(top.contains("trix") && top.contains(':'), "the name and clock stay at {w}: {top:?}");
+            assert!(top.contains("trix"), "the name stays at {w}: {top:?}");
             let needs = top.contains("1 needs you");
             if needs {
                 seen_needs = true;
@@ -3067,7 +3069,10 @@ mod tests {
                     assert!(top.contains(version), "the idle count goes before the version at {w}: {top:?}");
                 }
             } else {
-                assert!(!top.contains("idle") && !top.contains(version) && !top.contains("focus"), "needs you goes last, at {w}: {top:?}");
+                assert!(!top.contains("idle") && !top.contains(version) && !top.contains("focus") && !top.contains(':'), "needs you goes last, at {w}: {top:?}");
+            }
+            if w == 30 {
+                assert!(needs, "needs you fits at 30, without the clock: {top:?}");
             }
         }
         assert!(seen_needs);
