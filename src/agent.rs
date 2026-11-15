@@ -38,13 +38,27 @@ pub enum Kind {
     /// Google's Antigravity CLI (`agy`), which Gemini CLI's personal sign-in
     /// moved to.
     Antigravity,
+    /// Sourcegraph's Amp (`amp`).
+    Amp,
     Shell,
     Custom,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 11] =
-        [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Gemini, Kind::Antigravity, Kind::Shell, Kind::Custom];
+    pub const ALL: [Kind; 12] = [
+        Kind::Claude,
+        Kind::Codex,
+        Kind::Grok,
+        Kind::OpenCode,
+        Kind::Cursor,
+        Kind::Copilot,
+        Kind::Muse,
+        Kind::Gemini,
+        Kind::Antigravity,
+        Kind::Amp,
+        Kind::Shell,
+        Kind::Custom,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -56,6 +70,7 @@ impl Kind {
             Kind::Muse => "muse",
             Kind::Gemini => "gemini",
             Kind::Antigravity => "antigravity",
+            Kind::Amp => "amp",
             Kind::Shell => "shell",
             Kind::Custom => "custom",
         }
@@ -69,7 +84,10 @@ impl Kind {
     /// A known coding agent, so typing a prompt into it is safe. A custom
     /// command may be anything (bash, ssh, psql), so it is not.
     pub fn takes_prompts(self) -> bool {
-        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse | Kind::Gemini | Kind::Antigravity)
+        matches!(
+            self,
+            Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse | Kind::Gemini | Kind::Antigravity | Kind::Amp
+        )
     }
     /// It can be started again in the conversation it was in.
     pub fn resumes(self) -> bool {
@@ -102,6 +120,8 @@ impl Kind {
             // gem-i-ni: `g` is Grok's.
             Kind::Gemini => Some('i'),
             Kind::Antigravity => Some('a'),
+            // amp-e-re: `a`, `m` and `p` are taken.
+            Kind::Amp => Some('e'),
             Kind::Shell => Some('s'),
             Kind::Custom => None,
         }
@@ -350,7 +370,10 @@ impl Agent {
         } else {
             None
         };
-        let (program, args) = if installing.is_some() { crate::install::wrap(exe, spec.kind, program, args) } else { (program, args) };
+        // So does one that reads its first prompt from stdin: `trix install`
+        // hands it over as it becomes the agent, installed already or not.
+        let stdin = stdin_prompt(&spec);
+        let (program, args) = if installing.is_some() || stdin.is_some() { crate::install::wrap(exe, spec.kind, stdin, program, args) } else { (program, args) };
 
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -649,8 +672,8 @@ impl Agent {
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
             // trix's own plugin (OpenCode, Copilot), its managed hooks (Muse)
-            // or the user's hooks (Grok, Gemini, Antigravity).
-            "opencode" | "grok" | "copilot" | "muse" | "gemini" | "antigravity" => self.hooked = true,
+            // or the user's hooks (Grok, Gemini, Antigravity) or plugin (Amp).
+            "opencode" | "grok" | "copilot" | "muse" | "gemini" | "antigravity" | "amp" => self.hooked = true,
             // Cursor runs only `sessionStart` and the tool hooks from trix's
             // plugin (cursor-agent 2026.11.11): no prompt, no turn end. Its
             // screen says when a turn starts and ends; its hooks add what it
@@ -673,8 +696,10 @@ impl Agent {
             // Muse runs `SessionStart`'s hooks only as its first turn begins,
             // alongside that turn's own (1.4.18), so it may land after the
             // turn ended: it names the conversation, and the state is the
-            // turn's. Until then, the screen says.
-            "SessionStart" if msg.source == "muse" => None,
+            // turn's. Until then, the screen says. Amp's `session.start`
+            // comes with a thread's first message too, and again as you
+            // open or switch to another thread.
+            "SessionStart" if matches!(msg.source.as_str(), "muse" | "amp") => None,
             "SessionStart" => {
                 self.activity = "ready".into();
                 self.set_state(State::Idle, focused)
@@ -714,8 +739,9 @@ impl Agent {
             }
             // Copilot's, Muse's and Gemini's permission prompts come as a
             // notification naming no tool: the tool it was about to run is
-            // what it asks about.
-            "PermissionRequest" if matches!(msg.source.as_str(), "copilot" | "muse" | "gemini") => {
+            // what it asks about. Amp's thread says only that it waits on
+            // an approval.
+            "PermissionRequest" if matches!(msg.source.as_str(), "copilot" | "muse" | "gemini" | "amp") => {
                 self.activity = match (&self.pending_tool, msg.detail.as_deref().filter(|d| !d.is_empty())) {
                     (Some(t), _) => format!("approve {t}"),
                     (None, Some(m)) => hooks::one_line(m, 60),
@@ -746,7 +772,7 @@ impl Agent {
             }
             // OpenCode reports its session idle at start too, and the new
             // agents' turn ends mean nothing before a turn began.
-            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse" | "gemini" | "antigravity") && !self.turn_seen => None,
+            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse" | "gemini" | "antigravity" | "amp") && !self.turn_seen => None,
             "Stop" | "agent-turn-complete" => {
                 self.pending_tool = None;
                 self.activity = match self.tools_used {
@@ -786,6 +812,9 @@ impl Agent {
                 self.activity = msg.detail.clone().unwrap_or_else(|| "has a question".into());
                 self.set_state(State::Blocked, focused)
             }
+            // Amp's thread says it is running as every turn starts as well:
+            // that is news only after an approval.
+            "Answered" if msg.source == "amp" && self.state != State::Blocked => None,
             // A permission or a question was answered: back to work.
             "Answered" => {
                 self.activity = "working".into();
@@ -990,9 +1019,14 @@ impl Agent {
             }
             State::Idle | State::Done if busy && !title_idle => {
                 // Cursor's title names the conversation and Muse's the
-                // folder, not what they do. Gemini's is read above, and
-                // Antigravity's is whatever your own title command prints.
-                self.activity = self.title.clone().filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse | Kind::Gemini | Kind::Antigravity)).unwrap_or_else(|| "working".into());
+                // folder, not what they do. Gemini's is read above,
+                // Antigravity's is whatever your own title command prints,
+                // and what Amp's says isn't documented.
+                self.activity = self
+                    .title
+                    .clone()
+                    .filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse | Kind::Gemini | Kind::Antigravity | Kind::Amp))
+                    .unwrap_or_else(|| "working".into());
                 self.set_state(State::Working, focused)
             }
             State::Idle | State::Done if quiet > Duration::from_millis(800) && self.kind.is_agent() => {
@@ -1623,6 +1657,16 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             }
             ("agy".into(), args)
         }
+        // `amp`, or `amp threads continue <id>`, your extra flags after
+        // it as Amp's docs place them. Amp takes no first prompt as an
+        // argument: it reads one from its stdin (see `stdin_prompt`).
+        Kind::Amp => {
+            if let Some(id) = &spec.resume {
+                args.extend(["threads".into(), "continue".into(), id.clone()]);
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            ("amp".into(), args)
+        }
         Kind::Claude => {
             if let Some(s) = &integrations.claude_settings {
                 args.push("--settings".into());
@@ -1697,6 +1741,15 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             (shell, vec!["-lc".into(), cmd])
         }
     }
+}
+
+/// The first prompt of an agent that takes it on its stdin, not as an
+/// argument. Amp: "If you pipe input to the CLI, it uses the input as the
+/// first user message in interactive mode" (its CLI docs), and no flag or
+/// argument does the same. A thread it continues takes none.
+fn stdin_prompt(spec: &Spawn) -> Option<&str> {
+    let prompt = spec.prompt.as_deref().filter(|p| !p.trim().is_empty())?;
+    (spec.kind == Kind::Amp && spec.resume.is_none()).then_some(prompt)
 }
 
 /// The first prompt, last on the command line. One starting with `-` (a
@@ -3500,5 +3553,123 @@ mod tests {
         assert!(!kind_prompt(Kind::Antigravity, "I asked whether to drop the table; you said no, deny it, so I left it."));
         assert!(!kind_prompt(Kind::Antigravity, "Do you trust the files in this folder?"), "Gemini's");
         assert!(!kind_prompt(Kind::Gemini, "Do you trust the contents of this project?"));
+    }
+
+    #[test]
+    fn amp_has_its_own_letter() {
+        assert_eq!(Kind::Amp.shortcut(), Some('e'));
+        assert_eq!(Kind::from_shortcut('e'), Some(Kind::Amp));
+        assert_eq!(Kind::from_label("amp"), Some(Kind::Amp));
+        assert!(Kind::Amp.takes_prompts() && Kind::Amp.resumes() && Kind::Amp.is_agent());
+        // Its own approval wording isn't known: no prompt of its own to read mid-turn.
+        assert!(!Kind::Amp.reads_prompts_on_screen() && !Kind::Amp.prompts_only_on_screen());
+        // Every letter picks one kind.
+        for k in Kind::ALL {
+            if let Some(c) = k.shortcut() {
+                assert_eq!(Kind::from_shortcut(c), Some(k), "{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn amp_command_line() {
+        let ints = ints();
+        // New: just amp, which names its thread itself. The first prompt
+        // is no argument: it goes to its stdin.
+        let mut s = spec(Kind::Amp);
+        assert_eq!(command_for(&s, &ints, Path::new("/bin/trix"), None), ("amp".into(), vec![]));
+        assert_eq!(stdin_prompt(&s), None);
+        s.prompt = Some("- fix the login".into());
+        assert_eq!(new_conversation(&s), None);
+        assert_eq!(command_for(&s, &ints, Path::new("/bin/trix"), None), ("amp".into(), vec![]));
+        assert_eq!(stdin_prompt(&s), Some("- fix the login"));
+        s.command = Some("--fast --settings-file '/x/my settings.json'".into());
+        assert_eq!(command_for(&s, &ints, Path::new("/bin/trix"), None).1, ["--fast", "--settings-file", "/x/my settings.json"]);
+        // Restored: back in its thread, extra flags after it, and no prompt.
+        s.resume = Some("T-7f395a45-7fae-4983-8de0-d02e61d30183".into());
+        assert_eq!(
+            command_for(&s, &ints, Path::new("/bin/trix"), None).1,
+            ["threads", "continue", "T-7f395a45-7fae-4983-8de0-d02e61d30183", "--fast", "--settings-file", "/x/my settings.json"]
+        );
+        assert_eq!(stdin_prompt(&s), None);
+        // Only Amp reads its prompt there, and a blank one is none.
+        let mut c = spec(Kind::Claude);
+        c.prompt = Some("hi".into());
+        assert_eq!(stdin_prompt(&c), None);
+        let mut blank = spec(Kind::Amp);
+        blank.prompt = Some("  \n".into());
+        assert_eq!(stdin_prompt(&blank), None);
+    }
+
+    fn amp(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        hook("amp", event, tool, detail)
+    }
+
+    /// With trix's plugin added to Amp: the events as `condense_amp` puts them.
+    #[test]
+    fn amp_turn_from_its_plugin() {
+        let mut a = test_agent(Kind::Amp);
+        a.set_state(State::Idle, false);
+        // A turn's end before any turn means nothing.
+        assert_eq!(a.on_hook(&amp("Stop", None, None), false), None);
+        assert_eq!(a.state, State::Idle);
+        assert!(a.hooked);
+        a.on_hook(&amp("UserPromptSubmit", None, Some("fix the login")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.last_prompt.as_deref()), (State::Working, "thinking", Some("fix the login")));
+        // Its thread says it runs as the turn starts: no news.
+        assert_eq!(a.on_hook(&amp("Answered", None, None), false), None);
+        assert_eq!(a.activity, "thinking");
+        // A tool, once it has run.
+        assert_eq!(a.on_hook(&amp("ToolDone", Some("Bash"), Some("cargo test")), false), None);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "Bash cargo test ✓"));
+        // Its thread waits on an approval, naming no tool; then runs again.
+        a.on_hook(&amp("PermissionRequest", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "needs your approval"));
+        a.on_hook(&amp("Answered", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "working"));
+        a.on_hook(&amp("ToolDone", Some("edit_file"), Some("app.rs")), false);
+        a.on_hook(&amp("Stop", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 2 tools"));
+        // A turn you stopped ends as cancelled.
+        a.on_hook(&amp("UserPromptSubmit", None, Some("and the tests")), false);
+        a.on_hook(&amp("Interrupt", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        a.shutdown();
+    }
+
+    /// Amp's `session.start` comes with a thread's first message, and again
+    /// when you open or switch to another thread: it names the conversation
+    /// to restore, and the state is the turn's.
+    #[test]
+    fn amp_session_start_only_names_the_thread() {
+        let mut a = test_agent(Kind::Amp);
+        a.set_state(State::Idle, false);
+        a.on_hook(&amp("UserPromptSubmit", None, Some("hi")), false);
+        let mut start = amp("SessionStart", None, None);
+        start.session = Some("T-7f395a45-7fae-4983-8de0-d02e61d30183".into());
+        assert_eq!(a.on_hook(&start, false), None);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "thinking"));
+        assert_eq!(a.session.as_deref(), Some("T-7f395a45-7fae-4983-8de0-d02e61d30183"));
+        a.on_hook(&amp("Stop", None, None), false);
+        // Another thread opened: that one is what a restore continues.
+        start.session = Some("T-0b1c".into());
+        assert_eq!(a.on_hook(&start, false), None);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "replied"));
+        assert_eq!(a.session.as_deref(), Some("T-0b1c"));
+        a.shutdown();
+    }
+
+    /// Without the plugin: output cadence, as for any agent trix has no
+    /// hooks in, and "working" for what it does (its title isn't documented).
+    #[test]
+    fn amp_without_its_plugin_reads_as_working_from_its_output() {
+        let mut a = test_agent(Kind::Amp);
+        a.set_state(State::Idle, false);
+        a.on_title("amp - fix the login".into());
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "working"));
+        assert!(!a.hooked);
+        a.shutdown();
     }
 }

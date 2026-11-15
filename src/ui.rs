@@ -633,6 +633,7 @@ fn kind_color(t: &Theme, k: Kind) -> Color {
         Kind::Muse => mix(t.magenta, t.orange, 0.5),
         Kind::Gemini => mix(t.accent, t.magenta, 0.5),
         Kind::Antigravity => mix(t.accent, t.cyan, 0.5),
+        Kind::Amp => t.yellow,
         Kind::Shell => t.dim,
         Kind::Custom => t.magenta,
     }
@@ -2868,7 +2869,7 @@ mod tests {
         let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
         f.kind = Kind::Grok;
         f.more = true;
-        assert_eq!(kind_row(&mut app).0, "‹ grok   opencode   cursor   copilot   muse   gemini  ›", "open, in place: antigravity is off the row's end");
+        assert_eq!(kind_row(&mut app).0, "‹ grok   opencode   cursor   copilot   muse   gemini  ›", "open, in place: antigravity and amp are off the row's end");
         let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
         f.more = false;
         f.kind = Kind::Copilot;
