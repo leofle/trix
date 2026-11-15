@@ -74,6 +74,7 @@ fn ways(kind: Kind) -> &'static [Via] {
         // Meta ships Muse Code only as its install script: npm's
         // `@muse-code/sdk` is its SDK, not the CLI.
         Kind::Muse => &[Via::Script("https://dev.meta.ai/install.sh")],
+        Kind::Gemini => &[Via::Mise("npm:@google/gemini-cli"), Via::Brew("gemini-cli"), Via::Npm("@google/gemini-cli")],
         Kind::Shell | Kind::Custom => &[],
     }
 }
