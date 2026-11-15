@@ -95,7 +95,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     // The grid puts two panes side by side; give them room to be usable
     // before giving the sidebar any.
-    let main_min = if app.view == View::Grid && app.agents.len() > 1 { 2 * GRID_TILE_MIN + 2 } else { 34 };
+    let main_min = if app.view == View::Grid && app.grid_shown().len() > 1 { 2 * GRID_TILE_MIN + 2 } else { 34 };
     let show_sidebar = app.sidebar && body.width >= side_w + main_min;
     let (side, main) = if show_sidebar {
         let [s, m] = Layout::horizontal([Constraint::Length(side_w), Constraint::Min(20)]).areas(body);
@@ -225,17 +225,28 @@ fn clock() -> String {
 /// agent?): returns where they are.
 fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Action)> {
     let key = |k: &str| Span::styled(format!(" {k} "), Style::new().fg(t.fg_bright).bg(t.surface_hi));
-    let lab = |l: &'static str| Span::styled(format!(" {l}   "), Style::new().fg(t.dim));
+    let lab = |l: &str| Span::styled(format!(" {l}   "), Style::new().fg(t.dim));
     let mut spans = vec![Span::raw(" ")];
-    let hints: Vec<(String, &str, Option<Action>)> = if app.modal.is_some() {
+    let hints: Vec<(String, String, Option<Action>)> = if app.modal.is_some() {
         // A list or a page of help has nothing to cancel.
         let leaves = matches!(app.modal, Some(Modal::Help | Modal::Settings(_) | Modal::Search(_) | Modal::Menu(_)));
-        vec![("esc".into(), if leaves { "close" } else { "cancel" }, None)]
+        vec![("esc".into(), (if leaves { "close" } else { "cancel" }).into(), None)]
     } else {
-        let shown: &[(Action, &str)] = if app.agents.is_empty() {
-            &[(Action::New, "new agent"), (Action::Help, "keys"), (Action::Settings, "settings"), (Action::Quit, "quit")]
+        let n = app.selected.len();
+        let shown: Vec<(Action, String)> = if app.agents.is_empty() {
+            vec![(Action::New, "new agent".into()), (Action::Help, "keys".into()), (Action::Settings, "settings".into()), (Action::Quit, "quit".into())]
+        } else if n > 0 {
+            // What the keys do to the selection now.
+            vec![
+                (Action::Grid, format!("grid of {n}")),
+                (Action::Broadcast, format!("send to {n}")),
+                (Action::Close, format!("close {n}")),
+                (Action::Menu, "menu".into()),
+                (Action::Select, "select".into()),
+                (Action::Help, "keys".into()),
+            ]
         } else {
-            &[
+            [
                 (Action::New, "new"),
                 (Action::Attention, "attention"),
                 (Action::Jump, "jump"),
@@ -244,9 +255,12 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
                 (Action::Help, "keys"),
                 (Action::Settings, "settings"),
             ]
+            .into_iter()
+            .map(|(a, l)| (a, l.to_string()))
+            .collect()
         };
         // An action with no key has nothing to hint at.
-        shown.iter().filter_map(|&(a, l)| Some((app.config.keys.label(a)?, l, Some(a).filter(|&a| a != Action::Jump)))).collect()
+        shown.into_iter().filter_map(|(a, l)| Some((app.config.keys.label(a)?, l, Some(a).filter(|&a| a != Action::Jump)))).collect()
     };
     // A toast sits at the right: the hints stop two cells short of it.
     let toast = app.toast.as_ref().map(|toast| {
@@ -270,7 +284,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> Vec<(Rect, Act
     let mut buttons = Vec::new();
     let mut x = area.x + 1;
     for (k, l, action) in hints {
-        let (k, l) = (key(&k), lab(l));
+        let (k, l) = (key(&k), lab(&l));
         // The button is the key and its word, not the gap after them.
         let w = (k.width() + l.width()).saturating_sub(2) as u16;
         // A key without its word says nothing: on a narrow terminal, stop at
@@ -303,7 +317,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
         return;
     }
     let icons = app.sidebar_size() == SidebarSize::Icons;
-    let header = if icons {
+    let mut header = if icons {
         // No room for the word: just how many.
         TLine::from(Span::styled(format!(" {}", app.agents.len()), Style::new().fg(t.dim).add_modifier(Modifier::BOLD)))
     } else {
@@ -312,6 +326,18 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             Span::styled(format!("  {}", app.agents.len()), Style::new().fg(t.muted)),
         ])
     };
+    // How many are selected, and a ✕ that unselects them. The icons rail
+    // has no room: its tinted cards show who, and the menu unselects.
+    if !app.selected.is_empty() && !icons {
+        let n = app.selected.len();
+        let picked = if app.sidebar_mini { format!(" ✓{n}") } else { format!("   ✓ {n} selected") };
+        header.push_span(Span::styled(picked, Style::new().fg(t.accent).add_modifier(Modifier::BOLD)));
+        let x = inner.x + header.width() as u16 + 1;
+        header.push_span(Span::styled(" ✕", Style::new().fg(t.dim)));
+        if x < inner.right() {
+            app.hits.unselect = Some(Rect { x, y: inner.y, width: 1, height: 1 });
+        }
+    }
     f.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
 
     let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), ..inner };
@@ -393,10 +419,17 @@ fn sidebar_window(was: usize, focus: Option<usize>, n: usize, fit: usize) -> usi
     }
 }
 
+/// A card's background: lighter when focused, tinted when selected (for
+/// the keys that act on several at once).
+fn card_bg(app: &App, i: usize, t: &Theme) -> Color {
+    let base = if i == app.focus { t.surface_hi } else { t.surface };
+    if app.selected.contains(&app.agents[i].id) { mix(base, t.accent, 0.2) } else { base }
+}
+
 fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, t: &Theme) {
     let a = &app.agents[i];
     let selected = i == app.focus;
-    let bg = if selected { t.surface_hi } else { t.surface };
+    let bg = card_bg(app, i, t);
     f.buffer_mut().set_style(r, Style::new().bg(bg));
     card_text(f, app, i, r, compact, mini, t);
     // Last, so the text's leading spaces don't paint over it.
@@ -422,7 +455,13 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     let a = &app.agents[i];
     let selected = i == app.focus;
     let sc = state_color(t, a.state);
-    let bg = if selected { t.surface_hi } else { t.surface };
+    let bg = card_bg(app, i, t);
+    let picked = app.selected.contains(&a.id);
+    let idx_style = match (picked, selected) {
+        (true, _) => Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+        (false, true) => Style::new().fg(t.accent),
+        (false, false) => Style::new().fg(t.muted),
+    };
 
     let (g, gs) = glyph(app, a.state);
     let idx = if i < 9 { format!("{}", i + 1) } else { " ".into() };
@@ -438,7 +477,7 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
         // marks the focus and who needs you.
         let mut line = vec![
             Span::raw(" "),
-            Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
+            Span::styled(idx, idx_style),
             Span::raw(" "),
             Span::styled(g, gs),
         ];
@@ -454,7 +493,7 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
         let name_max = (r.width as usize).saturating_sub(5 + if dot { 2 } else { 0 } + if a.pinned { 2 } else { 0 });
         let mut line = vec![
             Span::raw(" "),
-            Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
+            Span::styled(idx, idx_style),
             Span::raw(" "),
             Span::styled(g, gs),
             Span::raw(" "),
@@ -473,8 +512,9 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     let w = r.width as usize;
     let name_max = w.saturating_sub(7 + time.len() + 2 + if a.pinned { 2 } else { 0 });
     let mut line1 = vec![
-        Span::raw("  "),
-        Span::styled(idx, Style::new().fg(if selected { t.accent } else { t.muted })),
+        // Selected: a check by its number.
+        if picked { Span::styled(" ✓", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)) } else { Span::raw("  ") },
+        Span::styled(idx, idx_style),
         Span::raw("  "),
         Span::styled(g, gs),
         Span::raw(" "),
@@ -894,7 +934,8 @@ fn attention_strip(f: &mut Frame, app: &mut App, pane: Rect, t: &Theme) {
 /// Agents per grid page: more than that and each gets too small to read.
 pub const GRID_PAGE: usize = 4;
 
-/// Is agent `i` on the grid page that's on screen (the focused agent's)?
+/// Is the agent in grid slot `i` on the page that's on screen (the one with
+/// the focused agent's slot)? See `App::grid_slot`.
 pub fn on_grid_page(i: usize, focus: usize) -> bool {
     i / GRID_PAGE == focus / GRID_PAGE
 }
@@ -921,9 +962,12 @@ fn grid_tiles(n: usize, focus: usize, area: Rect) -> (Vec<(usize, Rect)>, usize,
 }
 
 fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16, u16)> {
-    let (tiles, page, pages) = grid_tiles(app.agents.len(), app.focus, area);
+    // The selected agents, or with none selected, all of them.
+    let shown = app.grid_shown();
+    let slot = app.grid_slot(app.focus).unwrap_or(0);
+    let (tiles, page, pages) = grid_tiles(shown.len(), slot, area);
     let mut cursor = None;
-    for (i, c) in tiles {
+    for (i, c) in tiles.into_iter().map(|(s, c)| (shown[s], c)) {
         let focused = i == app.focus;
         let block = pane_block(app, &app.agents[i], focused, c.width, c.width < 70, t);
         let inner = block.inner(c);
@@ -942,10 +986,18 @@ fn grid_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u16
         }
         pane_overlays(f, a, c, inner, &app.key(Action::Close), t);
     }
+    // On the bottom border: that these are the selection, which page, and
+    // how to get to the others.
+    let mut notes = Vec::new();
+    if !app.selected.is_empty() {
+        notes.push(format!("{} of {} · the selection", shown.len(), app.agents.len()));
+    }
     if pages > 1 {
-        // On the bottom border: which page, and how to get to the others.
         let next = app.config.keys.label(Action::Next).unwrap_or_default();
-        let s = format!(" page {page}/{pages} · {next} next ");
+        notes.push(format!("page {page}/{pages} · {next} next"));
+    }
+    if !notes.is_empty() {
+        let s = format!(" {} ", notes.join(" · "));
         let w = (s.chars().count() as u16).min(area.width);
         let r = Rect { x: area.x + area.width.saturating_sub(w) / 2, y: area.bottom().saturating_sub(1), width: w, height: 1 };
         f.render_widget(Paragraph::new(Span::styled(s, Style::new().fg(t.bg).bg(t.accent))), r);
@@ -1446,7 +1498,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             // A spacer, the target, a spacer, the message, then a note under a
             // spacer when there is one; the hint is on the last line.
             let rows = Rows::new(inner, 2, true);
-            let n = app.agents.iter().filter(|a| crate::app::broadcast_reaches(a, *target)).count();
+            let n = app.agents.iter().filter(|a| app.reaches(a, *target)).count();
             let held = app.agents.iter().filter(|a| a.kind.takes_prompts() && matches!(a.state, State::Blocked | State::Starting)).count();
             let pill = |on: bool, s: &'static str| {
                 if on {
@@ -1479,15 +1531,28 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 // count's spacing: how many it reaches stays to the last.
                 let count = format!("→ {n} agent{}", if n == 1 { "" } else { "s" });
                 let to = Span::styled("To  ", Style::new().fg(t.dim));
-                let chosen = pill(true, if *target == BroadcastTarget::All { "every agent" } else { "idle & done only" });
+                let word = |target| match target {
+                    BroadcastTarget::All => "every agent",
+                    BroadcastTarget::Waiting => "idle & done only",
+                    BroadcastTarget::Selected => "selected",
+                };
+                let chosen = pill(true, word(*target));
+                // The selection comes first, and only while there is one.
+                let mut every = vec![to.clone()];
+                let targets: &[BroadcastTarget] = if app.selected.is_empty() {
+                    &[BroadcastTarget::All, BroadcastTarget::Waiting]
+                } else {
+                    &[BroadcastTarget::Selected, BroadcastTarget::All, BroadcastTarget::Waiting]
+                };
+                for (k, &o) in targets.iter().enumerate() {
+                    if k > 0 {
+                        every.push(Span::raw(" "));
+                    }
+                    every.push(pill(*target == o, word(o)));
+                }
+                every.push(Span::styled(format!("   {count}"), Style::new().fg(t.fg)));
                 let tries = [
-                    vec![
-                        to.clone(),
-                        pill(*target == BroadcastTarget::All, "every agent"),
-                        Span::raw(" "),
-                        pill(*target == BroadcastTarget::Waiting, "idle & done only"),
-                        Span::styled(format!("   {count}"), Style::new().fg(t.fg)),
-                    ],
+                    every,
                     vec![to, chosen.clone(), Span::styled(format!("   {count}"), Style::new().fg(t.fg))],
                     vec![chosen, Span::styled(format!(" {count}"), Style::new().fg(t.fg))],
                 ];
@@ -1537,6 +1602,19 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             let name = app.agents.iter().find(|a| a.id == *id).map(|a| a.name.clone()).unwrap_or_default();
             // Named in the title too: on a short terminal the question goes.
             confirm(f, area, t, &format!("Close {name}"), &format!("Stop {name} and close its pane?"), &app.dialog_hidden);
+        }
+        Modal::ConfirmCloseMany(ids) => {
+            let picked: Vec<&Agent> = app.agents.iter().filter(|a| ids.contains(&a.id)).collect();
+            let n = picked.len();
+            let running = picked.iter().filter(|a| a.state != State::Exited).count();
+            let names = picked.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+            let still = match running {
+                0 => String::new(),
+                1 => " 1 is still running.".into(),
+                r => format!(" {r} are still running."),
+            };
+            let text = format!("Stop {} and close their panes?{still}", trunc(&names, 48));
+            confirm(f, area, t, &format!("Close {n} agent{}", if n == 1 { "" } else { "s" }), &text, &app.dialog_hidden);
         }
         Modal::ConfirmQuit => {
             let live = app.agents.iter().filter(|a| a.state != State::Exited).count();
@@ -1731,9 +1809,11 @@ fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: 
     let items = app.menu_items(m.agent);
     let Some(a) = app.agents.iter().find(|a| a.id == m.agent) else { return };
     let keys: Vec<String> = items.iter().map(|&i| menu_key(app, i)).collect();
-    let label_w = items.iter().map(|i| i.label().width()).max().unwrap_or(0);
+    let labels: Vec<String> = items.iter().map(|&i| app.menu_label(m.agent, i)).collect();
+    let label_w = labels.iter().map(|l| l.width()).max().unwrap_or(0);
     let key_w = keys.iter().map(|k| k.width()).max().unwrap_or(0);
-    let name = trunc(&a.name, 24);
+    // The selection's menu is about all of them.
+    let name = if app.menu_is_bulk(m.agent) { format!("{} selected", app.selected.len()) } else { trunc(&a.name, 24) };
     let w = (label_w + if key_w > 0 { key_w + 3 } else { 0 } + 4).max(name.width() + 7) as u16;
     let r = menu_rect(m.at, w, items.len() as u16 + 2, area);
     f.render_widget(Clear, r);
@@ -1741,7 +1821,7 @@ fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: 
     let inner = block.inner(r);
     f.render_widget(block, r);
     app.hits.menu = Some(r);
-    for (n, (&item, key)) in items.iter().zip(&keys).enumerate() {
+    for (n, ((&item, key), label)) in items.iter().zip(&keys).zip(&labels).enumerate() {
         let row = Rect { y: inner.y + n as u16, height: 1, ..inner };
         if row.y >= inner.bottom() {
             break;
@@ -1749,7 +1829,7 @@ fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: 
         let selected = item == m.sel || (n == 0 && !items.contains(&m.sel));
         let base = if selected { Style::new().fg(t.bg).bg(t.accent).add_modifier(Modifier::BOLD) } else { Style::new().fg(t.fg) };
         // The item's letter, underlined where it first appears.
-        let label = item.label();
+        let label = label.as_str();
         let at = label.char_indices().find(|(_, c)| c.to_ascii_lowercase() == item.letter()).map(|(i, _)| i);
         let mut spans = vec![Span::styled(" ", base)];
         match at {
@@ -2071,6 +2151,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Rename), "rename · double-click"),
         (k(Action::Close), "close"),
         (k(Action::Menu), "menu · or right-click"),
+        (k(Action::Select), "select · or alt+click"),
         ("enter".into(), "restart an exited agent"),
     ];
     let right: Vec<(String, &str)> = vec![
@@ -3083,6 +3164,48 @@ mod tests {
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_grid_and_the_sidebar_show_the_selection() {
+        let mut app = grid_app();
+        for (k, a) in app.agents.iter_mut().enumerate() {
+            a.id = k as u32 + 1;
+        }
+        app.selected = vec![4, 2];
+        app.focus = 1;
+        let screen = grid_screen(&mut app, 140, 30);
+        println!("{screen}");
+        let tiles: Vec<u32> = app.hits.titles.iter().map(|&(_, id)| id).collect();
+        assert_eq!(tiles, [2, 4], "only the selected, in the list's order");
+        assert!(screen.contains("✓ 2 selected ✕"), "the header counts them");
+        assert!(screen.contains("2 of 4 · the selection"), "the grid says it's the selection");
+        let checked: Vec<&str> = screen.lines().filter(|l| l.starts_with(" ▌✓") || l.starts_with("  ✓")).collect();
+        assert_eq!(checked.len(), 2, "a check on each selected card: {checked:?}");
+        assert!(checked[0].contains("claude-2") && checked[1].contains("shell-1"));
+        // The ✕ is where it's drawn.
+        let x = app.hits.unselect.expect("a ✕ to click").x;
+        let row = screen.lines().nth(app.hits.unselect.unwrap().y as usize).unwrap();
+        assert_eq!(row.chars().nth(x as usize), Some('✕'));
+        // The bottom bar says what the keys do to them.
+        let bottom = screen.lines().last().unwrap();
+        assert!(bottom.contains("grid of 2") && bottom.contains("close 2"), "{bottom}");
+        // A dialog to close them, and their menu, say how many.
+        app.modal = Some(Modal::ConfirmCloseMany(vec![2, 4]));
+        let screen = grid_screen(&mut app, 140, 30);
+        assert!(screen.contains("Close 2 agents") && screen.contains("claude-2, shell-1"), "{screen}");
+        app.open_menu(2, None);
+        let screen = grid_screen(&mut app, 140, 30);
+        assert!(screen.contains("2 selected") && screen.contains("Close 2 agents") && !screen.contains("Rename"), "{screen}");
+        // Nothing selected: everyone, no counts.
+        app.modal = None;
+        app.selected.clear();
+        let screen = grid_screen(&mut app, 140, 30);
+        assert_eq!(app.hits.titles.len(), 4);
+        assert!(!screen.contains("selected") && !screen.contains('✓'));
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
