@@ -327,6 +327,25 @@ To make your own theme, edit your copy. It is Omarchy's `colors.toml` format, on
 
 trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme. The start screen, with no agents open, and the settings' **Theme** row say which one is in use. While `TRIX_THEME` is set, the settings can't change the theme. On Linux with Omarchy, the file sets trix's theme apart from the desktop's. To follow Omarchy again, choose **Follow Omarchy** at the top of the list, or remove the file. On Linux without Omarchy, it all works as on a Mac.
 
+### Agent workspace discovery
+
+Trix supplies workspace discovery instructions to Claude through
+`--append-system-prompt` and Codex through `-c developer_instructions=…`.
+New sessions are instructed to run `trix ls --json`, identify their own pane,
+and use Trix commands for authorized coordination. Claude's custom append
+prompt is combined with these instructions. So are the `developer_instructions`
+in your Codex `config.toml` (the active profile's, else the top level's), which
+`-c` would otherwise replace. A `-c developer_instructions=…` in your own Codex
+args comes last and replaces both.
+
+OpenCode receives a runtime instruction file through its session configuration;
+Copilot receives the same file through `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`,
+appended to existing directories. Muse receives context from its own
+`SessionStart` hook (when Trix’s managed hooks are enabled). Grok and Cursor
+do not yet receive this context.
+Existing conversations may retain their original instructions; start a new
+conversation after updating Trix. No user configuration files are modified.
+
 ## Supported agents
 
 trix starts each of these agents by name, with an argv (never through a shell), and installs nothing into your agent configs: everything it adds is passed to that one process and lives in `$XDG_RUNTIME_DIR/trix` until the server stops. An agent that isn't installed yet installs first, in its own pane ([below](#not-installed-yet)). Log in to each agent yourself the first time it runs.
@@ -371,7 +390,7 @@ trix starts each of these agents by name, with an argv (never through a shell), 
   - **Start-up.** Muse runs `SessionStart`'s hooks only as its first turn begins, at the same time as that turn's own, so trix takes from it only the conversation id, never the state. Until the first prompt, the screen says: Muse's workspace trust needs you, and once it's answered the pane is idle, not done. Muse's title is its folder, with a braille spinner in front while it works, so its redraws as it starts or resumes don't read as work.
   - **Conversations.** Muse takes no session id for an interactive session, so trix learns it from the hooks and restores with `muse resume <id>`, which takes no first prompt. A first prompt goes in as `muse <prompt>`.
   - **Your managed hooks win.** Muse refuses a run that sets one setting twice, and trix's `-c` would replace a `managed_hooks_path` in your Muse settings for that run. So when your extra args or Muse's `settings.json` set its managed hooks, trix passes none, and that Muse's state comes from its screen.
-  - **Watching only.** trix's hook is `trix hook muse || true` and prints nothing: it never decides anything.
+  - **Watching only.** trix's hook is `trix hook muse || true`. It adds workspace discovery context at session startup; it never decides approvals.
   - An interrupted turn raises no hook: it reads as interrupted once the screen goes quiet. Tested with Muse Code 1.4.18 and its offline `echo` provider (`muse --provider echo`): start-up, workspace trust, first prompts, turn ends, interrupts, reminder subagents, resume, and your own managed hooks. The echo provider calls no tools, so the tool and approval hooks follow Muse's documented events and the wording in its binary.
 - **Gemini** ([Gemini CLI](https://github.com/google-gemini/gemini-cli), Google's) can't be handed hooks per process either. It reads hooks from its `settings.json` files, and the only per-process ones, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` and `GEMINI_CLI_SYSTEM_DEFAULTS_PATH`, must sit in a folder owned by root, or Gemini skips them with a security warning (0.68.0). `GEMINI_CLI_HOME` would move your whole `~/.gemini`, logins included. So, as with Grok, trix reads Gemini's terminal title (`ui.dynamicWindowTitle`, on by default): `◇ Ready`, `✦ Working…` (or its thought) and `⏲ Working…`, and `✋ Action Required` while an approval or a question waits. Its folder trust (`Do you trust the files in this folder?`) and approval prompt (`No, suggest changes (esc)`) count on screen as well. trix names each new conversation with `--session-id`, so restore resumes it, unless your extra args pick one (`-r`/`--resume`, `--session-id`, `--session-file`). A first prompt goes in as `--prompt-interactive=<prompt>`. For tool-by-tool detail, add trix's hook yourself, in `~/.gemini/settings.json` (`trix hook gemini` does nothing outside a trix pane; Gemini runs these hooks only in folders you've trusted):
   ```json
@@ -419,6 +438,8 @@ Codex runs a hook only after you've trusted it in its `/hooks` screen. trix pass
 From then on, Codex panes show live detail like Claude's: `exec_command cargo test`, `apply_patch app.rs, new.md`, `approve exec_command rm -rf dist`, and `interrupted` when you press esc.
 
 Until the hooks are trusted, Codex skips them and trix falls back to Codex's `notify`, which only reports finished turns. Screen heuristics cover the rest, and the first finished turn shows a one-time reminder. Codex records trust against the hook's exact definition, which includes the path to trix. If you run trix from another path, such as `target/release/trix` while developing, Codex asks you to trust its hooks again.
+
+Codex panes can drive the workspace like any other agent: `trix ls`, `trix send`, `trix spawn` and the rest. Codex's sandbox blocks every socket while its network is off, trix's own included, so trix also passes `-c sandbox_workspace_write.network_access=true`. Without it, those commands say `no workspace running`. That setting also lets the commands Codex runs reach the network, as they would in a plain shell. To keep it off, start Codex with `-c sandbox_workspace_write.network_access=false` in its command (your own args come after trix's, so they win). In read-only mode (`--sandbox read-only`, or a folder you haven't trusted), Codex can't reach trix either way.
 
 Codex shows a startup warning that `-c` overrides run it "without the shared background server". That's been true of every Codex pane in trix, because trix has always passed `-c notify=…`.
 
