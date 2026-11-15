@@ -210,7 +210,7 @@ impl NewForm {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BroadcastTarget {
     All,
     Waiting,
@@ -235,12 +235,13 @@ pub enum Modal {
     Search(Search),
     Broadcast(TextInput, BroadcastTarget),
     Rename(u32, TextInput),
-    ConfirmClose(u32),
+    /// The last number in these four is the active button (`Buttons`).
+    ConfirmClose(u32, usize),
     /// Close every selected agent: these, by id.
-    ConfirmCloseMany(Vec<u32>),
-    ConfirmQuit,
+    ConfirmCloseMany(Vec<u32>, usize),
+    ConfirmQuit(usize),
     /// A fresh server found a saved workspace: bring it back?
-    Restore,
+    Restore(usize),
     Help,
     Menu(Menu),
     /// alt+, or "settings" in the bottom bar.
@@ -343,7 +344,31 @@ pub struct HitMap {
     /// the theme list) by its number.
     pub settings: Option<Rect>,
     pub settings_rows: Vec<(Rect, usize)>,
+    /// What can be clicked in an open dialog.
+    pub dialog: Vec<(Rect, DialogHit)>,
 }
+
+/// Something in a dialog a click works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogHit {
+    /// A button or a hint: clicking it is pressing this key.
+    Key(KeyCode),
+    /// A yes/no dialog's button, by its place in `Buttons`.
+    Button(usize),
+    /// One of Broadcast's targets.
+    Target(BroadcastTarget),
+    /// A field of the new-agent form, by number.
+    Field(usize),
+    /// A kind on the form's kind row; `None` is "more ▸".
+    Kind(Option<Kind>),
+    /// A search result, by number.
+    Result(usize),
+}
+
+/// The buttons of the yes/no dialogs, left to right: the label, and the key
+/// that presses it. The first is the one Enter presses when the dialog opens.
+pub const CONFIRM_BUTTONS: [(&str, &str); 2] = [("y", "yes"), ("esc", "keep")];
+pub const RESTORE_BUTTONS: [(&str, &str); 3] = [("y", "restore"), ("n", "start fresh"), ("esc", "later")];
 
 struct Drag {
     agent: u32,
@@ -618,7 +643,7 @@ impl App {
         self.update_title();
         if self.pending_restore.is_some() && self.modal.is_none() {
             match self.config.workspace.restore {
-                crate::config::Restore::Ask => self.modal = Some(Modal::Restore),
+                crate::config::Restore::Ask => self.modal = Some(Modal::Restore(0)),
                 crate::config::Restore::Always => self.restore_saved(),
                 crate::config::Restore::Never => {
                     self.pending_restore = None;
@@ -1007,7 +1032,7 @@ impl App {
         if self.selected_agents().all(|a| a.state == State::Exited) {
             self.close_many(&ids);
         } else {
-            self.modal = Some(Modal::ConfirmCloseMany(ids));
+            self.modal = Some(Modal::ConfirmCloseMany(ids, 0));
         }
     }
 
@@ -1053,7 +1078,7 @@ impl App {
     fn ask_close(&mut self, id: u32) {
         match self.index_of(id).map(|i| self.agents[i].state) {
             Some(State::Exited) => self.close(id),
-            Some(_) => self.modal = Some(Modal::ConfirmClose(id)),
+            Some(_) => self.modal = Some(Modal::ConfirmClose(id, 0)),
             None => {}
         }
     }
@@ -1365,11 +1390,11 @@ impl App {
             let a = self.agents.remove(i);
             a.shutdown();
             // A menu or dialog about it has nothing left to act on.
-            if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent)) if agent == id) {
+            if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent, _)) if agent == id) {
                 self.modal = None;
             }
             self.selected.retain(|&s| s != id);
-            if let Some(Modal::ConfirmCloseMany(ids)) = &mut self.modal {
+            if let Some(Modal::ConfirmCloseMany(ids, _)) = &mut self.modal {
                 ids.retain(|&s| s != id);
                 if ids.is_empty() {
                     self.modal = None;
@@ -1796,7 +1821,7 @@ impl App {
             Action::Settings => self.open_settings(),
             Action::Quit => {
                 if self.agents.iter().any(|a| a.state != State::Exited) {
-                    self.modal = Some(Modal::ConfirmQuit);
+                    self.modal = Some(Modal::ConfirmQuit(0));
                 } else {
                     self.quit = true;
                 }
@@ -2220,6 +2245,56 @@ impl App {
         self.dirty = true;
     }
 
+    /// A click in a dialog works what it's on, as its keys would.
+    fn dialog_mouse(&mut self, m: MouseEvent) {
+        if m.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let (x, y) = (m.column, m.row);
+        let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        let Some(&(_, hit)) = self.hits.dialog.iter().find(|(r, _)| inside(r)) else { return };
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        match (hit, &mut self.modal) {
+            (DialogHit::Key(code), _) => self.modal_key(press(code)),
+            (DialogHit::Button(i), Some(Modal::ConfirmClose(_, sel) | Modal::ConfirmCloseMany(_, sel) | Modal::ConfirmQuit(sel) | Modal::Restore(sel))) => {
+                *sel = i;
+                self.modal_key(press(KeyCode::Enter));
+            }
+            (DialogHit::Target(to), Some(Modal::Broadcast(_, target))) => *target = to,
+            (DialogHit::Result(i), Some(Modal::Search(s))) => {
+                s.sel = i;
+                self.modal_key(press(KeyCode::Enter));
+            }
+            (DialogHit::Kind(kind), Some(Modal::New(f))) => {
+                f.field = 0;
+                f.error = None;
+                match kind {
+                    Some(k) => f.pick(k),
+                    // "more ▸" opens on its first kind, as → onto it does.
+                    None => {
+                        if let Some(&k) = f.more_kinds().first() {
+                            f.kind = k;
+                            f.more = true;
+                        }
+                    }
+                }
+            }
+            (DialogHit::Field(i), Some(Modal::New(f))) => {
+                f.error = None;
+                // The worktree row is a switch: a click flips it.
+                if i == 4 {
+                    f.worktree = !f.worktree;
+                }
+                f.field = i;
+                if i != 0 {
+                    f.more = false;
+                }
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
     fn modal_key(&mut self, k: KeyEvent) {
         // Jump to a hit for what's typed now, not for what was typed last scan.
         if k.code == KeyCode::Enter && self.search_due.is_some() && matches!(self.modal, Some(Modal::Search(_))) {
@@ -2269,35 +2344,50 @@ impl App {
                 }
             }
             // Keys the dialog doesn't show do nothing: no answering unseen.
-            Modal::Restore if self.dialog_hidden.get() => {}
-            Modal::Restore => match k.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    self.modal = None;
-                    self.restore_saved();
-                }
-                KeyCode::Char('n') => {
-                    self.modal = None;
-                    self.pending_restore = None;
-                    self.toast("starting fresh", ToastKind::Info);
-                }
-                _ => {}
-            },
-            Modal::ConfirmQuit => match k.code {
-                KeyCode::Char('y') | KeyCode::Enter if !self.dialog_hidden.get() => self.quit = true,
-                _ => self.modal = None,
-            },
-            Modal::ConfirmClose(id) => {
-                let id = *id;
-                self.modal = None;
-                if matches!(k.code, KeyCode::Char('y') | KeyCode::Enter) && !self.dialog_hidden.get() {
-                    self.close(id);
+            Modal::Restore(_) if self.dialog_hidden.get() => {}
+            Modal::Restore(sel) => {
+                // Tab and the arrows move the active button; enter presses it.
+                let press = match k.code {
+                    KeyCode::Char('y') => Some(0),
+                    KeyCode::Char('n') => Some(1),
+                    KeyCode::Enter => Some(*sel),
+                    _ => {
+                        if let Some(to) = move_button(*sel, RESTORE_BUTTONS.len(), k.code) {
+                            *sel = to;
+                        }
+                        None
+                    }
+                };
+                match press {
+                    Some(0) => {
+                        self.modal = None;
+                        self.restore_saved();
+                    }
+                    Some(1) => {
+                        self.modal = None;
+                        self.pending_restore = None;
+                        self.toast("starting fresh", ToastKind::Info);
+                    }
+                    // "later", as esc.
+                    Some(_) => self.modal = None,
+                    None => {}
                 }
             }
-            Modal::ConfirmCloseMany(ids) => {
-                let ids = std::mem::take(ids);
-                self.modal = None;
-                if matches!(k.code, KeyCode::Char('y') | KeyCode::Enter) && !self.dialog_hidden.get() {
-                    self.close_many(&ids);
+            Modal::ConfirmQuit(sel) | Modal::ConfirmClose(_, sel) | Modal::ConfirmCloseMany(_, sel) => {
+                if let Some(to) = move_button(*sel, CONFIRM_BUTTONS.len(), k.code) {
+                    *sel = to;
+                    return;
+                }
+                // y, or enter on yes, says yes; anything else keeps them.
+                let yes = (k.code == KeyCode::Char('y') || (k.code == KeyCode::Enter && *sel == 0)) && !self.dialog_hidden.get();
+                match self.modal.take() {
+                    Some(Modal::ConfirmQuit(_)) if yes => {
+                        self.modal = Some(Modal::ConfirmQuit(0));
+                        self.quit = true;
+                    }
+                    Some(Modal::ConfirmClose(id, _)) if yes => self.close(id),
+                    Some(Modal::ConfirmCloseMany(ids, _)) if yes => self.close_many(&ids),
+                    _ => {}
                 }
             }
             Modal::Rename(_, _) | Modal::Broadcast(..) | Modal::New(_) if k.code == KeyCode::Enter && self.dialog_hidden.get() => {
@@ -2521,6 +2611,7 @@ impl App {
             return;
         }
         if self.modal.is_some() {
+            self.dialog_mouse(m);
             return;
         }
         let (x, y) = (m.column, m.row);
@@ -2672,6 +2763,16 @@ impl App {
     pub fn shutdown_all(&mut self) {
         let pids: Vec<u32> = self.agents.iter().filter(|a| a.hang_up()).map(|a| a.pid).collect();
         crate::platform::stop(&pids, crate::agent::STOP_GRACE);
+    }
+}
+
+/// Tab, shift+tab and the arrows on a row of `n` buttons: the button they
+/// make active, round at the ends. `None` for any other key.
+fn move_button(sel: usize, n: usize, key: KeyCode) -> Option<usize> {
+    match key {
+        KeyCode::Tab | KeyCode::Right => Some((sel + 1) % n),
+        KeyCode::BackTab | KeyCode::Left => Some((sel + n - 1) % n),
+        _ => None,
     }
 }
 
@@ -2970,13 +3071,13 @@ mod tests {
         let key = |app: &mut App, code| app.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
         // The draw found no room for the keys or the input.
         app.dialog_hidden.set(true);
-        app.modal = Some(Modal::ConfirmQuit);
+        app.modal = Some(Modal::ConfirmQuit(0));
         key(&mut app, KeyCode::Char('y'));
         key(&mut app, KeyCode::Enter);
         assert!(!app.quit, "quit on a key the dialog didn't show");
-        app.modal = Some(Modal::Restore);
+        app.modal = Some(Modal::Restore(0));
         key(&mut app, KeyCode::Char('n'));
-        assert!(matches!(app.modal, Some(Modal::Restore)), "answered a prompt it couldn't show");
+        assert!(matches!(app.modal, Some(Modal::Restore(_))), "answered a prompt it couldn't show");
         app.modal = Some(Modal::Broadcast(TextInput::new("ship it"), BroadcastTarget::All));
         key(&mut app, KeyCode::Enter);
         assert!(matches!(&app.modal, Some(Modal::Broadcast(i, _)) if i.text == "ship it"), "sent a message it couldn't show");
@@ -2991,7 +3092,7 @@ mod tests {
         assert!(app.modal.is_none());
         // Shown, y quits.
         app.dialog_hidden.set(false);
-        app.modal = Some(Modal::ConfirmQuit);
+        app.modal = Some(Modal::ConfirmQuit(0));
         key(&mut app, KeyCode::Char('y'));
         assert!(app.quit);
     }
@@ -3137,7 +3238,7 @@ mod tests {
         app.open_menu(2, None);
         hit(&mut app, KeyCode::End, KeyModifiers::NONE);
         hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2))));
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2, _))));
         app.modal = None;
         // An exited agent can be restarted, and closes without asking.
         app.agents[1].set_state(State::Exited, false);
@@ -3224,7 +3325,7 @@ mod tests {
             app.open_menu(2, None);
             hit(&mut app, KeyCode::Char(code), m);
             assert_eq!(app.agents.len(), 2, "{m:?}+{code} closed it");
-            assert!(!matches!(app.modal, Some(Modal::Rename(..) | Modal::ConfirmClose(_))), "{m:?}+{code} opened a dialog");
+            assert!(!matches!(app.modal, Some(Modal::Rename(..) | Modal::ConfirmClose(..))), "{m:?}+{code} opened a dialog");
         }
         // ctrl+c is "go away".
         app.open_menu(2, None);
@@ -3337,10 +3438,10 @@ mod tests {
         alt_click(&mut app, 3, 6);
         alt_click(&mut app, 3, 12);
         hit(&mut app, KeyCode::Char('w'), alt);
-        assert!(matches!(&app.modal, Some(Modal::ConfirmCloseMany(ids)) if *ids == [2, 4]), "asks, they still run");
+        assert!(matches!(&app.modal, Some(Modal::ConfirmCloseMany(ids, _)) if *ids == [2, 4]), "asks, they still run");
         // One closes some other way while it asks: the rest is still asked about.
         app.close(4);
-        assert!(matches!(&app.modal, Some(Modal::ConfirmCloseMany(ids)) if *ids == [2]));
+        assert!(matches!(&app.modal, Some(Modal::ConfirmCloseMany(ids, _)) if *ids == [2]));
         tap(&mut app, KeyCode::Char('n'));
         assert_eq!(app.agents.len(), 3, "no: nothing closed");
         assert_eq!(app.selected, [2], "and the selection stays");
@@ -4212,7 +4313,7 @@ mod tests {
         let saved = || Some(crate::state::Saved::new(0, Vec::new()));
         app.pending_restore = saved();
         app.on_attach(PathBuf::from("/"));
-        assert!(matches!(app.modal, Some(Modal::Restore)), "ask, by default");
+        assert!(matches!(app.modal, Some(Modal::Restore(_))), "ask, by default");
         app.modal = None;
         app.config.workspace.restore = Restore::Never;
         app.on_attach(PathBuf::from("/"));

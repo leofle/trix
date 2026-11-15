@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
-use crate::app::{App, BroadcastTarget, MenuItem, Modal, NEW_FIELDS, Search, SidebarSize, TextInput, ToastKind, View, tilde};
+use crate::app::{App, BroadcastTarget, CONFIRM_BUTTONS, DialogHit, MenuItem, Modal, NEW_FIELDS, RESTORE_BUTTONS, Search, SidebarSize, TextInput, ToastKind, View, tilde};
 use crate::settings::{Picker, Row, Settings};
 use crate::theme::{Source as ThemeSource, Theme, contrast, mix};
 
@@ -135,7 +135,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         settings(f, app, area, &t);
     } else if app.modal.is_some() {
         backdrop(f.buffer_mut(), area, &t);
-        modal(f, app, area, &t);
+        let mut hits = Vec::new();
+        modal(f, app, area, &t, &mut hits);
+        app.hits.dialog = hits;
     } else if let Some((x, y)) = cursor {
         f.set_cursor_position((x, y));
     }
@@ -1385,12 +1387,13 @@ fn chip_window(widths: &[usize], sel: usize, room: usize) -> (usize, usize) {
     (from, to.max(sel + 1))
 }
 
-fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
+/// An open dialog. What in it can be clicked goes in `hits`.
+fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, DialogHit)>) {
     app.dialog_hidden.set(false);
     let Some(m) = &app.modal else { return };
     match m {
         Modal::Menu(_) | Modal::Settings(_) => {}
-        Modal::Search(s) => search_box(f, app, s, area, t),
+        Modal::Search(s) => search_box(f, app, s, area, t, hits),
         Modal::New(form) => {
             // The kind row keeps the main kinds and "more ▸", so new kinds
             // don't widen it.
@@ -1429,6 +1432,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             for (i, name) in NEW_FIELDS.iter().enumerate().skip(first).take(fit) {
                 let Some(row) = (if on_foot { rows.foot() } else { rows.at(pad + (i - first) as u16 * step) }) else { break };
                 let y = row.y;
+                let row_rect = row;
                 let active = form.field == i;
                 let lab = Span::styled(
                     format!("{}{:<9}", if active { "› " } else { "  " }, name),
@@ -1446,6 +1450,14 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                         let mut v = Vec::new();
                         if form.more || from > 0 {
                             v.push(Span::styled("‹", Style::new().fg(t.muted)));
+                        }
+                        let mut x = row_rect.x + label_w + u16::from(form.more || from > 0);
+                        for (label, kind) in row.iter().take(to).skip(from) {
+                            let w = label.width() as u16 + 2;
+                            if x + w <= row_rect.right() {
+                                hits.push((Rect { x, width: w, ..row_rect }, DialogHit::Kind(*kind)));
+                            }
+                            x += w + 1;
                         }
                         for (c, (label, kind)) in row.iter().enumerate().take(to).skip(from) {
                             v.push(match kind {
@@ -1482,6 +1494,8 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                         input_spans(&form.args, active, ph, t, field_w)
                     }
                 };
+                // After the kind chips: those are found first.
+                hits.push((row, DialogHit::Field(i)));
                 let mut line = vec![lab];
                 if !matches!(i, 0) {
                     line.push(Span::raw(" "));
@@ -1508,7 +1522,9 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             };
             if let Some(row) = rows.foot().filter(|_| !on_foot) {
                 // One cell nearer the right border than the fields' edge.
-                f.render_widget(Paragraph::new(foot).alignment(Alignment::Right), Rect { x: r.x + 2, width: r.width.saturating_sub(4), ..row });
+                let row = Rect { x: r.x + 2, width: r.width.saturating_sub(4), ..row };
+                hint_hits(&foot, row, hits);
+                f.render_widget(Paragraph::new(foot).alignment(Alignment::Right), row);
             }
             if let Some(c) = cursor {
                 f.set_cursor_position(c);
@@ -1581,6 +1597,15 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                     vec![to, chosen.clone(), Span::styled(format!("   {count}"), Style::new().fg(t.fg))],
                     vec![chosen, Span::styled(format!(" {count}"), Style::new().fg(t.fg))],
                 ];
+                // All the targets fit: each can be clicked.
+                if TLine::from(tries[0].clone()).width() <= row.width as usize {
+                    let mut x = row.x + 4;
+                    for &o in targets {
+                        let w = word(o).width() as u16 + 2;
+                        hits.push((Rect { x, width: w, ..row }, DialogHit::Target(o)));
+                        x += w + 1;
+                    }
+                }
                 let line = tries
                     .into_iter()
                     .map(TLine::from)
@@ -1602,6 +1627,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             }
             if let Some(row) = hint_row {
                 let hints = fit_hints(&[("tab", "target"), ("enter", "send")], &[0, 1], row.width as usize, true, t);
+                hint_hits(&hints, row, hits);
                 f.render_widget(Paragraph::new(hints).alignment(Alignment::Right), row);
             }
         }
@@ -1623,12 +1649,12 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 f.set_cursor_position((row.x + 2 + cx, row.y));
             }
         }
-        Modal::ConfirmClose(id) => {
+        Modal::ConfirmClose(id, sel) => {
             let name = app.agents.iter().find(|a| a.id == *id).map(|a| a.name.clone()).unwrap_or_default();
             // Named in the title too: on a short terminal the question goes.
-            confirm(f, area, t, &format!("Close {name}"), &format!("Stop {name} and close its pane?"), &app.dialog_hidden);
+            app.dialog_hidden.set(confirm(f, area, t, &format!("Close {name}"), &format!("Stop {name} and close its pane?"), *sel, hits));
         }
-        Modal::ConfirmCloseMany(ids) => {
+        Modal::ConfirmCloseMany(ids, sel) => {
             let picked: Vec<&Agent> = app.agents.iter().filter(|a| ids.contains(&a.id)).collect();
             let n = picked.len();
             let running = picked.iter().filter(|a| a.state != State::Exited).count();
@@ -1639,22 +1665,22 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
                 r => format!(" {r} are still running."),
             };
             let text = format!("Stop {} and close their panes?{still}", trunc(&names, 48));
-            confirm(f, area, t, &format!("Close {n} agent{}", if n == 1 { "" } else { "s" }), &text, &app.dialog_hidden);
+            app.dialog_hidden.set(confirm(f, area, t, &format!("Close {n} agent{}", if n == 1 { "" } else { "s" }), &text, *sel, hits));
         }
-        Modal::ConfirmQuit => {
+        Modal::ConfirmQuit(sel) => {
             let live = app.agents.iter().filter(|a| a.state != State::Exited).count();
             let detach = app.config.keys.label(Action::Detach).map(|k| format!(" {k} detaches instead.")).unwrap_or_default();
-            confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped.{detach}", if live == 1 { " is" } else { "s are" }), &app.dialog_hidden);
+            app.dialog_hidden.set(confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped.{detach}", if live == 1 { " is" } else { "s are" }), *sel, hits));
         }
         Modal::Help => help(f, app, area, t),
-        Modal::Restore => {
+        Modal::Restore(sel) => {
             let summary = app.pending_restore.as_ref().map(|p| p.summary()).unwrap_or_default();
-            restore_prompt(f, area, t, &summary, &app.dialog_hidden);
+            restore_prompt(f, area, t, &summary, *sel, &app.dialog_hidden, hits);
         }
     }
 }
 
-fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str, hidden: &std::cell::Cell<bool>) {
+fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str, sel: usize, hidden: &std::cell::Cell<bool>, hits: &mut Vec<(Rect, DialogHit)>) {
     let r = centered(area, (text.width() as u16 + 8).max(52), 7);
     f.render_widget(Clear, r);
     let block = modal_block("Pick up where you left off?", t);
@@ -1666,22 +1692,13 @@ fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str, hidden: &std
     if let Some(row) = lines[1] {
         f.render_widget(Paragraph::new(Span::styled(text.to_string(), Style::new().fg(t.fg))).alignment(Alignment::Center), row);
     }
-    let Some(keys) = lines[3] else { return };
-    f.render_widget(
-        Paragraph::new(TLine::from(vec![
-            Span::styled(" y ", Style::new().fg(t.bg).bg(t.green).add_modifier(Modifier::BOLD)),
-            Span::styled(" restore     ", Style::new().fg(t.fg)),
-            Span::styled(" n ", Style::new().fg(t.fg_bright).bg(t.surface_hi)),
-            Span::styled(" start fresh     ", Style::new().fg(t.fg)),
-            Span::styled(" esc ", Style::new().fg(t.fg_bright).bg(t.surface_hi)),
-            Span::styled(" later", Style::new().fg(t.fg)),
-        ]))
-        .alignment(Alignment::Center),
-        keys,
-    );
+    if let Some(row) = lines[3] {
+        buttons(f, row, t, &RESTORE_BUTTONS, sel, t.green, hits);
+    }
 }
 
-fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str, hidden: &std::cell::Cell<bool>) {
+/// A yes/no dialog. True when it had no room to show its buttons.
+fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str, sel: usize, hits: &mut Vec<(Rect, DialogHit)>) -> bool {
     let r = centered(area, (text.width() as u16 + 8).max(44), 7);
     f.render_widget(Clear, r);
     let block = modal_block(title, t);
@@ -1690,22 +1707,52 @@ fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str, hidden
     // Centered across the whole width; a line with no room isn't drawn.
     // Short of room, the spacers go, then the question: the keys stay.
     let lines = Rows::new(inner, 0, false).fit(&[0, 2, 1, 3]);
-    hidden.set(lines[3].is_none());
     if let Some(row) = lines[1] {
         f.render_widget(Paragraph::new(Span::styled(text.to_string(), Style::new().fg(t.fg))).alignment(Alignment::Center), row);
     }
     if let Some(row) = lines[3] {
-        f.render_widget(
-            Paragraph::new(TLine::from(vec![
-                Span::styled(" y ", Style::new().fg(t.bg).bg(t.red).add_modifier(Modifier::BOLD)),
-                Span::styled(" yes     ", Style::new().fg(t.fg)),
-                Span::styled(" esc ", Style::new().fg(t.fg_bright).bg(t.surface_hi)),
-                Span::styled(" keep", Style::new().fg(t.fg)),
-            ]))
-            .alignment(Alignment::Center),
-            row,
-        );
+        buttons(f, row, t, &CONFIRM_BUTTONS, sel, t.red, hits);
     }
+    lines[3].is_none()
+}
+
+/// A yes/no dialog's buttons, centred on `row`: each its key and what it
+/// does. The active one (`sel`, the one enter presses) is lit, the first in
+/// `first`'s colour and the others in the accent; each can be clicked.
+fn buttons(f: &mut Frame, row: Rect, t: &Theme, all: &[(&str, &str)], sel: usize, first: Color, hits: &mut Vec<(Rect, DialogHit)>) {
+    const GAP: usize = 5;
+    let mut spans = Vec::new();
+    let mut at = Vec::new();
+    let mut w = 0;
+    for (i, (key, label)) in all.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(GAP)));
+            w += GAP;
+        }
+        let (chip, text) = if i == sel {
+            (
+                Style::new().fg(t.bg).bg(if i == 0 { first } else { t.accent }).add_modifier(Modifier::BOLD),
+                Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )
+        } else {
+            (Style::new().fg(t.fg_bright).bg(t.surface_hi), Style::new().fg(t.dim))
+        };
+        let (chip_s, text_s) = (format!(" {key} "), format!(" {label}"));
+        let bw = chip_s.width() + text_s.width();
+        at.push((w, bw));
+        w += bw;
+        spans.push(Span::styled(chip_s, chip));
+        spans.push(Span::styled(text_s, text));
+    }
+    // Where centring puts the line, so the clicks land on what they show.
+    let x0 = row.x + (row.width as usize).saturating_sub(w) as u16 / 2;
+    for (i, (from, bw)) in at.into_iter().enumerate() {
+        let x = x0 + from as u16;
+        if x < row.right() {
+            hits.push((Rect { x, width: (bw as u16).min(row.right() - x), ..row }, DialogHit::Button(i)));
+        }
+    }
+    f.render_widget(Paragraph::new(TLine::from(spans)).alignment(Alignment::Center), row);
 }
 
 /// "↑340", "↑12k", or "on screen" for a hit on the live screen.
@@ -1718,7 +1765,7 @@ fn hit_place(h: &crate::search::Hit) -> String {
     }
 }
 
-fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
+fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme, hits: &mut Vec<(Rect, DialogHit)>) {
     let r = centered(area, 110, area.height.saturating_sub(4).clamp(9, 26));
     f.render_widget(Clear, r);
     let block = modal_block("Search every agent", t);
@@ -1768,6 +1815,7 @@ fn search_box(f: &mut Frame, app: &App, s: &Search, area: Rect, t: &Theme) {
             let y = list.y + (i - top) as u16;
             let selected = i == s.sel;
             let row = Rect { y, height: 1, ..list };
+            hits.push((row, DialogHit::Result(i)));
             if selected {
                 f.buffer_mut().set_style(row, Style::new().bg(t.surface_hi));
             }
@@ -2094,6 +2142,32 @@ fn fit_hints(pairs: &[(&str, &str)], drop: &[usize], width: usize, accent_last: 
     TLine::from(spans)
 }
 
+/// The hints of a `fit_hints` line drawn right-aligned on `row` that are
+/// a key a click can press: enter, tab and esc.
+fn hint_hits(line: &TLine, row: Rect, hits: &mut Vec<(Rect, DialogHit)>) {
+    use crossterm::event::KeyCode;
+    let mut x = row.right().saturating_sub(line.width() as u16).max(row.x);
+    let mut spans = line.spans.iter().peekable();
+    while let Some(s) = spans.next() {
+        let w = s.content.width() as u16;
+        let key = match s.content.as_ref() {
+            "enter" => Some(KeyCode::Enter),
+            "tab" => Some(KeyCode::Tab),
+            "esc" => Some(KeyCode::Esc),
+            _ => None,
+        };
+        let Some(key) = key else {
+            x += w;
+            continue;
+        };
+        // The key and what it does, after it.
+        let what = spans.next().map_or(0, |s| s.content.width() as u16);
+        let width = (w + what).min(row.right().saturating_sub(x));
+        hits.push((Rect { x, width, ..row }, DialogHit::Key(key)));
+        x += w + what;
+    }
+}
+
 /// "▲ more" and "▼ more" over and under a list that goes on.
 fn more_marks(f: &mut Frame, inner: Rect, start: usize, fit: usize, n: usize, t: &Theme) {
     let more = |f: &mut Frame, y: u16, s: &'static str| {
@@ -2338,10 +2412,10 @@ mod tests {
             app.modal = Some(Modal::Rename(0, TextInput::new("")));
         }
         fn quit(app: &mut App) {
-            app.modal = Some(Modal::ConfirmQuit);
+            app.modal = Some(Modal::ConfirmQuit(0));
         }
         fn restore(app: &mut App) {
-            app.modal = Some(Modal::Restore);
+            app.modal = Some(Modal::Restore(0));
         }
         type Open = fn(&mut App);
         // What each dialog draws above its foot, and its foot.
@@ -2387,10 +2461,10 @@ mod tests {
             app.modal = Some(Modal::Rename(0, TextInput::new("web")));
         }
         fn quit(app: &mut App) {
-            app.modal = Some(Modal::ConfirmQuit);
+            app.modal = Some(Modal::ConfirmQuit(0));
         }
         fn restore(app: &mut App) {
-            app.modal = Some(Modal::Restore);
+            app.modal = Some(Modal::Restore(0));
         }
         type Open = fn(&mut App);
         // Whatever the height, if the dialog has a line inside its borders,
@@ -2543,7 +2617,7 @@ mod tests {
     fn esc_closes_what_has_nothing_to_cancel() {
         let bar = |m: fn() -> Modal| dialog(|app| app.modal = Some(m()), 100, 30).pop().unwrap();
         assert!(bar(|| Modal::Help).contains("esc  close"), "{:?}", bar(|| Modal::Help));
-        assert!(bar(|| Modal::ConfirmQuit).contains("esc  cancel"), "{:?}", bar(|| Modal::ConfirmQuit));
+        assert!(bar(|| Modal::ConfirmQuit(0)).contains("esc  cancel"), "{:?}", bar(|| Modal::ConfirmQuit(0)));
     }
 
     #[test]
@@ -3294,7 +3368,7 @@ mod tests {
         let bottom = screen.lines().last().unwrap();
         assert!(bottom.contains("grid of 2") && bottom.contains("close 2"), "{bottom}");
         // A dialog to close them, and their menu, say how many.
-        app.modal = Some(Modal::ConfirmCloseMany(vec![2, 4]));
+        app.modal = Some(Modal::ConfirmCloseMany(vec![2, 4], 0));
         let screen = grid_screen(&mut app, 140, 30);
         assert!(screen.contains("Close 2 agents") && screen.contains("claude-2, shell-1"), "{screen}");
         app.open_menu(2, None);
@@ -3411,5 +3485,203 @@ mod tests {
         for want in ["Theme", "Your terminal's colors  in use", "› Catppuccin Latte", "Everforest", "▼ more", " Aa ", "enter keep it"] {
             assert!(shown.contains(want), "{want:?} in\n{shown}");
         }
+    }
+
+    // ───── yes/no dialogs and the rest: tab moves, clicks press ─────
+
+    use crate::app::AppEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    /// An app with two idle Claudes, `a` (1) and `b` (2), not drawn yet.
+    fn clickable_app() -> App {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        for (id, name) in [(1, "a"), (2, "b")] {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        app
+    }
+
+    /// Draw it, as the frame would, and give back what's on screen.
+    fn frame(app: &mut App) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Where `text` first shows on screen.
+    fn spot(buf: &ratatui::buffer::Buffer, text: &str) -> (u16, u16) {
+        let want: Vec<String> = text.chars().map(String::from).collect();
+        let a = buf.area;
+        for y in 0..a.height {
+            for x in 0..a.width.saturating_sub(want.len() as u16 - 1) {
+                if want.iter().enumerate().all(|(i, c)| buf[(x + i as u16, y)].symbol() == c) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("{text:?} isn't on screen");
+    }
+
+    /// Draw, then click the middle of `text`, the way a person aims.
+    fn click_on(app: &mut App, text: &str) {
+        let (x, y) = spot(&frame(app), text);
+        let x = x + text.chars().count() as u16 / 2;
+        app.handle(AppEvent::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE }));
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        let m = if code == KeyCode::BackTab { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
+        frame(app);
+        app.handle(AppEvent::Key(KeyEvent::new(code, m)));
+    }
+
+    /// The active button is the one drawn underlined.
+    fn lit(app: &mut App, text: &str) -> bool {
+        let buf = frame(app);
+        let (x, y) = spot(&buf, text);
+        buf[(x, y)].modifier.contains(Modifier::UNDERLINED)
+    }
+
+    #[test]
+    fn tab_moves_the_close_dialogs_active_button_and_enter_presses_it() {
+        let mut app = clickable_app();
+        app.modal = Some(Modal::ConfirmClose(2, 0));
+        assert!(lit(&mut app, "yes") && !lit(&mut app, "keep"), "yes is the one enter presses, at first");
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2, 1))), "tab moved, and didn't close the dialog");
+        assert!(lit(&mut app, "keep") && !lit(&mut app, "yes"), "and shows it");
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2, 0))), "round at the end");
+        press(&mut app, KeyCode::BackTab);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2, 1))), "shift+tab goes back");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Right);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2, 1))), "the arrows move it too");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none() && app.agents.len() == 2, "enter on keep keeps it");
+        app.modal = Some(Modal::ConfirmClose(2, 0));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none() && app.agents.len() == 1, "enter on yes closes it");
+    }
+
+    #[test]
+    fn the_close_dialogs_keys_still_answer_it() {
+        let mut app = clickable_app();
+        for (key, closes) in [(KeyCode::Esc, false), (KeyCode::Char('n'), false), (KeyCode::Char('y'), true)] {
+            // y says yes from either button.
+            app.modal = Some(Modal::ConfirmClose(2, 1));
+            press(&mut app, key);
+            assert!(app.modal.is_none(), "{key:?} answers");
+            assert_eq!(app.agents.len(), if closes { 1 } else { 2 }, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn clicking_a_yes_no_dialogs_button_presses_it() {
+        let mut app = clickable_app();
+        app.modal = Some(Modal::ConfirmClose(2, 0));
+        click_on(&mut app, "keep");
+        assert!(app.modal.is_none() && app.agents.len() == 2, "keep keeps it");
+        app.modal = Some(Modal::ConfirmClose(2, 0));
+        click_on(&mut app, "Stop b and close");
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(2, 0))), "a click off the buttons does nothing");
+        click_on(&mut app, "yes");
+        assert!(app.modal.is_none() && app.agents.len() == 1, "yes closes it");
+        // Every selected one.
+        app.modal = Some(Modal::ConfirmCloseMany(vec![1], 1));
+        click_on(&mut app, "yes");
+        assert!(app.modal.is_none() && app.agents.is_empty(), "yes closes them, whichever button was active");
+        // Quit.
+        app.modal = Some(Modal::ConfirmQuit(0));
+        click_on(&mut app, "keep");
+        assert!(app.modal.is_none() && !app.quit);
+        app.modal = Some(Modal::ConfirmQuit(0));
+        press(&mut app, KeyCode::Tab);
+        click_on(&mut app, "yes");
+        assert!(app.quit, "clicked, yes quits even with keep active");
+    }
+
+    #[test]
+    fn the_restore_prompt_takes_tab_enter_and_clicks() {
+        let mut app = clickable_app();
+        app.modal = Some(Modal::Restore(0));
+        assert!(lit(&mut app, "restore"));
+        press(&mut app, KeyCode::Tab);
+        assert!(lit(&mut app, "start fresh") && !lit(&mut app, "restore"));
+        press(&mut app, KeyCode::Tab);
+        assert!(lit(&mut app, "later"));
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none(), "enter pressed start fresh");
+        assert_eq!(app.toast.take().map(|t| t.text).as_deref(), Some("starting fresh"));
+        app.modal = Some(Modal::Restore(0));
+        click_on(&mut app, "later");
+        assert!(app.modal.is_none() && app.toast.take().is_none(), "later: nothing restored, nothing thrown away");
+        app.modal = Some(Modal::Restore(0));
+        click_on(&mut app, "start fresh");
+        assert_eq!(app.toast.take().map(|t| t.text).as_deref(), Some("starting fresh"));
+    }
+
+    #[test]
+    fn clicking_a_broadcast_target_picks_it_and_its_hints_press_their_keys() {
+        let mut app = clickable_app();
+        app.modal = Some(Modal::Broadcast(TextInput::default(), BroadcastTarget::All));
+        click_on(&mut app, "idle & done only");
+        assert!(matches!(app.modal, Some(Modal::Broadcast(_, BroadcastTarget::Waiting))));
+        click_on(&mut app, "every agent");
+        assert!(matches!(app.modal, Some(Modal::Broadcast(_, BroadcastTarget::All))));
+        click_on(&mut app, "tab target");
+        assert!(matches!(app.modal, Some(Modal::Broadcast(_, BroadcastTarget::Waiting))), "the tab hint is tab");
+    }
+
+    #[test]
+    fn clicking_the_new_agent_form_picks_what_it_is_on() {
+        let mut app = clickable_app();
+        app.open_new();
+        click_on(&mut app, "codex");
+        let form = |app: &App| match &app.modal {
+            Some(Modal::New(f)) => (f.kind, f.field, f.worktree, f.more),
+            _ => panic!("the form closed"),
+        };
+        assert_eq!(form(&app), (Kind::Codex, 0, false, false));
+        click_on(&mut app, "Name");
+        assert_eq!(form(&app).1, 2, "a field's label focuses it");
+        click_on(&mut app, "Worktree");
+        assert_eq!((form(&app).1, form(&app).2), (4, true), "the worktree row is a switch");
+        click_on(&mut app, "isolated git worktree");
+        assert!(!form(&app).2, "and flips back");
+        click_on(&mut app, "more ▸");
+        let (kind, field, _, more) = form(&app);
+        assert!(more && field == 0 && !app.config.new.kinds.contains(&kind), "more opens on one of its kinds: {kind:?}");
+        click_on(&mut app, "tab next");
+        assert_eq!(form(&app).1, 1, "the tab hint is tab");
+    }
+
+    #[test]
+    fn clicking_a_search_result_jumps_to_it() {
+        let mut app = clickable_app();
+        let hit = |agent, text: &str| crate::search::Hit {
+            agent,
+            start: Point::new(Line(0), Column(0)),
+            end: Point::new(Line(0), Column(3)),
+            text: text.into(),
+            at: 0,
+            len: 4,
+            from_bottom: 0,
+            history: 0,
+        };
+        let mut s = Search { input: TextInput::new("beta"), ..Default::default() };
+        s.hits = vec![hit(1, "alpha line"), hit(99, "beta line")];
+        s.agents = 2;
+        app.modal = Some(Modal::Search(s));
+        click_on(&mut app, "beta line");
+        assert!(app.modal.is_none(), "the click went there");
+        assert_eq!(app.toast.take().map(|t| t.text).as_deref(), Some("that agent is gone"), "the one clicked, not the one selected");
     }
 }
