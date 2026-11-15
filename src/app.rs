@@ -644,6 +644,12 @@ impl App {
         Saved { grid, ..Saved::new(focus, agents) }
     }
 
+    /// The extra arguments this agent will be started with again (`trix
+    /// args`): what the next save writes, and a restore runs.
+    pub fn extra_args_mut(&mut self, id: u32) -> Option<&mut Option<String>> {
+        self.specs.get_mut(&id).map(|s| &mut s.command)
+    }
+
     /// The agents open now, as they'd be started again (saved workspace,
     /// `trix layout save`).
     pub fn open_agents(&self) -> Vec<SavedAgent> {
@@ -3579,6 +3585,21 @@ mod tests {
         let letters: Vec<char> = Kind::ALL.iter().filter_map(|k| k.shortcut()).collect();
         assert_eq!(letters.len(), letters.iter().collect::<HashSet<_>>().len());
         assert!(!letters.iter().any(|c| matches!(c, 'h' | 'l' | ' ')));
+    }
+
+    #[test]
+    fn changed_args_are_what_the_workspace_saves() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.id = 5;
+        app.specs.insert(5, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: Some("--model opus 5.5".into()), prompt: None, branch_note: None, resume: None });
+        app.agents.push(a);
+        *app.extra_args_mut(5).unwrap() = Some("--model claude-opus-5-5 --effort xhigh".into());
+        assert_eq!(app.open_agents()[0].command.as_deref(), Some("--model claude-opus-5-5 --effort xhigh"));
+        *app.extra_args_mut(5).unwrap() = None;
+        assert_eq!(app.open_agents()[0].command, None);
+        assert!(app.extra_args_mut(6).is_none(), "no such agent");
+        app.agents[0].shutdown();
     }
 
     #[test]

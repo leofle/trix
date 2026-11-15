@@ -61,6 +61,10 @@ agent control (for scripts, and for agents managing other agents):
                             seconds (300; 0 waits forever)
   trix close <agent> [--force]
                             close it; --force if it is working or needs you
+  trix args <agent> [<args…> | --clear]
+                            show or change the extra arguments it starts with
+                            (e.g. --model claude-opus-5-5). Used from its next
+                            start: a restore, or a saved layout
   trix events [agent…] [--json]
                             follow what agents do, live: one line per change
                             (spawned, state, renamed, closed). --json for
