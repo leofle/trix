@@ -419,6 +419,7 @@ pub enum Action {
     Rename,
     Close,
     Menu,
+    Select,
     Detach,
     Help,
     Settings,
@@ -426,7 +427,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 18] = [
+    pub const ALL: [Action; 19] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -441,6 +442,7 @@ impl Action {
         Action::Rename,
         Action::Close,
         Action::Menu,
+        Action::Select,
         Action::Detach,
         Action::Help,
         Action::Settings,
@@ -463,6 +465,7 @@ impl Action {
             Action::Rename => "rename",
             Action::Close => "close",
             Action::Menu => "menu",
+            Action::Select => "select",
             Action::Detach => "detach",
             Action::Help => "help",
             Action::Settings => "settings",
@@ -486,6 +489,7 @@ impl Action {
             Action::Rename => &["alt+r"],
             Action::Close => &["alt+w"],
             Action::Menu => &["alt+o"],
+            Action::Select => &["alt+x"],
             Action::Detach => &["alt+d"],
             Action::Help => &["alt+?", "alt+/"],
             Action::Settings => &["alt+,"],

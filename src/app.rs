@@ -214,6 +214,8 @@ impl NewForm {
 pub enum BroadcastTarget {
     All,
     Waiting,
+    /// Only the agents selected (alt+click, alt+x).
+    Selected,
 }
 
 /// The alt+f search box.
@@ -234,6 +236,8 @@ pub enum Modal {
     Broadcast(TextInput, BroadcastTarget),
     Rename(u32, TextInput),
     ConfirmClose(u32),
+    /// Close every selected agent: these, by id.
+    ConfirmCloseMany(Vec<u32>),
     ConfirmQuit,
     /// A fresh server found a saved workspace: bring it back?
     Restore,
@@ -260,6 +264,8 @@ pub enum MenuItem {
     Restart,
     CopyPath,
     Close,
+    /// Select it, or unselect it; in the menu of a selection, unselect all.
+    Select,
 }
 
 impl MenuItem {
@@ -269,6 +275,7 @@ impl MenuItem {
             MenuItem::Restart => "Restart",
             MenuItem::CopyPath => "Copy folder path",
             MenuItem::Close => "Close",
+            MenuItem::Select => "Select",
         }
     }
 
@@ -279,6 +286,7 @@ impl MenuItem {
             MenuItem::Restart => 's',
             MenuItem::CopyPath => 'f',
             MenuItem::Close => 'c',
+            MenuItem::Select => 'e',
         }
     }
 
@@ -287,6 +295,7 @@ impl MenuItem {
         match self {
             MenuItem::Rename => Some(Action::Rename),
             MenuItem::Close => Some(Action::Close),
+            MenuItem::Select => Some(Action::Select),
             MenuItem::Restart | MenuItem::CopyPath => None,
         }
     }
@@ -321,6 +330,8 @@ pub struct HitMap {
     /// Each pane's pin, on its title: click to pin it to the top.
     pub pins: Vec<(Rect, u32)>,
     pub new_button: Option<Rect>,
+    /// The sidebar header's ✕: clears the selection.
+    pub unselect: Option<Rect>,
     /// The attention strip, and the agent it's about.
     pub strip: Option<(Rect, u32)>,
     /// An open menu: all of it, and the row of each item.
@@ -363,6 +374,10 @@ pub struct App {
     pub sidebar_compact: bool,
     /// The first card the sidebar shows; it follows the focus.
     pub sidebar_scroll: usize,
+    /// alt+click or alt+x: the agents picked to act on together, by id, in
+    /// the order picked. While there are any, close, the grid, broadcast and
+    /// the menu act on them. Not saved: a selection is for now.
+    pub selected: Vec<u32>,
     pub modal: Option<Modal>,
     pub theme: Theme,
     theme_watch: ThemeWatcher,
@@ -459,6 +474,7 @@ impl App {
             sidebar_icons: prefs.sidebar_icons,
             sidebar_compact: prefs.sidebar_compact,
             sidebar_scroll: 0,
+            selected: Vec::new(),
             modal: None,
             theme,
             theme_watch,
@@ -804,28 +820,70 @@ impl App {
         self.agents.iter().position(|a| a.id == id)
     }
 
-    /// What an agent's menu offers, in order. Nothing once it's gone.
+    /// What an agent's menu offers, in order. Nothing once it's gone. The
+    /// menu of a selected agent is the selection's: what it offers is for
+    /// all of them, and a name is one agent's, so there's no rename.
     pub fn menu_items(&self, id: u32) -> Vec<MenuItem> {
         let Some(a) = self.agents.iter().find(|a| a.id == id) else { return Vec::new() };
+        if self.menu_is_bulk(id) {
+            let mut items = Vec::new();
+            if self.selected_agents().any(|a| a.state == State::Exited) {
+                items.push(MenuItem::Restart);
+            }
+            items.extend([MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+            return items;
+        }
         let mut items = vec![MenuItem::Rename];
         if a.state == State::Exited {
             items.push(MenuItem::Restart);
         }
-        items.extend([MenuItem::CopyPath, MenuItem::Close]);
+        items.extend([MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
         items
+    }
+
+    /// Is this agent's menu the selection's?
+    pub fn menu_is_bulk(&self, id: u32) -> bool {
+        self.selected.contains(&id)
+    }
+
+    /// What a menu item says: in the selection's menu, how many it's for.
+    pub fn menu_label(&self, id: u32, item: MenuItem) -> String {
+        if !self.menu_is_bulk(id) {
+            return item.label().into();
+        }
+        let n = self.selected.len();
+        let agents = |n: usize| format!("{n} agent{}", if n == 1 { "" } else { "s" });
+        match item {
+            MenuItem::Restart => format!("Restart {} exited", self.selected_agents().filter(|a| a.state == State::Exited).count()),
+            MenuItem::CopyPath => format!("Copy {} folder path{}", n, if n == 1 { "" } else { "s" }),
+            MenuItem::Close => format!("Close {}", agents(n)),
+            MenuItem::Select => "Unselect all".into(),
+            MenuItem::Rename => item.label().into(),
+        }
     }
 
     pub fn open_menu(&mut self, id: u32, at: Option<(u16, u16)>) {
         let Some(i) = self.index_of(id) else { return };
         // On an exited agent, restarting it is what you most likely came for.
-        let sel = if self.agents[i].state == State::Exited { MenuItem::Restart } else { MenuItem::Rename };
+        let sel = if self.menu_is_bulk(id) {
+            if self.selected_agents().any(|a| a.state == State::Exited) { MenuItem::Restart } else { MenuItem::CopyPath }
+        } else if self.agents[i].state == State::Exited {
+            MenuItem::Restart
+        } else {
+            MenuItem::Rename
+        };
         self.modal = Some(Modal::Menu(Menu { agent: id, at, sel }));
         self.dirty = true;
     }
 
-    /// The menu key: the focused agent's menu, by its name on screen.
+    /// The menu key: the focused agent's menu, by its name on screen. With a
+    /// selection, the selection's, by the focused agent if it's selected.
     fn open_focused_menu(&mut self) {
-        let Some(id) = self.focused().map(|a| a.id) else { return };
+        let focused = self.focused().map(|a| a.id);
+        let Some(id) = focused.filter(|id| self.selected.is_empty() || self.selected.contains(id)).or_else(|| self.selected_agents().next().map(|a| a.id))
+        else {
+            return;
+        };
         let on = |hits: &[(Rect, u32)]| hits.iter().find(|(_, i)| *i == id).map(|(r, _)| (r.x + 2, r.y + 1));
         let at = on(&self.hits.titles).or_else(|| on(&self.hits.cards));
         self.open_menu(id, at);
@@ -835,6 +893,20 @@ impl App {
         self.modal = None;
         self.dirty = true;
         let Some(i) = self.index_of(id) else { return };
+        if self.menu_is_bulk(id) {
+            match item {
+                MenuItem::Rename => {}
+                MenuItem::Restart => self.restart_selected(),
+                MenuItem::CopyPath => {
+                    let paths: Vec<String> = self.selected_agents().map(|a| a.live_cwd().display().to_string()).collect();
+                    copy_to_clipboard(&self.out, &paths.join("\n"));
+                    self.toast(format!("copied {} folder path{}", paths.len(), if paths.len() == 1 { "" } else { "s" }), ToastKind::Good);
+                }
+                MenuItem::Close => self.ask_close_selected(),
+                MenuItem::Select => self.clear_selection(),
+            }
+            return;
+        }
         match item {
             MenuItem::Rename => self.start_rename(id),
             MenuItem::Restart => self.restart(i),
@@ -845,7 +917,123 @@ impl App {
                 self.toast(format!("copied {}", tilde(&cwd)), ToastKind::Good);
             }
             MenuItem::Close => self.ask_close(id),
+            MenuItem::Select => self.toggle_selected(id),
         }
+    }
+
+    // ─────────────────────────── selection ───────────────────────────
+
+    /// The selected agents, in the list's order.
+    pub fn selected_agents(&self) -> impl Iterator<Item = &Agent> {
+        self.agents.iter().filter(|a| self.selected.contains(&a.id))
+    }
+
+    /// alt+click on a card, or alt+x: in the selection, or out of it.
+    pub fn toggle_selected(&mut self, id: u32) {
+        let Some(i) = self.index_of(id) else { return };
+        let name = self.agents[i].name.clone();
+        let picked = match self.selected.iter().position(|&s| s == id) {
+            Some(p) => {
+                self.selected.remove(p);
+                false
+            }
+            None => {
+                self.selected.push(id);
+                true
+            }
+        };
+        let n = self.selected.len();
+        let msg = match (picked, n) {
+            (false, 0) => format!("unselected {name} · nothing selected"),
+            (true, _) => format!("selected {name} · {n} selected"),
+            (false, _) => format!("unselected {name} · {n} selected"),
+        };
+        self.toast(msg, ToastKind::Info);
+        self.keep_grid_focus();
+        self.dirty = true;
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.selected.clear();
+        self.toast("nothing selected", ToastKind::Info);
+        self.dirty = true;
+    }
+
+    /// Agent `i`'s place among the agents the grid shows: the selected ones,
+    /// or with none selected, all. `None`: the grid leaves it out.
+    pub fn grid_slot(&self, i: usize) -> Option<usize> {
+        let a = self.agents.get(i)?;
+        if self.selected.is_empty() {
+            return Some(i);
+        }
+        if !self.selected.contains(&a.id) {
+            return None;
+        }
+        Some(self.agents[..i].iter().filter(|a| self.selected.contains(&a.id)).count())
+    }
+
+    /// The agents the grid shows, by index, in order.
+    pub fn grid_shown(&self) -> Vec<usize> {
+        (0..self.agents.len()).filter(|&i| self.grid_slot(i).is_some()).collect()
+    }
+
+    /// The grid shows the selection: keep the focus on an agent in it, the
+    /// next one after where it was if it just left.
+    fn keep_grid_focus(&mut self) {
+        if self.view != View::Grid || self.grid_slot(self.focus).is_some() {
+            return;
+        }
+        let shown = self.grid_shown();
+        if let Some(&i) = shown.iter().find(|&&i| i > self.focus).or(shown.first()) {
+            self.set_focus(i);
+        }
+    }
+
+    /// alt+w with a selection: close them all, asking first if any still runs.
+    fn ask_close_selected(&mut self) {
+        let ids: Vec<u32> = self.selected_agents().map(|a| a.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        if self.selected_agents().all(|a| a.state == State::Exited) {
+            self.close_many(&ids);
+        } else {
+            self.modal = Some(Modal::ConfirmCloseMany(ids));
+        }
+    }
+
+    fn close_many(&mut self, ids: &[u32]) {
+        let mut n = 0;
+        for &id in ids {
+            if self.index_of(id).is_some() {
+                self.close(id);
+                n += 1;
+            }
+        }
+        if n > 1 {
+            self.toast(format!("closed {n} agents"), ToastKind::Info);
+        }
+    }
+
+    /// The selection's menu: restart every exited agent in it.
+    fn restart_selected(&mut self) {
+        let exited: Vec<u32> = self.selected_agents().filter(|a| a.state == State::Exited).map(|a| a.id).collect();
+        for id in &exited {
+            if let Some(i) = self.index_of(*id) {
+                self.restart(i);
+            }
+        }
+        if exited.len() > 1 {
+            self.toast(format!("restarted {} agents", exited.len()), ToastKind::Good);
+        }
+    }
+
+    /// Would a broadcast to `target` reach this agent?
+    pub fn reaches(&self, a: &Agent, target: BroadcastTarget) -> bool {
+        (target != BroadcastTarget::Selected || self.selected.contains(&a.id)) && broadcast_reaches(a, target)
     }
 
     fn start_rename(&mut self, id: u32) {
@@ -1151,6 +1339,9 @@ impl App {
             Ok(a) => {
                 self.agents[idx].shutdown();
                 self.agents[idx] = a;
+                if let Some(s) = self.selected.iter_mut().find(|s| **s == old_id) {
+                    *s = id;
+                }
                 crate::events::restarted(self, old_id, id);
                 self.toast(format!("restarted {}", spec.name), ToastKind::Good);
                 self.specs.insert(id, spec);
@@ -1171,6 +1362,13 @@ impl App {
             if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent)) if agent == id) {
                 self.modal = None;
             }
+            self.selected.retain(|&s| s != id);
+            if let Some(Modal::ConfirmCloseMany(ids)) = &mut self.modal {
+                ids.retain(|&s| s != id);
+                if ids.is_empty() {
+                    self.modal = None;
+                }
+            }
             self.specs.remove(&id);
             self.parked.remove(&id);
             let was_focused = i == self.focus;
@@ -1190,6 +1388,7 @@ impl App {
                 self.dirty = true;
             }
             self.toast(format!("closed {}", a.name), ToastKind::Info);
+            self.keep_grid_focus();
             self.sync_git_targets();
         }
     }
@@ -1259,6 +1458,10 @@ impl App {
         }
         self.focus = idx;
         self.agents[idx].unseen = false;
+        // The grid shows the selection: an agent outside it is seen alone.
+        if self.view == View::Grid && self.grid_slot(idx).is_none() {
+            self.view = View::Focus;
+        }
         self.dirty = true;
     }
 
@@ -1313,7 +1516,11 @@ impl App {
                     self.agents[i].on_output();
                     // Only redraw for output we can actually see: the grid
                     // shows one page of agents, not all of them.
-                    let seen = if self.view == View::Grid { crate::ui::on_grid_page(i, self.focus) } else { i == self.focus };
+                    let seen = if self.view == View::Grid {
+                        matches!((self.grid_slot(i), self.grid_slot(self.focus)), (Some(i), Some(f)) if crate::ui::on_grid_page(i, f))
+                    } else {
+                        i == self.focus
+                    };
                     if seen {
                         self.dirty = true;
                     }
@@ -1527,18 +1734,12 @@ impl App {
         match action {
             Action::New => self.open_new(),
             Action::Jump => self.set_focus(n),
-            Action::Next => {
-                if !self.agents.is_empty() {
-                    self.set_focus((self.focus + 1) % self.agents.len());
-                }
-            }
-            Action::Prev => {
-                if !self.agents.is_empty() {
-                    self.set_focus((self.focus + self.agents.len() - 1) % self.agents.len());
-                }
-            }
+            Action::Next | Action::Prev => self.step_focus(action == Action::Next),
             Action::Attention => self.next_attention(),
-            Action::Grid => self.view = if self.view == View::Grid { View::Focus } else { View::Grid },
+            Action::Grid => {
+                self.view = if self.view == View::Grid { View::Focus } else { View::Grid };
+                self.keep_grid_focus();
+            }
             Action::Sidebar => self.sidebar = !self.sidebar,
             // wide → narrow → icons → wide. From hidden, it brings the
             // sidebar back small, as narrow as it was.
@@ -1562,7 +1763,8 @@ impl App {
                 if self.agents.is_empty() {
                     self.toast("no agents to talk to yet", ToastKind::Info);
                 } else {
-                    self.modal = Some(Modal::Broadcast(TextInput::default(), BroadcastTarget::All));
+                    let target = if self.selected.is_empty() { BroadcastTarget::All } else { BroadcastTarget::Selected };
+                    self.modal = Some(Modal::Broadcast(TextInput::default(), target));
                 }
             }
             Action::Rename => {
@@ -1571,11 +1773,18 @@ impl App {
                 }
             }
             Action::Close => {
-                if let Some(id) = self.focused().map(|a| a.id) {
+                if !self.selected.is_empty() {
+                    self.ask_close_selected();
+                } else if let Some(id) = self.focused().map(|a| a.id) {
                     self.ask_close(id);
                 }
             }
             Action::Menu => self.open_focused_menu(),
+            Action::Select => {
+                if let Some(id) = self.focused().map(|a| a.id) {
+                    self.toggle_selected(id);
+                }
+            }
             Action::Detach => self.detach = true,
             Action::Help => self.modal = Some(Modal::Help),
             Action::Settings => self.open_settings(),
@@ -1595,6 +1804,22 @@ impl App {
             (true, false) => SidebarSize::Narrow,
             (true, true) => SidebarSize::Icons,
         }
+    }
+
+    /// alt+j / alt+k: the next or previous agent; in a grid of the
+    /// selection, the next or previous one in it.
+    fn step_focus(&mut self, forward: bool) {
+        let order = if self.view == View::Grid { self.grid_shown() } else { (0..self.agents.len()).collect() };
+        if order.is_empty() {
+            return;
+        }
+        let n = order.len();
+        let next = match order.iter().position(|&i| i == self.focus) {
+            Some(p) if forward => order[(p + 1) % n],
+            Some(p) => order[(p + n - 1) % n],
+            None => order[0],
+        };
+        self.set_focus(next);
     }
 
     /// alt+m, or the settings: the sidebar's width, remembered.
@@ -2062,6 +2287,13 @@ impl App {
                     self.close(id);
                 }
             }
+            Modal::ConfirmCloseMany(ids) => {
+                let ids = std::mem::take(ids);
+                self.modal = None;
+                if matches!(k.code, KeyCode::Char('y') | KeyCode::Enter) && !self.dialog_hidden.get() {
+                    self.close_many(&ids);
+                }
+            }
             Modal::Rename(_, _) | Modal::Broadcast(..) | Modal::New(_) if k.code == KeyCode::Enter && self.dialog_hidden.get() => {
                 let what = match modal {
                     Modal::Rename(..) => "the new name",
@@ -2097,11 +2329,18 @@ impl App {
             }
             Modal::Broadcast(t, target) => match k.code {
                 KeyCode::Tab | KeyCode::BackTab => {
-                    *target = if *target == BroadcastTarget::All { BroadcastTarget::Waiting } else { BroadcastTarget::All };
+                    // The selection is a target only while there is one.
+                    let mut order = vec![BroadcastTarget::All, BroadcastTarget::Waiting];
+                    if !self.selected.is_empty() {
+                        order.insert(0, BroadcastTarget::Selected);
+                    }
+                    let n = order.len();
+                    let at = order.iter().position(|o| o == target).unwrap_or(0);
+                    *target = order[if k.code == KeyCode::Tab { (at + 1) % n } else { (at + n - 1) % n }];
                 }
                 KeyCode::Enter => {
                     let (text, target) = (t.text.clone(), *target);
-                    if !text.trim().is_empty() && !self.agents.iter().any(|a| broadcast_reaches(a, target)) {
+                    if !text.trim().is_empty() && !self.agents.iter().any(|a| self.reaches(a, target)) {
                         // Keep the dialog, and what was typed, for when one is free.
                         self.toast("no agent would get it: nothing was sent", ToastKind::Bad);
                         return;
@@ -2254,8 +2493,9 @@ impl App {
             return;
         }
         let mut n = 0;
-        for a in self.agents.iter_mut() {
-            if !broadcast_reaches(a, target) {
+        let reach: Vec<bool> = self.agents.iter().map(|a| self.reaches(a, target)).collect();
+        for (a, reach) in self.agents.iter_mut().zip(reach) {
+            if !reach {
                 continue;
             }
             let mode = *a.term.lock().mode();
@@ -2299,6 +2539,20 @@ impl App {
                 {
                     self.open_new();
                     self.dirty = true;
+                    return;
+                }
+                if let Some(r) = self.hits.unselect
+                    && inside(&r)
+                {
+                    self.clear_selection();
+                    return;
+                }
+                // alt+click on a card: in the selection or out, nothing else.
+                if m.modifiers.contains(KeyModifiers::ALT)
+                    && let Some(&(_, id)) = self.hits.cards.iter().find(|(r, _)| inside(r))
+                {
+                    self.last_click = None;
+                    self.toggle_selected(id);
                     return;
                 }
                 if let Some(&(_, id)) = self.hits.pins.iter().find(|(r, _)| inside(r)) {
@@ -2430,7 +2684,7 @@ pub fn broadcast_reaches(a: &Agent, target: BroadcastTarget) -> bool {
         return false;
     }
     let by_state = match target {
-        BroadcastTarget::All => matches!(a.state, State::Idle | State::Working | State::Done),
+        BroadcastTarget::All | BroadcastTarget::Selected => matches!(a.state, State::Idle | State::Working | State::Done),
         BroadcastTarget::Waiting => matches!(a.state, State::Idle | State::Done),
     };
     // The state can lag behind the screen: a permission dialog is up before
@@ -2800,7 +3054,8 @@ mod tests {
         click(&mut app, MouseButton::Right, 3, 6);
         assert_eq!(menu_of(&app), Some(Menu { agent: 2, at: Some((3, 6)), sel: MenuItem::Rename }));
         assert_eq!(app.focus, 0, "a menu doesn't move the focus");
-        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::CopyPath, MenuItem::Close]);
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close));
@@ -2880,7 +3135,7 @@ mod tests {
         app.modal = None;
         // An exited agent can be restarted, and closes without asking.
         app.agents[1].set_state(State::Exited, false);
-        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Close]);
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
         app.open_menu(2, None);
         hit(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
         assert_eq!(app.agents.len(), 1);
@@ -2985,6 +3240,207 @@ mod tests {
         assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Rename));
     }
 
+    /// Four idle agents, ids 1–4, their cards one under the other.
+    fn selection_app() -> App {
+        let mut app = test_app();
+        for id in 1..=4u32 {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.name = format!("a{id}");
+            a.set_state(State::Idle, false);
+            app.agents.push(a);
+        }
+        app.hits.cards = (0..4u16).map(|k| (Rect::new(0, 2 + 3 * k, 20, 3), u32::from(k) + 1)).collect();
+        app
+    }
+    fn alt_click(app: &mut App, x: u16, y: u16) {
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::ALT });
+    }
+    fn names(app: &App) -> Vec<String> {
+        app.selected_agents().map(|a| a.name.clone()).collect()
+    }
+
+    #[test]
+    fn alt_click_and_alt_x_pick_agents_without_moving_the_focus() {
+        let mut app = selection_app();
+        let alt = KeyModifiers::ALT;
+        alt_click(&mut app, 3, 6);
+        assert_eq!(names(&app), ["a2"]);
+        assert_eq!(app.focus, 0, "alt+click doesn't move the focus");
+        // A second one right after isn't a double-click: no rename, just out.
+        alt_click(&mut app, 3, 6);
+        assert!(app.modal.is_none());
+        assert!(app.selected.is_empty());
+        alt_click(&mut app, 3, 9);
+        hit(&mut app, KeyCode::Char('x'), alt);
+        assert_eq!(names(&app), ["a1", "a3"], "in the list's order");
+        assert_eq!(app.selected, [3, 1], "kept in the order picked");
+        // The header's ✕ clears them.
+        app.hits.unselect = Some(Rect::new(30, 1, 1, 1));
+        click(&mut app, MouseButton::Left, 30, 1);
+        assert!(app.selected.is_empty());
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn the_grid_shows_the_selection_live() {
+        let mut app = selection_app();
+        let alt = KeyModifiers::ALT;
+        for y in [6, 9] {
+            alt_click(&mut app, 3, y);
+        }
+        // From an agent outside the selection, the grid goes to one in it.
+        hit(&mut app, KeyCode::Char('g'), alt);
+        assert!(app.view == View::Grid);
+        assert_eq!(app.grid_shown(), [1, 2]);
+        assert_eq!(app.focus, 1);
+        assert_eq!((app.grid_slot(0), app.grid_slot(2)), (None, Some(1)));
+        // alt+j and alt+k go round the selection only.
+        hit(&mut app, KeyCode::Char('j'), alt);
+        assert_eq!(app.focus, 2);
+        hit(&mut app, KeyCode::Char('j'), alt);
+        assert_eq!(app.focus, 1);
+        hit(&mut app, KeyCode::Char('k'), alt);
+        assert_eq!(app.focus, 2);
+        // Picking one more adds a tile; unpicking the focused one moves on.
+        alt_click(&mut app, 3, 12);
+        assert_eq!(app.grid_shown(), [1, 2, 3]);
+        hit(&mut app, KeyCode::Char('x'), alt);
+        assert_eq!(app.grid_shown(), [1, 3]);
+        assert_eq!(app.focus, 3, "the next one in the selection");
+        // An agent the grid leaves out is seen on its own.
+        hit(&mut app, KeyCode::Char('1'), alt);
+        assert!(app.view == View::Focus);
+        assert_eq!(app.focus, 0);
+        // With nothing selected, the grid has everyone again.
+        app.selected.clear();
+        hit(&mut app, KeyCode::Char('g'), alt);
+        assert_eq!(app.grid_shown(), [0, 1, 2, 3]);
+        assert_eq!(app.focus, 0);
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn close_takes_the_whole_selection_and_asks_once() {
+        let mut app = selection_app();
+        let alt = KeyModifiers::ALT;
+        alt_click(&mut app, 3, 6);
+        alt_click(&mut app, 3, 12);
+        hit(&mut app, KeyCode::Char('w'), alt);
+        assert!(matches!(&app.modal, Some(Modal::ConfirmCloseMany(ids)) if *ids == [2, 4]), "asks, they still run");
+        // One closes some other way while it asks: the rest is still asked about.
+        app.close(4);
+        assert!(matches!(&app.modal, Some(Modal::ConfirmCloseMany(ids)) if *ids == [2]));
+        tap(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.agents.len(), 3, "no: nothing closed");
+        assert_eq!(app.selected, [2], "and the selection stays");
+        alt_click(&mut app, 3, 9);
+        hit(&mut app, KeyCode::Char('w'), alt);
+        tap(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["a1"]);
+        assert!(app.selected.is_empty());
+        assert!(app.toast.as_ref().is_some_and(|t| t.text == "closed 2 agents"));
+        // Exited ones go without asking, like one would.
+        let mut b = crate::agent::test_agent(Kind::Claude);
+        b.id = 9;
+        b.set_state(State::Exited, false);
+        app.agents.push(b);
+        app.selected = vec![9];
+        hit(&mut app, KeyCode::Char('w'), alt);
+        assert!(app.modal.is_none());
+        assert_eq!(app.agents.len(), 1);
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn the_menu_of_a_selected_agent_is_the_selections() {
+        let mut app = selection_app();
+        let alt = KeyModifiers::ALT;
+        // An agent's own menu selects it.
+        app.open_menu(3, None);
+        tap(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.selected, [3]);
+        alt_click(&mut app, 3, 12);
+        app.agents[3].set_state(State::Exited, false);
+        // Right-click on one of them: the selection's menu, no rename.
+        click(&mut app, MouseButton::Right, 3, 9);
+        assert_eq!(app.menu_items(3), [MenuItem::Restart, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+        let labels: Vec<String> = app.menu_items(3).into_iter().map(|i| app.menu_label(3, i)).collect();
+        assert_eq!(labels, ["Restart 1 exited", "Copy 2 folder paths", "Unselect all", "Close 2 agents"]);
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Restart));
+        // On one outside it: that one's own.
+        app.modal = None;
+        click(&mut app, MouseButton::Right, 3, 3);
+        assert_eq!(app.menu_items(1)[0], MenuItem::Rename);
+        // alt+o with a selection: the selection's, whatever has the focus.
+        app.modal = None;
+        hit(&mut app, KeyCode::Char('o'), alt);
+        assert!(menu_of(&app).is_some_and(|m| app.menu_is_bulk(m.agent)));
+        tap(&mut app, KeyCode::Char('f'));
+        assert!(app.toast.as_ref().is_some_and(|t| t.text == "copied 2 folder paths"));
+        hit(&mut app, KeyCode::Char('o'), alt);
+        tap(&mut app, KeyCode::Char('e'));
+        assert!(app.selected.is_empty(), "unselect all");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_restarted_agent_stays_selected() {
+        let mut app = test_app();
+        let spec = |name: &str| Spawn {
+            kind: Kind::Custom,
+            name: name.into(),
+            cwd: std::env::temp_dir(),
+            command: Some("exec sleep 60".into()),
+            prompt: None,
+            branch_note: None,
+            resume: None,
+        };
+        let a = app.spawn_quiet(spec("x")).unwrap();
+        let b = app.spawn_quiet(spec("y")).unwrap();
+        app.selected = vec![a, b];
+        for ag in &mut app.agents {
+            ag.set_state(State::Exited, false);
+        }
+        app.open_menu(a, None);
+        tap(&mut app, KeyCode::Char('s'));
+        assert!(app.agents.iter().all(|ag| ag.id != a && ag.id != b), "new processes, new ids");
+        assert_eq!(app.selected_agents().count(), 2, "both still selected");
+        app.shutdown_all();
+    }
+
+    #[test]
+    fn a_broadcast_goes_to_the_selection_first() {
+        let mut app = selection_app();
+        let alt = KeyModifiers::ALT;
+        hit(&mut app, KeyCode::Char('b'), alt);
+        assert!(matches!(app.modal, Some(Modal::Broadcast(_, BroadcastTarget::All))), "nothing selected: everyone");
+        tap(&mut app, KeyCode::Tab);
+        tap(&mut app, KeyCode::Tab);
+        assert!(matches!(app.modal, Some(Modal::Broadcast(_, BroadcastTarget::All))), "no selection to cycle to");
+        app.modal = None;
+        alt_click(&mut app, 3, 6);
+        hit(&mut app, KeyCode::Char('b'), alt);
+        assert!(matches!(app.modal, Some(Modal::Broadcast(_, BroadcastTarget::Selected))));
+        let reach: Vec<bool> = app.agents.iter().map(|a| app.reaches(a, BroadcastTarget::Selected)).collect();
+        assert_eq!(reach, [false, true, false, false]);
+        for (code, want) in [(KeyCode::Tab, BroadcastTarget::All), (KeyCode::Tab, BroadcastTarget::Waiting), (KeyCode::Tab, BroadcastTarget::Selected), (KeyCode::BackTab, BroadcastTarget::Waiting)] {
+            tap(&mut app, code);
+            assert!(matches!(app.modal, Some(Modal::Broadcast(_, t)) if t == want));
+        }
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
     #[test]
     fn the_highlight_stays_on_its_item_when_the_list_changes() {
         let mut app = menu_app();
@@ -2994,7 +3450,7 @@ mod tests {
         // It exits while the menu is open: Restart comes in above Close.
         app.agents[1].set_state(State::Exited, false);
         hit(&mut app, KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::CopyPath), "one up from Close");
+        assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Select), "one up from Close");
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.agents.len(), 1, "Enter ran Close, not what took its place");
