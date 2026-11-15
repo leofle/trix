@@ -262,12 +262,16 @@ pub fn copilot_instruction_dirs(existing: Option<&str>, dir: &Path) -> String {
 }
 
 /// Only the pane's own startup gets workspace context, never observer subagents.
+/// Muse's from trix's managed hooks; Gemini's from the hooks you added
+/// (Gemini 0.68 puts `additionalContext` in the conversation as a
+/// `<hook_context>` turn; its subagents run no `SessionStart`).
 fn workspace_hook_context(source: &str, payload: &Value, pane: Option<&str>) -> Option<Value> {
-    if source != "muse" || payload.get("hook_event_name")?.as_str()? != "SessionStart" {
+    if !matches!(source, "muse" | "gemini") || payload.get("hook_event_name")?.as_str()? != "SessionStart" {
         return None;
     }
     // An empty `MUSE_SESSION_ID` names no pane, as in `condense_muse`.
-    if let Some(pane) = pane.filter(|p| !p.is_empty())
+    if source == "muse"
+        && let Some(pane) = pane.filter(|p| !p.is_empty())
         && payload.get("session_id").and_then(Value::as_str) != Some(pane)
     {
         return None;
@@ -989,7 +993,12 @@ fn condense_gemini(agent: u32, v: &Value) -> HookMsg {
     m.tool = text(v, "tool_name").map(|t| if t == "ask_user" { "AskUserQuestion".into() } else { t });
     m.detail = match event {
         "PreToolUse" => v.get("tool_input").and_then(|i| tool_detail(m.tool.as_deref(), i)),
-        "UserPromptSubmit" => text(v, "prompt").map(|p| one_line(&p, 80)),
+        // Headless (`-p`), Gemini puts `SessionStart`'s context before the
+        // prompt itself: the prompt is what's after it.
+        "UserPromptSubmit" => text(v, "prompt").map(|p| {
+            let own = p.trim_start().strip_prefix("<hook_context>").and_then(|r| r.split_once("</hook_context>")).map_or(p.as_str(), |(_, r)| r);
+            one_line(own, 80)
+        }),
         // "Tool Confirm Shell Command requires execution": what it asks
         // about, should no `BeforeTool` have named it.
         "PermissionRequest" => v
@@ -1317,6 +1326,10 @@ mod tests {
         assert!(workspace_hook_context("muse", &start, Some("")).is_some());
         assert!(workspace_hook_context("muse", &start, None).is_some());
         assert!(workspace_hook_context("copilot", &start, None).is_none());
+        // Gemini's, from the hooks you add; Muse's pane id means nothing to it.
+        let gemini = json!({"hook_event_name":"SessionStart","session_id":"g-1","source":"startup"});
+        assert_eq!(workspace_hook_context("gemini", &gemini, Some("pane")), Some(context.clone()));
+        assert!(workspace_hook_context("gemini", &json!({"hook_event_name":"BeforeAgent"}), None).is_none(), "startup only, never a turn's");
         assert!(workspace_hook_context("muse", &json!({"hook_event_name":"PermissionRequest"}), None).is_none());
     }
 
@@ -1618,6 +1631,8 @@ process.stdout.write(JSON.stringify(out));"#
         assert_eq!((m.source.as_str(), m.event.as_str(), m.session.as_deref(), m.transcript.as_deref()), ("gemini", "SessionStart", Some("6f1c-s"), None));
         let m = g(with("BeforeAgent", json!({"prompt": "fix\n the   login"})));
         assert_eq!((m.event.as_str(), m.detail.as_deref()), ("UserPromptSubmit", Some("fix the login")));
+        let m = g(with("BeforeAgent", json!({"prompt": "<hook_context>You are running inside a Trix workspace…</hook_context>\n\nsay hi"})));
+        assert_eq!(m.detail.as_deref(), Some("say hi"), "headless: the workspace context, then the prompt");
         let m = g(with("BeforeTool", json!({"tool_name": "run_shell_command", "tool_input": {"command": "cargo test", "description": "Run the tests"}})));
         assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref()), ("PreToolUse", Some("run_shell_command"), Some("cargo test")));
         let m = g(with("BeforeTool", json!({"tool_name": "replace", "tool_input": {"file_path": "/w/src/app.rs", "old_string": "a", "new_string": "b"}})));
