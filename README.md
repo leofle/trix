@@ -333,8 +333,10 @@ Trix supplies workspace discovery instructions to Claude through
 `--append-system-prompt` and Codex through `-c developer_instructions=…`.
 New sessions are instructed to run `trix ls --json`, identify their own pane,
 and use Trix commands for authorized coordination. Claude's custom append
-prompt is combined with these instructions; explicit Codex command overrides
-come last and take precedence.
+prompt is combined with these instructions. So are the `developer_instructions`
+in your Codex `config.toml` (the active profile's, else the top level's), which
+`-c` would otherwise replace. A `-c developer_instructions=…` in your own Codex
+args comes last and replaces both.
 
 OpenCode receives a runtime instruction file through its session configuration;
 Copilot receives the same file through `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`,

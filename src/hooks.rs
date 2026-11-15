@@ -155,6 +155,9 @@ pub struct Integrations {
     /// Muse Code managed hooks file, named with `muse -c
     /// managed_hooks_path=…`.
     pub muse_hooks: Option<PathBuf>,
+    /// Codex's config folder, read at each Codex start for the user's own
+    /// `developer_instructions`. Nothing is written there.
+    pub codex_home: Option<PathBuf>,
     /// OpenCode takes `--standalone` (2.x). Without it, OpenCode 2 joins a
     /// background server that the first OpenCode started, with that one's
     /// environment: the plugin, the pane and the trix server it reports to.
@@ -192,6 +195,7 @@ impl Integrations {
             cursor_plugin: write_cursor_plugin(exe).ok(),
             copilot_plugin: write_copilot_plugin(exe).ok(),
             muse_hooks: write_muse_hooks(exe).ok(),
+            codex_home: crate::agent::codex_home(),
             standalone,
             themed: false,
         }
@@ -207,6 +211,7 @@ impl Integrations {
             cursor_plugin: None,
             copilot_plugin: None,
             muse_hooks: None,
+            codex_home: None,
             standalone: Arc::new(OnceLock::from(standalone)),
             themed: false,
         }
@@ -261,7 +266,8 @@ fn workspace_hook_context(source: &str, payload: &Value, pane: Option<&str>) -> 
     if source != "muse" || payload.get("hook_event_name")?.as_str()? != "SessionStart" {
         return None;
     }
-    if let Some(pane) = pane
+    // An empty `MUSE_SESSION_ID` names no pane, as in `condense_muse`.
+    if let Some(pane) = pane.filter(|p| !p.is_empty())
         && payload.get("session_id").and_then(Value::as_str) != Some(pane)
     {
         return None;
@@ -1267,6 +1273,8 @@ mod tests {
         assert_eq!(context["hookSpecificOutput"]["additionalContext"], crate::agent::WORKSPACE_INSTRUCTIONS);
         assert!(context.get("decision").is_none());
         assert!(workspace_hook_context("muse", &start, Some("observer")).is_none());
+        assert!(workspace_hook_context("muse", &start, Some("")).is_some());
+        assert!(workspace_hook_context("muse", &start, None).is_some());
         assert!(workspace_hook_context("copilot", &start, None).is_none());
         assert!(workspace_hook_context("muse", &json!({"hook_event_name":"PermissionRequest"}), None).is_none());
     }
