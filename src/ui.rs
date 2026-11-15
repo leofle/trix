@@ -146,24 +146,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     f.buffer_mut().set_style(area, Style::new().bg(t.surface));
     let count = |s: State| app.agents.iter().filter(|a| a.state == s).count();
-    let mut spans = vec![
-        Span::styled(" ◆ ", Style::new().fg(t.accent)),
-        Span::styled("trix", Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
-        Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), Style::new().fg(t.muted)),
+    // Each item says how soon it goes when the bar is too narrow for both
+    // sides with a space between: the lowest rank first, whole items only.
+    const KEEP: u8 = u8::MAX;
+    let mut left: Vec<(u8, Vec<Span>)> = vec![
+        (KEEP, vec![
+            Span::styled(" ◆ ", Style::new().fg(t.accent)),
+            Span::styled("trix", Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
+        ]),
+        (1, vec![Span::styled(concat!(" v", env!("CARGO_PKG_VERSION")), Style::new().fg(t.muted))]),
     ];
     if !crate::session::is_default() {
-        spans.push(Span::styled(" · ", Style::new().fg(t.muted)));
-        spans.push(Span::styled(crate::session::name(), Style::new().fg(t.accent).add_modifier(Modifier::BOLD)));
+        left.push((4, vec![
+            Span::styled(" · ", Style::new().fg(t.muted)),
+            Span::styled(crate::session::name(), Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+        ]));
     }
-    spans.push(Span::styled("   ", Style::new()));
     let pills = [
-        (State::Blocked, "needs you"),
-        (State::Working, "working"),
-        (State::Done, "done"),
-        (State::Idle, "idle"),
+        (State::Blocked, "needs you", 7),
+        (State::Working, "working", 3),
+        (State::Done, "done", 2),
+        (State::Idle, "idle", 0),
     ];
     let mut any = false;
-    for (s, label) in pills {
+    for (s, label, rank) in pills {
         let n = count(s) + if s == State::Working { count(State::Starting) } else { 0 };
         if n == 0 {
             continue;
@@ -172,34 +178,44 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         let (g, gs) = glyph(app, s);
         let c = state_color(t, s);
         let bold = if s == State::Blocked { Modifier::BOLD } else { Modifier::empty() };
-        spans.push(Span::styled(format!("{g} "), gs));
-        spans.push(Span::styled(format!("{n} {label}"), Style::new().fg(c).add_modifier(bold)));
-        spans.push(Span::raw("   "));
+        left.push((rank, vec![
+            Span::raw("   "),
+            Span::styled(format!("{g} "), gs),
+            Span::styled(format!("{n} {label}"), Style::new().fg(c).add_modifier(bold)),
+        ]));
     }
     if !any {
-        spans.push(Span::styled("no agents yet", Style::new().fg(t.dim)));
+        left.push((0, vec![Span::raw("   "), Span::styled("no agents yet", Style::new().fg(t.dim))]));
     }
-    f.render_widget(Paragraph::new(TLine::from(spans)), area);
 
-    let now = clock();
     let view = match app.view {
         View::Focus => "focus",
         View::Grid => "grid",
     };
-    let mut right = Vec::new();
+    let mut right: Vec<(u8, Vec<Span>)> = Vec::new();
     if app.viewers > 0 {
-        right.push(Span::styled("◉ ", Style::new().fg(t.accent)));
-        right.push(Span::styled(format!("{} watching", app.viewers), Style::new().fg(t.fg)));
-        right.push(Span::styled("  ·  ", Style::new().fg(t.muted)));
+        right.push((5, vec![
+            Span::styled("◉ ", Style::new().fg(t.accent)),
+            Span::styled(format!("{} watching", app.viewers), Style::new().fg(t.fg)),
+            Span::styled("  ·  ", Style::new().fg(t.muted)),
+        ]));
     }
-    right.extend([
-        Span::styled(view, Style::new().fg(t.dim)),
-        Span::styled("  ·  ", Style::new().fg(t.muted)),
-        Span::styled(now, Style::new().fg(t.fg)),
-        Span::raw(" "),
-    ]);
-    let right = TLine::from(right);
-    f.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+    right.push((6, vec![Span::styled(view, Style::new().fg(t.dim)), Span::styled("  ·  ", Style::new().fg(t.muted))]));
+    right.push((KEEP, vec![Span::styled(clock(), Style::new().fg(t.fg)), Span::raw(" ")]));
+
+    let width = |items: &[(u8, Vec<Span>)]| items.iter().flat_map(|(_, s)| s).map(|s| s.width()).sum::<usize>();
+    while width(&left) + 1 + width(&right) > area.width as usize {
+        let lowest = |items: &[(u8, Vec<Span>)]| items.iter().enumerate().filter(|(_, (r, _))| *r != KEEP).min_by_key(|(_, (r, _))| *r).map(|(i, (r, _))| (*r, i));
+        match (lowest(&left), lowest(&right)) {
+            (Some(l), Some(r)) if r.0 < l.0 => drop(right.remove(r.1)),
+            (Some(l), _) => drop(left.remove(l.1)),
+            (None, Some(r)) => drop(right.remove(r.1)),
+            (None, None) => break,
+        }
+    }
+    let line = |items: Vec<(u8, Vec<Span<'static>>)>| TLine::from(items.into_iter().flat_map(|(_, s)| s).collect::<Vec<_>>());
+    f.render_widget(Paragraph::new(line(left)), area);
+    f.render_widget(Paragraph::new(line(right)).alignment(Alignment::Right), area);
 }
 
 /// Every time shown on screen as text: the clock and each agent's time in
@@ -340,7 +356,9 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     }
     f.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
 
-    let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), ..inner };
+    // The icons rail gives its cards the right-hand margin too, so a row
+    // has room for a two-digit number: " ▌12 ⠹•".
+    let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), width: inner.width + u16::from(icons), ..inner };
     let n = app.agents.len();
     let mini = app.sidebar_mini;
     // Cards keep their size (alt+c makes them one line); what doesn't fit
@@ -473,11 +491,13 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
         Style::new().fg(t.fg)
     };
     if mini && app.sidebar_icons {
-        // " 1 ⠹•": which agent, and its state. The bar on the left still
-        // marks the focus and who needs you.
+        // "  1 ⠹•" or " 12 ⠹•": which agent, and its state. With no names
+        // here, the number is all that tells rows apart, so 10 and up get
+        // theirs too, right-aligned. The bar on the left still marks the
+        // focus and who needs you.
         let mut line = vec![
             Span::raw(" "),
-            Span::styled(idx, idx_style),
+            Span::styled(format!("{:>2}", i + 1), idx_style),
             Span::raw(" "),
             Span::styled(g, gs),
         ];
@@ -2964,17 +2984,89 @@ mod tests {
         println!("{icons}");
         let cards = &app.hits.cards;
         assert_eq!(cards.len(), 4);
-        assert!(cards.iter().all(|(r, _)| r.height == 1 && r.width == SIDEBAR_ICONS_W - 2));
+        assert!(cards.iter().all(|(r, _)| r.height == 1 && r.width == SIDEBAR_ICONS_W - 1));
         let row = |i: usize| icons.lines().nth(cards[i].0.y as usize).unwrap().chars().take(SIDEBAR_ICONS_W as usize).collect::<String>();
         let (g, _) = glyph(&app, State::Blocked);
-        assert!(row(0).starts_with(" ▌1 "), "focused: accent bar: {}", row(0));
-        assert_eq!(row(1).trim_end(), format!(" ▌2 {g}"), "needs you: red bar and its glyph, no dot");
+        assert!(row(0).starts_with(" ▌ 1 "), "focused: accent bar: {}", row(0));
+        assert_eq!(row(1).trim_end(), format!(" ▌ 2 {g}"), "needs you: red bar and its glyph, no dot");
         assert!(row(2).trim_end().ends_with('•'), "unseen work keeps its dot: {}", row(2));
-        assert!(row(3).starts_with("  4 "), "nothing to say: no bar: {}", row(3));
+        assert!(row(3).starts_with("   4 "), "nothing to say: no bar: {}", row(3));
         for name in ["web", "api", "docs", "AGENTS", "new"] {
             assert!(!icons.lines().any(|l| l.chars().take(SIDEBAR_ICONS_W as usize).collect::<String>().contains(name)), "no {name} in the rail:\n{icons}");
         }
         assert!(icons.lines().any(|l| l.trim_end() == "  +" || l.starts_with("  +  ")), "the new button stays, as a +");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn icons_sidebar_numbers_every_agent() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.sidebar_mini = true;
+        app.sidebar_icons = true;
+        for i in 0..12 {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Shell);
+            a.name = format!("a{i}");
+            a.set_state(if i == 11 { State::Blocked } else { State::Idle }, false);
+            app.agents.push(a);
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |i: usize| {
+            let r = app.hits.cards[i].0;
+            (0..SIDEBAR_ICONS_W).map(|x| buf[(x, r.y)].symbol().to_string()).collect::<String>()
+        };
+        let (idle, _) = glyph(&app, State::Idle);
+        let (blocked, _) = glyph(&app, State::Blocked);
+        assert_eq!(row(8).trim_end(), format!("   9 {idle}"), "single digits line up with two");
+        assert_eq!(row(9).trim_end(), format!("  10 {idle}"));
+        assert_eq!(row(10).trim_end(), format!("  11 {idle}"));
+        assert_eq!(row(11).trim_end(), format!(" ▌12 {blocked}"), "the one that needs you can be named");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn top_bar_drops_whole_items_when_narrow() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        for i in 0..12 {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Shell);
+            a.name = format!("a{i}");
+            a.set_state(if i == 11 { State::Blocked } else { State::Idle }, false);
+            app.agents.push(a);
+        }
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let mut seen_needs = false;
+        for w in (24..=80).rev() {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let top: String = (0..w).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+            let top = top.trim_end();
+            let (left, right) = top.split_at(top.rfind("  ").map(|i| i + 2).unwrap_or(0));
+            // Every word is whole: no item is cut or drawn over another.
+            for word in left.split_whitespace().chain(right.split_whitespace()) {
+                assert!(["◆", "trix", version, "▲", "○", "1", "11", "needs", "you", "idle", "focus", "·"].contains(&word) || word.contains(':'), "{w} cols, cut word {word:?}: {top:?}");
+            }
+            assert!(top.contains("trix") && top.contains(':'), "the name and clock stay at {w}: {top:?}");
+            let needs = top.contains("1 needs you");
+            if needs {
+                seen_needs = true;
+                if top.contains("idle") {
+                    assert!(top.contains(version), "the idle count goes before the version at {w}: {top:?}");
+                }
+            } else {
+                assert!(!top.contains("idle") && !top.contains(version) && !top.contains("focus"), "needs you goes last, at {w}: {top:?}");
+            }
+        }
+        assert!(seen_needs);
         for a in &app.agents {
             a.shutdown();
         }
