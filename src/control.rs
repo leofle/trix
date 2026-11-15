@@ -1,7 +1,7 @@
 //! Agents driving agents.
 //!
-//! `trix ls --json`, `trix send`, `trix read`, `trix wait`, `trix spawn` and
-//! `trix close` let anything with a shell (most usefully, an agent in another
+//! `trix ls --json`, `trix send`, `trix read`, `trix wait`, `trix spawn`,
+//! `trix close` and `trix args` let anything with a shell (most usefully, an agent in another
 //! pane) work the workspace the way the human does. They talk to the server
 //! over the control socket: one `ClientMsg::Control` request, one JSON
 //! `Reply` back in a `TEXT` frame, and the client prints it and exits with its
@@ -58,6 +58,9 @@ pub enum Request {
     Wait { targets: Vec<String>, all: bool, timeout_secs: u64 },
     Spawn { kind: String, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool },
     Close { target: String, force: bool },
+    /// Show (`set: None`, `clear: false`), replace or clear the extra
+    /// arguments an agent starts with next time (`trix args`).
+    Args { target: String, set: Option<String>, clear: bool },
     /// The agents open now, as JSON `SavedAgent`s (`trix layout save`).
     Layout,
     /// Start a saved layout's agents (`trix layout open`).
@@ -84,7 +87,7 @@ impl Reply {
 
 // ───────────────────────────── client side ─────────────────────────────
 
-pub const COMMANDS: [&str; 6] = ["send", "read", "wait", "spawn", "close", "events"];
+pub const COMMANDS: [&str; 7] = ["send", "read", "wait", "spawn", "close", "events", "args"];
 
 /// Flags whose next argument is their value, whatever it looks like.
 pub const VALUE_FLAGS: &[&str] = &["--lines", "-n", "--timeout", "-t", "--name", "--cwd", "--prompt", "--args"];
@@ -92,6 +95,9 @@ pub const VALUE_FLAGS: &[&str] = &["--lines", "-n", "--timeout", "-t", "--name",
 /// Parse `trix <command> …` (session flags already taken out).
 pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
     let (cmd, rest) = args.split_first().ok_or("no command")?;
+    if cmd == "args" {
+        return parse_args(rest);
+    }
     let mut pos = Vec::new();
     let mut flags: Vec<(String, Option<String>)> = Vec::new();
     let takes_value = |f: &str| VALUE_FLAGS.contains(&f);
@@ -186,6 +192,36 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
     })
 }
 
+/// `trix args <agent> [--clear | <args…>]`. Everything after the agent is
+/// the new arguments, flags included (they are the point: `--model …`), so
+/// this doesn't go through the option parser. One word is taken as already
+/// written for a shell (`trix args web "--model x --effort high"`); several
+/// are quoted back together, so `-- --allow-tool 'shell(trix:*)'` survives.
+fn parse_args(rest: &[String]) -> Result<Request, String> {
+    let rest = match rest.first() {
+        Some(f) if f == "--" => &rest[1..],
+        _ => rest,
+    };
+    let (target, words) = rest.split_first().ok_or("args needs an agent (and the new arguments, or --clear)")?;
+    let (words, raw) = match words.first() {
+        Some(f) if f == "--" => (&words[1..], true),
+        _ => (words, false),
+    };
+    let (set, clear) = match words {
+        [] => (None, false),
+        [c] if c == "--clear" && !raw => (None, true),
+        [one] => (Some(one.trim().to_string()), false),
+        many => (Some(shell_words::join(many)), false),
+    };
+    if let Some(s) = &set {
+        if s.is_empty() {
+            return Err("args: the arguments are empty (use --clear to remove them)".into());
+        }
+        shell_words::split(s).map_err(|e| format!("args: can't split '{s}': {e}"))?;
+    }
+    Ok(Request::Args { target: target.clone(), set, clear })
+}
+
 fn absolute(p: PathBuf, cwd: &std::path::Path) -> PathBuf {
     if p.is_absolute() { p } else { cwd.join(p) }
 }
@@ -256,6 +292,7 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Read { target, lines } => read(app, &target, lines),
         Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree),
         Request::Close { target, force } => close(app, from, &target, force),
+        Request::Args { target, set, clear } => extra_args(app, from, &target, set, clear),
         Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
         Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
         Request::Wait { .. } | Request::Events { .. } => unreachable!(),
@@ -534,6 +571,39 @@ fn close(app: &mut App, from: Option<u32>, target: &str, force: bool) -> Reply {
     Reply::ok(format!("closed {name}\n"))
 }
 
+/// Show or change the extra arguments an agent starts with. A change is
+/// saved with the workspace and used the next time trix starts the agent
+/// (a restore, or `trix layout save`); the agent running now keeps the ones
+/// it started with. An agent may change its own: fixing your own launch
+/// flags is the main use.
+fn extra_args(app: &mut App, from: Option<u32>, target: &str, set: Option<String>, clear: bool) -> Reply {
+    let i = match find(app, target) {
+        Ok(i) => i,
+        Err(e) => return Reply::fail(e),
+    };
+    let (id, name, kind) = (app.agents[i].id, app.agents[i].name.clone(), app.agents[i].kind);
+    if kind == Kind::Shell {
+        return Reply::fail(format!("'{name}' is a shell: shells take no extra arguments"));
+    }
+    if kind == Kind::Custom && clear {
+        return Reply::fail(format!("'{name}' is a custom command: its arguments are the command, so it can't go without"));
+    }
+    let Some(args) = app.extra_args_mut(id) else {
+        return Reply::fail(format!("'{name}' has no saved launch to change"));
+    };
+    if set.is_none() && !clear {
+        return Reply::ok(args.as_deref().map(|a| format!("{a}\n")).unwrap_or_default());
+    }
+    let old = std::mem::replace(args, set.clone());
+    let what = set.as_deref().unwrap_or("no extra arguments");
+    let was = old.map(|o| format!(" (was: {o})")).unwrap_or_default();
+    if from != Some(id) {
+        let who = caller_name(app, from).unwrap_or_else(|| "trix args".into());
+        app.toast(format!("{who} → {name}: args {what}"), ToastKind::Info);
+    }
+    Reply::ok(format!("{name} will start with: {what}{was}\n"))
+}
+
 #[derive(Serialize)]
 struct JsonAgent<'a> {
     id: u32,
@@ -668,6 +738,20 @@ mod tests {
         assert!(p(&["wait", "--all", "a"]).is_ok());
         assert!(p(&["close", "--all"]).is_err());
         assert!(p(&["send", "web", "   "]).unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn parses_args_with_their_flags() {
+        let args = |t: &str, set: Option<&str>, clear| Ok(Request::Args { target: t.into(), set: set.map(String::from), clear });
+        assert_eq!(p(&["args", "web"]), args("web", None, false), "no arguments: show them");
+        assert_eq!(p(&["args", "web", "--clear"]), args("web", None, true));
+        assert_eq!(p(&["args", "web", "--model claude-opus-5-5 --effort xhigh"]), args("web", Some("--model claude-opus-5-5 --effort xhigh"), false), "one word is taken as written");
+        assert_eq!(p(&["args", "alpha dog", "--model", "x"]), args("alpha dog", Some("--model x"), false), "flags are the arguments, not trix's options");
+        assert_eq!(p(&["args", "web", "--", "--allow-tool", "shell(trix:*)"]), args("web", Some("--allow-tool 'shell(trix:*)'"), false), "quoted back together");
+        assert_eq!(p(&["args", "web", "--", "--clear"]), args("web", Some("--clear"), false), "after --, --clear is an argument");
+        assert!(p(&["args"]).unwrap_err().contains("needs an agent"));
+        assert!(p(&["args", "web", "  "]).unwrap_err().contains("empty"));
+        assert!(p(&["args", "web", "--append-system-prompt \"unclosed"]).unwrap_err().contains("can't split"));
     }
 
     #[test]
