@@ -75,6 +75,8 @@ fn ways(kind: Kind) -> &'static [Via] {
         // `@muse-code/sdk` is its SDK, not the CLI.
         Kind::Muse => &[Via::Script("https://dev.meta.ai/install.sh")],
         Kind::Gemini => &[Via::Mise("npm:@google/gemini-cli"), Via::Brew("gemini-cli"), Via::Npm("@google/gemini-cli")],
+        // Google ships Antigravity CLI only as its install script.
+        Kind::Antigravity => &[Via::Script("https://antigravity.google/cli/install.sh")],
         Kind::Shell | Kind::Custom => &[],
     }
 }
@@ -289,6 +291,8 @@ mod tests {
         let path = dir.clone().into_os_string();
         assert_eq!(pick(Kind::Copilot, Some(&path)), Some(Via::Script("https://gh.io/copilot-install")));
         assert_eq!(pick(Kind::Muse, Some(&path)), Some(Via::Script("https://dev.meta.ai/install.sh")));
+        // Google's install script is the only Antigravity CLI.
+        assert_eq!(pick(Kind::Antigravity, Some(&path)), Some(Via::Script("https://antigravity.google/cli/install.sh")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -299,6 +303,7 @@ mod tests {
         assert_eq!(needs(Kind::Cursor), "brew or curl");
         assert_eq!(needs(Kind::Copilot), "mise, brew, npm or curl");
         assert_eq!(needs(Kind::Muse), "curl");
+        assert_eq!(needs(Kind::Antigravity), "curl");
     }
 
     #[test]

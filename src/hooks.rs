@@ -684,6 +684,18 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
         println!("{}", if submit { r#"{"continue":true}"# } else { "{}" });
         return report(source, &v, None);
     }
+    // Antigravity reads every hook's stdout as its answer as well, and the
+    // hooks file you add trix to is the one its app and IDE run too: so
+    // answer in a trix pane or out of one, with an answer that decides
+    // nothing.
+    if source == "antigravity" {
+        let mut s = String::new();
+        let _ = std::io::stdin().take(64 << 20).read_to_string(&mut s);
+        let v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+        let pane = std::env::var("TRIX_SOCKET").is_ok() && std::env::var("TRIX_AGENT_ID").is_ok();
+        println!("{}", antigravity_answer(&v, pane));
+        return report(source, &v, None);
+    }
     let (Ok(_), Ok(_)) = (std::env::var("TRIX_SOCKET"), std::env::var("TRIX_AGENT_ID")) else {
         return;
     };
@@ -764,6 +776,7 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         "copilot" => return condense_copilot(agent, v),
         "muse" => return condense_muse(agent, v, std::env::var("MUSE_SESSION_ID").ok().as_deref()),
         "gemini" => return condense_gemini(agent, v),
+        "antigravity" => return condense_antigravity(agent, v),
         _ => {}
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
@@ -1009,6 +1022,73 @@ fn condense_gemini(agent: u32, v: &Value) -> HookMsg {
         _ => None,
     };
     m
+}
+
+/// What `trix hook antigravity` answers: the workspace discovery
+/// instructions as its session starts in a trix pane (a `systemMessage`
+/// step, which takes a nested object), and otherwise nothing that decides
+/// anything. Before a tool that takes a decision: Antigravity 1.5.9 denies
+/// the tool on an answer without one ("tool call denied by pre-tool
+/// hook"), and on `allow` goes on to its own permissions, asking you
+/// where it would have asked.
+fn antigravity_answer(v: &Value, pane: bool) -> Value {
+    match v.get("hookEventName").and_then(Value::as_str) {
+        Some("PreToolUse") => serde_json::json!({"decision": "allow"}),
+        Some("SessionStart") if pane => serde_json::json!({"injectSteps": [{"systemMessage": {"systemMessage": crate::agent::WORKSPACE_INSTRUCTIONS}}]}),
+        _ => serde_json::json!({}),
+    }
+}
+
+/// An Antigravity CLI hook payload (camelCase, as its hooks contract in
+/// 1.5.9 has it), from hooks the user added themselves, put in Claude's
+/// terms. It has no prompt event: `PreInvocation` runs before each model
+/// call, and the agent takes the one that finds no turn under way as the
+/// turn's start. No event reports an approval either: the screen does.
+fn condense_antigravity(agent: u32, v: &Value) -> HookMsg {
+    let name = text(v, "hookEventName").unwrap_or_default();
+    let event = match name.as_str() {
+        "PreInvocation" if v.get("invocationNum").and_then(Value::as_u64) == Some(0) => "UserPromptSubmit",
+        "PreInvocation" => "Busy",
+        "Stop" if text(v, "terminationReason").as_deref() == Some("USER_CANCELED") => "Interrupt",
+        "SessionStart" | "PreToolUse" | "PostToolUse" | "Stop" => name.as_str(),
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "antigravity", event);
+    // Only its session's start names the conversation: a later event may
+    // be a subagent's, with a conversation of its own.
+    if event == "SessionStart" {
+        m.session = text(v, "conversationId");
+    }
+    let call = v.get("toolCall");
+    m.tool = call.and_then(|c| text(c, "name")).map(|t| if t == "ask_question" { "AskUserQuestion".into() } else { t });
+    m.detail = match event {
+        "PreToolUse" => call.and_then(|c| c.get("args")).and_then(|a| antigravity_tool_detail(m.tool.as_deref(), a)),
+        "UserPromptSubmit" | "Busy" => text(v, "lastUserInput").map(|p| one_line(&p, 80)),
+        _ => None,
+    };
+    m
+}
+
+/// What an Antigravity tool call is about. Its arguments are PascalCase
+/// (`CommandLine`, `TargetFile`).
+fn antigravity_tool_detail(tool: Option<&str>, args: &Value) -> Option<String> {
+    let g = |keys: &[&str]| keys.iter().find_map(|k| args.get(*k).and_then(Value::as_str)).filter(|s| !s.is_empty());
+    let base = |p: &str| Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.into());
+    match tool.unwrap_or("") {
+        "run_command" => g(&["CommandLine"]).map(|c| one_line(c, 60)),
+        "view_file" | "view_file_outline" | "write_to_file" | "replace_file_content" | "multi_replace_file_content" => g(&["TargetFile", "AbsolutePath"]).map(base),
+        "list_dir" => g(&["DirectoryPath"]).map(base),
+        "grep_search" | "codebase_search" | "search_web" => g(&["Query", "query"]).map(|q| one_line(q, 40)),
+        "find_by_name" => g(&["Pattern"]).map(|q| one_line(q, 40)),
+        "read_url_content" => g(&["Url"]).map(|u| one_line(u, 50)),
+        "AskUserQuestion" => ["Questions", "questions"]
+            .iter()
+            .find_map(|k| args.get(*k)?.get(0))
+            .and_then(|q| q.get("Question").or_else(|| q.get("question")))
+            .and_then(Value::as_str)
+            .map(|q| one_line(q, 60)),
+        _ => None,
+    }
 }
 
 /// A shell command as a string: Claude sends one; Codex may send an argv,
@@ -1661,5 +1741,62 @@ process.stdout.write(JSON.stringify(out));"#
         assert_eq!(m.event, "Stop");
         assert_eq!(g(with("SessionEnd", json!({"reason": "exit"}))).event, "SessionEnd");
         assert_eq!(g(base("BeforeModel")).event, "unknown");
+    }
+
+    fn ag(v: Value) -> HookMsg {
+        condense(3, "antigravity", &v)
+    }
+
+    /// Payloads as Antigravity CLI 1.5.9's hooks contract has them.
+    #[test]
+    fn antigravity_payloads_in_claude_terms() {
+        let with = |event: &str, extra: Value| {
+            let mut v = json!({"conversationId": "ec33ebf9", "workspacePaths": ["/w"], "transcriptPath": "/t.jsonl", "modelName": "auto", "lastUserInput": "fix\n the   login", "hookEventName": event, "cwd": "/w"});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let m = ag(with("SessionStart", json!({})));
+        assert_eq!((m.source.as_str(), m.event.as_str(), m.session.as_deref()), ("antigravity", "SessionStart", Some("ec33ebf9")));
+        // The turn's first model call is its start; the rest are the same turn's.
+        let m = ag(with("PreInvocation", json!({"invocationNum": 0, "initialNumSteps": 0})));
+        assert_eq!((m.event.as_str(), m.detail.as_deref(), m.session.as_deref()), ("UserPromptSubmit", Some("fix the login"), None));
+        let m = ag(with("PreInvocation", json!({"invocationNum": 3, "initialNumSteps": 10})));
+        assert_eq!((m.event.as_str(), m.detail.as_deref()), ("Busy", Some("fix the login")));
+        assert_eq!(ag(with("PostInvocation", json!({"invocationNum": 3}))).event, "unknown");
+        let m = ag(with("PreToolUse", json!({"toolCall": {"id": "toolu_01", "name": "run_command", "args": {"CommandLine": "npm test", "Cwd": "/w"}}, "stepIdx": 19})));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref(), m.session.as_deref()), ("PreToolUse", Some("run_command"), Some("npm test"), None));
+        let m = ag(with("PreToolUse", json!({"toolCall": {"name": "replace_file_content", "args": {"TargetFile": "/w/src/app.rs"}}})));
+        assert_eq!(m.detail.as_deref(), Some("app.rs"));
+        let m = ag(with("PreToolUse", json!({"toolCall": {"name": "grep_search", "args": {"Query": "fn main", "SearchPath": "/w"}}})));
+        assert_eq!(m.detail.as_deref(), Some("fn main"));
+        let m = ag(with("PreToolUse", json!({"toolCall": {"name": "browser_click", "args": {"x": 1}}})));
+        assert_eq!((m.tool.as_deref(), m.detail.as_deref()), (Some("browser_click"), None));
+        // Its question tool is Claude's.
+        let m = ag(with("PreToolUse", json!({"toolCall": {"name": "ask_question", "args": {"Questions": [{"Question": "Which database?"}]}}})));
+        assert_eq!((m.tool.as_deref(), m.detail.as_deref()), (Some("AskUserQuestion"), Some("Which database?")));
+        let m = ag(with("PostToolUse", json!({"toolCall": {"id": "toolu_01", "name": "run_command", "args": {}}, "error": "exit status 1"})));
+        assert_eq!((m.event.as_str(), m.tool.as_deref()), ("PostToolUse", Some("run_command")));
+        assert_eq!(ag(with("Stop", json!({"executionNum": 1, "terminationReason": "NO_TOOL_CALL", "fullyIdle": true}))).event, "Stop");
+        assert_eq!(ag(with("Stop", json!({"terminationReason": "ERROR", "error": "quota"}))).event, "Stop");
+        assert_eq!(ag(with("Stop", json!({"terminationReason": "USER_CANCELED"}))).event, "Interrupt");
+        assert_eq!(ag(json!({"conversationId": "x"})).event, "unknown", "no event name: an older agy");
+    }
+
+    /// trix's hook only watches: before a tool, the answer that leaves the
+    /// asking to Antigravity's own permissions (none at all denies the
+    /// tool); the workspace instructions at a session's start, in a trix
+    /// pane only.
+    #[test]
+    fn antigravity_answers_decide_nothing() {
+        for pane in [true, false] {
+            assert_eq!(antigravity_answer(&json!({"hookEventName": "PreToolUse"}), pane), json!({"decision": "allow"}));
+            for event in ["PostToolUse", "PreInvocation", "PostInvocation", "Stop"] {
+                assert_eq!(antigravity_answer(&json!({"hookEventName": event}), pane), json!({}), "{event}");
+            }
+        }
+        assert_eq!(antigravity_answer(&json!({"hookEventName": "SessionStart"}), false), json!({}), "its app's and IDE's sessions");
+        assert_eq!(antigravity_answer(&Value::Null, true), json!({}));
+        let a = antigravity_answer(&json!({"hookEventName": "SessionStart"}), true);
+        assert_eq!(a["injectSteps"][0]["systemMessage"]["systemMessage"], crate::agent::WORKSPACE_INSTRUCTIONS);
     }
 }

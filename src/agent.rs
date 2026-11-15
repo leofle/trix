@@ -35,13 +35,16 @@ pub enum Kind {
     Muse,
     /// Google's Gemini CLI (`gemini`).
     Gemini,
+    /// Google's Antigravity CLI (`agy`), which Gemini CLI's personal sign-in
+    /// moved to.
+    Antigravity,
     Shell,
     Custom,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 10] =
-        [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Gemini, Kind::Shell, Kind::Custom];
+    pub const ALL: [Kind; 11] =
+        [Kind::Claude, Kind::Codex, Kind::Grok, Kind::OpenCode, Kind::Cursor, Kind::Copilot, Kind::Muse, Kind::Gemini, Kind::Antigravity, Kind::Shell, Kind::Custom];
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -52,6 +55,7 @@ impl Kind {
             Kind::Copilot => "copilot",
             Kind::Muse => "muse",
             Kind::Gemini => "gemini",
+            Kind::Antigravity => "antigravity",
             Kind::Shell => "shell",
             Kind::Custom => "custom",
         }
@@ -65,7 +69,7 @@ impl Kind {
     /// A known coding agent, so typing a prompt into it is safe. A custom
     /// command may be anything (bash, ssh, psql), so it is not.
     pub fn takes_prompts(self) -> bool {
-        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse | Kind::Gemini)
+        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok | Kind::OpenCode | Kind::Cursor | Kind::Copilot | Kind::Muse | Kind::Gemini | Kind::Antigravity)
     }
     /// It can be started again in the conversation it was in.
     pub fn resumes(self) -> bool {
@@ -78,9 +82,11 @@ impl Kind {
     }
     /// Kinds whose own approval wording `kind_prompt` knows, so a prompt on
     /// screen turns them blocked mid-turn. OpenCode's come as events too:
-    /// the screen is a second source, never the only one.
+    /// the screen is a second source, never the only one. Antigravity has
+    /// no hook for its approvals, but one for the tool it asks about and
+    /// for its questions.
     fn reads_prompts_on_screen(self) -> bool {
-        self.prompts_only_on_screen() || self == Kind::OpenCode
+        self.prompts_only_on_screen() || matches!(self, Kind::OpenCode | Kind::Antigravity)
     }
     /// The new-agent dialog's letter for this kind, on its main row or under
     /// "more ▸". Not `h` or `l`, which step through the kinds.
@@ -95,6 +101,7 @@ impl Kind {
             Kind::Muse => Some('m'),
             // gem-i-ni: `g` is Grok's.
             Kind::Gemini => Some('i'),
+            Kind::Antigravity => Some('a'),
             Kind::Shell => Some('s'),
             Kind::Custom => None,
         }
@@ -642,8 +649,8 @@ impl Agent {
             "codex" if msg.event != "agent-turn-complete" => self.hooked = true,
             "codex" => {}
             // trix's own plugin (OpenCode, Copilot), its managed hooks (Muse)
-            // or the user's hooks (Grok, Gemini).
-            "opencode" | "grok" | "copilot" | "muse" | "gemini" => self.hooked = true,
+            // or the user's hooks (Grok, Gemini, Antigravity).
+            "opencode" | "grok" | "copilot" | "muse" | "gemini" | "antigravity" => self.hooked = true,
             // Cursor runs only `sessionStart` and the tool hooks from trix's
             // plugin (cursor-agent 2026.11.11): no prompt, no turn end. Its
             // screen says when a turn starts and ends; its hooks add what it
@@ -656,7 +663,13 @@ impl Agent {
             Some(d) if !d.is_empty() => format!("{tool} {d}"),
             _ => tool.clone(),
         };
-        match msg.event.as_str() {
+        // Antigravity runs `PreInvocation` before each model call, a turn's
+        // later ones too: one that finds no turn under way starts it.
+        let event = match msg.event.as_str() {
+            "Busy" if msg.source == "antigravity" && !matches!(self.state, State::Working | State::Blocked) => "UserPromptSubmit",
+            e => e,
+        };
+        match event {
             // Muse runs `SessionStart`'s hooks only as its first turn begins,
             // alongside that turn's own (1.4.18), so it may land after the
             // turn ended: it names the conversation, and the state is the
@@ -733,7 +746,7 @@ impl Agent {
             }
             // OpenCode reports its session idle at start too, and the new
             // agents' turn ends mean nothing before a turn began.
-            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse" | "gemini") && !self.turn_seen => None,
+            "Stop" if matches!(msg.source.as_str(), "opencode" | "cursor" | "grok" | "copilot" | "muse" | "gemini" | "antigravity") && !self.turn_seen => None,
             "Stop" | "agent-turn-complete" => {
                 self.pending_tool = None;
                 self.activity = match self.tools_used {
@@ -875,8 +888,20 @@ impl Agent {
             && (self.kind == Kind::OpenCode || quiet > Duration::from_millis(500))
             && self.screen_kind_prompt()
         {
-            self.activity = "needs your approval".into();
+            // Antigravity's `PreToolUse` named the tool it now asks about.
+            self.activity = match &self.pending_tool {
+                Some(t) if self.kind == Kind::Antigravity => format!("approve {t}"),
+                _ => "needs your approval".into(),
+            };
             return self.set_state(State::Blocked, focused);
+        }
+        // Antigravity runs no hook for a tool you decline (1.5.9): the turn
+        // ends there, its prompt gone and the screen still. One you allow
+        // runs on, with its spinner and then its `PostToolUse`.
+        if self.kind == Kind::Antigravity && self.hooked && self.state == State::Blocked && self.pending_tool.is_some() && quiet > Duration::from_secs(2) && !self.screen_kind_prompt() {
+            self.pending_tool = None;
+            self.activity = "declined".into();
+            return self.set_state(State::Idle, focused);
         }
         if self.kind.prompts_only_on_screen() {
             // The agent's prose ("would you like to…") can stay on screen
@@ -965,8 +990,9 @@ impl Agent {
             }
             State::Idle | State::Done if busy && !title_idle => {
                 // Cursor's title names the conversation and Muse's the
-                // folder, not what they do. Gemini's is read above.
-                self.activity = self.title.clone().filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse | Kind::Gemini)).unwrap_or_else(|| "working".into());
+                // folder, not what they do. Gemini's is read above, and
+                // Antigravity's is whatever your own title command prints.
+                self.activity = self.title.clone().filter(|_| !matches!(self.kind, Kind::Cursor | Kind::Muse | Kind::Gemini | Kind::Antigravity)).unwrap_or_else(|| "working".into());
                 self.set_state(State::Working, focused)
             }
             State::Idle | State::Done if quiet > Duration::from_millis(800) && self.kind.is_agent() => {
@@ -1185,8 +1211,8 @@ fn needs_input(screen: &str) -> bool {
 /// (`packages/tui/src/routes/session/permission.tsx`), Cursor CLI's
 /// approval prompts and workspace-trust screen, Copilot CLI's folder trust
 /// and approval prompt, Muse Code's workspace trust, approval choices and
-/// question dialog, Gemini CLI's folder trust and approval prompt, and
-/// Codex's folder-trust
+/// question dialog, Gemini CLI's folder trust and approval prompt,
+/// Antigravity CLI's project trust and approval choices, and Codex's folder-trust
 /// and hooks-review dialogs (as Codex 0.167.2 draws them).
 fn kind_prompt(kind: Kind, screen: &str) -> bool {
     let t = screen.to_lowercase();
@@ -1230,6 +1256,21 @@ fn kind_prompt(kind: Kind, screen: &str) -> bool {
         // Gemini CLI 0.68: its folder trust at start, and its approval
         // prompt's way out, as it words them.
         Kind::Gemini => any(&["do you trust the files in this folder?", "do you trust the following folders being added", "no, suggest changes (esc)"]),
+        // Antigravity CLI 1.5.9: its sign-in and project trust at start and
+        // a command's approval, as it draws them, and, as its binary words
+        // them (not seen drawn), the ways out of its other approval
+        // prompts ("No, deny access", "No, deny tool call", "No, reject this
+        // change", "No, and tell agy what to do differently"…), each a
+        // choice on a line of its own after whatever marks or numbers it.
+        Kind::Antigravity => {
+            let choice = |label: &str| t.lines().any(|l| l.trim_start_matches(|c: char| !c.is_alphabetic()).starts_with(label));
+            any(&["select login method:", "paste the authorization code below", "do you trust the contents of this project?", "yes, i trust this folder", "requesting permission for:"])
+                || choice("yes, run command")
+                || choice("no, deny")
+                || choice("no, reject this change")
+                || choice("no, and tell ")
+                || choice("no, and always deny ")
+        }
         // Codex 0.167's start-up dialogs: trusting the folder, then
         // trix's hooks (and any of yours) once they're new or changed.
         Kind::Codex => any(&["trust and continue", "your trust decision will be saved", "hooks need review", "need review before they can run", "continue without trusting"]),
@@ -1566,6 +1607,21 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
                 args.push(format!("--prompt-interactive={p}"));
             }
             ("gemini".into(), args)
+        }
+        // `agy [-i PROMPT]`: it reads a prompt only from `-i`, `-p` (which
+        // exits after it) or stdin, and refuses a positional one.
+        // `--conversation <id>` takes one back. It has no flag to name a
+        // new one: its id comes from the hooks you add, if you do.
+        Kind::Antigravity => {
+            if let Some(id) = &spec.resume {
+                args.extend(["--conversation".into(), id.clone()]);
+            }
+            args.extend(extra.map(split_args).unwrap_or_default());
+            if let Some(p) = prompt {
+                // With `=`, a prompt starting with `-` stays the value.
+                args.push(format!("--prompt-interactive={p}"));
+            }
+            ("agy".into(), args)
         }
         Kind::Claude => {
             if let Some(s) = &integrations.claude_settings {
@@ -3333,5 +3389,116 @@ mod tests {
         assert!(kind_prompt(Kind::Gemini, "rm -rf dist\nAllow execution of: 'rm'?\n● 1. Allow once\n  2. Allow for this session\n  3. No, suggest changes (esc)"));
         assert!(!kind_prompt(Kind::Gemini, "I can allow once more retry, or suggest changes."));
         assert!(!kind_prompt(Kind::Codex, "Do you trust the files in this folder?"), "Gemini's own wording");
+    }
+
+    #[test]
+    fn antigravity_has_its_own_letter() {
+        assert_eq!(Kind::Antigravity.shortcut(), Some('a'));
+        assert_eq!(Kind::from_shortcut('a'), Some(Kind::Antigravity));
+        assert_eq!(Kind::from_label("antigravity"), Some(Kind::Antigravity));
+        assert!(Kind::Antigravity.takes_prompts() && Kind::Antigravity.resumes());
+        // No hook reports its approvals, with hooks or without: the screen does.
+        assert!(Kind::Antigravity.reads_prompts_on_screen() && !Kind::Antigravity.prompts_only_on_screen());
+    }
+
+    #[test]
+    fn antigravity_command_line() {
+        let ints = ints();
+        // New: the first prompt keeps the session open; agy names the conversation itself.
+        let mut s = spec(Kind::Antigravity);
+        s.prompt = Some("- fix the login".into());
+        assert_eq!(new_conversation(&s), None);
+        let (program, args) = command_for(&s, &ints, Path::new("/bin/trix"), None);
+        assert_eq!(program, "agy");
+        assert_eq!(args, ["--prompt-interactive=- fix the login"]);
+        // Restored: back in its conversation; extra flags after.
+        s.prompt = None;
+        s.resume = Some("ec33ebf9".into());
+        s.command = Some("--model gemini-4-pro".into());
+        assert_eq!(command_for(&s, &ints, Path::new("/bin/trix"), None).1, ["--conversation", "ec33ebf9", "--model", "gemini-4-pro"]);
+        // Nothing asked: just agy.
+        assert!(command_for(&spec(Kind::Antigravity), &ints, Path::new("/bin/trix"), None).1.is_empty());
+    }
+
+    fn agy(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
+        hook("antigravity", event, tool, detail)
+    }
+
+    #[test]
+    fn antigravity_turn_from_its_hooks() {
+        let mut a = test_agent(Kind::Antigravity);
+        a.set_state(State::Idle, false);
+        assert_eq!(a.on_hook(&agy("Stop", None, None), false), None, "no turn yet");
+        a.on_hook(&agy("SessionStart", None, None), false);
+        assert!(a.hooked);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "ready"));
+        // Its first model call of a turn starts it.
+        a.on_hook(&agy("UserPromptSubmit", None, Some("clean up dist")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.last_prompt.as_deref()), (State::Working, "thinking", Some("clean up dist")));
+        a.on_hook(&agy("PreToolUse", Some("run_command"), Some("rm -rf dist")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "run_command rm -rf dist"));
+        a.on_hook(&agy("PostToolUse", Some("run_command"), None), false);
+        // The model call after a tool is the same turn's.
+        a.on_hook(&agy("Busy", None, Some("clean up dist")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.tools_used), (State::Working, "run_command rm -rf dist", 1));
+        // Its question: the tool names it.
+        a.on_hook(&agy("PreToolUse", Some("AskUserQuestion"), Some("Which database?")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which database?"));
+        a.on_hook(&agy("Busy", None, None), false);
+        assert_eq!(a.state, State::Blocked, "still asking");
+        a.on_hook(&agy("PostToolUse", Some("AskUserQuestion"), None), false);
+        a.on_hook(&agy("Stop", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "finished · 2 tools"));
+        // The next turn, whatever number agy gives its model call.
+        a.on_hook(&agy("Busy", None, Some("now the tests")), false);
+        assert_eq!((a.state, a.activity.as_str(), a.last_prompt.as_deref(), a.tools_used), (State::Working, "thinking", Some("now the tests"), 0));
+        // Stopped with esc: its `Stop` says so.
+        a.on_hook(&agy("Interrupt", None, None), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        a.shutdown();
+    }
+
+    /// Declining a tool ends the turn with no hook: the prompt gone from a
+    /// still screen says so. A question stays one, whatever the screen says.
+    #[test]
+    fn antigravity_declined_tool_from_its_screen() {
+        let mut a = test_agent(Kind::Antigravity);
+        a.set_state(State::Idle, false);
+        a.on_hook(&agy("UserPromptSubmit", None, Some("clean up dist")), false);
+        a.on_hook(&agy("PreToolUse", Some("run_command"), Some("rm -rf dist")), false);
+        // As the screen showed its prompt.
+        a.activity = "approve run_command rm -rf dist".into();
+        a.set_state(State::Blocked, false);
+        a.last_output = ago(Duration::from_secs(1));
+        a.heuristics(false);
+        assert_eq!(a.state, State::Blocked, "not still for long enough");
+        a.last_output = ago(Duration::from_secs(3));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "declined"));
+        a.on_hook(&agy("Busy", None, Some("then just list it")), false);
+        a.on_hook(&agy("PreToolUse", Some("AskUserQuestion"), Some("Which folder?")), false);
+        a.last_output = ago(Duration::from_secs(3));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "Which folder?"));
+        a.shutdown();
+    }
+
+    #[test]
+    fn antigravity_trust_and_approval_need_you() {
+        // Its sign-in, as Antigravity CLI 1.5.9 draws it.
+        assert!(kind_prompt(Kind::Antigravity, "Welcome to the Antigravity CLI. You are currently not signed in.\n\nSelect login method:\n> 1. Google OAuth\n  2. Use a Google Cloud project\n\n  ↑/↓ Navigate · enter Select"));
+        assert!(kind_prompt(Kind::Antigravity, "→ Click here to authenticate\n\nIf you aren't automatically redirected, paste the authorization code below:\n\nauthorization code..."));
+        // Its project trust and its approval of a command, as it draws them.
+        assert!(kind_prompt(Kind::Antigravity, "Requesting permission for:\n   curl -sI https://example.com\n\nRun this command?\n> 1. Yes, run command\n  2. Yes, and always allow in this conversation for commands that start with 'curl'\n  4. No, cancel\n\n  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command"));
+        // The rest is its wording for other approvals, from its binary.
+        assert!(kind_prompt(Kind::Antigravity, "Do you trust the contents of this project?\n\n❯ Yes, I trust this folder\n  No, exit"));
+        assert!(kind_prompt(Kind::Antigravity, "Run this command?\n  rm -rf dist\n❯ 1. Yes, run command\n  2. No, deny"));
+        assert!(kind_prompt(Kind::Antigravity, "Accept this file edit?\n> Yes, approve\n  No, reject this change"));
+        assert!(kind_prompt(Kind::Antigravity, "● Yes, allow access\n○ No, deny access\n○ No, and always deny access to '/etc' in this conversation"));
+        assert!(kind_prompt(Kind::Antigravity, "  Yes, allow tool call\n  No, and tell agy what to do differently"));
+        // Its prose, and other agents' prompts.
+        assert!(!kind_prompt(Kind::Antigravity, "I asked whether to drop the table; you said no, deny it, so I left it."));
+        assert!(!kind_prompt(Kind::Antigravity, "Do you trust the files in this folder?"), "Gemini's");
+        assert!(!kind_prompt(Kind::Gemini, "Do you trust the contents of this project?"));
     }
 }
