@@ -243,7 +243,17 @@ fn write_workspace_instructions() -> anyhow::Result<PathBuf> {
     let dir = runtime_dir().join(format!("workspace-instructions-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("AGENTS.md"), crate::agent::WORKSPACE_INSTRUCTIONS)?;
+    // Copilot reads `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` for
+    // `.github/instructions/*.instructions.md`, not for a root `AGENTS.md`.
+    let nested = dir.join(".github").join("instructions");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::write(nested.join("trix-workspace.instructions.md"), copilot_instructions())?;
     Ok(dir)
+}
+
+/// The workspace instructions as a Copilot instructions file, applied to every file.
+fn copilot_instructions() -> String {
+    format!("---\napplyTo: \"**\"\n---\n{}\n", crate::agent::WORKSPACE_INSTRUCTIONS)
 }
 
 /// Merge a session instruction path without discarding user configuration.
@@ -1588,6 +1598,16 @@ process.stdout.write(JSON.stringify(out));"#
         assert_eq!(c(json!({"hook_event_name":"Stop","agent_id":"sub-1","stop_reason":"end_turn"})).event, "unknown");
         assert_eq!(c(json!({"hook_event_name":"PermissionRequest","tool_name":"Bash"})).event, "unknown", "fires before Copilot's own rules");
         assert_eq!(c(json!({"sessionId":"s1","toolName":"bash"})).event, "unknown");
+    }
+
+    #[test]
+    fn workspace_instructions_reach_copilot_as_an_instructions_file() {
+        let dir = write_workspace_instructions().unwrap();
+        let f = std::fs::read_to_string(dir.join(".github/instructions/trix-workspace.instructions.md")).unwrap();
+        assert!(f.starts_with("---\napplyTo: \"**\"\n---\n"));
+        assert!(f.contains(crate::agent::WORKSPACE_INSTRUCTIONS));
+        assert_eq!(std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(), crate::agent::WORKSPACE_INSTRUCTIONS);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
