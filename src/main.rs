@@ -162,9 +162,7 @@ fn main() -> anyhow::Result<()> {
     let from_env = std::env::var("TRIX_SESSION").ok().filter(|n| session::check_name(n).is_ok());
     let explicit = flag.is_some() || from_env.is_some();
     session::set_name(flag.or(from_env).unwrap_or_else(|| session::DEFAULT.into()));
-    let missing = || {
-        if session::is_default() { "trix: no workspace running".to_string() } else { format!("trix: no session '{}' running", session::name()) }
-    };
+    let missing = || format!("trix: {}", session::missing());
 
     match args.first().map(String::as_str) {
         Some("server") => return server(),
@@ -321,8 +319,11 @@ fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
         Some(s) => s,
         None if start => session::start_server()?,
         None => {
-            let what = if session::is_default() { "no workspace running".to_string() } else { format!("no session '{}' running", session::name()) };
-            eprintln!("trix: {what} — start it with `{}`", session::command());
+            if session::blocked() {
+                eprintln!("trix: {}", session::missing());
+            } else {
+                eprintln!("trix: {} — start it with `{}`", session::missing(), session::command());
+            }
             std::process::exit(1);
         }
     };
