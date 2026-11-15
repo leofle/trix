@@ -6,6 +6,10 @@
 //! the vendor's own install script), with its output on screen, tells the
 //! server the install is over, and becomes the agent (`exec`): the same
 //! process, with the same arguments the agent would have had.
+//!
+//! An agent that reads its first prompt from stdin (Amp) starts this way
+//! too, installed or not: `--stdin <prompt>` puts the prompt there as trix
+//! becomes the agent, with no shell in between.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
@@ -77,6 +81,9 @@ fn ways(kind: Kind) -> &'static [Via] {
         Kind::Gemini => &[Via::Mise("npm:@google/gemini-cli"), Via::Brew("gemini-cli"), Via::Npm("@google/gemini-cli")],
         // Google ships Antigravity CLI only as its install script.
         Kind::Antigravity => &[Via::Script("https://antigravity.google/cli/install.sh")],
+        // npm's package was `@sourcegraph/amp` until May 2026. Its install
+        // script puts Amp in `~/.amp/bin` and links it into `~/.local/bin`.
+        Kind::Amp => &[Via::Mise("npm:@ampcode/cli"), Via::Npm("@ampcode/cli"), Via::Script("https://ampcode.com/install.sh")],
         Kind::Shell | Kind::Custom => &[],
     }
 }
@@ -121,11 +128,70 @@ pub fn missing(program: &str) -> bool {
     find(program, std::env::var_os("PATH").as_deref()).is_none()
 }
 
-/// The pane's command that installs `kind` and then runs `program args`.
-pub fn wrap(exe: &Path, kind: Kind, program: String, args: Vec<String>) -> (String, Vec<String>) {
-    let mut all = vec!["install".to_string(), kind.label().into(), "--".into(), program];
+/// The pane's command that installs `kind` if it's missing and then runs
+/// `program args`, with `stdin`, if any, as what it reads there first.
+pub fn wrap(exe: &Path, kind: Kind, stdin: Option<&str>, program: String, args: Vec<String>) -> (String, Vec<String>) {
+    let mut all = vec!["install".to_string(), kind.label().into()];
+    if let Some(text) = stdin {
+        all.extend(["--stdin".into(), text.into()]);
+    }
+    all.extend(["--".into(), program]);
     all.extend(args);
     (exe.display().to_string(), all)
+}
+
+/// `text` as a program's stdin: a pipe holding all of it, its writing end
+/// closed, so the program reads the text and then the end. Text too long
+/// for a pipe to hold goes in a file with no name left instead.
+fn stdin_holding(text: &str) -> std::io::Result<std::fs::File> {
+    use std::io::{Seek, Write};
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+        // Owned from here: both close when dropped, and neither is left
+        // open in the agent (its stdin is a copy of the reading end).
+        let (read, mut write) = unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) };
+        // Nothing reads yet: a write that would wait for room never ends.
+        unsafe {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        if write.write_all(text.as_bytes()).is_ok() {
+            return Ok(read);
+        }
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = crate::hooks::runtime_dir().join(format!("stdin-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    f.write_all(text.as_bytes())?;
+    f.rewind()?;
+    Ok(f)
+}
+
+/// Give `cmd` the first prompt as its stdin. Without it, the agent still
+/// starts, with the terminal as its stdin as usual.
+fn feed(cmd: &mut Command, program: &str, text: &str) {
+    match stdin_holding(text) {
+        Ok(f) => {
+            cmd.stdin(f);
+        }
+        Err(e) => eprintln!("trix: couldn't hand {program} its first prompt ({e}): starting it without."),
+    }
+}
+
+/// `<kind> [--stdin <text>] -- <command> [args…]`: the kind, what its stdin
+/// starts with, its command and arguments.
+fn parse(args: &[String]) -> Option<(Kind, Option<&str>, &str, &[String])> {
+    let kind = args.first().and_then(|k| Kind::from_label(k)).filter(|k| !ways(*k).is_empty())?;
+    let (stdin, rest) = match args.get(1).map(String::as_str) {
+        Some("--stdin") => (Some(args.get(2)?.as_str()), &args[3..]),
+        _ => (None, &args[1..]),
+    };
+    let (program, agent_args) = rest.strip_prefix(&["--".to_string()])?.split_first()?;
+    Some((kind, stdin, program, agent_args))
 }
 
 /// `PATH`, with `~/.local/bin` (where install scripts put agents) last if
@@ -155,18 +221,15 @@ fn lock(kind: Kind) -> Option<std::fs::File> {
     Some(f)
 }
 
-/// `trix install <kind> -- <command> [args…]`, run as a pane's command.
-/// Returns the exit code; on success it never returns: it becomes the agent.
+/// `trix install <kind> [--stdin <text>] -- <command> [args…]`, run as a
+/// pane's command. Returns the exit code; on success it never returns: it
+/// becomes the agent.
 pub fn run(args: &[String]) -> i32 {
     let usage = || {
-        eprintln!("usage: trix install <kind> -- <command> [args…]   (internal: trix runs it in a pane)");
+        eprintln!("usage: trix install <kind> [--stdin <text>] -- <command> [args…]   (internal: trix runs it in a pane)");
         2
     };
-    let Some(kind) = args.first().and_then(|k| Kind::from_label(k)).filter(|k| !ways(*k).is_empty()) else { return usage() };
-    if args.get(1).map(String::as_str) != Some("--") {
-        return usage();
-    }
-    let Some((program, agent_args)) = args[2..].split_first() else { return usage() };
+    let Some((kind, stdin, program, agent_args)) = parse(args) else { return usage() };
 
     let path = std::env::var_os("PATH");
     let held = lock(kind);
@@ -213,6 +276,10 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("trix: {program} was installed, but it isn't on your PATH. Add its folder to PATH, restart trix, and press Enter here.");
         return 127;
     };
+    // The installer above had the terminal: only the agent reads the text.
+    if let Some(text) = stdin {
+        feed(&mut cmd, program, text);
+    }
     let err = cmd.env("PATH", &path).exec();
     eprintln!("trix: couldn't start {program}: {err}");
     126
@@ -271,6 +338,7 @@ mod tests {
         assert_eq!(pick(Kind::Grok, Some(&path)), Some(Via::Mise("npm:@xai-official/grok")));
         assert_eq!(pick(Kind::OpenCode, Some(&path)), Some(Via::Mise("opencode")));
         assert_eq!(pick(Kind::Copilot, Some(&path)), Some(Via::Mise("npm:@github/copilot")));
+        assert_eq!(pick(Kind::Amp, Some(&path)), Some(Via::Mise("npm:@ampcode/cli")));
         // Meta's install script is the only Muse Code: no mise, Homebrew or npm package.
         assert_eq!(pick(Kind::Muse, Some(&path)), None);
         // mise has no Cursor of Omarchy's to install.
@@ -286,6 +354,7 @@ mod tests {
         let dir = bin_dir("pick-npm", &["npm", "curl", "bash"], &[]);
         let path = dir.clone().into_os_string();
         assert_eq!(pick(Kind::Copilot, Some(&path)), Some(Via::Npm("@github/copilot")));
+        assert_eq!(pick(Kind::Amp, Some(&path)), Some(Via::Npm("@ampcode/cli")));
         let _ = std::fs::remove_dir_all(dir);
         let dir = bin_dir("pick-script", &["curl", "bash"], &[]);
         let path = dir.clone().into_os_string();
@@ -293,6 +362,7 @@ mod tests {
         assert_eq!(pick(Kind::Muse, Some(&path)), Some(Via::Script("https://dev.meta.ai/install.sh")));
         // Google's install script is the only Antigravity CLI.
         assert_eq!(pick(Kind::Antigravity, Some(&path)), Some(Via::Script("https://antigravity.google/cli/install.sh")));
+        assert_eq!(pick(Kind::Amp, Some(&path)), Some(Via::Script("https://ampcode.com/install.sh")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -304,13 +374,61 @@ mod tests {
         assert_eq!(needs(Kind::Copilot), "mise, brew, npm or curl");
         assert_eq!(needs(Kind::Muse), "curl");
         assert_eq!(needs(Kind::Antigravity), "curl");
+        assert_eq!(needs(Kind::Amp), "mise, npm or curl");
     }
 
     #[test]
     fn wrap_keeps_the_agents_own_command_line() {
-        let (prog, args) = wrap(Path::new("/x/trix"), Kind::Grok, "grok".into(), vec!["--session-id".into(), "u".into(), "-- hi".into()]);
+        let (prog, args) = wrap(Path::new("/x/trix"), Kind::Grok, None, "grok".into(), vec!["--session-id".into(), "u".into(), "-- hi".into()]);
         assert_eq!(prog, "/x/trix");
         assert_eq!(args, ["install", "grok", "--", "grok", "--session-id", "u", "-- hi"]);
+        // A first prompt for the agent's stdin, whatever it starts with.
+        let (_, args) = wrap(Path::new("/x/trix"), Kind::Amp, Some("-- fix\nit"), "amp".into(), vec!["--fast".into()]);
+        assert_eq!(args, ["install", "amp", "--stdin", "-- fix\nit", "--", "amp", "--fast"]);
+    }
+
+    /// What the agent reads on its stdin: the text, then the end.
+    #[test]
+    fn stdin_holds_the_prompt_and_ends() {
+        use std::io::Read;
+        for text in ["fix the login\nthen run the tests", "", &"a long prompt, longer than a pipe holds. ".repeat(40_000)] {
+            let mut read = String::new();
+            stdin_holding(text).unwrap().read_to_string(&mut read).unwrap();
+            assert_eq!(read.len(), text.len());
+            assert!(read == text);
+        }
+    }
+
+    /// The agent `trix install` becomes reads the prompt on its stdin, and
+    /// keeps its own arguments.
+    #[test]
+    fn the_agent_starts_with_its_prompt_on_stdin() {
+        let dir = bin_dir("stdin", &[], &[]);
+        let out = dir.join("out");
+        let script = dir.join("amp");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > '{0}'\nprintf ' [%s]' \"$@\" >> '{0}'\n", out.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cmd = Command::new(&script);
+        cmd.args(["--fast", "-x y"]);
+        feed(&mut cmd, "amp", "- fix it\nplease");
+        assert!(cmd.status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "- fix it\nplease [--fast] [-x y]");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_arguments() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let args = v(&["grok", "--", "grok", "--session-id", "u"]);
+        assert_eq!(parse(&args), Some((Kind::Grok, None, "grok", &args[3..])));
+        // The prompt is one argument, whatever it holds.
+        let args = v(&["amp", "--stdin", "-- fix it", "--", "amp", "--fast"]);
+        assert_eq!(parse(&args), Some((Kind::Amp, Some("-- fix it"), "amp", &args[5..])));
+        let args = v(&["amp", "--stdin", "--", "--", "amp"]);
+        assert_eq!(parse(&args), Some((Kind::Amp, Some("--"), "amp", &args[5..])));
+        for bad in [&["amp"][..], &["amp", "--"], &["amp", "--stdin"], &["amp", "--stdin", "hi", "amp"], &["shell", "--", "sh"], &["gpt", "--", "gpt"]] {
+            assert_eq!(parse(&v(bad)), None, "{bad:?}");
+        }
     }
 
     #[test]

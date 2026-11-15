@@ -49,7 +49,8 @@ usage:
 agent control (for scripts, and for agents managing other agents):
   trix spawn <kind> [--name N] [--cwd DIR] [--worktree] [--prompt P] [--args A]
                             start claude, codex, grok, opencode, cursor (cursor-agent),
-                            copilot, muse, gemini, antigravity, shell or custom; prints its name
+                            copilot, muse, gemini, antigravity, amp, shell or custom; prints
+                            its name
   trix send <agent> <prompt…>
                             type a prompt into an agent and submit it (prompt
                             from stdin when omitted). Refuses agents that need
@@ -85,8 +86,11 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
                             notifications); trix reloads it on every save
 
   trix hook <source>        (internal) agent lifecycle reporter
-  trix install <kind> -- <command…>
-                            (internal) install a missing agent in its pane, then run it
+  trix hook amp --plugin    print trix's plugin for Amp, to save where Amp reads
+                            plugins (see the README)
+  trix install <kind> [--stdin <text>] -- <command…>
+                            (internal) install a missing agent in its pane, then
+                            run it, with <text> as what it reads on stdin first
   trix server               (internal) the background workspace
 
   -s, --session <name>      work with a named session instead of the default
@@ -283,6 +287,7 @@ fn main() -> anyhow::Result<()> {
             "muse" => Kind::Muse,
             "gemini" => Kind::Gemini,
             "antigravity" | "agy" => Kind::Antigravity,
+            "amp" => Kind::Amp,
             "shell" | "sh" => Kind::Shell,
             other => {
                 eprintln!("trix: unknown argument '{other}'\n\n{HELP}");

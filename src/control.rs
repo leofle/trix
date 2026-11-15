@@ -175,7 +175,7 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
             Request::Wait { targets: pos.clone(), all: has(&["--all"]), timeout_secs: number(&["--timeout", "-t"], WAIT_SECS)? }
         }
         "spawn" => {
-            let kind = one("agent kind (claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, shell or custom)")?;
+            let kind = one("agent kind (claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell or custom)")?;
             let cwd = value(&["--cwd"]).map(|d| absolute(app::expand(&d), &cwd)).unwrap_or(cwd);
             Request::Spawn {
                 kind,
@@ -494,7 +494,7 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
         "agy" => Some(Kind::Antigravity),
         _ => None,
     }) else {
-        return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, shell or custom)"));
+        return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell or custom)"));
     };
     if !cwd.is_dir() {
         return Reply::fail(format!("folder not found: {}", app::tilde(&cwd)));

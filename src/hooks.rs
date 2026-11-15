@@ -7,6 +7,9 @@
 //! call `trix hook <kind>`, which condenses the hook
 //! payload into one small JSON line and writes it to the socket. Nothing in the
 //! user's own agent config is modified: everything is passed per process.
+//! Agents that can't be handed hooks per process (Grok, Gemini, Antigravity,
+//! Amp) report the same way once you add trix's hook, or its plugin
+//! (`AMP_PLUGIN`), to their config yourself.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -680,9 +683,117 @@ pub fn muse_hooks(exe: &Path) -> Value {
     serde_json::json!({ "hooks": hooks })
 }
 
+/// trix's plugin for Amp, which reads plugins only from `.amp/plugins/` in
+/// a project and `~/.config/amp/plugins/`, never per process: you add it
+/// there yourself (`trix hook amp --plugin` prints it). Written against
+/// Amp's plugin API (`@ampcode/plugin`, November 2026): `session.start`,
+/// `agent.start`, `tool.result` and `agent.end`, and the thread's own state
+/// (`awaiting-approval`). It handles no `tool.call`, which must answer
+/// whether the tool runs: this one only watches. Each event goes to `trix
+/// hook amp` through Amp's `$`, the payload in hex, which is one plain word
+/// however `$` quotes what it's given. Amp fires its events for the thread
+/// they belong to: only the one on screen is the pane's.
+pub const AMP_PLUGIN: &str = r#"// trix's plugin for Amp: it tells the trix pane this Amp runs in what its
+// turns are doing. Save it as ~/.config/amp/plugins/trix.ts
+// (`trix hook amp --plugin` prints it). Outside a trix pane it does nothing.
+// It only watches: it handles no `tool.call`, so it never decides whether a
+// tool runs.
+const KEYS = ["command", "cmd", "path", "pattern", "query", "url", "description"];
+
+// At most 400 UTF-16 units, never half an emoji: a lone surrogate is
+// invalid in JSON, and the whole report would be dropped.
+function cut(s) {
+  let t = s.slice(0, 400);
+  if (/[\uD800-\uDBFF]$/.test(t)) t = t.slice(0, -1);
+  return typeof t.toWellFormed === "function" ? t.toWellFormed() : t;
+}
+
+function brief(input) {
+  const out = {};
+  for (const k of KEYS) {
+    const v = input?.[k];
+    if (typeof v === "string") out[k] = cut(v);
+  }
+  return out;
+}
+
+export default function (amp) {
+  if (!process.env.TRIX_SOCKET || !process.env.TRIX_AGENT_ID) return;
+  let seq = 0;
+  // In hex, the payload is one plain word, however `$` quotes it.
+  const report = (event, thread, more) => {
+    seq = Math.max(seq + 1, Date.now() * 1000);
+    const hex = Buffer.from(JSON.stringify({ event, thread, trix_seq: seq, ...more })).toString("hex");
+    try {
+      return amp.$`trix hook amp ${hex}`.catch(() => undefined);
+    } catch {
+      return Promise.resolve(undefined);
+    }
+  };
+  // A thread that isn't the one on screen (a subagent's) isn't the pane's.
+  const mine = (thread) => {
+    const active = amp.activeThread?.current;
+    return !active || active.id === thread;
+  };
+  // The thread's own state says when it waits on an approval.
+  let watched;
+  const watch = (thread) => {
+    if (watched?.thread === thread) return;
+    try {
+      watched?.sub.unsubscribe();
+      const sub = amp.threads.get(thread).state.subscribe((state) => report("thread.state", thread, { state }));
+      watched = { thread, sub };
+    } catch {}
+  };
+  const told = new Set();
+
+  amp.on("session.start", (event) => {
+    const thread = event.thread.id;
+    if (!mine(thread)) return;
+    watch(thread);
+    report("session.start", thread);
+  });
+  amp.on("agent.start", async (event) => {
+    const thread = event.thread.id;
+    if (!mine(thread)) return {};
+    watch(thread);
+    const first = !told.has(thread);
+    told.add(thread);
+    const out = await report("agent.start", thread, { message: cut(String(event.message ?? "")), first });
+    // trix's answer: with a thread's first prompt, how to find the pane's peers.
+    try {
+      const answer = JSON.parse(out?.stdout || "{}");
+      return answer && typeof answer === "object" ? answer : {};
+    } catch {
+      return {};
+    }
+  });
+  amp.on("tool.result", (event) => {
+    const thread = event.thread.id;
+    if (!mine(thread)) return;
+    let command;
+    try {
+      command = amp.helpers.shellCommandFromToolCall(event)?.command;
+    } catch {}
+    const more = { tool: event.tool, status: event.status, input: brief(event.input) };
+    if (typeof command === "string") more.command = cut(command);
+    report("tool.result", thread, more);
+  });
+  amp.on("agent.end", (event) => {
+    const thread = event.thread.id;
+    if (mine(thread)) report("agent.end", thread, { status: event.status });
+  });
+}
+"#;
+
 /// `trix hook <source> [payload]` — runs inside the agent's process tree.
 /// Must be fast, silent and never fail loudly: the agent is waiting on it.
 pub fn run_client(source: &str, arg_payload: Option<String>) {
+    // The plugin itself, for you to save where Amp reads plugins.
+    if source == "amp" && arg_payload.as_deref() == Some("--plugin") {
+        print!("{AMP_PLUGIN}");
+        return;
+    }
     // Cursor reads every hook's stdout as its answer. trix's hooks only
     // watch: answer with nothing to say (and let a prompt through), so no
     // reply of ours can read as a decision.
@@ -726,6 +837,8 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
     }
     let seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let raw = match arg_payload {
+        // trix's Amp plugin sends its payload in hex (see `AMP_PLUGIN`).
+        Some(p) if source == "amp" => unhex(&p).unwrap_or(p),
         Some(p) => p,
         None => {
             let mut s = String::new();
@@ -738,6 +851,11 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
     let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     if let Some(context) = workspace_hook_context(source, &v, std::env::var("MUSE_SESSION_ID").ok().as_deref()) {
         println!("{context}");
+    }
+    if source == "amp"
+        && let Some(answer) = amp_answer(&v)
+    {
+        println!("{answer}");
     }
     report(source, &v, Some(seq));
 }
@@ -787,6 +905,7 @@ fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
         "muse" => return condense_muse(agent, v, std::env::var("MUSE_SESSION_ID").ok().as_deref()),
         "gemini" => return condense_gemini(agent, v),
         "antigravity" => return condense_antigravity(agent, v),
+        "amp" => return condense_amp(agent, v),
         _ => {}
     }
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
@@ -1101,6 +1220,78 @@ fn antigravity_tool_detail(tool: Option<&str>, args: &Value) -> Option<String> {
     }
 }
 
+/// Text sent as hex digits, two per byte.
+fn unhex(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() || !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect();
+    String::from_utf8(bytes?).ok()
+}
+
+/// What `trix hook amp` answers trix's plugin, which hands it back to Amp
+/// as its `agent.start` result: with a thread's first prompt, the
+/// workspace discovery instructions, as text for the model that Amp
+/// doesn't show. Nothing otherwise.
+fn amp_answer(v: &Value) -> Option<Value> {
+    let first = text(v, "event").as_deref() == Some("agent.start") && v.get("first").and_then(Value::as_bool) == Some(true);
+    first.then(|| serde_json::json!({"message": {"content": crate::agent::WORKSPACE_INSTRUCTIONS}}))
+}
+
+/// An event from trix's Amp plugin (see `AMP_PLUGIN`): Amp's own event
+/// names and fields, put in Claude's terms. Amp reports a tool once it has
+/// run (`tool.result`), and an approval as its thread's state, naming no
+/// tool. A turn you stop still ends, as `cancelled`.
+fn condense_amp(agent: u32, v: &Value) -> HookMsg {
+    let name = text(v, "event").unwrap_or_default();
+    let event = match name.as_str() {
+        "session.start" => "SessionStart",
+        "agent.start" => "UserPromptSubmit",
+        "tool.result" => "ToolDone",
+        "agent.end" if text(v, "status").as_deref() == Some("cancelled") => "Interrupt",
+        // `done`, or `error`: a turn that failed still ended.
+        "agent.end" => "Stop",
+        "thread.state" => match text(v, "state").as_deref() {
+            Some("awaiting-approval") => "PermissionRequest",
+            // Running again: with an approval before it, that was answered.
+            Some("running") => "Answered",
+            // `idle` and `error`: the turn's own end says so.
+            _ => "unknown",
+        },
+        _ => "unknown",
+    };
+    let mut m = msg(agent, "amp", event);
+    // A thread's start and its prompts name the conversation (`T-…`).
+    if matches!(event, "SessionStart" | "UserPromptSubmit") {
+        m.session = text(v, "thread").filter(|t| t.starts_with("T-"));
+    }
+    match event {
+        "UserPromptSubmit" => m.detail = text(v, "message").map(|p| one_line(&p, 80)),
+        "ToolDone" => {
+            m.tool = text(v, "tool");
+            m.detail = amp_tool_detail(m.tool.as_deref(), v);
+        }
+        _ => {}
+    }
+    m
+}
+
+/// What an Amp tool call was about: the command Amp's own
+/// `shellCommandFromToolCall` finds in it, the arguments of tools trix
+/// knows by name, or the one any tool is most likely about.
+fn amp_tool_detail(tool: Option<&str>, v: &Value) -> Option<String> {
+    if let Some(command) = text(v, "command") {
+        return Some(one_line(&command, 60));
+    }
+    let input = v.get("input")?;
+    let g = |k: &str| text(input, k);
+    tool_detail(tool, input)
+        .or_else(|| g("path").map(|p| Path::new(&p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or(p)))
+        .or_else(|| g("pattern").or_else(|| g("query")).map(|q| one_line(&q, 40)))
+        .or_else(|| g("url").map(|u| one_line(&u, 50)))
+}
+
 /// A shell command as a string: Claude sends one; Codex may send an argv,
 /// often `["bash", "-lc", "<script>"]`, where the script is what matters.
 fn shell_command(v: Option<&Value>) -> Option<String> {
@@ -1139,8 +1330,8 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             g("file_path").or(g("notebook_path")).or(g("path")).map(base)
         }
-        // OpenCode's file tools, Grok's, Cursor's, Muse's and Gemini's own.
-        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "edit_file" | "search_replace" | "StrReplace" | "Delete" | "replace" => {
+        // OpenCode's file tools, Grok's, Cursor's, Muse's, Gemini's and Amp's own.
+        "read" | "write" | "edit" | "patch" | "read_file" | "write_file" | "edit_file" | "create_file" | "search_replace" | "StrReplace" | "Delete" | "replace" => {
             g("filePath").or(g("file_path")).or(g("path")).or(g("target_file")).map(base)
         }
         // Muse's `search` is ripgrep, Gemini's `grep_search`.
@@ -1818,5 +2009,170 @@ process.stdout.write(JSON.stringify(out));"#
         assert_eq!(antigravity_answer(&Value::Null, true), json!({}));
         let a = antigravity_answer(&json!({"hookEventName": "SessionStart"}), true);
         assert_eq!(a["injectSteps"][0]["systemMessage"]["systemMessage"], crate::agent::WORKSPACE_INSTRUCTIONS);
+    }
+
+    /// Events as trix's Amp plugin sends them (`AMP_PLUGIN`), with the
+    /// fields of Amp's plugin API (`@ampcode/plugin`).
+    #[test]
+    fn condenses_amp_plugin_events() {
+        let thread = "T-7f395a45-7fae-4983-8de0-d02e61d30183";
+        let c = |v: Value| condense(4, "amp", &v);
+        let m = c(json!({"event": "session.start", "thread": thread, "trix_seq": 1}));
+        assert_eq!((m.source.as_str(), m.event.as_str(), m.session.as_deref()), ("amp", "SessionStart", Some(thread)));
+        let m = c(json!({"event": "agent.start", "thread": thread, "message": "fix\nthe   login", "first": true}));
+        assert_eq!((m.event.as_str(), m.detail.as_deref(), m.session.as_deref()), ("UserPromptSubmit", Some("fix the login"), Some(thread)));
+        // A tool, once it has run: the command Amp's helper found in it.
+        let m = c(json!({"event": "tool.result", "thread": thread, "tool": "Bash", "status": "done", "input": {}, "command": "cargo   test"}));
+        assert_eq!((m.event.as_str(), m.tool.as_deref(), m.detail.as_deref(), m.session), ("ToolDone", Some("Bash"), Some("cargo test"), None));
+        // Or what its arguments say: tools trix knows, then any tool's path, pattern or URL.
+        for (tool, input, detail) in [
+            ("Bash", json!({"cmd": "ls -la"}), Some("ls -la")),
+            ("edit_file", json!({"path": "/w/src/app.rs"}), Some("app.rs")),
+            ("create_file", json!({"path": "notes.md"}), Some("notes.md")),
+            ("Read", json!({"path": "/w/src/main.rs"}), Some("main.rs")),
+            ("Grep", json!({"pattern": "fn main", "path": "src"}), Some("fn main")),
+            ("finder", json!({"query": "where is the login handled"}), Some("where is the login handled")),
+            ("read_web_page", json!({"url": "https://ampcode.com/docs"}), Some("https://ampcode.com/docs")),
+            ("oracle", json!({}), None),
+        ] {
+            let m = c(json!({"event": "tool.result", "thread": thread, "tool": tool, "status": "error", "input": input}));
+            assert_eq!((m.event.as_str(), m.detail.as_deref()), ("ToolDone", detail), "{tool}");
+        }
+        // A turn's end: done, failed, or stopped by you.
+        assert_eq!(c(json!({"event": "agent.end", "thread": thread, "status": "done"})).event, "Stop");
+        assert_eq!(c(json!({"event": "agent.end", "thread": thread, "status": "error"})).event, "Stop", "a turn that failed ended");
+        assert_eq!(c(json!({"event": "agent.end", "thread": thread, "status": "cancelled"})).event, "Interrupt");
+        // Its thread's state: waiting on an approval, and running again.
+        let m = c(json!({"event": "thread.state", "thread": thread, "state": "awaiting-approval"}));
+        assert_eq!((m.event.as_str(), m.tool, m.detail, m.session), ("PermissionRequest", None, None, None));
+        assert_eq!(c(json!({"event": "thread.state", "thread": thread, "state": "running"})).event, "Answered");
+        for state in ["idle", "error", "paused"] {
+            assert_eq!(c(json!({"event": "thread.state", "thread": thread, "state": state})).event, "unknown", "{state}");
+        }
+        for ev in ["tool.call", "changes.prompt", "session.end"] {
+            assert_eq!(c(json!({"event": ev, "thread": thread})).event, "unknown", "{ev}");
+        }
+        // Only a thread id names the conversation.
+        assert_eq!(c(json!({"event": "session.start", "thread": "main"})).session, None);
+        assert_eq!(c(Value::Null).event, "unknown");
+    }
+
+    #[test]
+    fn amp_payloads_come_in_hex() {
+        assert_eq!(unhex("7b226576656e74223a226167656e742e656e64227d").as_deref(), Some(r#"{"event":"agent.end"}"#));
+        assert_eq!(unhex(" C3A9\n").as_deref(), Some("é"));
+        // Not hex: JSON as it is, half a byte, or bytes that aren't text.
+        for bad in [r#"{"event":"agent.end"}"#, "", "abc", "ff"] {
+            assert_eq!(unhex(bad), None, "{bad}");
+        }
+    }
+
+    /// trix answers only a thread's first prompt, with the workspace
+    /// instructions as text Amp gives the model without showing it.
+    #[test]
+    fn amp_answer_is_the_workspace_instructions_once() {
+        let a = amp_answer(&json!({"event": "agent.start", "thread": "T-1", "message": "hi", "first": true})).unwrap();
+        assert_eq!(a, json!({"message": {"content": crate::agent::WORKSPACE_INSTRUCTIONS}}));
+        assert_eq!(amp_answer(&json!({"event": "agent.start", "thread": "T-1", "first": false})), None);
+        assert_eq!(amp_answer(&json!({"event": "agent.start", "thread": "T-1"})), None);
+        assert_eq!(amp_answer(&json!({"event": "tool.result", "first": true})), None);
+        assert_eq!(amp_answer(&Value::Null), None);
+    }
+
+    /// The plugin only watches: it handles no `tool.call`, which must
+    /// answer whether the tool runs, and runs nothing but `trix hook amp`.
+    #[test]
+    fn amp_plugin_only_watches() {
+        assert_eq!(AMP_PLUGIN.matches("amp.on(").count(), 4);
+        for ev in ["session.start", "agent.start", "tool.result", "agent.end"] {
+            assert!(AMP_PLUGIN.contains(&format!(r#"amp.on("{ev}""#)), "{ev}");
+        }
+        assert_eq!(AMP_PLUGIN.matches("amp.$`").count(), 1);
+        assert!(AMP_PLUGIN.contains("amp.$`trix hook amp ${hex}`"));
+        assert!(!AMP_PLUGIN.contains("child_process") && !AMP_PLUGIN.contains("import "));
+    }
+
+    /// The plugin, run by Node against a fake of Amp's plugin API: what it
+    /// sends `trix hook amp` for each event, and what that reads as.
+    #[test]
+    fn amp_plugin_reports_the_panes_thread() {
+        let src = AMP_PLUGIN.replace("export default function", "const plugin = function");
+        let script = format!(
+            r#"{src}
+const sent = [];
+const handlers = {{}};
+let state;
+let unsubscribed = 0;
+const amp = {{
+  $: (strings, ...values) => {{
+    const payload = JSON.parse(Buffer.from(values[0], "hex").toString());
+    sent.push({{ command: strings.join("<>"), hex: values[0] }});
+    return Promise.resolve({{ exitCode: 0, stderr: "", stdout: payload.first ? '{{"message":{{"content":"peers"}}}}\n' : "" }});
+  }},
+  on: (name, fn) => {{ handlers[name] = fn; }},
+  activeThread: {{ current: {{ id: "T-1" }} }},
+  threads: {{ get: (id) => ({{ state: {{ subscribe: (fn) => {{ state = fn; return {{ unsubscribe() {{ unsubscribed++; }} }}; }} }} }}) }},
+  helpers: {{ shellCommandFromToolCall: (e) => (e.tool === "Bash" ? {{ command: e.input.cmd }} : null) }},
+}};
+// Outside a trix pane: nothing registered.
+delete process.env.TRIX_SOCKET;
+plugin(amp);
+const outside = Object.keys(handlers).length;
+process.env.TRIX_SOCKET = "s"; process.env.TRIX_AGENT_ID = "1";
+plugin(amp);
+const answers = [];
+handlers["session.start"]({{ thread: {{ id: "T-1" }} }});
+handlers["session.start"]({{ thread: {{ id: "T-sub" }} }});
+answers.push(await handlers["agent.start"]({{ thread: {{ id: "T-1" }}, message: "fix the login " + "x".repeat(385) + "\u{{1F600}} and more", id: 1 }}));
+answers.push(await handlers["agent.start"]({{ thread: {{ id: "T-sub" }}, message: "look around", id: 1 }}));
+handlers["tool.result"]({{ thread: {{ id: "T-1" }}, toolUseID: "t1", tool: "Bash", input: {{ cmd: "cargo test", cwd: "/w", timeout: 5 }}, status: "done", output: "ok" }});
+handlers["tool.result"]({{ thread: {{ id: "T-sub" }}, toolUseID: "t2", tool: "Read", input: {{ path: "/w/a.rs" }}, status: "done" }});
+handlers["tool.result"]({{ thread: {{ id: "T-1" }}, toolUseID: "t3", tool: "edit_file", input: {{ path: "/w/src/app.rs", old_str: "a", new_str: "b" }}, status: "done" }});
+state("awaiting-approval");
+state("running");
+handlers["agent.end"]({{ thread: {{ id: "T-sub" }}, message: "done", id: 2, status: "done", messages: [] }});
+handlers["agent.end"]({{ thread: {{ id: "T-1" }}, message: "done", id: 2, status: "done", messages: [] }});
+answers.push(await handlers["agent.start"]({{ thread: {{ id: "T-1" }}, message: "and the tests", id: 3 }}));
+// Another thread opened: its state is the one watched from then on.
+amp.activeThread.current = {{ id: "T-2" }};
+handlers["session.start"]({{ thread: {{ id: "T-2" }} }});
+await new Promise((r) => setTimeout(r, 20));
+process.stdout.write(JSON.stringify({{ outside, sent, answers, unsubscribed, registered: Object.keys(handlers).sort() }}));"#
+        );
+        let Ok(out) = std::process::Command::new("node").arg("--input-type=module").arg("-e").arg(&script).output() else { return };
+        if !out.status.success() {
+            panic!("{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let got: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(got["outside"], 0, "outside a trix pane it registers nothing");
+        assert_eq!(got["registered"], json!(["agent.end", "agent.start", "session.start", "tool.result"]));
+        let sent = got["sent"].as_array().unwrap();
+        // One command, the payload its only argument, in hex.
+        assert!(sent.iter().all(|s| s["command"] == "trix hook amp <>"), "{got}");
+        let payloads: Vec<Value> = sent.iter().map(|s| serde_json::from_str(&unhex(s["hex"].as_str().unwrap()).unwrap()).unwrap()).collect();
+        let events: Vec<String> = payloads.iter().map(|p| condense_amp(1, p).event).collect();
+        // The other thread's (a subagent's) never show.
+        assert_eq!(
+            events,
+            ["SessionStart", "UserPromptSubmit", "ToolDone", "ToolDone", "PermissionRequest", "Answered", "Stop", "UserPromptSubmit", "SessionStart"],
+            "{payloads:?}"
+        );
+        assert!(payloads[..8].iter().all(|p| p["thread"] == "T-1") && payloads[8]["thread"] == "T-2");
+        // In the order they happened, whichever `trix hook` gets there first.
+        let seqs: Vec<u64> = payloads.iter().map(|p| p["trix_seq"].as_u64().unwrap()).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        // The prompt, cut before the emoji it would have split.
+        let prompt = payloads[1]["message"].as_str().unwrap();
+        assert_eq!((prompt.chars().count(), prompt.ends_with('x'), payloads[1]["first"].as_bool()), (399, true, Some(true)));
+        assert_eq!(payloads[7]["first"], false, "a thread's later prompts");
+        // Tools: the command Amp's helper finds, and only the arguments that say what it was about.
+        assert_eq!(payloads[2]["command"], "cargo test");
+        assert_eq!(payloads[2]["input"], json!({"cmd": "cargo test"}));
+        assert_eq!(payloads[3]["input"], json!({"path": "/w/src/app.rs"}));
+        let details: Vec<Option<String>> = payloads[2..4].iter().map(|p| condense_amp(1, p).detail).collect();
+        assert_eq!(details, [Some("cargo test".to_string()), Some("app.rs".to_string())]);
+        // What `agent.start` hands back to Amp: trix's answer to a first prompt, else nothing.
+        assert_eq!(got["answers"], json!([{"message": {"content": "peers"}}, {}, {}]));
+        assert_eq!(got["unsubscribed"], 1, "the thread left is no longer watched");
     }
 }
