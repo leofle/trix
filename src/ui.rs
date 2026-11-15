@@ -147,7 +147,8 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     f.buffer_mut().set_style(area, Style::new().bg(t.surface));
     let count = |s: State| app.agents.iter().filter(|a| a.state == s).count();
     // Each item says how soon it goes when the bar is too narrow for both
-    // sides with a space between: the lowest rank first, whole items only.
+    // sides with a clear gap between ("needs you focus" would read as one
+    // phrase): the lowest rank first, whole items only.
     const KEEP: u8 = u8::MAX;
     let mut left: Vec<(u8, Vec<Span>)> = vec![
         (KEEP, vec![
@@ -204,7 +205,7 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     right.push((KEEP, vec![Span::styled(clock(), Style::new().fg(t.fg)), Span::raw(" ")]));
 
     let width = |items: &[(u8, Vec<Span>)]| items.iter().flat_map(|(_, s)| s).map(|s| s.width()).sum::<usize>();
-    while width(&left) + 1 + width(&right) > area.width as usize {
+    while width(&left) + 3 + width(&right) > area.width as usize {
         let lowest = |items: &[(u8, Vec<Span>)]| items.iter().enumerate().filter(|(_, (r, _))| *r != KEEP).min_by_key(|(_, (r, _))| *r).map(|(i, (r, _))| (*r, i));
         match (lowest(&left), lowest(&right)) {
             (Some(l), Some(r)) if r.0 < l.0 => drop(right.remove(r.1)),
@@ -3051,6 +3052,9 @@ mod tests {
             let top: String = (0..w).map(|x| buf[(x, 0)].symbol().to_string()).collect();
             let top = top.trim_end();
             let (left, right) = top.split_at(top.rfind("  ").map(|i| i + 2).unwrap_or(0));
+            if let (Some(l), Some(r)) = (top.find("you"), top.find("focus")) {
+                assert!(r >= l + 3 + 3, "{w} cols, the sides run together: {top:?}");
+            }
             // Every word is whole: no item is cut or drawn over another.
             for word in left.split_whitespace().chain(right.split_whitespace()) {
                 assert!(["◆", "trix", version, "▲", "○", "1", "11", "needs", "you", "idle", "focus", "·"].contains(&word) || word.contains(':'), "{w} cols, cut word {word:?}: {top:?}");
