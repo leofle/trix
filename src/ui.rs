@@ -27,6 +27,49 @@ const SIDEBAR_ICONS_W: u16 = 7;
 /// The narrowest a grid pane gets while the sidebar shows. Narrower
 /// than this, the sidebar steps aside in grid view.
 const GRID_TILE_MIN: u16 = 30;
+/// In focus view, the sidebar steps down a size rather than leave the
+/// agent's pane narrower than this.
+const FOCUS_COMFORT_W: u16 = 60;
+/// ...and hides rather than leave it narrower than this beside the chosen
+/// size (the floor trix always had).
+const FOCUS_MIN_W: u16 = 34;
+
+fn sidebar_w(size: SidebarSize) -> u16 {
+    match size {
+        SidebarSize::Wide => SIDEBAR_W,
+        SidebarSize::Narrow => SIDEBAR_MINI_W,
+        SidebarSize::Icons => SIDEBAR_ICONS_W,
+    }
+}
+
+/// The sidebar size drawn in a body this wide, or `None` to hide it. In
+/// focus view the chosen size steps down (wide, narrow, icons) while it
+/// would leave the agent's pane under a comfortable width. When even the
+/// icons rail can't, the sidebar keeps to the floor of the chosen size,
+/// drawn as the rail, and hides below it: a smaller sidebar is never worth
+/// a pane squeezed past where hiding would have left it. The grid only
+/// shows the chosen size or nothing, since any sidebar narrows every
+/// tile. The choice itself (prefs.json) stays as it is, so a wider window
+/// brings it back.
+fn sidebar_fit(pref: SidebarSize, width: u16, grid: bool) -> Option<SidebarSize> {
+    if grid {
+        // The grid puts two panes side by side; give them room to be
+        // usable before giving the sidebar any.
+        return (width >= sidebar_w(pref) + 2 * GRID_TILE_MIN + 2).then_some(pref);
+    }
+    let mut size = pref;
+    loop {
+        if width >= sidebar_w(size) + FOCUS_COMFORT_W {
+            return Some(size);
+        }
+        size = match size {
+            SidebarSize::Wide => SidebarSize::Narrow,
+            SidebarSize::Narrow => SidebarSize::Icons,
+            SidebarSize::Icons => break,
+        };
+    }
+    (width >= sidebar_w(pref) + FOCUS_MIN_W).then_some(SidebarSize::Icons)
+}
 
 pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
@@ -88,25 +131,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let [top, body, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let side_w = match app.sidebar_size() {
-        SidebarSize::Wide => SIDEBAR_W,
-        SidebarSize::Narrow => SIDEBAR_MINI_W,
-        SidebarSize::Icons => SIDEBAR_ICONS_W,
-    };
-    // The grid puts two panes side by side; give them room to be usable
-    // before giving the sidebar any.
-    let main_min = if app.view == View::Grid && app.grid_shown().len() > 1 { 2 * GRID_TILE_MIN + 2 } else { 34 };
-    let show_sidebar = app.sidebar && body.width >= side_w + main_min;
-    let (side, main) = if show_sidebar {
-        let [s, m] = Layout::horizontal([Constraint::Length(side_w), Constraint::Min(20)]).areas(body);
-        (Some(s), m)
-    } else {
-        (None, body)
+    let grid = app.view == View::Grid && app.grid_shown().len() > 1;
+    let shown = if app.sidebar { sidebar_fit(app.sidebar_size(), body.width, grid) } else { None };
+    let (side, main) = match shown {
+        Some(size) => {
+            let [s, m] = Layout::horizontal([Constraint::Length(sidebar_w(size)), Constraint::Min(20)]).areas(body);
+            (Some((s, size)), m)
+        }
+        None => (None, body),
     };
 
     top_bar(f, app, top, &t);
-    if let Some(s) = side {
-        sidebar(f, app, s, &t);
+    if let Some((s, size)) = side {
+        sidebar(f, app, s, size, &t);
     }
     let main = Rect { x: main.x + 1, width: main.width.saturating_sub(2), ..main };
     if app.view != View::Focus || app.agents.is_empty() {
@@ -337,13 +374,14 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> (Vec<(Rect, Ac
     (buttons, esc)
 }
 
-fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
+fn sidebar(f: &mut Frame, app: &mut App, area: Rect, size: SidebarSize, t: &Theme) {
     f.buffer_mut().set_style(area, Style::new().bg(t.surface));
     let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(1) };
     if inner.height < 4 {
         return;
     }
-    let icons = app.sidebar_size() == SidebarSize::Icons;
+    let icons = size == SidebarSize::Icons;
+    let mini = size != SidebarSize::Wide;
     let mut header = if icons {
         // No room for the word: just how many.
         TLine::from(Span::styled(format!(" {}", app.agents.len()), Style::new().fg(t.dim).add_modifier(Modifier::BOLD)))
@@ -357,7 +395,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     // has no room: its tinted cards show who, and the menu unselects.
     if !app.selected.is_empty() && !icons {
         let n = app.selected.len();
-        let picked = if app.sidebar_mini { format!(" ✓{n}") } else { format!("   ✓ {n} selected") };
+        let picked = if mini { format!(" ✓{n}") } else { format!("   ✓ {n} selected") };
         header.push_span(Span::styled(picked, Style::new().fg(t.accent).add_modifier(Modifier::BOLD)));
         let x = inner.x + header.width() as u16 + 1;
         header.push_span(Span::styled(" ✕", Style::new().fg(t.dim)));
@@ -371,7 +409,6 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     // has room for a two-digit number: " ▌12 ⠹•".
     let list = Rect { y: inner.y + 2, height: inner.height.saturating_sub(5), width: inner.width + u16::from(icons), ..inner };
     let n = app.agents.len();
-    let mini = app.sidebar_mini;
     // Cards keep their size (alt+c makes them one line); what doesn't fit
     // scrolls, with the focused card always in view.
     let compact = mini || app.sidebar_compact;
@@ -390,7 +427,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let height = if compact { 1 } else { 3 };
     for i in 0..held {
         let r = Rect { x: list.x, y: list.y + (i * per) as u16, width: list.width, height };
-        card(f, app, i, r, compact, mini, t);
+        card(f, app, i, r, compact, size, t);
         app.hits.cards.push((r, app.agents[i].id));
     }
     let top = list.y + (held * per + gap) as u16;
@@ -401,7 +438,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     let shown = room.min(rest - first.min(rest));
     for (k, i) in (held + first..held + first + shown).enumerate() {
         let r = Rect { x: list.x, y: top + (k * per) as u16, width: list.width, height };
-        card(f, app, i, r, compact, mini, t);
+        card(f, app, i, r, compact, size, t);
         app.hits.cards.push((r, app.agents[i].id));
     }
     // What's out of view, in the free rows above and below the scrolling part.
@@ -455,12 +492,12 @@ fn card_bg(app: &App, i: usize, t: &Theme) -> Color {
     if app.selected.contains(&app.agents[i].id) { mix(base, t.accent, 0.2) } else { base }
 }
 
-fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, t: &Theme) {
+fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, size: SidebarSize, t: &Theme) {
     let a = &app.agents[i];
     let selected = i == app.focus;
     let bg = card_bg(app, i, t);
     f.buffer_mut().set_style(r, Style::new().bg(bg));
-    card_text(f, app, i, r, compact, mini, t);
+    card_text(f, app, i, r, compact, size, t);
     // Last, so the text's leading spaces don't paint over it.
     let bar_color = if a.state == State::Blocked {
         Some(t.red)
@@ -480,7 +517,8 @@ fn card(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, 
     }
 }
 
-fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: bool, t: &Theme) {
+fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, size: SidebarSize, t: &Theme) {
+    let mini = size != SidebarSize::Wide;
     let a = &app.agents[i];
     let selected = i == app.focus;
     let sc = state_color(t, a.state);
@@ -501,7 +539,7 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, mini: b
     } else {
         Style::new().fg(t.fg)
     };
-    if mini && app.sidebar_icons {
+    if size == SidebarSize::Icons {
         // "  1 ⠹•" or " 12 ⠹•": which agent, and its state. With no names
         // here, the number is all that tells rows apart, so 10 and up get
         // theirs too, right-aligned. The bar on the left still marks the
@@ -3175,6 +3213,74 @@ mod tests {
     }
 
     #[test]
+    fn the_sidebar_steps_down_before_it_hides() {
+        use SidebarSize::*;
+        // Focus view: wide while it leaves 60 columns, then narrow, then
+        // the icons rail while that leaves 60.
+        assert_eq!(sidebar_fit(Wide, 96, false), Some(Wide));
+        assert_eq!(sidebar_fit(Wide, 95, false), Some(Narrow));
+        assert_eq!(sidebar_fit(Wide, 80, false), Some(Narrow), "80x24: the agent keeps 62 columns");
+        assert_eq!(sidebar_fit(Wide, 78, false), Some(Narrow));
+        assert_eq!(sidebar_fit(Wide, 77, false), Some(Icons));
+        assert_eq!(sidebar_fit(Wide, 67, false), Some(Icons));
+        // Below that, the wide sidebar's own floor: it hid under 70, so
+        // the rail goes too rather than squeeze the agent.
+        assert_eq!(sidebar_fit(Wide, 66, false), None);
+        assert_eq!(sidebar_fit(Wide, 41, false), None);
+        // Never wider than the chosen size, however wide the window.
+        assert_eq!(sidebar_fit(Narrow, 300, false), Some(Narrow));
+        assert_eq!(sidebar_fit(Narrow, 77, false), Some(Icons));
+        // The narrow one's floor is 52, and the rail holds to it.
+        assert_eq!(sidebar_fit(Narrow, 52, false), Some(Icons));
+        assert_eq!(sidebar_fit(Narrow, 51, false), None);
+        assert_eq!(sidebar_fit(Icons, 300, false), Some(Icons));
+        assert_eq!(sidebar_fit(Icons, 41, false), Some(Icons));
+        assert_eq!(sidebar_fit(Icons, 40, false), None);
+        // Shrinking the window never brings a bigger sidebar back.
+        for pref in [Wide, Narrow, Icons] {
+            let mut last = sidebar_fit(pref, 200, false).map(sidebar_w);
+            for w in (20..200).rev() {
+                let now = sidebar_fit(pref, w, false).map(sidebar_w);
+                assert!(now.unwrap_or(0) <= last.unwrap_or(0), "{pref:?} grew at {w}");
+                last = now;
+            }
+        }
+        // Grid: the chosen size or nothing, as two tiles need the room.
+        let tiles = 2 * GRID_TILE_MIN + 2;
+        assert_eq!(sidebar_fit(Wide, SIDEBAR_W + tiles, true), Some(Wide));
+        assert_eq!(sidebar_fit(Wide, SIDEBAR_W + tiles - 1, true), None);
+        assert_eq!(sidebar_fit(Narrow, SIDEBAR_MINI_W + tiles, true), Some(Narrow));
+        assert_eq!(sidebar_fit(Narrow, SIDEBAR_MINI_W + tiles - 1, true), None);
+    }
+
+    #[test]
+    fn a_narrow_window_draws_a_smaller_sidebar_but_keeps_the_choice() {
+        // Wide chosen, 80 columns: drawn (and clicked) as the narrow one.
+        let (text, app) = screen(false, 80);
+        assert_eq!(app.sidebar_size(), SidebarSize::Wide, "the choice is untouched");
+        let cards = &app.hits.cards;
+        assert_eq!(cards.len(), 4);
+        assert!(cards.iter().all(|(r, _)| r.height == 1 && r.width == SIDEBAR_MINI_W - 2), "narrow cards:\n{text}");
+        assert!(!text.contains("new agent"), "the narrow footer:\n{text}");
+        for a in &app.agents {
+            a.shutdown();
+        }
+        // Narrower still: the icons rail, its cards and hits as wide as it.
+        let (text, app) = screen(false, 70);
+        assert!(app.hits.cards.iter().all(|(r, _)| r.width == SIDEBAR_ICONS_W - 1), "icon cards:\n{text}");
+        assert!(!text.lines().any(|l| l.chars().take(SIDEBAR_ICONS_W as usize).collect::<String>().contains("web")), "no names:\n{text}");
+        for a in &app.agents {
+            a.shutdown();
+        }
+        // Wide enough again: the chosen size is back.
+        let (_, app) = screen(false, 100);
+        assert!(app.hits.cards.iter().all(|(r, _)| r.width > SIDEBAR_MINI_W), "wide again");
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
     fn the_sidebar_window_follows_the_focus() {
         // Everything fits: no scrolling, wherever it was.
         assert_eq!(sidebar_window(5, Some(3), 4, 10), 0);
@@ -3421,8 +3527,11 @@ mod tests {
     #[test]
     fn the_sidebar_steps_aside_for_a_narrow_grid() {
         let mut app = grid_app();
-        let text = grid_screen(&mut app, 80, 24);
-        assert!(app.hits.cards.is_empty(), "no sidebar for a 2x2 grid at 80:\n{text}");
+        // Any sidebar narrows every tile, so it steps aside, not down.
+        for w in [60, 70, 80] {
+            let text = grid_screen(&mut app, w, 24);
+            assert!(app.hits.cards.is_empty(), "no sidebar for a 2x2 grid at {w}:\n{text}");
+        }
         let text = grid_screen(&mut app, 140, 40);
         assert_eq!(app.hits.cards.len(), 4, "the sidebar at 140:\n{text}");
         for a in &app.agents {
@@ -3437,8 +3546,19 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
-        let (_, app) = screen(true, 60);
-        assert_eq!(app.hits.cards.len(), 4, "but the mini one fits");
+        let (_, app) = screen(true, 90);
+        assert!(app.hits.cards.iter().all(|(r, _)| r.width == SIDEBAR_MINI_W - 2), "the mini one fits at 90");
+        for a in &app.agents {
+            a.shutdown();
+        }
+        let (text, app) = screen(true, 60);
+        assert_eq!(app.hits.cards.len(), 4, "the mini one keeps a sidebar at 60:\n{text}");
+        assert!(app.hits.cards.iter().all(|(r, _)| r.width == SIDEBAR_ICONS_W - 1), "as the icons rail:\n{text}");
+        for a in &app.agents {
+            a.shutdown();
+        }
+        let (_, app) = screen(true, 40);
+        assert!(app.hits.cards.is_empty(), "nothing fits at 40");
         for a in &app.agents {
             a.shutdown();
         }
