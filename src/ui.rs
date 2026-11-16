@@ -51,7 +51,7 @@ fn sidebar_w(size: SidebarSize) -> u16 {
 /// shows the chosen size or nothing, since any sidebar narrows every
 /// tile. The choice itself (prefs.json) stays as it is, so a wider window
 /// brings it back.
-fn sidebar_fit(pref: SidebarSize, width: u16, grid: bool) -> Option<SidebarSize> {
+pub fn sidebar_fit(pref: SidebarSize, width: u16, grid: bool) -> Option<SidebarSize> {
     if grid {
         // The grid puts two panes side by side; give them room to be
         // usable before giving the sidebar any.
@@ -131,8 +131,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let [top, body, bottom] = Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let grid = app.view == View::Grid && app.grid_shown().len() > 1;
-    let shown = if app.sidebar { sidebar_fit(app.sidebar_size(), body.width, grid) } else { None };
+    let shown = if app.sidebar { sidebar_fit(app.sidebar_size(), body.width, app.grid_split()) } else { None };
+    (app.sidebar_drawn, app.sidebar_room) = (shown, body.width);
     let (side, main) = match shown {
         Some(size) => {
             let [s, m] = Layout::horizontal([Constraint::Length(sidebar_w(size)), Constraint::Min(20)]).areas(body);

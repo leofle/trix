@@ -397,6 +397,11 @@ pub struct App {
     /// alt+m again, from narrow: only each agent's number and state glyph.
     /// Only means something with `sidebar_mini`.
     pub sidebar_icons: bool,
+    /// The sidebar size the last draw showed (`None`: hidden), which a
+    /// narrow window can make smaller than the one chosen, and the width
+    /// it had to fit in (0 before the first draw). alt+m cycles from it.
+    pub sidebar_drawn: Option<SidebarSize>,
+    pub sidebar_room: u16,
     /// alt+c: one-line cards, so more fit. Otherwise cards keep their size
     /// and the list scrolls.
     pub sidebar_compact: bool,
@@ -500,6 +505,8 @@ impl App {
             sidebar: true,
             sidebar_mini: prefs.sidebar_mini,
             sidebar_icons: prefs.sidebar_icons,
+            sidebar_drawn: None,
+            sidebar_room: 0,
             sidebar_compact: prefs.sidebar_compact,
             sidebar_scroll: 0,
             selected: Vec::new(),
@@ -1775,11 +1782,28 @@ impl App {
                 self.keep_grid_focus();
             }
             Action::Sidebar => self.sidebar = !self.sidebar,
-            // wide → narrow → icons → wide. From hidden, it brings the
-            // sidebar back small, as narrow as it was.
+            // wide → narrow → icons → wide, from what's on screen. From
+            // hidden, it brings the sidebar back small, as narrow as it was.
             Action::MiniSidebar => {
-                let size = if self.sidebar { self.sidebar_size().cycle(true) } else { self.sidebar_size().max(SidebarSize::Narrow) };
-                self.set_sidebar_size(size);
+                if !self.sidebar || self.sidebar_room == 0 {
+                    let size = if self.sidebar { self.sidebar_size().cycle(true) } else { self.sidebar_size().max(SidebarSize::Narrow) };
+                    self.set_sidebar_size(size);
+                } else {
+                    // A narrow window draws a smaller size than the one
+                    // chosen, so cycle from the one drawn, to the next
+                    // choice that draws something else.
+                    let from = self.sidebar_drawn;
+                    let (room, grid) = (self.sidebar_room, self.grid_split());
+                    let mut size = from.unwrap_or(self.sidebar_size());
+                    let next = (0..3).find_map(|_| {
+                        size = size.cycle(true);
+                        (crate::ui::sidebar_fit(size, room, grid) != from).then_some(size)
+                    });
+                    match next {
+                        Some(size) => self.set_sidebar_size(size),
+                        None => self.toast("sidebar: no room for another size in a window this narrow", ToastKind::Info),
+                    }
+                }
             }
             Action::Compact => {
                 let on = !self.sidebar_compact;
@@ -1830,6 +1854,12 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Two or more panes side by side in the grid, which the sidebar
+    /// steps aside for rather than narrow.
+    pub fn grid_split(&self) -> bool {
+        self.view == View::Grid && self.grid_shown().len() > 1
     }
 
     pub fn sidebar_size(&self) -> SidebarSize {
@@ -3078,6 +3108,40 @@ mod tests {
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
+    }
+
+    #[test]
+    fn alt_m_cycles_from_the_sidebar_on_screen() {
+        let mut app = test_app();
+        let draw = |app: &mut App, w: u16| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 24)).unwrap();
+            term.draw(|f| crate::ui::draw(f, app)).unwrap();
+            app.sidebar_drawn
+        };
+        // Wide chosen, 80 columns: drawn narrow. Every press changes what
+        // shows: icons, then narrow again (wide chosen back, still drawn
+        // narrow), never a press that does nothing.
+        assert_eq!(draw(&mut app, 80), Some(SidebarSize::Narrow));
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!((app.sidebar_size(), draw(&mut app, 80)), (SidebarSize::Icons, Some(SidebarSize::Icons)));
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!((app.sidebar_size(), draw(&mut app, 80)), (SidebarSize::Wide, Some(SidebarSize::Narrow)));
+        // Wide enough, the plain cycle.
+        assert_eq!(draw(&mut app, 140), Some(SidebarSize::Wide));
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!(draw(&mut app, 140), Some(SidebarSize::Narrow));
+        // At 70 every choice draws the icons rail: say so, change nothing.
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!(draw(&mut app, 140), Some(SidebarSize::Icons));
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!((app.sidebar_size(), draw(&mut app, 70)), (SidebarSize::Wide, Some(SidebarSize::Icons)));
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!(app.sidebar_size(), SidebarSize::Wide, "the choice stays");
+        assert!(app.toast.is_some(), "and a toast says why nothing changed");
+        // Hidden by a narrow window: back as the rail, the one that fits.
+        assert_eq!(draw(&mut app, 60), None);
+        app.run(Action::MiniSidebar, 1);
+        assert_eq!(draw(&mut app, 60), Some(SidebarSize::Icons));
     }
 
     #[test]
