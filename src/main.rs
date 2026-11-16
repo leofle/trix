@@ -15,6 +15,7 @@ mod session;
 mod settings;
 mod state;
 mod theme;
+mod trixy;
 mod ui;
 mod usage;
 

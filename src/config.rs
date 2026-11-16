@@ -29,11 +29,19 @@ pub struct Config {
 }
 
 /// How trix draws its own icons.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ui {
     /// The terminal's font is a Nerd Font, so its icons can be drawn (the
     /// pane pin). Off, plain Unicode that every font has.
     pub nerd_font: bool,
+    /// Trixy, the animated mascot, in the sidebar over "new agent".
+    pub mascot: bool,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Ui { nerd_font: false, mascot: true }
+    }
 }
 
 /// alt+n's form, as it opens.
@@ -222,6 +230,7 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct FileUi {
     nerd_font: Option<bool>,
+    mascot: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -351,7 +360,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         None => Restore::Ask,
         Some(s) => Restore::ALL.into_iter().find(|r| r.name() == s).ok_or_else(|| format!("workspace.restore: '{s}' is not ask, always or never"))?,
     };
-    let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false) };
+    let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false), mascot: f.ui.mascot.unwrap_or(true) };
     Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore } })
 }
 
@@ -821,6 +830,8 @@ mod tests {
         assert!(!c.ui.nerd_font, "plain Unicode by default");
         assert!(read("[ui]\nnerd_font = true\n").unwrap().ui.nerd_font);
         assert!(read("[ui]\nnerd_fonts = true\n").is_err(), "a misspelling is a mistake");
+        assert!(c.ui.mascot, "Trixy shows by default");
+        assert!(!read("[ui]\nmascot = false\n").unwrap().ui.mascot);
         assert_eq!(read("[new]\nagent = \"last\"\n").unwrap().new.agent, None, "the one started last");
         assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
         assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));

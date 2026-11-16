@@ -154,6 +154,24 @@ trix layout rm work-layout
 - `--resume` only applies to Claude, Codex, Grok, OpenCode, Cursor, Copilot, Muse, Gemini, Antigravity and Amp tabs that have a saved `session`. Everything else starts fresh either way.
 - How this differs from [Restore](#restore): restore brings back whatever was open after a crash or restart, and it's per session and one-shot. A layout stays until you remove it, and you can open it into any session, any number of times.
 
+### Trixy
+
+Trixy, trix's mascot, stands in the sidebar's bottom corner and is the *new agent* button: click it, or press `alt+n`. It shows what the workspace is doing, the most pressing thing first:
+
+| Trixy | When |
+|---|---|
+| red light flashing | an agent needs you |
+| bouncing with sparkles, green light | an agent just finished |
+| bobbing, amber light pulsing | agents are working |
+| looking up, thought dots | they're all still thinking |
+| a light running across the bulb | an agent is starting |
+| blue light sending waves | finished work you haven't looked at |
+| hopping | no agents yet |
+| looking around, walking | all quiet, for a few seconds |
+| asleep, z's floating up | all quiet |
+
+It takes four rows of the wide and narrow sidebars. The icons rail and a very short sidebar keep the plain `+ new agent`. Asleep, it holds still while the terminal isn't in focus, so an idle trix in the background draws nothing. `[ui] mascot = false`, or *Trixy in the sidebar* in the settings, brings the plain button back.
+
 ### Settings
 
 `alt+,`, or a click on *settings* in the bottom bar, opens the settings:
@@ -162,6 +180,7 @@ trix layout rm work-layout
 - **Theme in agent panes** is on by default: a theme of trix's own paints the panes, and Claude, Grok and OpenCode take it too. Off, trix's bars and sidebar keep the theme, but the panes keep your terminal's colors (and its window transparency), and the agents keep their own themes. It does nothing while trix follows Omarchy's theme, which themes the terminal itself.
 - **Needs-you strip** sets the color of the bar that says another agent needs you: the theme's red, orange, yellow, green, cyan, accent or magenta, so it follows a theme switch, or the `#rrggbb` your config names.
 - **Sidebar** (wide, narrow or icons) and **sidebar cards** (full or compact) do the same as `alt+m` and `alt+c`, and are remembered the same way.
+- **Trixy in the sidebar** is on by default (see [Trixy](#trixy)).
 - **Nerd Font icons** is off by default. On, the pane pin comes from a Nerd Font. The row shows the pin as it will look, so if it shows as a box, your font isn't a Nerd Font: leave it off.
 - **New ones start as** picks the agent `alt+n`'s form starts on: claude (the default), codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell, or *last*, the one you started last. **New ones in a worktree** ticks the form's worktree box to begin with.
 - **Bring back the last workspace** is what a fresh trix does with the workspace saved last time: *ask* (the default), *always* bring it back, or *never*, starting fresh (see [Restore](#restore)).
@@ -208,6 +227,7 @@ panes = false                     # keep the panes in the terminal's colors (on 
 
 [ui]
 nerd_font = true                  # draw icons from a Nerd Font (off by default: plain Unicode)
+mascot = false                    # a plain "+ new agent", no Trixy (on by default)
 
 [workspace]
 restore = "always"                # a fresh trix and the saved workspace: "ask" (default), "always", "never"
@@ -220,6 +240,7 @@ restore = "always"                # a fresh trix and the saved workspace: "ask" 
 - **New agents** take `agent` and `worktree` as where `alt+n`'s form starts; you can still change both in it. `"last"` is the kind you started last from the form, remembered in `prefs.json`, or claude before you've started one. `kinds` is the form's kind row, in your order: claude, codex, shell and custom by default. Every other kind, including any trix adds later, waits under *more ▸*, and its letter picks it all the same. A name that isn't a kind, or one named twice, is a mistake.
 - **`[theme] panes = false`** keeps a theme of trix's own to its bars, sidebar and cards (see [Themes](#themes)).
 - **`[ui] nerd_font = true`** draws the pane pin from a Nerd Font (``) instead of plain Unicode (`⚲`). Turn it on only if your terminal's font is a Nerd Font: trix can't see the font, and without one the icon shows as an empty box.
+- **`[ui] mascot = false`** makes the sidebar's new-agent button the plain `+ new agent` instead of Trixy (see [Trixy](#trixy)).
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
 

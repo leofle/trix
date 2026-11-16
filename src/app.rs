@@ -331,6 +331,9 @@ pub struct HitMap {
     /// Each pane's pin, on its title: click to pin it to the top.
     pub pins: Vec<(Rect, u32)>,
     pub new_button: Option<Rect>,
+    /// Trixy, where it's on screen: its animation is worth drawing frames
+    /// for, and a click on it is one on the button it stands on.
+    pub trixy: Option<Rect>,
     /// The sidebar header's ✕: clears the selection.
     pub unselect: Option<Rect>,
     /// The attention strip, and the agent it's about.
@@ -1184,8 +1187,8 @@ impl App {
     }
 
     /// When the picture next changes on its own: the next spinner step (every
-    /// 90 ms), the next blink of a "needs you" glyph (every 540 ms), a toast
-    /// fading. `None` when nothing moves. Frames are numbered from `started`
+    /// 90 ms), the next blink of a "needs you" glyph (every 540 ms), Trixy's
+    /// next frame, a toast fading. `None` when nothing moves. Frames are numbered from `started`
     /// (see `ui::frame_no`), so these are exact.
     pub fn next_frame_change(&self) -> Option<Instant> {
         const STEP: u128 = 90;
@@ -1205,6 +1208,11 @@ impl App {
             && let Some(step) = crate::ui::next_strip_step(since.elapsed())
         {
             take(since + step);
+        }
+        if self.hits.trixy.is_some()
+            && let Some(d) = crate::trixy::next_change(self)
+        {
+            take(Instant::now() + d + Duration::from_millis(1));
         }
         if let Some(t) = &self.toast {
             let fade = t.at + Duration::from_millis(3200);
@@ -2056,6 +2064,10 @@ impl App {
             }
             Row::SidebarMini => self.set_sidebar_size(self.sidebar_size().cycle(forward)),
             Row::SidebarCompact => self.set_sidebar_compact(!self.sidebar_compact),
+            Row::Mascot => {
+                let on = !self.config.ui.mascot;
+                self.set_config("ui", "mascot", on.into(), on);
+            }
             Row::NerdFont => {
                 let on = !self.config.ui.nerd_font;
                 self.set_config("ui", "nerd_font", on.into(), !on);
@@ -2676,9 +2688,7 @@ impl App {
                     self.dirty = true;
                     return;
                 }
-                if let Some(r) = self.hits.new_button
-                    && inside(&r)
-                {
+                if [self.hits.new_button, self.hits.trixy].iter().flatten().any(inside) {
                     self.open_new();
                     self.dirty = true;
                     return;

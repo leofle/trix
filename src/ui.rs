@@ -168,10 +168,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // A theme tried on shows undimmed all round.
         if s.picker.is_none() {
             backdrop(f.buffer_mut(), area, &t);
+            trixy_dimmed(f.buffer_mut(), app, &t);
         }
         settings(f, app, area, &t);
     } else if app.modal.is_some() {
         backdrop(f.buffer_mut(), area, &t);
+        trixy_dimmed(f.buffer_mut(), app, &t);
         let mut hits = Vec::new();
         modal(f, app, area, &t, &mut hits);
         app.hits.dialog = hits;
@@ -412,6 +414,12 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, size: SidebarSize, t: &Them
     // Cards keep their size (alt+c makes them one line); what doesn't fit
     // scrolls, with the focused card always in view.
     let compact = mini || app.sidebar_compact;
+    // Trixy is the "new agent" button, standing on its row and three more:
+    // the list gives those up while it keeps room for two full cards. The
+    // icons rail is too narrow for it.
+    let over = crate::trixy::ROWS - 1;
+    let trixy = app.config.ui.mascot && !icons && list.height >= over + 7;
+    let list = Rect { height: list.height - if trixy { over } else { 0 }, ..list };
     let per = if compact { 1 } else { 4 };
     // A full card is 3 rows and a gap; the last needs no gap.
     let fit = if compact { list.height as usize } else { (list.height as usize + 1) / 4 };
@@ -449,18 +457,26 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect, size: SidebarSize, t: &Them
     // Right under the last card shown: its gap row, or the next row.
     let below = rest - first.min(rest) - shown;
     let y = top + (shown.saturating_sub(1) * per) as u16 + if compact { 1 } else { 3 };
-    if below > 0 && shown > 0 && y < area.bottom().saturating_sub(2) {
+    if below > 0 && shown > 0 && y <= list.bottom() {
         f.render_widget(Paragraph::new(Span::styled(more(below, "↓"), Style::new().fg(t.muted))), Rect { y, height: 1, ..inner });
     }
 
     // "new agent" button pinned to the bottom of the rail.
     let by = area.bottom().saturating_sub(2);
     let btn = Rect { x: inner.x, y: by, width: inner.width, height: 1 };
-    let line = TLine::from(vec![
-        Span::styled(" + ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(if icons { "" } else if mini { "new" } else { "new agent" }, Style::new().fg(t.fg)),
-    ]);
-    f.render_widget(Paragraph::new(line), btn);
+    if trixy {
+        // In place of the words, where the "+" was.
+        let (mood, at) = crate::trixy::mood(app);
+        let r = Rect { x: inner.x + 1, y: by - over, width: crate::trixy::COLS, height: crate::trixy::ROWS };
+        crate::trixy::draw(f.buffer_mut(), r, mood, at, t.surface, None);
+        app.hits.trixy = Some(r);
+    } else {
+        let line = TLine::from(vec![
+            Span::styled(" + ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(if icons { "" } else if mini { "new" } else { "new agent" }, Style::new().fg(t.fg)),
+        ]);
+        f.render_widget(Paragraph::new(line), btn);
+    }
     if let Some(k) = app.config.keys.label(Action::New).filter(|_| !mini) {
         f.render_widget(
             Paragraph::new(Span::styled(format!("{k} "), Style::new().fg(t.muted))).alignment(Alignment::Right),
@@ -1260,6 +1276,23 @@ fn backdrop(buf: &mut Buffer, area: Rect, t: &Theme) {
     }
 }
 
+/// Trixy under the backdrop: drawn again dimmed. The backdrop gives every
+/// cell one foreground, which would leave a picture made of half blocks in
+/// stripes.
+fn trixy_dimmed(buf: &mut Buffer, app: &App, t: &Theme) {
+    let Some(r) = app.hits.trixy else { return };
+    let surface = mix(t.surface, t.bg, 0.5);
+    for y in r.top()..r.bottom() {
+        for x in r.left()..r.right() {
+            if let Some(c) = buf.cell_mut((x, y)) {
+                c.set_symbol(" ").set_bg(surface);
+            }
+        }
+    }
+    let (mood, at) = crate::trixy::mood(app);
+    crate::trixy::draw(buf, r, mood, at, surface, Some(t.bg));
+}
+
 // ───────────────────────────── empty state ─────────────────────────────
 
 const LOGO: [&str; 3] = ["▀█▀ █▀█ █ ▀▄▀", " █  █▀▄ █ ▄▀▄", ""];
@@ -2000,6 +2033,7 @@ fn setting_value(app: &App, s: &Settings, row: Row, t: &Theme) -> Vec<Span<'stat
         }
         Row::SidebarMini => text(app.sidebar_size().word().into(), t.fg),
         Row::SidebarCompact => text((if app.sidebar_compact { "compact" } else { "full" }).into(), t.fg),
+        Row::Mascot => toggle(app.config.ui.mascot),
         Row::NerdFont => {
             let mut v = toggle(app.config.ui.nerd_font);
             v.insert(0, pin_span(app, true));
@@ -3079,7 +3113,7 @@ mod tests {
         let (full, app) = screen(false, 100);
         assert!(full.lines().any(|l| l.starts_with(" ▌ 2")), "the full sidebar shows the bar too:\n{full}");
         let full_w = app.hits.cards[0].0.width;
-        assert!(full.contains("new agent") && full.contains("alt+n"));
+        assert!(app.hits.trixy.is_some() && !full.contains("new agent") && full.contains("alt+n"), "Trixy for the words, the key beside it");
         for a in &app.agents {
             a.shutdown();
         }
@@ -3098,7 +3132,7 @@ mod tests {
         assert!(row(1).contains("api-gate") && row(1).contains('…'), "long names are cut: {}", row(1));
         assert!(row(2).contains("docs •"), "unseen work keeps its dot: {}", row(2));
         assert!(!mini.contains("Edit src/app.rs") || mini.lines().all(|l| !l.starts_with("       Edit")), "no activity rows");
-        assert!(mini.contains("+ new") && !mini.contains("new agent"));
+        assert!(app.hits.trixy.is_some() && !mini.contains("+ new"), "Trixy alone: no room for the key");
         for a in &app.agents {
             a.shutdown();
         }
@@ -3382,6 +3416,45 @@ mod tests {
     }
 
     #[test]
+    fn trixy_is_the_new_agent_button() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.sidebar_mini = false;
+        let screen = |app: &mut App, rows: u16| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, rows)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            let body = (0..SIDEBAR_W).any(|x| (0..rows).any(|y| buf[(x, y)].bg == Color::Rgb(0x82, 0xa1, 0xf1)));
+            let text = (0..rows).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n");
+            (body, text)
+        };
+        let (body, text) = screen(&mut app, 30);
+        assert!(body && !text.contains("+ new agent"), "Trixy, not the words:\n{text}");
+        // Four rows in the corner, its feet on the button's row beside the key.
+        let (r, btn) = (app.hits.trixy.unwrap(), app.hits.new_button.unwrap());
+        assert_eq!((r.x, r.bottom(), r.width, r.height), (2, btn.bottom(), 9, 4));
+        assert!(text.lines().nth(btn.y as usize).unwrap().contains("alt+n"));
+        // A click on it is a click on the button.
+        let click = crossterm::event::MouseEvent { kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), column: r.x + 4, row: r.y, modifiers: crossterm::event::KeyModifiers::NONE };
+        app.handle(crate::app::AppEvent::Mouse(click));
+        assert!(matches!(app.modal, Some(Modal::New(_))), "the new-agent form");
+        app.modal = None;
+        app.sidebar_mini = true;
+        assert!(screen(&mut app, 30).0, "the narrow sidebar has it too");
+        // Where it can't be, the words are back.
+        app.sidebar_icons = true;
+        assert!(!screen(&mut app, 30).0 && app.hits.trixy.is_none(), "the icons rail is too narrow");
+        app.sidebar_icons = false;
+        app.sidebar_mini = false;
+        let (body, text) = screen(&mut app, 12);
+        assert!(!body && text.contains("+ new agent"), "too short a sidebar keeps its rows for cards:\n{text}");
+        app.config.ui.mascot = false;
+        let (body, text) = screen(&mut app, 30);
+        assert!(!body && text.contains("+ new agent"), "[ui] mascot = false:\n{text}");
+    }
+
+    #[test]
     fn full_cards_scroll_and_compact_ones_fit() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
@@ -3593,15 +3666,17 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
-        let text = |app: &mut App| {
-            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let text_at = |app: &mut App, rows: u16| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, rows)).unwrap();
             term.draw(|f| draw(f, app)).unwrap();
             let buf = term.backend().buffer();
             (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
         };
+        let text = |app: &mut App| text_at(app, 30);
         app.config.notify.bell = false;
         app.open_settings();
-        let shown = text(&mut app);
+        // Tall enough for every row: shorter, the list scrolls.
+        let shown = text_at(&mut app, 32);
         for want in ["Settings", "LOOK", "Theme", "Your terminal's colors ›", "Sidebar  alt+m", "wide", "With the terminal bell", "off", "When one is done", "chime", "Keys, mutes, a notify command"] {
             assert!(shown.contains(want), "{want:?} in\n{shown}");
         }
