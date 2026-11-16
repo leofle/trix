@@ -243,16 +243,33 @@ fn main() -> anyhow::Result<()> {
         }
         Some("kill") => {
             if matches!(args.get(1).map(String::as_str), Some("-a" | "--all")) {
-                let killed = session::candidates().iter().filter(|n| session::send_once(n, &ClientMsg::Kill)).count();
+                let mut killed = 0;
+                for n in session::candidates() {
+                    match session::send_once(&n, &ClientMsg::Kill) {
+                        Ok(true) => killed += 1,
+                        Ok(false) => {}
+                        Err(why) => {
+                            eprintln!("{why}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 if killed == 0 {
                     eprintln!("trix: no workspace running");
                     std::process::exit(1);
                 }
                 return Ok(());
             }
-            if !session::send_once(session::name(), &ClientMsg::Kill) {
-                eprintln!("{}", missing());
-                std::process::exit(1);
+            match session::send_once(session::name(), &ClientMsg::Kill) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!("{}", missing());
+                    std::process::exit(1);
+                }
+                Err(why) => {
+                    eprintln!("{why}");
+                    std::process::exit(1);
+                }
             }
             return Ok(());
         }
@@ -572,7 +589,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
         SessionEvent::List(mut stream) => {
             let _ = session::write_frame(&mut stream, session::TEXT, app.listing().as_bytes());
         }
-        SessionEvent::Control { stream, from, req } => control::handle(app, stream, from, req),
+        SessionEvent::Control { stream, from, req, sandboxed } => control::handle(app, stream, from, req, sandboxed),
         SessionEvent::Kill(stream) => killed.push(stream),
     }
 }

@@ -18,6 +18,99 @@ pub fn alive(pid: u32) -> bool {
     ok || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// The process on the other end of a Unix socket, from the kernel: what it
+/// says about itself can't be trusted.
+#[cfg(target_os = "macos")]
+pub fn peer_pid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len) };
+    (r == 0 && pid > 0).then_some(pid as u32)
+}
+
+#[cfg(target_os = "linux")]
+pub fn peer_pid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len) };
+    (r == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn peer_pid(_s: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
+}
+
+/// Is `pid` inside a sandbox this process isn't in? Commands an agent runs
+/// in its sandbox (Codex's, say) can reach the control socket, and must not
+/// use trix to do what the sandbox stops them doing. A sandbox survives fork,
+/// exec and being orphaned, so a command can't slip out of this by
+/// double-forking. When it can't tell (the process is gone, say) on macOS or
+/// Linux, the answer is yes.
+#[cfg(target_os = "macos")]
+pub fn sandboxed(pid: Option<u32>) -> bool {
+    unsafe extern "C" {
+        // libsystem_sandbox: with no operation, non-zero when `pid` is
+        // sandboxed (and when there's no such process).
+        fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, kind: libc::c_int, ...) -> libc::c_int;
+    }
+    let check = |pid: u32| unsafe { sandbox_check(pid as libc::pid_t, std::ptr::null(), 0) } != 0;
+    static SELF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // A workspace started inside a sandbox can't tell its own from a pane's.
+    if *SELF.get_or_init(|| check(std::process::id())) {
+        return false;
+    }
+    pid.is_none_or(check)
+}
+
+/// Linux sandboxes (Landlock, seccomp, bubblewrap) leave marks a process
+/// can't take off: no_new_privs, seccomp filters, its own user namespace.
+#[cfg(target_os = "linux")]
+pub fn sandboxed(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else { return true };
+    let me = Confinement::of("self");
+    match Confinement::of(&pid.to_string()) {
+        Some(them) => me.is_some_and(|me| them.tighter_than(&me)),
+        None => me.is_some(),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn sandboxed(_pid: Option<u32>) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq)]
+struct Confinement {
+    no_new_privs: bool,
+    seccomp_filters: u32,
+    user_ns: Option<PathBuf>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Confinement {
+    #[cfg(target_os = "linux")]
+    fn of(pid: &str) -> Option<Confinement> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let user_ns = std::fs::read_link(format!("/proc/{pid}/ns/user")).ok();
+        Some(Confinement::parse(&status, user_ns))
+    }
+
+    fn parse(status: &str, user_ns: Option<PathBuf>) -> Confinement {
+        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')).map(str::trim);
+        // Kernels before 5.9 have no count, only the mode (2: filtered).
+        let seccomp_filters = field("Seccomp_filters").and_then(|v| v.parse().ok()).unwrap_or(u32::from(field("Seccomp") == Some("2")));
+        Confinement { no_new_privs: field("NoNewPrivs") == Some("1"), seccomp_filters, user_ns }
+    }
+
+    fn tighter_than(&self, me: &Confinement) -> bool {
+        // A namespace we can't read is one we aren't in.
+        let other_ns = me.user_ns.is_some() && self.user_ns != me.user_ns;
+        (self.no_new_privs && !me.no_new_privs) || self.seccomp_filters > me.seccomp_filters || other_ns
+    }
+}
+
 /// Open files the server asks for at most. macOS refuses more than 10240
 /// (`OPEN_MAX`) however high the hard limit is, and that is about 2000 agents.
 const FD_WANTED: libc::rlim_t = 10240;
@@ -281,6 +374,58 @@ pub fn copy(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_is_the_connecting_process() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(peer_pid(&a), Some(std::process::id()));
+        assert!(!sandboxed(Some(std::process::id())), "we aren't in a sandbox of our own");
+    }
+
+    /// The real thing, as Codex's commands run on macOS: sandbox-exec.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_process_is_seen_as_one() {
+        let mut free = Command::new("sleep").arg("5").spawn().unwrap();
+        let mut boxed = Command::new("/usr/bin/sandbox-exec").args(["-p", "(version 1)(allow default)", "sleep", "5"]).spawn().unwrap();
+        // sandbox-exec applies the profile, then execs sleep.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!sandboxed(Some(free.id())));
+        assert!(sandboxed(Some(boxed.id())));
+        assert!(sandboxed(None), "can't tell: assume the worst");
+        for c in [&mut free, &mut boxed] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_without_new_privileges_is_seen_as_sandboxed() {
+        assert!(sandboxed(None), "can't tell: assume the worst");
+        let Ok(mut c) = Command::new("setpriv").args(["--no-new-privs", "sleep", "5"]).spawn() else { return };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(sandboxed(Some(c.id())));
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    #[test]
+    fn confinement_from_proc_status() {
+        let ns = |s: &str| Some(PathBuf::from(s));
+        let me = Confinement::parse("Name:\ttrix\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n", ns("user:[1]"));
+        assert_eq!(me, Confinement { no_new_privs: false, seccomp_filters: 0, user_ns: ns("user:[1]") });
+        let same = Confinement::parse("NoNewPrivs:\t0\nSeccomp:\t0\n", ns("user:[1]"));
+        assert!(!same.tighter_than(&me));
+        assert!(Confinement::parse("NoNewPrivs:\t1\n", ns("user:[1]")).tighter_than(&me));
+        assert!(Confinement::parse("Seccomp:\t2\n", ns("user:[1]")).tighter_than(&me), "old kernels: mode only");
+        assert!(Confinement::parse("Seccomp:\t2\nSeccomp_filters:\t3\n", ns("user:[1]")).tighter_than(&me));
+        assert!(Confinement::parse("", ns("user:[9]")).tighter_than(&Confinement::parse("", ns("user:[1]"))), "its own user namespace");
+        assert!(Confinement::parse("", None).tighter_than(&Confinement::parse("", ns("user:[1]"))), "a namespace we can't read");
+        // In a container everything has filters: only more than ours counts.
+        let boxed_me = Confinement::parse("NoNewPrivs:\t1\nSeccomp_filters:\t1\n", ns("user:[1]"));
+        assert!(!Confinement::parse("NoNewPrivs:\t1\nSeccomp_filters:\t1\n", ns("user:[1]")).tighter_than(&boxed_me));
+    }
 
     #[test]
     fn liveness() {
