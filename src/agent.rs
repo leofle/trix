@@ -348,6 +348,9 @@ impl Agent {
         integrations: &Integrations,
         exe: &std::path::Path,
     ) -> anyhow::Result<Agent> {
+        // A sliver of a window gives a pane with no rows or columns, and the
+        // terminal grid can't be made that small: same floor as `resize`.
+        let size = (size.0.max(2), size.1.max(1));
         // Your own managed Muse hooks stay yours (`muse_user_managed_hooks`).
         let without_muse_hooks;
         let integrations = if spec.kind == Kind::Muse && integrations.muse_hooks.is_some() && muse_user_managed_hooks() {
@@ -1869,6 +1872,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(a.running_command(), "sleep is in the foreground, not the shell");
+        a.shutdown();
+    }
+
+    #[test]
+    fn spawns_into_a_pane_with_no_room() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut s = spec(Kind::Custom);
+        s.command = Some("exec cat".into());
+        s.cwd = std::env::temp_dir();
+        let mut a = Agent::spawn(1, s, (0, 0), tx, &std::env::temp_dir().join("trix-test.sock"), &Integrations::default(), Path::new("/bin/true")).unwrap();
+        a.resize(0, 0);
+        a.resize(80, 24);
+        a.resize(0, 0);
         a.shutdown();
     }
 
