@@ -273,7 +273,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 | `alt+x`, alt+click a card | select / unselect an agent: close, grid, broadcast and the menu then act on all selected |
 | `alt+d` | detach (agents keep running) |
 | `alt+s` | toggle sidebar |
-| `alt+m` | sidebar size, in turn: narrow (one line per agent, half the width), icons (only each agent's number and state), wide again (remembered) |
+| `alt+m` | sidebar size, in turn: narrow (one line per agent, half the width), icons (only each agent's number and state), wide again (remembered). In a window too narrow for your choice, the sidebar steps down a size or two on its own and hides only where that would squeeze the agent; it comes back as you chose it when the window widens. `alt+m` goes on from the size you see, to the next one that looks different there |
 | `alt+c` | compact sidebar: one-line cards instead of full ones that scroll (remembered) |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
