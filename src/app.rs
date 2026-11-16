@@ -839,7 +839,7 @@ impl App {
         for (i, a) in self.agents.iter().enumerate() {
             let since = crate::ui::fmt_dur(a.state_since.elapsed());
             let mark = if a.unseen { "•" } else { " " };
-            let name = format!("{:<w$}", a.name);
+            let name = format!("{:<w$}", crate::hooks::printable(&a.name));
             out.push_str(&format!(
                 "{:>2} {mark} {name}  {:<8}  {:<9} {:>6}  {}  {}\n",
                 i + 1,
@@ -847,7 +847,7 @@ impl App {
                 a.state.label(),
                 since,
                 crate::hooks::one_line(&a.activity, 50),
-                tilde(&a.cwd),
+                crate::hooks::printable(&tilde(&a.cwd)),
             ));
         }
         out

@@ -45,6 +45,23 @@ pub struct HookMsg {
     pub seq: u64,
 }
 
+impl HookMsg {
+    /// Hook text is whatever the agent says. It ends up printed by `trix ls`
+    /// and `trix events`, so control characters (escape sequences) go.
+    fn clean(&mut self) {
+        self.event = printable(&self.event);
+        for f in [&mut self.tool, &mut self.detail, &mut self.session, &mut self.transcript].into_iter().flatten() {
+            *f = printable(f);
+        }
+    }
+}
+
+/// `s` with every control character (C0, DEL, C1) turned into a space, so
+/// printing it can't send escape sequences to a terminal.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 pub fn runtime_dir() -> PathBuf {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(base) => PathBuf::from(base).join("trix"),
@@ -129,7 +146,8 @@ pub fn serve(path: &Path, tx: Sender<AppEvent>) -> anyhow::Result<()> {
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    if let Ok(msg) = serde_json::from_str::<HookMsg>(&line) {
+                    if let Ok(mut msg) = serde_json::from_str::<HookMsg>(&line) {
+                        msg.clean();
                         let _ = tx.send(AppEvent::Hook(msg));
                     }
                 }
@@ -1384,7 +1402,7 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
 }
 
 pub fn one_line(s: &str, max: usize) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat: String = printable(s).split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max {
         let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
@@ -1524,6 +1542,15 @@ mod tests {
         assert_eq!(one_line("abcdefg", 6), "abcde…");
         assert_eq!(one_line("日本語テキスト", 4), "日本語…");
         assert_eq!(one_line("abc", 0), "…");
+        assert_eq!(one_line("a\x1b]0;x\x07b\u{9b}c\x7f", 50), "a ]0;x b c");
+    }
+
+    #[test]
+    fn hook_text_loses_control_characters() {
+        let mut m = msg(1, "claude", "tool\x1b[2J");
+        m.detail = Some("ls\x1b]52;c;eA==\x07".into());
+        m.clean();
+        assert!(!m.event.chars().chain(m.detail.unwrap().chars()).any(char::is_control));
     }
 
     #[test]
