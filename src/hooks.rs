@@ -54,7 +54,36 @@ pub fn runtime_dir() -> PathBuf {
     };
     use std::os::unix::fs::DirBuilderExt;
     let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+    // create() is fine with a folder that is already there, whoever made it.
+    // In a shared /tmp another user could have made it first, and then they
+    // could swap the settings and plugins agents load, or the sockets.
+    // Checked once, at startup (main calls this first): exiting later, from
+    // some background thread of the server, would take every agent with it.
+    static CHECKED: OnceLock<()> = OnceLock::new();
+    CHECKED.get_or_init(|| {
+        if let Err(why) = check_private(&dir) {
+            eprintln!("trix: refusing to use {}: {why}", dir.display());
+            std::process::exit(1);
+        }
+    });
     dir
+}
+
+/// The runtime folder must be a real folder that only we can get into.
+fn check_private(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_dir() {
+        return Err("it is not a folder (a symlink?)".into());
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(format!("it belongs to uid {}, not you (uid {uid})", meta.uid()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!("other users can get into it (mode {:o}); run chmod 700 on it", meta.mode() & 0o777));
+    }
+    Ok(())
 }
 
 /// Remove sockets / settings left behind by trix processes that died hard.
@@ -1372,6 +1401,24 @@ mod tests {
 
     fn c(v: Value) -> HookMsg {
         condense(7, "claude", &v)
+    }
+
+    #[test]
+    fn runtime_dir_must_be_ours_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("trix-private-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_private(&dir).is_ok());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_private(&dir).unwrap_err().contains("other users"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(check_private(&link).unwrap_err().contains("not a folder"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
