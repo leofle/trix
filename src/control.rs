@@ -269,7 +269,11 @@ pub fn reply(stream: &mut UnixStream, r: &Reply) {
     let _ = session::write_frame(stream, TEXT, &json);
 }
 
-pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Request) {
+pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Request, sandboxed: bool) {
+    if sandboxed && let Some(what) = outside_the_sandbox(&req) {
+        let err = format!("a command in a sandbox can't {what}: that would run outside the sandbox. Ask the user to do it, or run it outside the sandbox");
+        return reply(&mut stream, &Reply::fail(err));
+    }
     if let Request::Events { targets } = &req {
         return crate::events::subscribe(app, stream, targets);
     }
@@ -486,14 +490,35 @@ pub(crate) fn hung_up(s: &UnixStream) -> bool {
     n == 0 || (n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool) -> Reply {
-    let Some(kind) = Kind::from_label(kind).or(match kind {
+/// What a command inside an agent's sandbox may not ask trix for, because
+/// trix would do it outside the sandbox: run a shell or any command, type
+/// into a permission prompt, change how agents start, take over or stop the
+/// workspace. Reading, waiting, sending prompts and starting agents as they
+/// normally start stay open, so sandboxed agents can still work with others.
+fn outside_the_sandbox(req: &Request) -> Option<&'static str> {
+    match req {
+        Request::Send { force: true, .. } => Some("send --force (it could answer another agent's permission prompt)"),
+        Request::Spawn { kind, .. } if matches!(kind_of(kind), Some(Kind::Shell | Kind::Custom)) => Some("start a shell or a custom command"),
+        Request::Spawn { command: Some(c), .. } if !c.trim().is_empty() => Some("start an agent with --args"),
+        Request::Close { force: true, .. } => Some("close --force"),
+        Request::Args { set, clear, .. } if set.is_some() || *clear => Some("change the arguments an agent starts with"),
+        Request::Open { .. } => Some("open a layout (its agents can have any arguments and commands)"),
+        _ => None,
+    }
+}
+
+fn kind_of(label: &str) -> Option<Kind> {
+    Kind::from_label(label).or(match label {
         "sh" => Some(Kind::Shell),
         "cursor-agent" => Some(Kind::Cursor),
         "agy" => Some(Kind::Antigravity),
         _ => None,
-    }) else {
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool) -> Reply {
+    let Some(kind) = kind_of(kind) else {
         return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell or custom)"));
     };
     if !cwd.is_dir() {
@@ -694,6 +719,22 @@ mod tests {
     }
     fn p(s: &[&str]) -> Result<Request, String> {
         parse(&args(s), PathBuf::from("/work"))
+    }
+
+    #[test]
+    fn what_a_sandbox_may_ask_for() {
+        let open = |a: &[&str]| outside_the_sandbox(&p(a).unwrap()).is_none();
+        assert!(outside_the_sandbox(&Request::List { json: true }).is_none());
+        for ok in [&["send", "web", "hi"][..], &["read", "web"], &["wait", "web"], &["events"], &["args", "web"], &["close", "web"],
+                   &["spawn", "claude"], &["spawn", "codex", "--prompt", "fix it", "--worktree"], &["spawn", "claude", "--args", " "]] {
+            assert!(open(ok), "{ok:?} stays open");
+        }
+        for no in [&["send", "-f", "web", "y"][..], &["spawn", "shell"], &["spawn", "sh"], &["spawn", "custom", "--args", "id"],
+                   &["spawn", "claude", "--args", "--dangerously-skip-permissions"], &["close", "--force", "web"],
+                   &["args", "web", "--", "--yolo"], &["args", "web", "--clear"]] {
+            assert!(!open(no), "{no:?} is refused");
+        }
+        assert!(outside_the_sandbox(&Request::Open { name: "work".into(), agents: vec![], resume: false }).is_some());
     }
 
     #[test]

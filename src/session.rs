@@ -76,7 +76,8 @@ pub enum SessionEvent {
     Unview(u64),
     Detached(u64),
     List(UnixStream),
-    Control { stream: UnixStream, from: Option<u32>, req: crate::control::Request },
+    /// `sandboxed`: the process asking is inside a sandbox (`platform::sandboxed`).
+    Control { stream: UnixStream, from: Option<u32>, req: crate::control::Request, sandboxed: bool },
     /// Held open until the server has stopped, so `trix kill` can wait for it.
     Kill(UnixStream),
 }
@@ -660,7 +661,14 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
     };
     let _ = s.set_read_timeout(None);
     let send = |e: SessionEvent| tx.send(AppEvent::Session(e)).is_ok();
+    // Asked after the first message: the asker was alive to send it.
+    let sandboxed = || crate::platform::sandboxed(crate::platform::peer_pid(&s));
     match first {
+        // In control, it could type into any agent: outside its sandbox.
+        Ok(ClientMsg::Hello { .. }) if sandboxed() => {
+            let msg = "trix: a command in a sandbox can't take over the workspace (it could type into any agent, outside the sandbox). `trix view` watches it, or attach from your own terminal";
+            let _ = write_frame(&mut s, BYE, msg.as_bytes());
+        }
         Ok(ClientMsg::Hello { protocol, cols, rows, cwd, spawn }) => {
             let (cols, rows) = clamp_size(cols, rows);
             if protocol != PROTOCOL {
@@ -722,6 +730,10 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
         Ok(ClientMsg::List) => {
             send(SessionEvent::List(s));
         }
+        Ok(ClientMsg::Kill) if sandboxed() => {
+            let msg = "trix: a command in a sandbox can't stop the workspace. Run `trix kill` from your own terminal";
+            let _ = write_frame(&mut s, BYE, msg.as_bytes());
+        }
         Ok(ClientMsg::Kill) => {
             send(SessionEvent::Kill(s));
         }
@@ -731,7 +743,8 @@ fn serve_client(id: u64, mut s: UnixStream, tx: Sender<AppEvent>) {
                 crate::control::reply(&mut s, &r);
                 return;
             }
-            send(SessionEvent::Control { stream: s, from, req });
+            let sandboxed = sandboxed();
+            send(SessionEvent::Control { stream: s, from, req, sandboxed });
         }
         _ => {}
     }
@@ -852,16 +865,19 @@ pub fn open(msg: &ClientMsg) -> Result<UnixStream, String> {
     Ok(s)
 }
 
-pub fn send_once(session: &str, msg: &ClientMsg) -> bool {
+pub fn send_once(session: &str, msg: &ClientMsg) -> Result<bool, String> {
     match connect_to(session) {
         Some(mut s) => {
             let ok = send_msg(&mut s, msg).is_ok();
             // Wait for the server to hang up, so `trix kill && trix` is safe.
             let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            if let Ok((BYE, why)) = read_frame(&mut s) {
+                return Err(String::from_utf8_lossy(&why).into_owned());
+            }
             let _ = s.read_to_end(&mut Vec::new());
-            ok
+            Ok(ok)
         }
-        None => false,
+        None => Ok(false),
     }
 }
 
