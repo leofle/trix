@@ -197,7 +197,7 @@ impl Dimensions for TermSize {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Spawn {
     pub kind: Kind,
     pub name: String,
@@ -348,6 +348,9 @@ impl Agent {
         integrations: &Integrations,
         exe: &std::path::Path,
     ) -> anyhow::Result<Agent> {
+        // A sliver of a window gives a pane with no rows or columns, and the
+        // terminal grid can't be made that small: same floor as `resize`.
+        let size = (size.0.max(2), size.1.max(1));
         // Your own managed Muse hooks stay yours (`muse_user_managed_hooks`).
         let without_muse_hooks;
         let integrations = if spec.kind == Kind::Muse && integrations.muse_hooks.is_some() && muse_user_managed_hooks() {
@@ -663,7 +666,7 @@ impl Agent {
             self.last_hook_seq = msg.seq;
         }
         // `/clear` and friends start a new conversation: always track the latest.
-        if let Some(id) = &msg.session {
+        if let Some(id) = msg.session.as_ref().filter(|id| conversation_id_ok(id)) {
             self.session = Some(id.clone());
         }
         if let Some(p) = &msg.transcript {
@@ -1572,7 +1575,24 @@ fn codex_hooks(exe: &Path) -> String {
 /// Workspace discovery belongs in startup context, not a submitted user task.
 pub(crate) const WORKSPACE_INSTRUCTIONS: &str = "You are running inside a Trix workspace alongside other agents. At the start of a session, run `trix ls --json` to discover peers and identify yourself (the entry with `you: true`). Trix peers are separate from your built-in subagent registry. Use `trix read <agent> -n 60` to inspect recent output and `trix wait <agent> -t 30` to wait. When the user requests coordination, use `trix send <agent> <prompt>` to communicate. Do not start, interrupt, close, or assign work to peers unless the task authorizes it. Never use --force to bypass a permission prompt. If no workspace is reachable, report that limitation rather than assuming no peers exist.";
 
+/// What a conversation id can look like: UUIDs, `ses_…`, `T-…` and the like.
+/// Ids come from hook reports, workspace.json and layouts, and go on the
+/// agent's command line: one starting with `-` would be read as an option.
+pub fn conversation_id_ok(id: &str) -> bool {
+    let mut chars = id.chars();
+    id.len() <= 128
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
 fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path, new_session: Option<&str>) -> (String, Vec<String>) {
+    let checked;
+    let spec = if spec.resume.as_deref().is_some_and(|id| !conversation_id_ok(id)) {
+        checked = Spawn { resume: None, ..spec.clone() };
+        &checked
+    } else {
+        spec
+    };
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut args = Vec::new();
     let extra = spec.command.as_deref().filter(|c| !c.trim().is_empty());
@@ -1869,6 +1889,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(a.running_command(), "sleep is in the foreground, not the shell");
+        a.shutdown();
+    }
+
+    #[test]
+    fn odd_conversation_ids_are_not_resumed() {
+        for ok in ["abc", "ses_1", "T-7f395a45-7fae-4983-8de0-d02e61d30183", "01a1d56b-360c-7da2-9db2-8aac7b3bfe0f"] {
+            assert!(conversation_id_ok(ok), "{ok}");
+        }
+        for bad in ["", "-x", "--dangerously-skip-permissions", "a b", "a\nb", "a/b", &"a".repeat(129)] {
+            assert!(!conversation_id_ok(bad), "{bad}");
+        }
+        for kind in [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Gemini, Kind::Amp] {
+            let mut s = spec(kind);
+            s.resume = Some("--trix-injected".into());
+            let (_, args) = command_for(&s, &Integrations::default(), Path::new("/bin/true"), None);
+            assert!(!args.iter().any(|a| a.contains("trix-injected")), "{kind:?}: {args:?}");
+        }
+        let mut a = test_agent(Kind::Shell);
+        let mut m = crate::hooks::HookMsg { agent: a.id, source: "claude".into(), event: "SessionStart".into(), tool: None, detail: None, session: Some("-x".into()), transcript: None, seq: 0 };
+        a.on_hook(&m, true);
+        assert_eq!(a.session, None);
+        m.session = Some("abc".into());
+        a.on_hook(&m, true);
+        assert_eq!(a.session.as_deref(), Some("abc"));
+        a.shutdown();
+    }
+
+    #[test]
+    fn spawns_into_a_pane_with_no_room() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut s = spec(Kind::Custom);
+        s.command = Some("exec cat".into());
+        s.cwd = std::env::temp_dir();
+        let mut a = Agent::spawn(1, s, (0, 0), tx, &std::env::temp_dir().join("trix-test.sock"), &Integrations::default(), Path::new("/bin/true")).unwrap();
+        a.resize(0, 0);
+        a.resize(80, 24);
+        a.resize(0, 0);
         a.shutdown();
     }
 

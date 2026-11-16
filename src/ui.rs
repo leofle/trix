@@ -871,7 +871,7 @@ fn focus_view(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) -> Option<(u1
     f.render_widget(block, area);
     app.hits.titles.push((Rect { height: 1, ..area }, app.agents[app.focus].id));
     app.hits.pins.push((pin_rect(area), app.agents[app.focus].id));
-    app.pane_size = (inner.width, inner.height);
+    app.pane_size = (inner.width.max(2), inner.height.max(1));
     // Keep every agent sized to the main pane so switching is instant.
     for a in app.agents.iter_mut() {
         a.resize(inner.width, inner.height);

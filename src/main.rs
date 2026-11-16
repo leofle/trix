@@ -155,6 +155,8 @@ fn main() -> anyhow::Result<()> {
         hooks::run_client(&source, args.get(2).cloned());
         return Ok(());
     }
+    // Check the runtime folder now, while the terminal is still normal.
+    hooks::runtime_dir();
     // Before the session flags: everything after `--` is the agent's.
     if args.first().map(String::as_str) == Some("install") {
         std::process::exit(install::run(&args[1..]));

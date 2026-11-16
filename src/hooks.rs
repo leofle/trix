@@ -45,6 +45,23 @@ pub struct HookMsg {
     pub seq: u64,
 }
 
+impl HookMsg {
+    /// Hook text is whatever the agent says. It ends up printed by `trix ls`
+    /// and `trix events`, so control characters (escape sequences) go.
+    fn clean(&mut self) {
+        self.event = printable(&self.event);
+        for f in [&mut self.tool, &mut self.detail, &mut self.session, &mut self.transcript].into_iter().flatten() {
+            *f = printable(f);
+        }
+    }
+}
+
+/// `s` with every control character (C0, DEL, C1) turned into a space, so
+/// printing it can't send escape sequences to a terminal.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 pub fn runtime_dir() -> PathBuf {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(base) => PathBuf::from(base).join("trix"),
@@ -54,7 +71,36 @@ pub fn runtime_dir() -> PathBuf {
     };
     use std::os::unix::fs::DirBuilderExt;
     let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+    // create() is fine with a folder that is already there, whoever made it.
+    // In a shared /tmp another user could have made it first, and then they
+    // could swap the settings and plugins agents load, or the sockets.
+    // Checked once, at startup (main calls this first): exiting later, from
+    // some background thread of the server, would take every agent with it.
+    static CHECKED: OnceLock<()> = OnceLock::new();
+    CHECKED.get_or_init(|| {
+        if let Err(why) = check_private(&dir) {
+            eprintln!("trix: refusing to use {}: {why}", dir.display());
+            std::process::exit(1);
+        }
+    });
     dir
+}
+
+/// The runtime folder must be a real folder that only we can get into.
+fn check_private(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_dir() {
+        return Err("it is not a folder (a symlink?)".into());
+    }
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(format!("it belongs to uid {}, not you (uid {uid})", meta.uid()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!("other users can get into it (mode {:o}); run chmod 700 on it", meta.mode() & 0o777));
+    }
+    Ok(())
 }
 
 /// Remove sockets / settings left behind by trix processes that died hard.
@@ -100,7 +146,8 @@ pub fn serve(path: &Path, tx: Sender<AppEvent>) -> anyhow::Result<()> {
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    if let Ok(msg) = serde_json::from_str::<HookMsg>(&line) {
+                    if let Ok(mut msg) = serde_json::from_str::<HookMsg>(&line) {
+                        msg.clean();
                         let _ = tx.send(AppEvent::Hook(msg));
                     }
                 }
@@ -1355,7 +1402,7 @@ fn tool_detail(tool: Option<&str>, input: &Value) -> Option<String> {
 }
 
 pub fn one_line(s: &str, max: usize) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat: String = printable(s).split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max {
         let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
@@ -1372,6 +1419,24 @@ mod tests {
 
     fn c(v: Value) -> HookMsg {
         condense(7, "claude", &v)
+    }
+
+    #[test]
+    fn runtime_dir_must_be_ours_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("trix-private-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_private(&dir).is_ok());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_private(&dir).unwrap_err().contains("other users"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(check_private(&link).unwrap_err().contains("not a folder"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1477,6 +1542,15 @@ mod tests {
         assert_eq!(one_line("abcdefg", 6), "abcde…");
         assert_eq!(one_line("日本語テキスト", 4), "日本語…");
         assert_eq!(one_line("abc", 0), "…");
+        assert_eq!(one_line("a\x1b]0;x\x07b\u{9b}c\x7f", 50), "a ]0;x b c");
+    }
+
+    #[test]
+    fn hook_text_loses_control_characters() {
+        let mut m = msg(1, "claude", "tool\x1b[2J");
+        m.detail = Some("ls\x1b]52;c;eA==\x07".into());
+        m.clean();
+        assert!(!m.event.chars().chain(m.detail.unwrap().chars()).any(char::is_control));
     }
 
     #[test]

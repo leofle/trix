@@ -314,7 +314,7 @@ fn fail(e: &str, code: i32) -> ! {
 
 /// `10:21:03  web  working → done  finished after 2m10s`
 fn human(v: &Value, color: bool) -> Option<String> {
-    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let s = |k: &str| crate::hooks::printable(v[k].as_str().unwrap_or_default());
     let time = local_time(v["at"].as_u64().unwrap_or_default() / 1000);
     let name = s("name");
     let what = match s("event").as_str() {

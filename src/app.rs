@@ -839,7 +839,7 @@ impl App {
         for (i, a) in self.agents.iter().enumerate() {
             let since = crate::ui::fmt_dur(a.state_since.elapsed());
             let mark = if a.unseen { "•" } else { " " };
-            let name = format!("{:<w$}", a.name);
+            let name = format!("{:<w$}", crate::hooks::printable(&a.name));
             out.push_str(&format!(
                 "{:>2} {mark} {name}  {:<8}  {:<9} {:>6}  {}  {}\n",
                 i + 1,
@@ -847,7 +847,7 @@ impl App {
                 a.state.label(),
                 since,
                 crate::hooks::one_line(&a.activity, 50),
-                tilde(&a.cwd),
+                crate::hooks::printable(&tilde(&a.cwd)),
             ));
         }
         out
@@ -1619,7 +1619,10 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppEvent::Clipboard(s) => copy_to_clipboard(&self.out, &s),
+            // A program in a pane asked to set the clipboard: pass the request
+            // on and let the user's terminal decide, as it would without trix.
+            // Never straight to pbcopy / wl-copy: that would skip its policy.
+            AppEvent::Clipboard(s) => send_osc52(&self.out, &s),
             AppEvent::Hook(msg) => {
                 if let Some(i) = self.index_of(msg.agent) {
                     let focused = i == self.focus && self.term_focused;
@@ -3077,12 +3080,17 @@ fn desktop_notify(title: &str, body: &str, urgent: bool) {
     crate::platform::notify(title, body, urgent);
 }
 
+/// trix's own copies (selection, paths): the user asked for them.
 pub fn copy_to_clipboard(out: &Out, text: &str) {
     // OSC 52 reaches the attached terminal (works over SSH too)…
-    let b64 = base64(text.as_bytes());
-    out.send(format!("\x1b]52;c;{b64}\x07").as_bytes());
+    send_osc52(out, text);
     // …and the system clipboard covers terminals that ignore it.
     crate::platform::copy(text);
+}
+
+fn send_osc52(out: &Out, text: &str) {
+    let b64 = base64(text.as_bytes());
+    out.send(format!("\x1b]52;c;{b64}\x07").as_bytes());
 }
 
 fn base64(data: &[u8]) -> String {
