@@ -1307,6 +1307,16 @@ impl App {
             match crate::holder::attach(&path) {
                 // Its socket names a hash of the session; the holder, all of it.
                 Ok(att) if !att.hello.session.is_empty() && att.hello.session != crate::session::name() => {}
+                // From a newer trix: left running, for that one to collect.
+                Ok(att) if !att.hello.compatible() => {
+                    let msg = format!(
+                        "agent {id} runs under a newer trix (holder protocol {}, this one speaks {}): left running; open it with that trix, or `trix kill` stops it",
+                        att.hello.protocol(),
+                        crate::holder::PROTOCOL
+                    );
+                    eprintln!("trix: {msg}");
+                    self.toast(&msg, ToastKind::Info);
+                }
                 Ok(att) => {
                     if att.hello.dropped > 0 {
                         eprintln!("trix: agent {id}: replaying {} bytes of output, {} older ones dropped", att.replay.len(), att.hello.dropped);
@@ -2904,9 +2914,9 @@ impl App {
     /// stop their program the same way, then end.
     pub fn shutdown_all(&mut self) {
         let pids: Vec<u32> = self.agents.iter().filter(|a| a.hang_up() && a.holder.is_none()).map(|a| a.pid).collect();
-        let holders: Vec<u32> = self.agents.iter().filter_map(|a| a.holder).collect();
+        let held: Vec<(u32, u32)> = self.agents.iter().filter_map(|a| a.holder.map(|h| (h, a.pid))).collect();
         crate::platform::stop(&pids, crate::agent::STOP_GRACE);
-        crate::holder::wait_gone(&holders, crate::agent::STOP_GRACE * 2 + Duration::from_secs(1));
+        crate::holder::see_stopped(&held, crate::agent::HOLDER_GRACE);
     }
 }
 

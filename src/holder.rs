@@ -16,7 +16,19 @@
 //! holder). Out of it, once per attach: `HELLO` (JSON `Hello`), then `OUTPUT`
 //! with everything buffered. After that `OUTPUT` as the program writes, and
 //! `EXIT` (JSON, its exit code or null) when it ends. One server at a time:
-//! a new connection takes over from the last.
+//! a new connection takes over from the last, which is told `BYE` first, so
+//! it knows it was replaced rather than dropped. A server that stops reading
+//! is hung up on without one, and may attach again.
+//!
+//! A holder that can't write to its server within `WRITE_TIMEOUT` hangs up
+//! on it; the server attaches again (`agent::read_holder`). Input for the
+//! program goes through a queue and a thread of its own, so a program that
+//! stopped reading never keeps a `KILL` from being heard.
+//!
+//! `Hello` carries `PROTOCOL`, since holders outlive upgrades: a server
+//! attaches to holders that speak its version or an older one, and leaves
+//! newer ones be. That a holder greets with `HELLO` first, and stops on
+//! `KILL`, never changes.
 //!
 //! Sockets are named `holder.<session hash>.<agent id>.<holder pid>.sock`
 //! (`hooks::short_hash`: a session name of any length fits in a socket
@@ -32,7 +44,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -48,6 +60,12 @@ pub const KILL: u8 = 4;
 pub const HELLO: u8 = 10;
 pub const OUTPUT: u8 = 11;
 pub const EXIT: u8 = 12;
+pub const BYE: u8 = 13;
+
+/// What holders and servers speak. Bumped when either side would misread
+/// the other; `Hello` from a holder before versions says 0, and is read as 1
+/// (nothing changed but the field).
+pub const PROTOCOL: u32 = 1;
 
 /// Bigger than any replay or paste; anything larger is a broken peer.
 const MAX_FRAME: usize = 16 << 20;
@@ -60,6 +78,9 @@ const LINGER: Duration = Duration::from_secs(60 * 60);
 /// A server that stops reading for this long is let go, rather than the
 /// program being stalled behind it.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Input the program hasn't read yet, at most: a program that stopped
+/// reading loses keystrokes past this, rather than stalling the holder.
+const INPUT_BACKLOG: usize = 1 << 20;
 /// Trimming the oldest output starts the replay at a line, if one starts
 /// this close to the cut.
 const LINE_SEARCH: usize = 4096;
@@ -320,6 +341,9 @@ enum Ready {
 /// What a holder says first to every server that attaches.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Hello {
+    /// What it speaks (`PROTOCOL`); 0 from a holder before versions.
+    #[serde(default)]
+    pub version: u32,
     /// The program's pid.
     pub pid: u32,
     /// The holder's own.
@@ -342,6 +366,22 @@ pub struct Hello {
     pub exited: bool,
     #[serde(default)]
     pub code: Option<i32>,
+    /// How long since the program last wrote anything, in milliseconds.
+    #[serde(default)]
+    pub quiet_ms: u64,
+}
+
+impl Hello {
+    /// What it speaks, counting a holder from before versions as 1.
+    pub fn protocol(&self) -> u32 {
+        self.version.max(1)
+    }
+
+    /// Whether this trix can serve it: it speaks this version or an older
+    /// one. A newer holder is left running for the trix that started it.
+    pub fn compatible(&self) -> bool {
+        self.protocol() <= PROTOCOL
+    }
 }
 
 // ───────────────────────────── where ─────────────────────────────
@@ -405,9 +445,9 @@ pub fn kill_orphans(session: Option<&str>) -> usize {
         match attach(&path) {
             Ok(mut att) => {
                 let _ = att.stream.set_write_timeout(Some(Duration::from_secs(2)));
-                if write_frame(&mut att.stream, KILL, &[]).is_ok() {
-                    holders.push((att.hello.holder, att.stream));
-                }
+                // Stopped whether or not it hears it (`see_stopped`).
+                let _ = write_frame(&mut att.stream, KILL, &[]);
+                holders.push(((att.hello.holder, att.hello.pid), att.stream));
             }
             // Alive by its pid, but nobody listens: the pid is someone else's.
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
@@ -416,9 +456,9 @@ pub fn kill_orphans(session: Option<&str>) -> usize {
             Err(_) => {}
         }
     }
-    let pids: Vec<u32> = holders.iter().map(|(p, _)| *p).collect();
-    wait_gone(&pids, crate::agent::STOP_GRACE * 2 + Duration::from_secs(1));
-    pids.len()
+    let held: Vec<(u32, u32)> = holders.iter().map(|(p, _)| *p).collect();
+    see_stopped(&held, crate::agent::HOLDER_GRACE);
+    held.len()
 }
 
 /// Wait until none of `pids` is alive, or `limit` passes.
@@ -451,6 +491,12 @@ impl std::fmt::Display for LaunchError {
 /// Start `exe holder` for `spec`, and wait until it's serving. The socket it
 /// serves on, and its pid.
 pub fn launch(exe: &Path, spec: &Spec) -> Result<(PathBuf, u32), LaunchError> {
+    launch_within(exe, spec, Duration::from_secs(10))
+}
+
+/// `launch`, giving the holder `limit` to say it's up. One that doesn't is
+/// stopped, so it can't start the program after the server gave up on it.
+fn launch_within(exe: &Path, spec: &Spec, limit: Duration) -> Result<(PathBuf, u32), LaunchError> {
     let bad = |e: &dyn std::fmt::Display| LaunchError::Holder(e.to_string());
     let json = serde_json::to_vec(spec).map_err(|e| bad(&e))?;
     let mut child = Command::new(exe)
@@ -474,12 +520,69 @@ pub fn launch(exe: &Path, spec: &Spec) -> Result<(PathBuf, u32), LaunchError> {
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
-    let line = rx.recv_timeout(Duration::from_secs(10)).map_err(|_| bad(&"the holder did not start"))?;
+    let path = socket_path(&spec.session, spec.id, holder);
+    let Ok(line) = rx.recv_timeout(limit) else {
+        abandon(holder, &path);
+        return Err(bad(&"the holder did not start in time"));
+    };
     match serde_json::from_str::<Ready>(line.trim()) {
-        Ok(Ready::Up { .. }) => Ok((socket_path(&spec.session, spec.id, holder), holder)),
+        Ok(Ready::Up { .. }) => Ok((path, holder)),
         Ok(Ready::Failed { error }) => Err(LaunchError::Program(error)),
-        Err(_) => Err(bad(&"the holder did not start")),
+        Err(_) => {
+            abandon(holder, &path);
+            Err(bad(&"the holder did not start"))
+        }
     }
+}
+
+/// A holder the server gave up on: killed, and its socket removed. A
+/// program it started by then is hung up on as its PTY closes.
+pub fn abandon(holder: u32, path: &Path) {
+    if holder == std::process::id() {
+        return;
+    }
+    if let Ok(p) = libc::pid_t::try_from(holder) {
+        unsafe { libc::kill(p, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Make sure holders told to stop (`KILL`) did, with their programs: those
+/// still up after `limit` are made to, holder and program group both. Each
+/// is (holder pid, program pid). The server mustn't leave one running that
+/// couldn't take its `KILL`, or the next server would put the agent back.
+pub fn see_stopped(held: &[(u32, u32)], limit: Duration) {
+    let me = std::process::id();
+    // A holder in this very process (tests run them so) is never waited on.
+    let holders: Vec<u32> = held.iter().map(|&(h, _)| h).filter(|&h| h != me).collect();
+    wait_gone(&holders, limit);
+    let stuck: Vec<(u32, u32)> = held.iter().copied().filter(|&(h, p)| h != me && p != me && crate::platform::alive(h)).collect();
+    if stuck.is_empty() {
+        return;
+    }
+    eprintln!("trix: {} holder(s) did not stop when told; stopping them", stuck.len());
+    let signal_all = |sig: libc::c_int| {
+        for &(h, pid) in &stuck {
+            for (p, group) in [(pid, true), (h, false)] {
+                let Ok(p) = libc::pid_t::try_from(p) else { continue };
+                if p <= 0 {
+                    continue;
+                }
+                unsafe {
+                    // The program leads its own group (its terminal's session).
+                    if group && libc::getpgid(p) == p {
+                        libc::kill(-p, sig);
+                    }
+                    libc::kill(p, sig);
+                }
+            }
+        }
+    };
+    let pids: Vec<u32> = stuck.iter().flat_map(|&(h, p)| [h, p]).collect();
+    signal_all(libc::SIGTERM);
+    wait_gone(&pids, crate::agent::STOP_GRACE);
+    signal_all(libc::SIGKILL);
+    wait_gone(&pids, Duration::from_secs(1));
 }
 
 /// A server's line to one holder, just attached.
@@ -488,6 +591,8 @@ pub struct Attached {
     /// The output it kept, oldest first.
     pub replay: Vec<u8>,
     pub stream: UnixStream,
+    /// Its socket, to attach again.
+    pub path: PathBuf,
 }
 
 /// Connect to the holder at `path` and take over from whoever had it.
@@ -504,7 +609,7 @@ pub fn attach(path: &Path) -> io::Result<Attached> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a trix holder"));
     }
     stream.set_read_timeout(None)?;
-    Ok(Attached { hello, replay, stream })
+    Ok(Attached { hello, replay, stream, path: path.to_path_buf() })
 }
 
 /// What the server sends a holder.
@@ -513,27 +618,59 @@ pub enum Req {
     Resize(u16, u16),
     Meta(String),
     Kill,
+    /// Attached again (the holder had let this server go): write here now.
+    Stream(UnixStream),
 }
 
 /// A thread that writes `Req`s to the holder in order, so the server's own
-/// loop never waits on a socket. It ends after `Kill`, at the first failed
-/// write, or when every sender is gone.
-pub fn writer(mut stream: UnixStream) -> Sender<Req> {
+/// loop never waits on a socket. After a failed write it keeps what comes
+/// (input up to `HELD_BACK`) until a new `Stream`, and sends it there; it
+/// ends after `Kill`, or when every sender is gone. `killed` says a `Kill`
+/// was sent: the holder's going away isn't news then.
+pub fn writer(stream: UnixStream, killed: Arc<AtomicBool>) -> Sender<Req> {
+    const HELD_BACK: usize = 64 << 10;
     let (tx, rx) = mpsc::channel::<Req>();
     let _ = std::thread::Builder::new().name("trix-held-write".into()).spawn(move || {
+        let send = |s: &mut UnixStream, req: &Req| match req {
+            Req::Input(b) => write_frame(s, INPUT, b),
+            Req::Resize(c, r) => write_frame(s, RESIZE, &resize_payload(*c, *r)),
+            Req::Meta(m) => write_frame(s, META, m.as_bytes()),
+            Req::Kill => write_frame(s, KILL, &[]),
+            Req::Stream(_) => Ok(()),
+        };
+        let mut stream = Some(stream);
+        // What couldn't be sent, for the next stream.
+        let mut waiting: Vec<Req> = Vec::new();
+        let mut waiting_input = 0;
         for req in rx {
-            let res = match req {
-                Req::Input(b) => write_frame(&mut stream, INPUT, &b),
-                Req::Resize(c, r) => write_frame(&mut stream, RESIZE, &resize_payload(c, r)),
-                Req::Meta(m) => write_frame(&mut stream, META, m.as_bytes()),
-                Req::Kill => {
-                    let _ = write_frame(&mut stream, KILL, &[]);
-                    break;
+            if let Req::Stream(mut s) = req {
+                let ok = waiting.drain(..).all(|r| send(&mut s, &r).is_ok());
+                waiting_input = 0;
+                stream = ok.then_some(s);
+                continue;
+            }
+            let kill = matches!(req, Req::Kill);
+            if kill {
+                killed.store(true, Ordering::SeqCst);
+            }
+            if let Some(s) = &mut stream {
+                if send(s, &req).is_ok() {
+                    if kill {
+                        break;
+                    }
+                    continue;
                 }
-            };
-            if res.is_err() {
+                stream = None;
+            }
+            if kill {
                 break;
             }
+            match &req {
+                Req::Input(b) if waiting_input + b.len() > HELD_BACK => continue,
+                Req::Input(b) => waiting_input += b.len(),
+                _ => {}
+            }
+            waiting.push(req);
         }
     });
     tx
@@ -602,15 +739,23 @@ struct Shared {
     exit: Option<Option<i32>>,
     /// When the last server went away.
     alone_since: Instant,
+    /// When the program last wrote anything.
+    last_output: Instant,
+    /// How long a server may keep a write waiting before it's let go.
+    write_timeout: Duration,
 }
 
 impl Shared {
-    /// Send to the attached server; one that can't take it is let go.
+    /// Send to the attached server; one that can't take it is let go, and
+    /// hung up on, so it hears that (and may attach again) rather than
+    /// waiting on a connection nobody serves.
     fn tell(&mut self, kind: u8, payload: &[u8]) {
         if let Some((_, c)) = &mut self.client
             && write_frame(c, kind, payload).is_err()
         {
-            self.client = None;
+            if let Some((_, c)) = self.client.take() {
+                let _ = c.shutdown(std::net::Shutdown::Both);
+            }
             self.alone_since = Instant::now();
         }
     }
@@ -638,16 +783,21 @@ impl Held {
     /// Bind `path`, start the program, and serve it from threads of this
     /// process. Tests run holders this way, inside the test process.
     pub fn start(spec: &Spec, path: &Path) -> io::Result<Held> {
+        Self::start_with(spec, path, WRITE_TIMEOUT)
+    }
+
+    /// `start`, letting a server that stops reading go after `write_timeout`.
+    pub(crate) fn start_with(spec: &Spec, path: &Path, write_timeout: Duration) -> io::Result<Held> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
-        let started = Self::spawn(spec, listener, path);
+        let started = Self::spawn(spec, listener, path, write_timeout);
         if started.is_err() {
             let _ = std::fs::remove_file(path);
         }
         started
     }
 
-    fn spawn(spec: &Spec, listener: UnixListener, path: &Path) -> io::Result<Held> {
+    fn spawn(spec: &Spec, listener: UnixListener, path: &Path, write_timeout: Duration) -> io::Result<Held> {
         let (cols, rows) = (spec.cols.max(2), spec.rows.max(1));
         let opts = tty::Options {
             shell: Some(tty::Shell::new(spec.program.clone(), spec.args.clone())),
@@ -679,6 +829,8 @@ impl Held {
             size: (cols, rows),
             exit: None,
             alone_since: Instant::now(),
+            last_output: Instant::now(),
+            write_timeout,
         }));
         let (done_tx, done) = mpsc::channel();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -695,6 +847,7 @@ impl Held {
                     Ok(n) => {
                         let mut s = lock(&sh);
                         s.ring.push(&buf[..n]);
+                        s.last_output = Instant::now();
                         s.tell(OUTPUT, &buf[..n]);
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -718,6 +871,21 @@ impl Held {
             let _ = tx.send(Done::Exited);
         })?;
 
+        // Input for the program, written on a thread of its own: a program
+        // that stopped reading blocks that one, never the server's commands
+        // (a `KILL` above all).
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let mut input = master.try_clone()?;
+        let pending = backlog.clone();
+        std::thread::Builder::new().name("trix-holder-input".into()).spawn(move || {
+            for bytes in input_rx {
+                let _ = input.write_all(&bytes);
+                pending.fetch_sub(bytes.len(), Ordering::Relaxed);
+            }
+        })?;
+        let input = Input { tx: input_tx, backlog };
+
         // Servers attaching.
         let sh = shared.clone();
         let stop = stopping.clone();
@@ -731,17 +899,31 @@ impl Held {
                     continue;
                 };
                 if let Some((n, from)) = welcome(&sh, conn, pid) {
-                    let Ok(input) = master.try_clone() else { continue };
+                    let Ok(pty) = master.try_clone() else { continue };
                     if n > 1 {
                         nudge(&sh, &master);
                     }
-                    let (sh, tx) = (sh.clone(), done_tx.clone());
-                    let _ = std::thread::Builder::new().name("trix-holder-client".into()).spawn(move || serve_client(n, from, input, pid, &sh, &tx));
+                    let (sh, tx, input) = (sh.clone(), done_tx.clone(), input.clone());
+                    let _ = std::thread::Builder::new().name("trix-holder-client".into()).spawn(move || serve_client(n, from, &input, &pty, pid, &sh, &tx));
                 }
             }
         })?;
 
         Ok(Held { pid, path: path.to_path_buf(), shared, done, stopping })
+    }
+
+    /// How many times a server has attached, as it goes: for tests.
+    #[cfg(test)]
+    pub(crate) fn attaches(&self) -> impl Fn() -> u64 + use<> {
+        let sh = self.shared.clone();
+        move || lock(&sh).attaches
+    }
+
+    /// The server's notes it has, as they go: for tests.
+    #[cfg(test)]
+    pub(crate) fn notes(&self) -> impl Fn() -> String + use<> {
+        let sh = self.shared.clone();
+        move || lock(&sh).meta.clone()
     }
 
     /// Serve until told to stop, or until the program ended and no server
@@ -774,13 +956,17 @@ impl Held {
 /// things are (`HELLO`, then the replay). Its number and the stream to read
 /// it from, unless it went away meanwhile.
 fn welcome(sh: &Mutex<Shared>, mut conn: UnixStream, pid: u32) -> Option<(u64, UnixStream)> {
-    let _ = conn.set_write_timeout(Some(WRITE_TIMEOUT));
-    let from = conn.try_clone().ok()?;
     let mut s = lock(sh);
-    if let Some((_, old)) = s.client.take() {
+    let _ = conn.set_write_timeout(Some(s.write_timeout));
+    let from = conn.try_clone().ok()?;
+    if let Some((_, mut old)) = s.client.take() {
+        // Told why, so it doesn't attach again and take it back.
+        let _ = old.set_write_timeout(Some(Duration::from_millis(200)));
+        let _ = write_frame(&mut old, BYE, &[]);
         let _ = old.shutdown(std::net::Shutdown::Both);
     }
     let hello = Hello {
+        version: PROTOCOL,
         pid,
         holder: std::process::id(),
         cols: s.size.0,
@@ -791,6 +977,7 @@ fn welcome(sh: &Mutex<Shared>, mut conn: UnixStream, pid: u32) -> Option<(u64, U
         dropped: s.ring.dropped(),
         exited: s.exit.is_some(),
         code: s.exit.flatten(),
+        quiet_ms: u64::try_from(s.last_output.elapsed().as_millis()).unwrap_or(u64::MAX),
     };
     let hello = serde_json::to_vec(&hello).ok()?;
     if write_frame(&mut conn, HELLO, &hello).is_err() || write_frame(&mut conn, OUTPUT, &s.ring.replay()).is_err() {
@@ -825,16 +1012,45 @@ fn nudge(sh: &Arc<Mutex<Shared>>, master: &File) {
     });
 }
 
+/// The queue to the thread writing the program's input, and how much is
+/// waiting in it.
+#[derive(Clone)]
+struct Input {
+    tx: Sender<Vec<u8>>,
+    backlog: Arc<AtomicUsize>,
+}
+
+impl Input {
+    /// Queue `bytes` for the program, unless it has stopped reading and
+    /// `INPUT_BACKLOG` is waiting already. Whether they were queued.
+    fn send(&self, bytes: Vec<u8>) -> bool {
+        let n = bytes.len();
+        if self.backlog.fetch_add(n, Ordering::Relaxed) + n > INPUT_BACKLOG {
+            self.backlog.fetch_sub(n, Ordering::Relaxed);
+            return false;
+        }
+        if self.tx.send(bytes).is_err() {
+            self.backlog.fetch_sub(n, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+}
+
 /// Do what server number `n` asks, until it goes.
-fn serve_client(n: u64, mut from: UnixStream, mut input: File, pid: u32, sh: &Mutex<Shared>, done: &Sender<Done>) {
+fn serve_client(n: u64, mut from: UnixStream, input: &Input, pty: &File, pid: u32, sh: &Mutex<Shared>, done: &Sender<Done>) {
+    let mut refused = false;
     loop {
         match read_frame(&mut from) {
             Ok((INPUT, bytes)) => {
-                let _ = input.write_all(&bytes);
+                // Said once per server, not per keystroke.
+                if !input.send(bytes) && !std::mem::replace(&mut refused, true) {
+                    eprintln!("trix holder: the program isn't reading its input; dropping what's typed until it does");
+                }
             }
             Ok((RESIZE, p)) => {
                 if let Some((cols, rows)) = parse_resize(&p) {
-                    set_size(&input, cols, rows);
+                    set_size(pty, cols, rows);
                     lock(sh).size = (cols, rows);
                 }
             }
@@ -1171,6 +1387,118 @@ pub(crate) mod tests {
         assert!(replay.starts_with(b"\x1b[?1049h"), "the preamble puts the screen back");
     }
 
+    #[test]
+    fn holders_greet_with_their_version() {
+        let hello = |version: u32| Hello { version, pid: 1, holder: 2, cols: 80, rows: 24, meta: String::new(), session: String::new(), id: 1, dropped: 0, exited: false, code: None, quiet_ms: 0 };
+        assert!(hello(0).compatible() && hello(0).protocol() == 1, "from before versions");
+        assert!(hello(PROTOCOL).compatible());
+        assert!(!hello(PROTOCOL + 1).compatible(), "a newer holder is left be");
+        // One from before versions reads as version 0.
+        let old: Hello = serde_json::from_str(r#"{"pid":1,"holder":2,"cols":80,"rows":24,"meta":""}"#).unwrap();
+        assert_eq!(old.version, 0);
+    }
+
+    /// Poll `f` until it holds, or `limit` passes. Whether it held.
+    fn eventually(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_server_that_stops_reading_is_hung_up_on() {
+        let dir = tmp_dir();
+        let path = dir.join("h.sock");
+        let held = Held::start_with(&spec("/bin/sh", &["-c", "yes flood-flood-flood | head -c 20000000; while read l; do echo \"got $l\"; done"]), &path, Duration::from_millis(200)).unwrap();
+        let (pid, shared) = (held.pid, held.shared.clone());
+        let serving = std::thread::spawn(move || held.serve());
+        // Attached, and then never read: it falls behind the flood.
+        let mut stalled = attach(&path).unwrap();
+        assert!(eventually(Duration::from_secs(10), || lock(&shared).client.is_none()), "let go");
+        let (said, ended) = drain(&mut stalled.stream);
+        assert!(ended, "and hung up on, so it hears it");
+        assert!(!said.contains(&BYE), "not told it was replaced: it may attach again");
+        assert!(crate::platform::alive(pid), "the program never noticed");
+        // Attaching again works (once the flood is over, which this one
+        // wouldn't keep up with either), and so does typing.
+        assert!(eventually(Duration::from_secs(10), || lock(&shared).last_output.elapsed() > Duration::from_millis(300)), "the flood is over");
+        let mut again = attach(&path).unwrap();
+        assert!(!again.hello.exited);
+        assert!(again.hello.dropped > 0, "it kept the newest of it");
+        write_frame(&mut again.stream, INPUT, b"ping\n").unwrap();
+        assert!(read_until(&mut again.stream, |k, p| k == OUTPUT && String::from_utf8_lossy(p).contains("got ping")));
+        write_frame(&mut again.stream, KILL, &[]).unwrap();
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kill_is_heard_while_the_program_ignores_its_input() {
+        let dir = tmp_dir();
+        let path = dir.join("h.sock");
+        let held = Held::start(&spec("/bin/sh", &["-c", "exec sleep 30"]), &path).unwrap();
+        let pid = held.pid;
+        let (done_tx, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            held.serve();
+            let _ = done_tx.send(());
+        });
+        let mut att = attach(&path).unwrap();
+        att.stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Far more than a PTY buffers, to a program that never reads it.
+        let chunk = vec![b'k'; 64 << 10];
+        for _ in 0..40 {
+            write_frame(&mut att.stream, INPUT, &chunk).expect("the holder keeps reading its server");
+        }
+        write_frame(&mut att.stream, KILL, &[]).unwrap();
+        assert!(done.recv_timeout(Duration::from_secs(10)).is_ok(), "the KILL was heard");
+        assert!(eventually(Duration::from_secs(2), || !crate::platform::alive(pid)), "and the program stopped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_holder_too_slow_to_start_is_stopped() {
+        let dir = tmp_dir();
+        let pidfile = dir.join("pid");
+        // A "holder" that never says it's up.
+        let exe = dir.join("slow-holder");
+        std::fs::write(&exe, format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pidfile.display())).unwrap();
+        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let res = launch_within(&exe, &spec("/bin/true", &[]), Duration::from_millis(500));
+        assert!(matches!(res, Err(LaunchError::Holder(_))), "the server runs the program some other way");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(eventually(Duration::from_secs(2), || pidfile.exists()), "it did start");
+        let pid: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        assert!(eventually(Duration::from_secs(3), || !crate::platform::alive(pid)), "and was stopped, so it can't start the program too");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn holders_that_dont_stop_are_made_to() {
+        use std::os::unix::process::CommandExt;
+        // A holder that ignores everything polite, and its program in a
+        // process group of its own, as a program in a PTY is.
+        let holder = Command::new("/bin/sh").args(["-c", "trap '' TERM HUP; while :; do sleep 0.05; done"]).spawn().unwrap();
+        let program = Command::new("/bin/sh").args(["-c", "trap '' TERM HUP; while :; do sleep 0.05; done"]).process_group(0).spawn().unwrap();
+        let (h, p) = (holder.id(), program.id());
+        crate::platform::reap(holder);
+        crate::platform::reap(program);
+        let started = Instant::now();
+        see_stopped(&[(h, p)], Duration::from_millis(200));
+        assert!(eventually(Duration::from_secs(2), || !crate::platform::alive(h) && !crate::platform::alive(p)), "both made to stop");
+        assert!(started.elapsed() < crate::agent::STOP_GRACE + Duration::from_secs(4));
+        // Its own process is never one of them (tests hold holders in it).
+        see_stopped(&[(std::process::id(), std::process::id())], Duration::from_millis(10));
+    }
+
     pub(crate) fn spec(program: &str, args: &[&str]) -> Spec {
         Spec {
             session: "test".into(),
@@ -1204,6 +1532,31 @@ pub(crate) mod tests {
             }
         }
         false
+    }
+
+    /// Read `s` to its end (or 5 seconds' silence): the kinds of the frames
+    /// it carried, and whether it ended.
+    fn drain(s: &mut UnixStream) -> (Vec<u8>, bool) {
+        // macOS refuses socket options on a socket the other end already
+        // shut down (EINVAL), which is itself the hang-up.
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut frames = Frames::default();
+        let mut kinds = Vec::new();
+        let mut buf = [0u8; 64 << 10];
+        let ended = loop {
+            match s.read(&mut buf) {
+                Ok(0) => break true,
+                Ok(n) => frames.feed(&buf[..n]),
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => break false,
+                Err(_) => break true,
+            }
+            while let Ok(Some((k, _))) = frames.next_frame() {
+                if kinds.last() != Some(&k) {
+                    kinds.push(k);
+                }
+            }
+        };
+        (kinds, ended)
     }
 
     #[test]
@@ -1247,14 +1600,11 @@ pub(crate) mod tests {
 
         // A third takes over from the second, which is let go.
         let third = attach(&path).unwrap();
-        let mut gone = [0u8; 1];
-        // macOS refuses socket options on a socket the other end already shut down
-        // (EINVAL), which is itself the hang-up we're looking for.
-        let hung_up = second.stream.set_read_timeout(Some(Duration::from_secs(2))).is_err()
-            || matches!(second.stream.read(&mut gone), Ok(0) | Err(_));
-        assert!(hung_up, "the old server is hung up on");
+        let (said, hung_up) = drain(&mut second.stream);
+        assert_eq!(said, vec![BYE], "the old server is told why");
+        assert!(hung_up, "and hung up on");
 
-        let tx = writer(third.stream.try_clone().unwrap());
+        let tx = writer(third.stream.try_clone().unwrap(), Arc::default());
         tx.send(Req::Kill).unwrap();
         serving.join().unwrap();
         assert!(!crate::platform::alive(pid), "killed means the program too");
@@ -1311,7 +1661,7 @@ pub(crate) mod tests {
         assert!(att.hello.exited);
         assert_eq!(att.hello.code, Some(3));
         assert!(String::from_utf8_lossy(&att.replay).contains("bye"));
-        let tx = writer(att.stream);
+        let tx = writer(att.stream, Arc::default());
         tx.send(Req::Kill).unwrap();
         serving.join().unwrap();
         assert!(!path.exists());

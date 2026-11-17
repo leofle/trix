@@ -347,6 +347,9 @@ const HOOK_REORDER_US: u64 = 5_000_000;
 /// How long a program may take to exit once hung up on, and then once told
 /// to terminate, before it's made to.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
+/// How long a holder told to stop gets to stop its program (which takes up
+/// to twice `STOP_GRACE`) and end, before the server stops both itself.
+pub const HOLDER_GRACE: Duration = Duration::from_secs(5);
 
 /// Where an agent's input, resizes and hang-up go: alacritty's event loop
 /// on a PTY of the server's own, or the writer thread to its holder.
@@ -438,30 +441,63 @@ fn delayed_writer(io: Io) -> Sender<(Instant, Cow<'static, [u8]>)> {
     tx
 }
 
+/// The server's line to a holder, as the thread reading it needs it.
+struct HeldLine {
+    stream: std::os::unix::net::UnixStream,
+    /// The holder's socket, to attach again.
+    path: PathBuf,
+    /// The writer thread's queue, to hand it a new stream.
+    writer: Sender<crate::holder::Req>,
+    /// A `KILL` went out: the holder going away is expected.
+    killed: Arc<AtomicBool>,
+}
+
 /// Read what a holder sends, into the emulator: output, and the program's
-/// exit. The end of the stream with no exit before it means the holder
-/// itself went (killed from outside): the agent has, too.
-fn read_holder(mut stream: std::os::unix::net::UnixStream, term: Arc<FairMutex<Term<Listener>>>, listener: Listener, mut parser: ansi::Processor) {
-    use crate::holder::{EXIT, Frames, OUTPUT};
+/// exit. If the holder hangs up without saying why (it let this server go,
+/// having waited on it too long), attach again, once, and carry on from
+/// what it kept. Otherwise the end of the stream with no exit before it
+/// means the holder itself went (killed from outside, or another server
+/// took over, `BYE`): the agent has, for this server, too.
+fn read_holder(line: HeldLine, term: Arc<FairMutex<Term<Listener>>>, listener: Listener, mut parser: ansi::Processor) {
+    use crate::holder::{BYE, EXIT, Frames, OUTPUT};
+    let HeldLine { mut stream, path, writer, killed } = line;
     let _ = std::thread::Builder::new().name("trix-held-read".into()).spawn(move || {
         let mut frames = Frames::default();
         let mut buf = vec![0u8; 64 << 10];
         let mut exited = false;
+        let mut bye = false;
         loop {
             // A synchronized update that never ends is drawn anyway once
             // its time is up, as alacritty's own loop does.
             let sync = parser.sync_timeout().sync_timeout().map(|t| t.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
             let _ = stream.set_read_timeout(sync);
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => frames.feed(&buf[..n]),
+            let ended = match stream.read(&mut buf) {
+                Ok(0) => true,
+                Ok(n) => {
+                    frames.feed(&buf[..n]);
+                    false
+                }
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                     parser.stop_sync(&mut *term.lock());
                     listener.send_event(TermEvent::Wakeup);
                     continue;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(_) => true,
+            };
+            if ended {
+                if exited || bye || killed.load(Ordering::SeqCst) {
+                    break;
+                }
+                match reattach_line(&path, &term, &listener, &writer) {
+                    Some((s, p)) => {
+                        stream = s;
+                        parser = p;
+                        frames = Frames::default();
+                        continue;
+                    }
+                    None => break,
+                }
             }
             loop {
                 match frames.next_frame() {
@@ -475,6 +511,7 @@ fn read_holder(mut stream: std::os::unix::net::UnixStream, term: Arc<FairMutex<T
                         let _ = listener.tx.send(AppEvent::Exit(listener.id, code));
                         listener.send_event(TermEvent::Wakeup);
                     }
+                    Ok(Some((BYE, _))) => bye = true,
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(_) => return,
@@ -485,6 +522,46 @@ fn read_holder(mut stream: std::os::unix::net::UnixStream, term: Arc<FairMutex<T
             let _ = listener.tx.send(AppEvent::Exit(listener.id, None));
         }
     });
+}
+
+/// Attach again to the holder at `path`, which let this server go, and
+/// redraw the emulator from what it kept. The new stream, and the parser
+/// that has read the replay; `None` if the holder is gone or won't have it.
+fn reattach_line(
+    path: &std::path::Path,
+    term: &Arc<FairMutex<Term<Listener>>>,
+    listener: &Listener,
+    writer: &Sender<crate::holder::Req>,
+) -> Option<(std::os::unix::net::UnixStream, ansi::Processor)> {
+    let att = match crate::holder::attach(path) {
+        Ok(att) if att.hello.compatible() && !att.hello.exited => att,
+        Ok(_) => return None,
+        Err(e) => {
+            eprintln!("trix: agent {}'s holder hung up, and attaching again failed: {e}", listener.id);
+            return None;
+        }
+    };
+    // Writes go to the new line first, with what waited for one, and the
+    // size this server has (it may have changed meanwhile).
+    let w = att.stream.try_clone().ok()?;
+    let _ = writer.send(crate::holder::Req::Stream(w));
+    let size = {
+        let t = term.lock();
+        (t.columns() as u16, t.screen_lines() as u16)
+    };
+    let _ = writer.send(crate::holder::Req::Resize(size.0, size.1));
+    eprintln!("trix: agent {}'s holder hung up (this server fell behind); attached again", listener.id);
+    let mut parser = ansi::Processor::new();
+    listener.muted.store(true, Ordering::Relaxed);
+    {
+        let mut t = term.lock();
+        // A full reset first: the replay redraws what it kept from scratch.
+        parser.advance(&mut *t, b"\x1bc");
+        parser.advance(&mut *t, &att.replay);
+    }
+    listener.muted.store(false, Ordering::Relaxed);
+    listener.send_event(TermEvent::Wakeup);
+    Some((att.stream, parser))
 }
 
 impl Agent {
@@ -610,7 +687,7 @@ impl Agent {
                     Ok(att) => a = Some(Agent::held(id, spec.name.clone(), spec.kind, spec.cwd.clone(), command_line.clone(), att, tx.clone())),
                     Err(e) => {
                         // Up, but not answering: it mustn't keep the program.
-                        unsafe { libc::kill(holder as libc::pid_t, libc::SIGTERM) };
+                        crate::holder::abandon(holder, &path);
                         eprintln!("trix: {}'s holder did not answer ({e}); its terminal stays in the server", spec.name);
                     }
                 },
@@ -653,7 +730,7 @@ impl Agent {
     /// An agent on the holder just attached (`att`): its emulator rebuilt
     /// from what the holder kept, at the size that was drawn at.
     fn held(id: u32, name: String, kind: Kind, cwd: PathBuf, command_line: String, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
-        let crate::holder::Attached { hello, replay, stream } = att;
+        let crate::holder::Attached { hello, replay, stream, path } = att;
         let size = (hello.cols.max(2), hello.rows.max(1));
         let muted = Arc::new(AtomicBool::new(true));
         let listener = Listener { id, tx, muted: muted.clone() };
@@ -661,13 +738,15 @@ impl Agent {
         let mut parser = ansi::Processor::new();
         parser.advance(&mut *term.lock(), &replay);
         muted.store(false, Ordering::Relaxed);
-        let io = match stream.try_clone() {
-            Ok(w) => Io::Held(crate::holder::writer(w)),
+        let killed = Arc::new(AtomicBool::new(false));
+        let writer = match stream.try_clone() {
+            Ok(w) => crate::holder::writer(w, killed.clone()),
             // No way to write to it: the writer side is a dead end, and the
             // reader below reports the agent gone when the holder is.
-            Err(_) => Io::Held(mpsc::channel().0),
+            Err(_) => mpsc::channel().0,
         };
-        read_holder(stream, term.clone(), listener, parser);
+        let io = Io::Held(writer.clone());
+        read_holder(HeldLine { stream, path, writer, killed }, term.clone(), listener, parser);
         let mut a = Agent::assemble(Parts { id, name, kind, cwd, command_line, term, io, pty: None, pid: hello.pid, holder: Some(hello.holder), size });
         if hello.exited {
             a.exit_code = hello.code;
@@ -848,10 +927,16 @@ impl Agent {
     /// Stop it: hang up, and if its program ignores that, end it anyway in
     /// the background (see `platform::stop`). A holder does that itself.
     pub fn shutdown(&self) {
-        if self.hang_up() && self.holder.is_none() {
-            let pid = self.pid;
-            let _ = std::thread::Builder::new().name("trix-stop".into()).spawn(move || crate::platform::stop(&[pid], STOP_GRACE));
+        if !self.hang_up() {
+            return;
         }
+        let pid = self.pid;
+        let holder = self.holder;
+        let _ = std::thread::Builder::new().name("trix-stop".into()).spawn(move || match holder {
+            // It stops its program; if it can't (or didn't hear), it's made to.
+            Some(h) => crate::holder::see_stopped(&[(h, pid)], HOLDER_GRACE),
+            None => crate::platform::stop(&[pid], STOP_GRACE),
+        });
     }
 
     /// Close its terminal, which hangs up on its program (a holder is told
@@ -2232,12 +2317,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
         let held = crate::holder::Held::start(&crate::holder::tests::spec("bash", &["--norc", "--noprofile", "-i"]), &path).unwrap();
+        let notes = held.notes();
         let serving = std::thread::spawn(move || held.serve());
         let (tx, rx) = std::sync::mpsc::channel();
         let att = crate::holder::attach(&path).unwrap();
         let mut a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "bash".into(), att, tx);
         assert_eq!(a.holder, Some(std::process::id()), "this test is its own holder");
-        std::thread::sleep(Duration::from_millis(500));
+        assert!(eventually(Duration::from_secs(5), || a.screen_text().contains('$')), "at the prompt");
         assert!(!a.running_command(), "at the prompt");
         a.resize(100, 30);
         a.write(&b"stty size; sleep 5\r"[..]);
@@ -2256,8 +2342,9 @@ mod tests {
         // Dropped without a stop (a server going down): the holder stays.
         let pid = a.pid;
         drop(a);
-        std::thread::sleep(Duration::from_millis(100));
         assert!(crate::platform::alive(pid), "detaching isn't stopping");
+        // The notes go out on the writer's thread.
+        assert!(eventually(Duration::from_secs(5), || serde_json::from_str::<Meta>(&notes()).ok() == Some(meta.clone())), "the holder has the notes");
         let att = crate::holder::attach(&path).unwrap();
         assert_eq!(serde_json::from_str::<Meta>(&att.hello.meta).unwrap(), meta, "the notes came back");
         let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "bash".into(), att, std::sync::mpsc::channel().0);
@@ -2266,6 +2353,58 @@ mod tests {
         serving.join().unwrap();
         assert!(!crate::platform::alive(pid));
         drop(rx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Poll `f` until it holds, or `limit` passes. Whether it held.
+    fn eventually(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn held_dir(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trix-test-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_server_its_holder_let_go_attaches_again() {
+        let dir = held_dir("let-go");
+        let path = dir.join("h.sock");
+        let stop = dir.join("stop");
+        let script = format!("while [ ! -e {} ]; do yes flood-flood-flood | head -c 1000000; done; echo; echo flooded; while read l; do echo \"got $l\"; done", stop.display());
+        let held = crate::holder::Held::start_with(&crate::holder::tests::spec("/bin/sh", &["-c", &script]), &path, Duration::from_millis(200)).unwrap();
+        let pid = held.pid;
+        let attaches = held.attaches();
+        let serving = std::thread::spawn(move || held.serve());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let att = crate::holder::attach(&path).unwrap();
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "sh".into(), att, tx);
+        // The server stalls (its emulator busy, say) while the program floods:
+        // the holder lets it go rather than stall the program.
+        {
+            let _busy = a.term.lock();
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        assert!(eventually(Duration::from_secs(10), || attaches() == 2), "attached again");
+        std::fs::write(&stop, "").unwrap();
+        assert!(eventually(Duration::from_secs(20), || a.screen_text().contains("flooded")), "and caught up: {:?}", a.screen_text());
+        a.write(&b"ping\r"[..]);
+        assert!(eventually(Duration::from_secs(5), || a.screen_text().contains("got ping")), "typing goes to the new connection: {:?}", { let t = a.screen_text(); t[t.len().saturating_sub(300)..].to_string() });
+        assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::Exit(..))), "never reported gone");
+        a.shutdown();
+        serving.join().unwrap();
+        assert!(!crate::platform::alive(pid));
         let _ = std::fs::remove_dir_all(dir);
     }
 
