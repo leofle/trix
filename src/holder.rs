@@ -18,8 +18,10 @@
 //! `EXIT` (JSON, its exit code or null) when it ends. One server at a time:
 //! a new connection takes over from the last.
 //!
-//! Sockets are named `holder.<session>.<agent id>.<holder pid>.sock`, so a
-//! new server knows whose they are, and which are stale, without asking.
+//! Sockets are named `holder.<session hash>.<agent id>.<holder pid>.sock`
+//! (`hooks::short_hash`: a session name of any length fits in a socket
+//! path), so a new server knows whose they are, and which are stale, without
+//! connecting to them. The greeting names the session in full.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -36,6 +38,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::tty;
+
+use crate::modes::Tracker;
 
 pub const INPUT: u8 = 1;
 pub const RESIZE: u8 = 2;
@@ -134,37 +138,116 @@ pub fn parse_resize(p: &[u8]) -> Option<(u16, u16)> {
 
 // ───────────────────────────── the buffer ─────────────────────────────
 
-/// The newest `cap` bytes of output. When the oldest go, the cut moves on to
-/// the next line start if there's one nearby, so a replay doesn't open in
-/// the middle of a line (or of an escape sequence on it).
+/// The newest `cap` bytes of output, and the terminal modes in force where
+/// they start (`modes::Tracker`), so a replay can open by restoring them.
+/// When the oldest go, the cut moves on to the next line start if there's
+/// one nearby, never stops inside an escape sequence, and on the alternate
+/// screen moves on to where the program next cleared it, if that's near: a
+/// full-screen program's replay then starts with a whole screen, not the
+/// tail of an update to one.
 pub struct Ring {
     buf: VecDeque<u8>,
     cap: usize,
+    /// Everything that fell off the front, followed.
+    base: Tracker,
+    /// Everything, followed: the modes in force now.
+    now: Tracker,
+    dropped: u64,
 }
+
+/// How far past the cut a clear of the alternate screen is looked for.
+const CLEAR_SEARCH: usize = 256 << 10;
+/// How far the cut moves on to get out of an escape sequence or a string.
+const GROUND_SEARCH: usize = 64 << 10;
 
 impl Ring {
     pub fn new(cap: usize) -> Ring {
-        Ring { buf: VecDeque::new(), cap }
+        Ring { buf: VecDeque::new(), cap, base: Tracker::default(), now: Tracker::default(), dropped: 0 }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        let skipped = bytes.len().saturating_sub(self.cap);
-        self.buf.extend(&bytes[skipped..]);
-        let over = self.buf.len().saturating_sub(self.cap);
-        if over == 0 && skipped == 0 {
+        self.now.feed(bytes);
+        let over = (self.buf.len() + bytes.len()).saturating_sub(self.cap);
+        if over == 0 {
+            self.buf.extend(bytes);
             return;
         }
-        self.buf.drain(..over);
+        // The oldest go first, then whatever of `bytes` doesn't fit either.
+        let old = over.min(self.buf.len());
+        self.take(old);
+        let skip = over - old;
+        self.base.feed(&bytes[..skip]);
+        self.dropped += skip as u64;
+        self.buf.extend(&bytes[skip..]);
+        self.settle();
+    }
+
+    /// Move the cut on to a better place to start a replay.
+    fn settle(&mut self) {
         let near = self.buf.len().min(LINE_SEARCH);
         if let Some(nl) = self.buf.range(..near).position(|&b| b == b'\n') {
-            self.buf.drain(..=nl);
+            self.take(nl + 1);
+        }
+        let mut n = 0;
+        while !self.base.ground() && !self.buf.is_empty() && n < GROUND_SEARCH {
+            self.take(1);
+            n += 1;
+        }
+        if self.base.ground()
+            && self.base.modes().alt.is_some()
+            && let Some(at) = find(self.buf.range(..self.buf.len().min(CLEAR_SEARCH)), b"\x1b[2J")
+            && at > 0
+        {
+            self.take(at);
         }
     }
 
+    /// Drop the oldest `n` bytes, following them.
+    fn take(&mut self, n: usize) {
+        let gone: Vec<u8> = self.buf.drain(..n).collect();
+        self.base.feed(&gone);
+        self.dropped += n as u64;
+    }
+
+    /// What a new emulator should be given: the modes in force where the
+    /// kept output starts, then that output.
+    pub fn replay(&self) -> Vec<u8> {
+        let mut out = self.base.modes().preamble();
+        let (a, b) = self.buf.as_slices();
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out
+    }
+
+    /// The modes in force now.
+    pub fn modes(&self) -> &crate::modes::Modes {
+        self.now.modes()
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    #[cfg(test)]
     pub fn bytes(&self) -> Vec<u8> {
         let (a, b) = self.buf.as_slices();
         [a, b].concat()
     }
+}
+
+/// Where `pat` first starts in `hay`.
+fn find<'a>(hay: impl Iterator<Item = &'a u8>, pat: &[u8]) -> Option<usize> {
+    let mut window: VecDeque<u8> = VecDeque::with_capacity(pat.len());
+    for (i, &b) in hay.enumerate() {
+        if window.len() == pat.len() {
+            window.pop_front();
+        }
+        window.push_back(b);
+        if window.len() == pat.len() && window.iter().eq(pat.iter()) {
+            return Some(i + 1 - pat.len());
+        }
+    }
+    None
 }
 
 // ───────────────────────────── what's said ─────────────────────────────
@@ -202,6 +285,15 @@ pub struct Hello {
     pub cols: u16,
     pub rows: u16,
     pub meta: String,
+    /// Whose it is: the session in full (its socket has only a hash), and
+    /// the agent's id.
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub id: u32,
+    /// How many bytes of output were dropped from the front of the replay.
+    #[serde(default)]
+    pub dropped: u64,
     /// The program has ended (and `code` is how).
     #[serde(default)]
     pub exited: bool,
@@ -212,46 +304,46 @@ pub struct Hello {
 // ───────────────────────────── where ─────────────────────────────
 
 fn socket_name(session: &str, id: u32, pid: u32) -> String {
-    format!("holder.{session}.{id}.{pid}.sock")
+    format!("holder.{}.{id}.{pid}.sock", crate::hooks::short_hash(session))
 }
 
 pub fn socket_path(session: &str, id: u32, pid: u32) -> PathBuf {
-    crate::hooks::runtime_dir().join(socket_name(session, id, pid))
+    crate::hooks::socket_in(&socket_name(session, id, pid))
 }
 
-/// (session, agent id, holder pid) from a socket's file name.
+/// (session hash, agent id, holder pid) from a socket's file name.
 fn parse_name(name: &str) -> Option<(&str, u32, u32)> {
     let rest = name.strip_prefix("holder.")?.strip_suffix(".sock")?;
     let mut parts = rest.split('.');
-    let (session, id, pid) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || crate::session::check_name(session).is_err() {
+    let (hash, id, pid) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || hash.len() != 12 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    Some((session, id.parse().ok()?, pid.parse().ok()?))
+    Some((hash, id.parse().ok()?, pid.parse().ok()?))
 }
 
 /// Holders of `session` whose process is alive, by agent id: (id, socket).
 /// Sockets of holders that are gone, any session's, are removed on the way.
 pub fn discover(session: &str) -> Vec<(u32, PathBuf)> {
-    discover_in(&crate::hooks::runtime_dir(), Some(session))
+    discover_in(&crate::hooks::socket_dirs(), Some(session))
 }
 
 /// Every session's live holders.
 pub fn discover_all() -> Vec<(u32, PathBuf)> {
-    discover_in(&crate::hooks::runtime_dir(), None)
+    discover_in(&crate::hooks::socket_dirs(), None)
 }
 
-fn discover_in(dir: &Path, session: Option<&str>) -> Vec<(u32, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+fn discover_in(dirs: &[PathBuf], session: Option<&str>) -> Vec<(u32, PathBuf)> {
+    let want = session.map(crate::hooks::short_hash);
     let mut found = Vec::new();
-    for e in entries.flatten() {
+    for e in dirs.iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()) {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some((s, id, pid)) = parse_name(&name) else { continue };
+        let Some((hash, id, pid)) = parse_name(&name) else { continue };
         if !crate::platform::alive(pid) {
             let _ = std::fs::remove_file(e.path());
             continue;
         }
-        if session.is_none_or(|want| want == s) {
+        if want.as_deref().is_none_or(|w| w == hash) {
             found.push((id, e.path()));
         }
     }
@@ -264,7 +356,7 @@ fn discover_in(dir: &Path, session: Option<&str>) -> Vec<(u32, PathBuf)> {
 /// they have (or after about twice `STOP_GRACE`).
 pub fn kill_orphans(session: Option<&str>) -> usize {
     let mut holders = Vec::new();
-    for (_, path) in discover_in(&crate::hooks::runtime_dir(), session) {
+    for (_, path) in discover_in(&crate::hooks::socket_dirs(), session) {
         // Attached first: a holder greets whoever connects, and one that
         // hung up before hearing it is dropped unread, KILL and all.
         match attach(&path) {
@@ -454,6 +546,8 @@ pub fn main() -> i32 {
 }
 
 struct Shared {
+    session: String,
+    id: u32,
     ring: Ring,
     /// The attached server, numbered so a reader that ended can tell
     /// whether it's still the current one.
@@ -533,6 +627,8 @@ impl Held {
             libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) & !libc::O_NONBLOCK);
         }
         let shared = Arc::new(Mutex::new(Shared {
+            session: spec.session.clone(),
+            id: spec.id,
             ring: Ring::new(RING_BYTES),
             client: None,
             attaches: 0,
@@ -593,6 +689,9 @@ impl Held {
                 };
                 if let Some((n, from)) = welcome(&sh, conn, pid) {
                     let Ok(input) = master.try_clone() else { continue };
+                    if n > 1 {
+                        nudge(&sh, &master);
+                    }
                     let (sh, tx) = (sh.clone(), done_tx.clone());
                     let _ = std::thread::Builder::new().name("trix-holder-client".into()).spawn(move || serve_client(n, from, input, pid, &sh, &tx));
                 }
@@ -644,11 +743,14 @@ fn welcome(sh: &Mutex<Shared>, mut conn: UnixStream, pid: u32) -> Option<(u64, U
         cols: s.size.0,
         rows: s.size.1,
         meta: s.meta.clone(),
+        session: s.session.clone(),
+        id: s.id,
+        dropped: s.ring.dropped(),
         exited: s.exit.is_some(),
         code: s.exit.flatten(),
     };
     let hello = serde_json::to_vec(&hello).ok()?;
-    if write_frame(&mut conn, HELLO, &hello).is_err() || write_frame(&mut conn, OUTPUT, &s.ring.bytes()).is_err() {
+    if write_frame(&mut conn, HELLO, &hello).is_err() || write_frame(&mut conn, OUTPUT, &s.ring.replay()).is_err() {
         s.alone_since = Instant::now();
         return None;
     }
@@ -656,6 +758,28 @@ fn welcome(sh: &Mutex<Shared>, mut conn: UnixStream, pid: u32) -> Option<(u64, U
     let n = s.attaches;
     s.client = Some((n, conn));
     Some((n, from))
+}
+
+/// A server took over from another: a full-screen program redraws all of
+/// its screen for it, when told the terminal changed size. One row less for
+/// a moment, then its size again (whatever it is by then: the new server
+/// may have resized it meanwhile). Shells, on the main screen, are left be.
+fn nudge(sh: &Arc<Mutex<Shared>>, master: &File) {
+    let (cols, rows) = {
+        let s = lock(sh);
+        if s.exit.is_some() || s.ring.modes().alt.is_none() {
+            return;
+        }
+        s.size
+    };
+    let Ok(pty) = master.try_clone() else { return };
+    let sh = sh.clone();
+    let _ = std::thread::Builder::new().name("trix-holder-nudge".into()).spawn(move || {
+        set_size(&pty, cols, if rows > 1 { rows - 1 } else { rows + 1 });
+        std::thread::sleep(Duration::from_millis(150));
+        let (cols, rows) = lock(&sh).size;
+        set_size(&pty, cols, rows);
+    });
 }
 
 /// Do what server number `n` asks, until it goes.
@@ -836,13 +960,28 @@ pub(crate) mod tests {
 
     #[test]
     fn socket_names_round_trip() {
-        assert_eq!(parse_name(&socket_name("default", 3, 4242)), Some(("default", 3, 4242)));
-        assert_eq!(parse_name(&socket_name("work-2_x", 17, 1)), Some(("work-2_x", 17, 1)));
-        assert_eq!(parse_name("holder.default.3.sock"), None, "no pid");
-        assert_eq!(parse_name("holder.default.3.4.5.sock"), None);
-        assert_eq!(parse_name("holder.a/b.3.4.sock"), None, "not a session name");
+        let h = |s: &str| crate::hooks::short_hash(s);
+        let (d, w) = (h("default"), h("work-2_x"));
+        assert_eq!(parse_name(&socket_name("default", 3, 4242)), Some((d.as_str(), 3, 4242)));
+        assert_eq!(parse_name(&socket_name("work-2_x", 17, 1)), Some((w.as_str(), 17, 1)));
+        assert_ne!(d, w);
+        assert_eq!(parse_name(&format!("holder.{d}.3.sock")), None, "no pid");
+        assert_eq!(parse_name(&format!("holder.{d}.3.4.5.sock")), None);
+        assert_eq!(parse_name("holder.default.3.4.sock"), None, "a name, not a hash: from before");
         assert_eq!(parse_name("session.sock"), None);
         assert_eq!(parse_name("trix-12.sock"), None);
+    }
+
+    #[test]
+    fn a_session_name_of_any_length_fits_a_socket() {
+        let long = "s".repeat(200);
+        let name = socket_name(&long, u32::MAX, u32::MAX);
+        assert!(name.len() <= crate::hooks::MAX_SOCKET_NAME, "{} bytes: {name}", name.len());
+        // Under a runtime folder as long as macOS's: still bindable.
+        let dir = PathBuf::from(format!("/var/folders/zz/{}/T/trix-501", "x".repeat(28)));
+        let path = dir.join(&name);
+        assert!(path.as_os_str().len() < 104, "{}", path.display());
+        assert_eq!(parse_name(&name).map(|(_, id, pid)| (id, pid)), Some((u32::MAX, u32::MAX)));
     }
 
     fn tmp_dir() -> PathBuf {
@@ -855,20 +994,103 @@ pub(crate) mod tests {
 
     #[test]
     fn stale_sockets_are_swept_and_live_ones_found() {
-        let dir = tmp_dir();
+        let (dir, short) = (tmp_dir(), tmp_dir());
         let mut dead = Command::new("true").spawn().unwrap();
         let dead_pid = dead.id();
         dead.wait().unwrap();
         let me = std::process::id();
+        let long = "l".repeat(200);
         for name in [socket_name("default", 2, me), socket_name("default", 1, me), socket_name("work", 5, me), socket_name("default", 9, dead_pid), "unrelated.sock".into()] {
             std::fs::write(dir.join(name), "").unwrap();
         }
-        let ids: Vec<u32> = discover_in(&dir, Some("default")).into_iter().map(|(id, _)| id).collect();
-        assert_eq!(ids, [1, 2], "this session's, by id");
+        // The short folder too, where sockets go that the runtime folder is too long for.
+        std::fs::write(short.join(socket_name("default", 3, me)), "").unwrap();
+        std::fs::write(short.join(socket_name(&long, 4, me)), "").unwrap();
+        let dirs = [dir.clone(), short.clone()];
+        let ids: Vec<u32> = discover_in(&dirs, Some("default")).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, [1, 2, 3], "this session's, by id, in either folder");
         assert!(!dir.join(socket_name("default", 9, dead_pid)).exists(), "a dead holder's socket is removed");
         assert!(dir.join("unrelated.sock").exists());
-        assert_eq!(discover_in(&dir, None).len(), 3, "every session's");
+        let ids: Vec<u32> = discover_in(&dirs, Some(&long)).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, [4], "a long session's");
+        assert_eq!(discover_in(&dirs, None).len(), 5, "every session's");
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(short);
+    }
+
+    /// A fresh emulator, fed `bytes`.
+    fn emulate(bytes: &[u8], cols: usize, lines: usize) -> alacritty_terminal::Term<alacritty_terminal::event::VoidListener> {
+        use alacritty_terminal::term::{Config, Term};
+        let size = crate::agent::TermSize { cols, lines };
+        let mut term = Term::new(Config::default(), &size, alacritty_terminal::event::VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut term, bytes);
+        term
+    }
+
+    fn screen(term: &alacritty_terminal::Term<alacritty_terminal::event::VoidListener>) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        let grid = term.grid();
+        (0..term.screen_lines() as i32)
+            .map(|l| (0..term.columns()).map(|c| grid[Line(l)][Column(c)].c).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_replay_restores_the_alternate_screen_after_its_setup_fell_off() {
+        use alacritty_terminal::term::TermMode;
+        let mut r = Ring::new(4096);
+        // A shell's history, then a full-screen program sets up...
+        r.push(b"$ ls\nfile-a file-b\n$ top\n");
+        r.push(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?25l\x1b[?1000h\x1b[?1006h");
+        // ...and repaints, over and over, much more than is kept.
+        for i in 0..400 {
+            r.push(format!("\x1b[H\x1b[2Jframe {i}\r\nload {}\r\n", i * 3).as_bytes());
+        }
+        assert!(r.dropped() > 0);
+        assert!(!r.bytes().windows(8).any(|w| w == b"\x1b[?1049h"), "the setup is gone from the buffer");
+        assert!(r.bytes().starts_with(b"\x1b[H\x1b[2J") || r.bytes().starts_with(b"\x1b[2J"), "it starts at a whole screen: {:?}", String::from_utf8_lossy(&r.bytes()[..20]));
+        let term = emulate(&r.replay(), 40, 10);
+        let mode = *term.mode();
+        assert!(mode.contains(TermMode::ALT_SCREEN), "on the alternate screen");
+        assert!(mode.contains(TermMode::APP_CURSOR) && mode.contains(TermMode::APP_KEYPAD));
+        assert!(!mode.contains(TermMode::SHOW_CURSOR), "cursor still hidden");
+        assert!(mode.contains(TermMode::MOUSE_REPORT_CLICK) && mode.contains(TermMode::SGR_MOUSE));
+        let shown = screen(&term);
+        assert!(shown.starts_with("frame 399\nload 1197"), "{shown:?}");
+        assert!(!shown.contains("file-a"), "no shell history on its screen");
+
+        // Without the preamble, the same bytes land on the main screen.
+        let bare = emulate(&r.bytes(), 40, 10);
+        assert!(!bare.mode().contains(TermMode::ALT_SCREEN));
+
+        // Once it quits, the main screen is back, and so are the modes.
+        r.push(b"\x1b[?1049l\x1b[?1l\x1b>\x1b[?25h\x1b[?1000l\x1b[?1006l$ ");
+        let term = emulate(&r.replay(), 40, 10);
+        assert!(!term.mode().contains(TermMode::ALT_SCREEN) && term.mode().contains(TermMode::SHOW_CURSOR));
+        assert!(!term.mode().contains(TermMode::APP_CURSOR));
+    }
+
+    #[test]
+    fn the_cut_never_lands_inside_a_sequence() {
+        let mut r = Ring::new(64);
+        // Long titles: strings that would straddle any cut.
+        for i in 0..50 {
+            r.push(format!("\x1b]0;a long window title number {i}\x07x").as_bytes());
+        }
+        let kept = r.bytes();
+        assert!(kept.starts_with(b"\x1b]") || kept.starts_with(b"x"), "{:?}", String::from_utf8_lossy(&kept));
+        // Split mode sequences are followed whole across pushes and cuts.
+        let mut r = Ring::new(32);
+        r.push(b"\x1b[?10");
+        r.push(b"49h");
+        for _ in 0..20 {
+            r.push(b"0123456789");
+        }
+        assert_eq!(r.modes().alt, Some(1049));
+        assert!(r.replay().starts_with(b"\x1b[?1049h"));
     }
 
     pub(crate) fn spec(program: &str, args: &[&str]) -> Spec {
@@ -919,6 +1141,7 @@ pub(crate) mod tests {
         assert_eq!(first.hello.pid, pid);
         assert_eq!((first.hello.cols, first.hello.rows), (80, 24));
         assert_eq!(first.hello.meta, r#"{"name":"t"}"#);
+        assert_eq!((first.hello.session.as_str(), first.hello.id, first.hello.dropped), ("test", 1, 0));
         assert!(!first.hello.exited);
         let mut seen = String::from_utf8_lossy(&first.replay).into_owned();
         assert!(seen.contains("started") || read_until(&mut first.stream, |k, p| {
@@ -956,6 +1179,37 @@ pub(crate) mod tests {
         assert!(!crate::platform::alive(pid), "killed means the program too");
         assert!(lock(&shared).exit.is_some() || !crate::platform::alive(pid));
         assert!(!path.exists(), "the socket goes with it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_full_screen_program_is_told_to_redraw_for_a_new_server() {
+        let dir = tmp_dir();
+        let path = dir.join("h.sock");
+        let script = "trap 'echo winch $(stty size)' WINCH; printf '\\033[?1049hready\\n'; while :; do sleep 0.05; done";
+        let held = Held::start(&spec("bash", &["--norc", "--noprofile", "-c", script]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let mut first = attach(&path).unwrap();
+        let mut seen = String::from_utf8_lossy(&first.replay).into_owned();
+        assert!(seen.contains("ready") || read_until(&mut first.stream, |_, p| {
+            seen.push_str(&String::from_utf8_lossy(p));
+            seen.contains("ready")
+        }));
+        assert!(!seen.contains("winch"), "the first server isn't a takeover");
+        let mut second = attach(&path).unwrap();
+        let mut told = String::new();
+        assert!(
+            read_until(&mut second.stream, |k, p| {
+                if k == OUTPUT {
+                    told.push_str(&String::from_utf8_lossy(p));
+                }
+                told.contains("winch 24 80")
+            }),
+            "the size wiggled, so it redraws, and is back where it was: {told:?}"
+        );
+        assert!(told.contains("winch 23 80"), "{told:?}");
+        write_frame(&mut second.stream, KILL, &[]).unwrap();
+        serving.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 

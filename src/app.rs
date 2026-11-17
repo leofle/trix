@@ -1305,7 +1305,12 @@ impl App {
                 continue;
             }
             match crate::holder::attach(&path) {
+                // Its socket names a hash of the session; the holder, all of it.
+                Ok(att) if !att.hello.session.is_empty() && att.hello.session != crate::session::name() => {}
                 Ok(att) => {
+                    if att.hello.dropped > 0 {
+                        eprintln!("trix: agent {id}: replaying {} bytes of output, {} older ones dropped", att.replay.len(), att.hello.dropped);
+                    }
                     let meta: crate::agent::Meta = serde_json::from_str(&att.hello.meta).unwrap_or_default();
                     found.push((id, meta, att));
                 }
@@ -3209,6 +3214,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("h.sock");
         let mut spec = crate::holder::tests::spec("/bin/sh", &["-c", "echo before; while read l; do echo \"after $l\"; done"]);
+        spec.session = crate::session::name().into();
         spec.id = 7;
         let meta = crate::agent::Meta {
             kind: "shell".into(),

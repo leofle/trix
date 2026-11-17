@@ -8,6 +8,7 @@ mod hooks;
 mod input;
 mod install;
 mod layout;
+mod modes;
 #[cfg(target_os = "macos")]
 mod notifier;
 mod platform;
