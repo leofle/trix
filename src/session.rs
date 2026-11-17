@@ -135,6 +135,11 @@ pub fn control_path() -> PathBuf {
     control_path_for(name())
 }
 
+/// The hook socket (`hooks::socket_path`).
+pub fn hooks_path() -> PathBuf {
+    file_for(name(), "hooks", "sock")
+}
+
 fn lock_path() -> PathBuf {
     file_for(name(), "session", "lock")
 }

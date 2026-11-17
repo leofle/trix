@@ -128,8 +128,11 @@ pub fn sweep_stale() {
     }
 }
 
+/// Where agents report (`TRIX_SOCKET`): one per session, not per server, so
+/// an agent still reaches the server that took over from the one that
+/// started it.
 pub fn socket_path() -> PathBuf {
-    runtime_dir().join(format!("trix-{}.sock", std::process::id()))
+    crate::session::hooks_path()
 }
 
 /// Start the listener thread. Each connection carries one or more JSON lines.
