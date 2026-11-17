@@ -173,28 +173,39 @@ fn check_private(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a server puts in the runtime folder under its own pid, as
+/// `<prefix><pid>` or `<prefix><pid>.<ext>`: a clean exit removes them, and
+/// `sweep_stale` removes what a server that died left behind.
+const PER_SERVER: [&str; 7] = [
+    "trix-",
+    "claude-settings-",
+    "opencode-plugin-",
+    "cursor-plugin-",
+    "copilot-plugin-",
+    "muse-hooks-",
+    "workspace-instructions-",
+];
+
+/// The server pid in the name of one of its runtime files, if it is one.
+fn server_pid(name: &str) -> Option<u32> {
+    PER_SERVER.iter().find_map(|p| name.strip_prefix(p))?.split('.').next()?.parse().ok()
+}
+
 /// Remove sockets / settings left behind by trix processes that died hard.
 /// Not the settings and plugins while a holder lives: its agent was started
 /// with them, by the server that died, and may read them again.
 pub fn sweep_stale() {
-    let Ok(entries) = std::fs::read_dir(runtime_dir()) else { return };
-    let holders = !crate::holder::discover_all().is_empty();
+    sweep_stale_in(&runtime_dir(), !crate::holder::discover_all().is_empty());
+}
+
+fn sweep_stale_in(dir: &Path, holders: bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let pid = name
-            .trim_start_matches("trix-")
-            .trim_start_matches("claude-settings-")
-            .trim_start_matches("opencode-plugin-")
-            .trim_start_matches("cursor-plugin-")
-            .trim_start_matches("copilot-plugin-")
-            .trim_start_matches("muse-hooks-")
-            .split('.')
-            .next()
-            .and_then(|p| p.parse::<u32>().ok());
         if holders && !name.ends_with(".sock") {
             continue;
         }
-        if pid.is_some_and(|pid| !crate::platform::alive(pid)) {
+        if server_pid(&name).is_some_and(|pid| !crate::platform::alive(pid)) {
             if e.file_type().is_ok_and(|t| t.is_dir()) {
                 let _ = std::fs::remove_dir_all(e.path());
             } else {
@@ -1542,6 +1553,57 @@ mod tests {
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(check_private(&link).unwrap_err().contains("not a folder"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn server_pids_come_from_runtime_file_names() {
+        assert_eq!(server_pid("claude-settings-123.json"), Some(123));
+        assert_eq!(server_pid("opencode-plugin-123.js"), Some(123));
+        assert_eq!(server_pid("workspace-instructions-123"), Some(123));
+        assert_eq!(server_pid("trix-123.sock"), Some(123));
+        for other in ["session.sock", "hooks.sock", "server.log", "session.lock", "holder.0123456789ab.1.123.sock", "123.sock", "muse-hooks-.json"] {
+            assert_eq!(server_pid(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_dead_servers_files_are_swept_and_a_live_ones_kept() {
+        let dir = std::env::temp_dir().join(format!("trix-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Above any pid_max (Linux 2^22, macOS 99998): never alive.
+        let dead = i32::MAX as u32;
+        let me = std::process::id();
+        let files = |pid: u32| [format!("trix-{pid}.sock"), format!("claude-settings-{pid}.json"), format!("muse-hooks-{pid}.json"), format!("opencode-plugin-{pid}.js")];
+        let folders = |pid: u32| [format!("workspace-instructions-{pid}"), format!("opencode-plugin-{pid}"), format!("cursor-plugin-{pid}"), format!("copilot-plugin-{pid}")];
+        for pid in [dead, me] {
+            for f in files(pid) {
+                std::fs::write(dir.join(f), "").unwrap();
+            }
+            for d in folders(pid) {
+                std::fs::create_dir_all(dir.join(d).join(".github")).unwrap();
+            }
+        }
+        for f in ["session.sock", "hooks.sock", "server.log"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let there = |n: &String| dir.join(n).exists();
+
+        // A holder lives: only the dead server's sockets go.
+        sweep_stale_in(&dir, true);
+        assert!(!there(&format!("trix-{dead}.sock")));
+        assert!(files(dead)[1..].iter().all(there), "settings stay while a holder may read them");
+        assert!(folders(dead).iter().all(there));
+
+        sweep_stale_in(&dir, false);
+        for n in files(dead).iter().chain(&folders(dead)) {
+            assert!(!there(n), "{n} of a dead server");
+        }
+        for n in files(me).iter().chain(&folders(me)) {
+            assert!(there(n), "{n} of a live server");
+        }
+        assert!(["session.sock", "hooks.sock", "server.log"].map(String::from).iter().all(there), "the session's own files");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
