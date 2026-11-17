@@ -82,6 +82,44 @@ jobs:
       - name: Attach to the release
         run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
 
+  # Pacman packages for Arch Linux and Omarchy, made from the Linux
+  # archives above so they hold the same binary. They're attached under
+  # names without the version, so the latest release's are always at
+  # .../releases/latest/download/trix-x86_64.pkg.tar.zst. The PKGBUILD
+  # goes up too, for anyone who'd rather run makepkg themselves.
+  pacman:
+    needs: build
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install makepkg's tools and gh
+        run: pacman -Syu --noconfirm --needed base-devel github-cli
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build the packages
+        run: |
+          # makepkg won't run as root.
+          useradd -m builder
+          mkdir /build && chown builder /build
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir sums
+          packaging/pkgbuild.sh "${TAG#v}" sums > /build/PKGBUILD
+          cd /build
+          for arch in x86_64 aarch64; do
+            # The archives are already built, so either architecture
+            # packages fine here: only makepkg's CARCH has to change.
+            sed "s/^CARCH=.*/CARCH=\"$arch\"/" /etc/makepkg.conf > "$arch.conf"
+            su builder -c "makepkg --config $arch.conf"
+            mv trix-*-"$arch".pkg.tar.zst "trix-$arch.pkg.tar.zst"
+            sha256sum "trix-$arch.pkg.tar.zst" > "trix-$arch.pkg.tar.zst.sha256"
+          done
+      - name: Attach to the release
+        working-directory: /build
+        run: |
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            trix-*.pkg.tar.zst trix-*.pkg.tar.zst.sha256 PKGBUILD
+
   # Point the Homebrew formula in leofle/homebrew-trix at this release.
   # Pushing to another repo needs a token of its own: a fine-grained one
   # with Contents read and write on homebrew-trix, saved in this repo as

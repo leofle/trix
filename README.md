@@ -47,6 +47,15 @@ Install with [Homebrew](https://brew.sh), on macOS or Linux:
 brew install leofle/trix/trix
 ```
 
+On Arch Linux or Omarchy, install the latest release's pacman package (x86_64 or aarch64):
+
+```sh
+curl -fLO https://github.com/leofle/trix/releases/latest/download/trix-$(uname -m).pkg.tar.zst
+sudo pacman -U ./trix-$(uname -m).pkg.tar.zst
+```
+
+Each release also carries its `PKGBUILD`, if you'd rather build the package with `makepkg`. Updates come the same way: run the two lines again.
+
 Or download the latest release for Linux or macOS (x86_64 or ARM) into `~/.local/bin`:
 
 ```sh
