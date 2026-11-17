@@ -2424,7 +2424,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(a.running_command(), "the foreground job, asked through the process");
-        assert!(a.screen_text().contains("30 100"), "resized through the holder: {:?}", a.screen_text());
+        // What `stty` wrote comes through the holder, after the shell has
+        // gone on to `sleep`: it may not be on the screen yet.
+        assert!(eventually(Duration::from_secs(5), || a.screen_text().contains("30 100")), "resized through the holder: {:?}", a.screen_text());
         // Its notes go to the holder, once per change.
         let meta = a.meta(2, true, None, false);
         a.send_meta(&meta);
