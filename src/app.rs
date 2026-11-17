@@ -1300,6 +1300,9 @@ impl App {
     fn reattach_from(&mut self, holders: Vec<(u32, PathBuf)>) -> usize {
         let mut found = Vec::new();
         for (id, path) in holders {
+            // Every id a holder has is taken, whether or not it comes back
+            // now: a new agent with it would get its hooks, and hide it.
+            self.next_id = self.next_id.max(id.saturating_add(1));
             // A holder this server has already (ids are unique per session).
             if self.agents.iter().any(|a| a.id == id) {
                 continue;
@@ -3248,11 +3251,12 @@ mod tests {
         let mut app = test_app();
         let saved = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: "/tmp".into(), command: None, session: None, pinned: false };
         app.pending_restore = Some(Saved::new(1, vec![saved("counter"), saved("other")]));
-        assert_eq!(app.reattach_from(vec![(7, path.clone())]), 1);
+        // And one whose holder can't be reached now: its id stays taken.
+        assert_eq!(app.reattach_from(vec![(7, path.clone()), (12, dir.join("unreachable.sock"))]), 1);
         let a = &app.agents[0];
         assert_eq!((a.id, a.name.as_str(), a.kind, a.pid, a.pinned, a.state), (7, "counter", Kind::Shell, pid, true, State::Idle));
         assert!(a.screen_text().contains("before"), "the screen comes back from the replay: {:?}", a.screen_text());
-        assert_eq!(app.next_id, 8, "new agents can't take its id (its hooks report it)");
+        assert_eq!(app.next_id, 13, "new agents can't take their ids (their hooks report them)");
         let offer: Vec<&str> = app.pending_restore.as_ref().unwrap().agents.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(offer, ["other"], "what came back isn't offered again");
 

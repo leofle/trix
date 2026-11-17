@@ -161,6 +161,10 @@ impl State {
             State::Exited => "exited",
         }
     }
+
+    pub fn from_label(s: &str) -> Option<State> {
+        [State::Starting, State::Idle, State::Working, State::Blocked, State::Done, State::Exited].into_iter().find(|st| st.label() == s)
+    }
 }
 
 #[derive(Clone)]
@@ -424,6 +428,15 @@ pub struct Meta {
     pub managed_by: Option<String>,
     #[serde(default)]
     pub transcript: Option<PathBuf>,
+    /// Where it was at (`State::label`), what it was doing, and whether
+    /// that was news nobody had looked at: put back on reattach, so an agent
+    /// that needed you still says so.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub activity: String,
+    #[serde(default)]
+    pub unseen: bool,
 }
 
 /// One thread per agent that sends each write when it's due, in the order
@@ -762,6 +775,7 @@ impl Agent {
     /// Put back an agent whose holder outlived the last server, from the
     /// notes it kept (`meta`) and the output it buffered.
     pub fn reattach(id: u32, kind: Kind, name: String, meta: &Meta, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
+        let quiet = Duration::from_millis(att.hello.quiet_ms);
         let mut a = Agent::held(id, name, kind, meta.cwd.clone(), meta.command_line.clone(), att, tx);
         a.meta_sent = serde_json::to_string(meta).unwrap_or_default();
         a.session = meta.session.clone();
@@ -774,11 +788,38 @@ impl Agent {
         a.managed_by = meta.managed_by.clone();
         a.transcript = meta.transcript.clone();
         if a.state != State::Exited {
-            // It has been running all along: not starting, whatever it's at.
-            a.state = State::Idle;
-            a.activity = "reattached".into();
+            a.restore_state(meta, quiet);
         }
         a
+    }
+
+    /// Where an agent that kept running without a server is at, from where
+    /// it was (`meta`), how long it has been quiet, and its screen. Never
+    /// starting: it has been running all along.
+    fn restore_state(&mut self, meta: &Meta, quiet: Duration) {
+        let was = State::from_label(&meta.state);
+        let (state, activity) = match was {
+            // Waiting on you is waiting until you answer.
+            Some(State::Blocked) => (State::Blocked, meta.activity.clone()),
+            // Done and not looked at yet is still news.
+            Some(State::Done) => (State::Done, meta.activity.clone()),
+            // Still at it, by its output; else the turn may have ended while
+            // no server heard (its hooks had nowhere to report).
+            Some(State::Working) if quiet < Duration::from_secs(5) => (State::Working, meta.activity.clone()),
+            _ => (State::Idle, "reattached".into()),
+        };
+        self.state = state;
+        self.activity = if activity.is_empty() { "reattached".into() } else { activity };
+        self.unseen = meta.unseen && matches!(state, State::Blocked | State::Done);
+        // What came up while no server watched: a question on its screen.
+        if state != State::Blocked && self.kind.is_agent() && self.screen_needs_input() {
+            self.state = State::Blocked;
+            self.activity = "waiting for an answer".into();
+            self.unseen = true;
+        }
+        if self.state == State::Blocked {
+            self.unseen = true;
+        }
     }
 
     /// Its notes for its holder (`Meta`), at place `pos` in the list.
@@ -801,6 +842,9 @@ impl Agent {
             asked: self.asked,
             managed_by: self.managed_by.clone(),
             transcript: self.transcript.clone(),
+            state: self.state.label().into(),
+            activity: self.activity.clone(),
+            unseen: self.unseen,
         }
     }
 
@@ -2405,6 +2449,65 @@ mod tests {
         a.shutdown();
         serving.join().unwrap();
         assert!(!crate::platform::alive(pid));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reattached_agent_is_where_it_was() {
+        let dir = held_dir("where");
+        let path = dir.join("h.sock");
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("/bin/sh", &["-c", "echo working away; exec sleep 30"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let attach = || {
+            let mut att = None;
+            assert!(eventually(Duration::from_secs(5), || {
+                let a = crate::holder::attach(&path).unwrap();
+                let ok = String::from_utf8_lossy(&a.replay).contains("working away");
+                att = Some(a);
+                ok
+            }));
+            att.unwrap()
+        };
+        let back = |meta: &Meta, quiet_ms: u64, kind: Kind| {
+            let mut att = attach();
+            att.hello.quiet_ms = quiet_ms;
+            Agent::reattach(1, kind, "t".into(), meta, att, std::sync::mpsc::channel().0)
+        };
+        let mut meta = Meta { kind: "claude".into(), name: "t".into(), state: "needs you".into(), activity: "Bash: rm -rf build".into(), ..Meta::default() };
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Blocked, "Bash: rm -rf build", true), "it still needs you");
+        meta.state = "working".into();
+        let a = back(&meta, 100, Kind::Claude);
+        assert_eq!(a.state, State::Working, "still writing: still working");
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"), "quiet for a minute: the turn may have ended unheard");
+        meta.state = "done".into();
+        meta.unseen = true;
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.unseen), (State::Done, true), "news nobody saw is still news");
+        // Notes from before states were kept: as before.
+        let a = back(&Meta::default(), 60_000, Kind::Shell);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"));
+        // The notes it sends carry where it is.
+        assert_eq!(a.meta(0, false, None, false).state, "idle");
+        a.shutdown();
+        serving.join().unwrap();
+
+        // A question that came up while no server watched is flagged too.
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("/bin/sh", &["-c", "echo 'Do you want to proceed? (y/n)'; exec sleep 30"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let mut att = None;
+        assert!(eventually(Duration::from_secs(5), || {
+            let a = crate::holder::attach(&path).unwrap();
+            let ok = String::from_utf8_lossy(&a.replay).contains("proceed");
+            att = Some(a);
+            ok
+        }));
+        let meta = Meta { state: "working".into(), ..Meta::default() };
+        let a = Agent::reattach(1, Kind::Claude, "t".into(), &meta, att.unwrap(), std::sync::mpsc::channel().0);
+        assert_eq!((a.state, a.unseen), (State::Blocked, true), "{:?}", a.screen_text());
+        a.shutdown();
+        serving.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
