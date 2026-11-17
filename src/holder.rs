@@ -438,8 +438,24 @@ fn discover_in(dirs: &[PathBuf], session: Option<&str>) -> Vec<(u32, PathBuf)> {
 /// running. `None`: every session's. How many were stopped; returns once
 /// they have (or after about twice `STOP_GRACE`).
 pub fn kill_orphans(session: Option<&str>) -> usize {
+    // A session whose lock is taken has a server, even one that isn't
+    // listening yet (it is starting, about to reattach): its holders aren't
+    // orphans. The other locks are kept until the holders have stopped, so
+    // no server starts meanwhile and puts back agents on their way out.
+    let (_locks, served) = crate::session::claim(session);
+    kill_orphans_in(&crate::hooks::socket_dirs(), session, &served)
+}
+
+/// `kill_orphans`, of the holders in `dirs`, leaving those of the sessions
+/// in `served` be.
+fn kill_orphans_in(dirs: &[PathBuf], session: Option<&str>, served: &[String]) -> usize {
+    let served: Vec<String> = served.iter().map(|s| crate::hooks::short_hash(s)).collect();
     let mut holders = Vec::new();
-    for (_, path) in discover_in(&crate::hooks::socket_dirs(), session) {
+    for (_, path) in discover_in(dirs, session) {
+        let hash = path.file_name().and_then(|n| n.to_str()).and_then(parse_name).map(|(hash, ..)| hash);
+        if hash.is_some_and(|h| served.iter().any(|s| s == h)) {
+            continue;
+        }
         // Attached first: a holder greets whoever connects, and one that
         // hung up before hearing it is dropped unread, KILL and all.
         match attach(&path) {
@@ -561,9 +577,14 @@ pub fn see_stopped(held: &[(u32, u32)], limit: Duration) {
         return;
     }
     eprintln!("trix: {} holder(s) did not stop when told; stopping them", stuck.len());
+    // A program is signalled only while it is its holder's child, asked once,
+    // now, while the holder is there to be its parent. One that ended left
+    // its pid to whatever was started since, and that must not be signalled.
+    let stuck: Vec<(u32, Option<u32>)> = stuck.into_iter().map(|(h, pid)| (h, Some(pid).filter(|&p| is_child(p, h)))).collect();
     let signal_all = |sig: libc::c_int| {
         for &(h, pid) in &stuck {
-            for (p, group) in [(pid, true), (h, false)] {
+            for (p, group) in [(pid, true), (Some(h), false)] {
+                let Some(p) = p else { continue };
                 let Ok(p) = libc::pid_t::try_from(p) else { continue };
                 if p <= 0 {
                     continue;
@@ -578,11 +599,20 @@ pub fn see_stopped(held: &[(u32, u32)], limit: Duration) {
             }
         }
     };
-    let pids: Vec<u32> = stuck.iter().flat_map(|&(h, p)| [h, p]).collect();
+    let pids: Vec<u32> = stuck.iter().flat_map(|&(h, p)| [Some(h), p]).flatten().collect();
     signal_all(libc::SIGTERM);
     wait_gone(&pids, crate::agent::STOP_GRACE);
     signal_all(libc::SIGKILL);
     wait_gone(&pids, Duration::from_secs(1));
+}
+
+/// Whether `pid` is running as a child of `parent`. Where the system can't
+/// say who its parent is, it's taken to be.
+fn is_child(pid: u32, parent: u32) -> bool {
+    match crate::platform::parent_of(pid) {
+        Some(p) => p == parent,
+        None => cfg!(not(any(target_os = "linux", target_os = "macos"))) && crate::platform::alive(pid),
+    }
 }
 
 /// A server's line to one holder, just attached.
@@ -917,6 +947,17 @@ impl Held {
     pub(crate) fn attaches(&self) -> impl Fn() -> u64 + use<> {
         let sh = self.shared.clone();
         move || lock(&sh).attaches
+    }
+
+    /// Whether its program has ended with no server attached, as it goes:
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) fn ended_alone(&self) -> impl Fn() -> bool + use<> {
+        let sh = self.shared.clone();
+        move || {
+            let s = lock(&sh);
+            s.exit.is_some() && s.client.is_none()
+        }
     }
 
     /// The server's notes it has, as they go: for tests.
@@ -1484,17 +1525,28 @@ pub(crate) mod tests {
     #[test]
     fn holders_that_dont_stop_are_made_to() {
         use std::os::unix::process::CommandExt;
-        // A holder that ignores everything polite, and its program in a
-        // process group of its own, as a program in a PTY is.
-        let holder = Command::new("/bin/sh").args(["-c", "trap '' TERM HUP; while :; do sleep 0.05; done"]).spawn().unwrap();
-        let program = Command::new("/bin/sh").args(["-c", "trap '' TERM HUP; while :; do sleep 0.05; done"]).process_group(0).spawn().unwrap();
-        let (h, p) = (holder.id(), program.id());
+        // A holder that ignores everything polite, and so does the program
+        // it started (whose pid it prints).
+        const STUBBORN: &str = "trap '' TERM HUP; while :; do sleep 0.05; done";
+        let mut holder = Command::new("/bin/sh").args(["-c", &format!("trap '' TERM HUP; ({STUBBORN}) & echo $!; {STUBBORN}")]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut line = String::new();
+        BufReader::new(holder.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let (h, p) = (holder.id(), line.trim().parse::<u32>().unwrap());
+        assert_eq!(crate::platform::parent_of(p), Some(h));
         crate::platform::reap(holder);
-        crate::platform::reap(program);
+        // Another, whose program ended long ago: its pid is someone else's
+        // now, a process in a group of its own that would die of a SIGTERM.
+        let holder = Command::new("/bin/sh").args(["-c", STUBBORN]).spawn().unwrap();
+        let mut bystander = Command::new("/bin/sh").args(["-c", "while :; do sleep 0.05; done"]).process_group(0).spawn().unwrap();
+        let (h2, b) = (holder.id(), bystander.id());
+        crate::platform::reap(holder);
         let started = Instant::now();
-        see_stopped(&[(h, p)], Duration::from_millis(200));
-        assert!(eventually(Duration::from_secs(2), || !crate::platform::alive(h) && !crate::platform::alive(p)), "both made to stop");
+        see_stopped(&[(h, p), (h2, b)], Duration::from_millis(200));
+        assert!(eventually(Duration::from_secs(2), || ![h, p, h2].into_iter().any(crate::platform::alive)), "holders and the program made to stop");
         assert!(started.elapsed() < crate::agent::STOP_GRACE + Duration::from_secs(4));
+        assert!(matches!(bystander.try_wait(), Ok(None)), "a pid that isn't the holder's child any more is left alone");
+        let _ = bystander.kill();
+        let _ = bystander.wait();
         // Its own process is never one of them (tests hold holders in it).
         see_stopped(&[(std::process::id(), std::process::id())], Duration::from_millis(10));
     }
@@ -1607,6 +1659,8 @@ pub(crate) mod tests {
         let tx = writer(third.stream.try_clone().unwrap(), Arc::default());
         tx.send(Req::Kill).unwrap();
         serving.join().unwrap();
+        // Stopped by then, but reaped a moment later (the holder's own thread).
+        crate::holder::wait_gone(&[pid], Duration::from_secs(2));
         assert!(!crate::platform::alive(pid), "killed means the program too");
         assert!(lock(&shared).exit.is_some() || !crate::platform::alive(pid));
         assert!(!path.exists(), "the socket goes with it");
@@ -1640,6 +1694,28 @@ pub(crate) mod tests {
         );
         assert!(told.contains("winch 23 80"), "{told:?}");
         write_frame(&mut second.stream, KILL, &[]).unwrap();
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn orphans_are_stopped_but_not_those_of_a_session_with_a_server() {
+        let me = std::process::id();
+        // Short: a real socket goes here, under its real name.
+        let dir = std::env::temp_dir().join(format!("tk{me}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(socket_name("test", 1, me));
+        let held = Held::start(&spec("/bin/sh", &["-c", "exec sleep 30"]), &path).unwrap();
+        let pid = held.pid;
+        let serving = std::thread::spawn(move || held.serve());
+        let dirs = [dir.clone()];
+        // A server has the session's lock (it is starting, and will reattach).
+        assert_eq!(kill_orphans_in(&dirs, Some("test"), &["test".into()]), 0, "not orphans: a server has their session");
+        assert_eq!(kill_orphans_in(&dirs, None, &["test".into()]), 0, "nor when every session's are stopped");
+        assert!(crate::platform::alive(pid) && attach(&path).is_ok_and(|a| !a.hello.exited), "left running");
+        assert_eq!(kill_orphans_in(&dirs, Some("test"), &["other".into()]), 1, "no server has it: stopped");
+        assert!(eventually(Duration::from_secs(5), || !crate::platform::alive(pid)));
         serving.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }

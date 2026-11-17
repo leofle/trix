@@ -195,16 +195,17 @@ pub fn cwd_of(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// A process's parent.
+/// A process's parent. `None` if it isn't running, or there's no way to
+/// ask here.
 #[cfg(target_os = "linux")]
-fn parent_of(pid: u32) -> Option<u32> {
+pub fn parent_of(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `pid (comm) state ppid …`, and the name may hold anything, ")" too.
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
 #[cfg(target_os = "macos")]
-fn parent_of(pid: u32) -> Option<u32> {
+pub fn parent_of(pid: u32) -> Option<u32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
@@ -212,7 +213,7 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn parent_of(_pid: u32) -> Option<u32> {
+pub fn parent_of(_pid: u32) -> Option<u32> {
     None
 }
 

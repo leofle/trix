@@ -3271,6 +3271,8 @@ mod tests {
         // Closing it is the end of it: holder and program.
         app.close(7);
         serving.join().unwrap();
+        // Stopped by then, but reaped a moment later (the holder's own thread).
+        crate::holder::wait_gone(&[pid], Duration::from_secs(2));
         assert!(!crate::platform::alive(pid));
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(dir);

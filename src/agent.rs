@@ -266,6 +266,10 @@ pub struct Agent {
     pub holder: Option<u32>,
     /// The notes last sent to its holder (`Meta`), to send only changes.
     meta_sent: String,
+    /// Put back as working by a reattach, and neither heard from (a hook)
+    /// nor typed to since. If it goes quiet now, its turn ended while no
+    /// server was listening for the hook that says so: nobody interrupted it.
+    away: bool,
     pub size: (u16, u16),
 
     pub state: State,
@@ -351,6 +355,8 @@ const HOOK_REORDER_US: u64 = 5_000_000;
 /// How long a program may take to exit once hung up on, and then once told
 /// to terminate, before it's made to.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
+/// What an agent did whose turn ended while no server heard its hook.
+const ENDED_AWAY: &str = "finished while trix was away";
 /// How long a holder told to stop gets to stop its program (which takes up
 /// to twice `STOP_GRACE`) and end, before the server stops both itself.
 pub const HOLDER_GRACE: Duration = Duration::from_secs(5);
@@ -503,10 +509,17 @@ fn read_holder(line: HeldLine, term: Arc<FairMutex<Term<Listener>>>, listener: L
                     break;
                 }
                 match reattach_line(&path, &term, &listener, &writer) {
-                    Some((s, p)) => {
-                        stream = s;
-                        parser = p;
+                    Some(back) => {
+                        stream = back.stream;
+                        parser = back.parser;
                         frames = Frames::default();
+                        // Its program ended while this server wasn't
+                        // reading: the holder had nobody to tell.
+                        if let Some(code) = back.ended {
+                            exited = true;
+                            let _ = listener.tx.send(AppEvent::Exit(listener.id, code));
+                            listener.send_event(TermEvent::Wakeup);
+                        }
                         continue;
                     }
                     None => break,
@@ -537,17 +550,28 @@ fn read_holder(line: HeldLine, term: Arc<FairMutex<Term<Listener>>>, listener: L
     });
 }
 
+/// A holder attached again (`reattach_line`).
+struct Reattached {
+    stream: std::os::unix::net::UnixStream,
+    /// The parser that has read the replay.
+    parser: ansi::Processor,
+    /// Its program ended meanwhile, with this code.
+    ended: Option<Option<i32>>,
+}
+
 /// Attach again to the holder at `path`, which let this server go, and
-/// redraw the emulator from what it kept. The new stream, and the parser
-/// that has read the replay; `None` if the holder is gone or won't have it.
+/// redraw the emulator from what it kept; `None` if the holder is gone or
+/// won't have it. A program that ended meanwhile is attached to as well:
+/// its last output and exit code are the holder's to give, and the line is
+/// how the holder hears it may go (`KILL`).
 fn reattach_line(
     path: &std::path::Path,
     term: &Arc<FairMutex<Term<Listener>>>,
     listener: &Listener,
     writer: &Sender<crate::holder::Req>,
-) -> Option<(std::os::unix::net::UnixStream, ansi::Processor)> {
+) -> Option<Reattached> {
     let att = match crate::holder::attach(path) {
-        Ok(att) if att.hello.compatible() && !att.hello.exited => att,
+        Ok(att) if att.hello.compatible() => att,
         Ok(_) => return None,
         Err(e) => {
             eprintln!("trix: agent {}'s holder hung up, and attaching again failed: {e}", listener.id);
@@ -574,7 +598,8 @@ fn reattach_line(
     }
     listener.muted.store(false, Ordering::Relaxed);
     listener.send_event(TermEvent::Wakeup);
-    Some((att.stream, parser))
+    let ended = att.hello.exited.then_some(att.hello.code);
+    Some(Reattached { stream: att.stream, parser, ended })
 }
 
 impl Agent {
@@ -798,19 +823,29 @@ impl Agent {
     /// starting: it has been running all along.
     fn restore_state(&mut self, meta: &Meta, quiet: Duration) {
         let was = State::from_label(&meta.state);
+        // An agent that reports its turns ended this one with a hook nobody
+        // heard, if it has gone quiet: it finished, and that is news. Nobody
+        // was there to interrupt it. OpenCode can be at work without a word.
+        let reports = self.hooked && self.kind != Kind::OpenCode;
         let (state, activity) = match was {
             // Waiting on you is waiting until you answer.
             Some(State::Blocked) => (State::Blocked, meta.activity.clone()),
             // Done and not looked at yet is still news.
             Some(State::Done) => (State::Done, meta.activity.clone()),
-            // Still at it, by its output; else the turn may have ended while
-            // no server heard (its hooks had nowhere to report).
-            Some(State::Working) if quiet < Duration::from_secs(5) => (State::Working, meta.activity.clone()),
+            // Still at it, by its output. If that stops with no hook heard,
+            // the turn had ended already (`heuristics`).
+            Some(State::Working) if quiet < Duration::from_secs(5) => {
+                self.away = reports;
+                (State::Working, meta.activity.clone())
+            }
+            Some(State::Working) if reports => (State::Done, ENDED_AWAY.into()),
+            // Whatever else it was doing, nothing says how that went.
             _ => (State::Idle, "reattached".into()),
         };
+        let ended_away = was == Some(State::Working) && state == State::Done;
         self.state = state;
         self.activity = if activity.is_empty() { "reattached".into() } else { activity };
-        self.unseen = meta.unseen && matches!(state, State::Blocked | State::Done);
+        self.unseen = ended_away || (meta.unseen && matches!(state, State::Blocked | State::Done));
         // What came up while no server watched: a question on its screen.
         if state != State::Blocked && self.kind.is_agent() && self.screen_needs_input() {
             self.state = State::Blocked;
@@ -880,6 +915,7 @@ impl Agent {
             pid: p.pid,
             holder: p.holder,
             meta_sent: String::new(),
+            away: false,
             size: p.size,
             state: State::Starting,
             state_since: now,
@@ -935,6 +971,7 @@ impl Agent {
         const GAP: Duration = Duration::from_millis(30);
         let now = Instant::now();
         self.last_input = now;
+        self.away = false;
         self.note_asked();
         let start = now.max(self.submit_free + GAP);
         let enter = start + ENTER_AFTER;
@@ -953,6 +990,7 @@ impl Agent {
 
     pub fn user_input(&mut self, bytes: Vec<u8>) {
         self.last_input = Instant::now();
+        self.away = false;
         self.note_asked();
         self.write(bytes);
     }
@@ -1000,6 +1038,7 @@ impl Agent {
         let prev = self.state;
         self.state = s;
         self.state_since = Instant::now();
+        self.away = false;
         // Bounded: without subscribers, nothing drains it but the server loop.
         if self.changes.len() >= 64 {
             self.changes.remove(0);
@@ -1097,6 +1136,8 @@ impl Agent {
             }
             self.last_hook_seq = msg.seq;
         }
+        // Heard from: what it does next, it says.
+        self.away = false;
         // `/clear` and friends start a new conversation: always track the latest.
         if let Some(id) = msg.session.as_ref().filter(|id| conversation_id_ok(id)) {
             self.session = Some(id.clone());
@@ -1417,6 +1458,13 @@ impl Agent {
                 if screen_question() {
                     self.activity = "waiting for an answer".into();
                     return self.set_state(State::Blocked, focused);
+                }
+                // Back from a reattach and silent since: its turn ended
+                // while no server heard the hook, which is news, not an
+                // interruption (nobody has typed to it).
+                if self.away {
+                    self.activity = ENDED_AWAY.into();
+                    return self.set_state(State::Done, focused);
                 }
                 self.activity = "interrupted".into();
                 return self.set_state(State::Idle, focused);
@@ -2395,6 +2443,8 @@ mod tests {
         assert!(a.screen_text().contains("30 100"), "and the screen, from the replay");
         a.shutdown();
         serving.join().unwrap();
+        // Stopped by then, but reaped a moment later (the holder's own thread).
+        crate::holder::wait_gone(&[pid], Duration::from_secs(2));
         assert!(!crate::platform::alive(pid));
         drop(rx);
         let _ = std::fs::remove_dir_all(dir);
@@ -2448,7 +2498,45 @@ mod tests {
         assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::Exit(..))), "never reported gone");
         a.shutdown();
         serving.join().unwrap();
+        // Stopped by then, but reaped a moment later (the holder's own thread).
+        crate::holder::wait_gone(&[pid], Duration::from_secs(2));
         assert!(!crate::platform::alive(pid));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_program_that_ended_while_its_server_fell_behind_is_heard_of() {
+        let dir = held_dir("ended-behind");
+        let path = dir.join("h.sock");
+        let stop = dir.join("stop");
+        let script = format!("while [ ! -e {} ]; do yes flood-flood-flood | head -c 1000000; done; echo; echo last words; exit 7", stop.display());
+        let held = crate::holder::Held::start_with(&crate::holder::tests::spec("/bin/sh", &["-c", &script]), &path, Duration::from_millis(200)).unwrap();
+        let (attaches, ended_alone) = (held.attaches(), held.ended_alone());
+        let serving = std::thread::spawn(move || held.serve());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let att = crate::holder::attach(&path).unwrap();
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "sh".into(), att, tx);
+        // The server stalls while the program floods, is let go, and the
+        // program ends before it is back: the holder has nobody to tell.
+        {
+            let _busy = a.term.lock();
+            std::thread::sleep(Duration::from_millis(600));
+            std::fs::write(&stop, "").unwrap();
+            assert!(eventually(Duration::from_secs(20), &ended_alone), "ended with no server attached");
+        }
+        // Attached again, it gets the program's last output and how it ended.
+        let mut code = None;
+        assert!(eventually(Duration::from_secs(20), || {
+            code = code.or(rx.try_iter().find_map(|e| if let AppEvent::Exit(1, c) = e { Some(c) } else { None }));
+            code.is_some()
+        }));
+        assert_eq!(code, Some(Some(7)), "its exit code, not a holder gone");
+        assert!(a.screen_text().contains("last words"), "{:?}", { let t = a.screen_text(); t[t.len().saturating_sub(300)..].to_string() });
+        assert_eq!(attaches(), 2);
+        // And the line is there for the holder to hear that it may go.
+        a.shutdown();
+        assert!(eventually(Duration::from_secs(5), || serving.is_finished()), "the holder heard the KILL");
+        assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::Exit(..))), "reported once");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2480,7 +2568,36 @@ mod tests {
         let a = back(&meta, 100, Kind::Claude);
         assert_eq!(a.state, State::Working, "still writing: still working");
         let a = back(&meta, 60_000, Kind::Claude);
-        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"), "quiet for a minute: the turn may have ended unheard");
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"), "quiet for a minute, and it never reported its turns: no telling");
+        // One that reports its turns ended this one, with a hook no server
+        // heard: it finished, which is news. Nobody was there to interrupt it.
+        meta.hooked = true;
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Done, ENDED_AWAY, true), "quiet for a minute: its turn ended unheard");
+        let a = back(&meta, 60_000, Kind::OpenCode);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"), "OpenCode works without a word");
+        // Still writing as the server came, then silent: the turn had just
+        // ended. The same news, not "interrupted".
+        let mut a = back(&meta, 100, Kind::Claude);
+        assert_eq!(a.state, State::Working);
+        a.last_output = ago(Duration::from_secs(3));
+        assert_eq!(a.heuristics(false), None, "spinner pauses happen");
+        a.last_output = ago(Duration::from_secs(7));
+        assert_eq!(a.heuristics(false), Some(State::Working));
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Done, ENDED_AWAY, true));
+        // Typed to since (an Esc, say): a silence is an interruption again.
+        let mut a = back(&meta, 100, Kind::Claude);
+        a.user_input(vec![0x1b]);
+        a.last_output = ago(Duration::from_secs(7));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        // And so it is once it has been heard from: its hooks get here.
+        let mut a = back(&meta, 100, Kind::Claude);
+        a.on_hook(&hook("claude", "PostToolUse", Some("Bash"), None), false);
+        a.last_output = ago(Duration::from_secs(7));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        meta.hooked = false;
         meta.state = "done".into();
         meta.unseen = true;
         let a = back(&meta, 60_000, Kind::Claude);

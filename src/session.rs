@@ -173,9 +173,14 @@ pub fn candidates() -> Vec<String> {
 
 /// Session names from runtime-dir file names, default first, then by name.
 fn session_names(files: impl Iterator<Item = String>) -> Vec<String> {
+    session_names_by(files, ".sock")
+}
+
+/// `session_names`, from the files that end in `ext` (`.sock`, `.lock`).
+fn session_names_by(files: impl Iterator<Item = String>, ext: &str) -> Vec<String> {
     let mut names: Vec<String> = files
         .filter_map(|file| {
-            let stem = file.strip_suffix(".sock")?;
+            let stem = file.strip_suffix(ext)?;
             if stem == "session" {
                 return Some(DEFAULT.to_string());
             }
@@ -644,9 +649,42 @@ impl Backend for RemoteBackend {
 /// Only one server per user. The lock is held for the server's lifetime and
 /// released by the kernel however it dies.
 pub fn lock() -> io::Result<Option<File>> {
-    let f = OpenOptions::new().create(true).truncate(false).write(true).open(lock_path())?;
+    lock_at(&lock_path())
+}
+
+/// Take the lock at `path`, for as long as the file returned is kept.
+/// `None` while another has it.
+fn lock_at(path: &Path) -> io::Result<Option<File>> {
+    let f = OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
     let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     Ok((r == 0).then_some(f))
+}
+
+/// Take the server's lock on `session` (`None`: on every session that has
+/// one), to act in a server's place: clearing up what one left behind. The
+/// locks taken, to keep until that's done, so that no server starts
+/// meanwhile; and the sessions whose lock a server has. Such a server may
+/// not be listening yet (it takes the lock first, then looks for its
+/// holders), and what's in its session is its own.
+pub fn claim(session: Option<&str>) -> (Vec<File>, Vec<String>) {
+    claim_in(&runtime_dir(), session)
+}
+
+fn claim_in(dir: &Path, session: Option<&str>) -> (Vec<File>, Vec<String>) {
+    let sessions = match session {
+        Some(s) => vec![s.to_string()],
+        None => session_names_by(std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()), ".lock"),
+    };
+    let (mut locks, mut served) = (Vec::new(), Vec::new());
+    for s in sessions {
+        let file = if s == DEFAULT { "session.lock".to_string() } else { format!("session-{s}.lock") };
+        match lock_at(&dir.join(file)) {
+            Ok(Some(lock)) => locks.push(lock),
+            // Taken, or no telling: left alone.
+            Ok(None) | Err(_) => served.push(s),
+        }
+    }
+    (locks, served)
 }
 
 /// Accept clients on the control socket.
@@ -786,11 +824,27 @@ pub fn blocked() -> bool {
 pub fn missing() -> String {
     if blocked() {
         "the workspace is running, but a sandbox blocks its socket here (Operation not permitted) — run this trix command again outside the sandbox".into()
-    } else if is_default() {
-        "no workspace running".into()
     } else {
-        format!("no session '{}' running", name())
+        let what = if is_default() { "no workspace running".to_string() } else { format!("no session '{}' running", name()) };
+        match left_running(name()) {
+            Some(note) => format!("{what} ({note})"),
+            None => what,
+        }
     }
+}
+
+/// What to say of the agents a server of `session` left running when it
+/// died (their holders keep them, `holder`), if there are any: that they
+/// are, how to get back to them, and how to stop them. Without it they'd
+/// work on unseen, and "no workspace running" would be believed.
+pub fn left_running(session: &str) -> Option<String> {
+    left_running_note(crate::holder::discover(session).len(), session)
+}
+
+fn left_running_note(agents: usize, session: &str) -> Option<String> {
+    let trix = if session == DEFAULT { "trix".to_string() } else { format!("trix -s {session}") };
+    let (are, them) = if agents == 1 { ("agent is", "it") } else { ("agents are", "them") };
+    (agents > 0).then(|| format!("{agents} {are} still running from a server that died: `{trix}` picks {them} up, `{trix} kill` stops {them}"))
 }
 
 fn connect_to(session: &str) -> Option<UnixStream> {
@@ -1006,6 +1060,40 @@ mod tests {
         for bad in ["", "-x", "_x", ".x", "a/b", "a b", "a.b", "é", "../up", &"x".repeat(33)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_session_a_server_has_is_not_claimed() {
+        let dir = std::env::temp_dir().join(format!("trix-test-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (locks, served) = claim_in(&dir, None);
+        assert!(locks.is_empty() && served.is_empty(), "no session has run here");
+        // A server takes its lock first, and keeps it for as long as it runs.
+        let server = lock_at(&dir.join("session-work.lock")).unwrap().expect("free");
+        let (locks, served) = claim_in(&dir, Some("work"));
+        assert!(locks.is_empty(), "a server has it");
+        assert_eq!(served, ["work"]);
+        let (default, served) = claim_in(&dir, Some(DEFAULT));
+        assert_eq!((default.len(), served.len()), (1, 0), "nobody has the default session: claimed");
+        assert!(dir.join("session.lock").exists());
+        let (locks, served) = claim_in(&dir, None);
+        assert!(locks.is_empty());
+        assert_eq!(served, [DEFAULT, "work"], "every session: both are taken, one by a server, one claimed above");
+        // The server died: its session is there to be cleared up.
+        drop(server);
+        let (locks, served) = claim_in(&dir, None);
+        assert_eq!((locks.len(), served), (1, vec![DEFAULT.to_string()]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agents_a_dead_server_left_running_are_said() {
+        assert_eq!(left_running_note(0, DEFAULT), None);
+        let one = left_running_note(1, DEFAULT).unwrap();
+        assert!(one.starts_with("1 agent is still running") && one.contains("`trix` picks it up") && one.contains("`trix kill` stops it"), "{one}");
+        let three = left_running_note(3, "work").unwrap();
+        assert!(three.starts_with("3 agents are still running") && three.contains("`trix -s work` picks them up") && three.contains("`trix -s work kill` stops them"), "{three}");
     }
 
     #[test]

@@ -223,7 +223,27 @@ fn main() -> anyhow::Result<()> {
         }
         Some("ls" | "list") => {
             let names = if explicit { vec![session::name().to_string()] } else { session::candidates() };
-            let texts: Vec<String> = names.iter().filter_map(|n| session::query(n, &ClientMsg::List)).collect();
+            let mut texts = Vec::new();
+            // Sessions with no server, but with agents one that died left
+            // running: said, or nobody would know they are.
+            let mut left = Vec::new();
+            for n in &names {
+                match session::query(n, &ClientMsg::List) {
+                    Some(text) => texts.push(text),
+                    None => left.extend(session::left_running(n).map(|note| (n, note))),
+                }
+            }
+            if texts.is_empty() {
+                // Says so of this session itself.
+                left.retain(|(n, _)| *n != session::name());
+            }
+            for (n, note) in &left {
+                if *n == session::DEFAULT {
+                    eprintln!("trix: {note}");
+                } else {
+                    eprintln!("trix: session '{n}': {note}");
+                }
+            }
             if texts.is_empty() {
                 eprintln!("{}", missing());
                 std::process::exit(1);
