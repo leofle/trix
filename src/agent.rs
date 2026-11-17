@@ -1056,7 +1056,14 @@ impl Agent {
                     self.work_started = Some(Instant::now());
                 }
             }
-            State::Done => self.unseen = !focused,
+            State::Done => {
+                self.unseen = !focused;
+                // Nor is output from before it finished: Codex animates its
+                // status line until the end of the turn, and the `notify`
+                // that says so lands right after. Only a new burst is a new
+                // turn.
+                self.burst.clear();
+            }
             State::Blocked => {
                 self.unseen = !focused;
                 // Output from before it asked (a spinner, streamed text) is
@@ -2859,6 +2866,25 @@ mod tests {
         a.on_hook(&hook("codex", "agent-turn-complete", None, Some("All green")), true);
         assert_eq!((a.state, a.activity.as_str()), (State::Done, "All green"));
         assert!(!a.hooked && !a.reported, "codex keeps the heuristics");
+    }
+
+    /// Codex animates its status line up to the end of a turn, so the
+    /// `notify` that ends it lands right after a burst of output. That burst
+    /// was the turn that ended, not a new one.
+    #[test]
+    fn codex_turn_complete_outlasts_the_output_before_it() {
+        let mut a = test_agent(Kind::Codex);
+        a.asked = true;
+        a.set_state(State::Working, false);
+        redraw(&mut a);
+        a.on_hook(&hook("codex", "agent-turn-complete", None, Some("All green")), false);
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Done, "All green", true), "the turn's own output doesn't reopen it");
+        // A new turn's output does.
+        redraw(&mut a);
+        a.heuristics(false);
+        assert_eq!(a.state, State::Working);
+        a.shutdown();
     }
 
     #[test]
