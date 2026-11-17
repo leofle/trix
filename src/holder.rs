@@ -1500,7 +1500,10 @@ pub(crate) mod tests {
         }
         write_frame(&mut att.stream, KILL, &[]).unwrap();
         assert!(done.recv_timeout(Duration::from_secs(10)).is_ok(), "the KILL was heard");
-        assert!(eventually(Duration::from_secs(2), || !crate::platform::alive(pid)), "and the program stopped");
+        // It failed here once on a macOS runner with two seconds to go, and
+        // never again: more time, and what the program was at if it's still
+        // there (running on, or stuck on its way out).
+        assert!(eventually(Duration::from_secs(10), || !crate::platform::alive(pid)), "and the program stopped: {:?}", ps(pid));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1563,6 +1566,13 @@ pub(crate) mod tests {
             rows: 24,
             meta: r#"{"name":"t"}"#.into(),
         }
+    }
+
+    /// What `ps` says of `pid` (its parent, state, age and command), for the
+    /// message of an assertion that it is gone.
+    pub(crate) fn ps(pid: u32) -> String {
+        let out = Command::new("ps").args(["-o", "pid=,ppid=,stat=,etime=,command=", "-p", &pid.to_string()]).output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
     }
 
     /// Read frames until `want` says stop, or 5 seconds pass.
@@ -1661,7 +1671,7 @@ pub(crate) mod tests {
         serving.join().unwrap();
         // Stopped by then, but reaped a moment later (the holder's own thread).
         crate::holder::wait_gone(&[pid], Duration::from_secs(2));
-        assert!(!crate::platform::alive(pid), "killed means the program too");
+        assert!(!crate::platform::alive(pid), "killed means the program too: {:?}", ps(pid));
         assert!(lock(&shared).exit.is_some() || !crate::platform::alive(pid));
         assert!(!path.exists(), "the socket goes with it");
         let _ = std::fs::remove_dir_all(dir);
