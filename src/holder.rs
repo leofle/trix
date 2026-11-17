@@ -1170,8 +1170,11 @@ pub(crate) mod tests {
         // A third takes over from the second, which is let go.
         let third = attach(&path).unwrap();
         let mut gone = [0u8; 1];
-        second.stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        assert!(matches!(second.stream.read(&mut gone), Ok(0) | Err(_)), "the old server is hung up on");
+        // macOS refuses socket options on a socket the other end already shut down
+        // (EINVAL), which is itself the hang-up we're looking for.
+        let hung_up = second.stream.set_read_timeout(Some(Duration::from_secs(2))).is_err()
+            || matches!(second.stream.read(&mut gone), Ok(0) | Err(_));
+        assert!(hung_up, "the old server is hung up on");
 
         let tx = writer(third.stream.try_clone().unwrap());
         tx.send(Req::Kill).unwrap();
