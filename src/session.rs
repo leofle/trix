@@ -127,8 +127,21 @@ fn file_for(session: &str, stem: &str, ext: &str) -> PathBuf {
     }
 }
 
+/// A socket of `session`'s: `<stem>.sock` for the default session,
+/// `<stem>-<name>.sock` otherwise, in the folder `hooks::socket_in` picks
+/// (the runtime folder, unless the path would be too long for a socket).
+/// A name too long for any socket is hashed; no valid session name is.
+fn socket_for(session: &str, stem: &str) -> PathBuf {
+    crate::hooks::socket_in(&socket_name(session, stem))
+}
+
+fn socket_name(session: &str, stem: &str) -> String {
+    let plain = if session == DEFAULT { format!("{stem}.sock") } else { format!("{stem}-{session}.sock") };
+    if plain.len() <= crate::hooks::MAX_SOCKET_NAME { plain } else { format!("{stem}-h{}.sock", crate::hooks::short_hash(session)) }
+}
+
 fn control_path_for(session: &str) -> PathBuf {
-    file_for(session, "session", "sock")
+    socket_for(session, "session")
 }
 
 pub fn control_path() -> PathBuf {
@@ -137,7 +150,7 @@ pub fn control_path() -> PathBuf {
 
 /// The hook socket (`hooks::socket_path`).
 pub fn hooks_path() -> PathBuf {
-    file_for(name(), "hooks", "sock")
+    socket_for(name(), "hooks")
 }
 
 fn lock_path() -> PathBuf {
@@ -151,10 +164,9 @@ pub fn log_path() -> PathBuf {
 /// Sessions that have a control socket, default first. A socket can outlive a
 /// server that died hard, so callers still have to connect to know.
 pub fn candidates() -> Vec<String> {
-    let files = std::fs::read_dir(runtime_dir())
+    let files = crate::hooks::socket_dirs()
         .into_iter()
-        .flatten()
-        .flatten()
+        .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
         .map(|e| e.file_name().to_string_lossy().into_owned());
     session_names(files)
 }
@@ -993,6 +1005,20 @@ mod tests {
         }
         for bad in ["", "-x", "_x", ".x", "a/b", "a b", "a.b", "é", "../up", &"x".repeat(33)] {
             assert!(check_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn socket_names_always_fit() {
+        assert_eq!(socket_name(DEFAULT, "hooks"), "hooks.sock");
+        assert_eq!(socket_name("work", "session"), "session-work.sock");
+        let longest = "x".repeat(32);
+        assert_eq!(socket_name(&longest, "session"), format!("session-{longest}.sock"), "every valid name as it is");
+        for long in ["y".repeat(200), "z".repeat(49)] {
+            let n = socket_name(&long, "hooks");
+            assert!(n.len() <= crate::hooks::MAX_SOCKET_NAME, "{n}");
+            assert_eq!(n, socket_name(&long, "hooks"), "stable");
+            assert_ne!(n, socket_name(&long[1..], "hooks"));
         }
     }
 
