@@ -153,20 +153,37 @@ pub struct Ring {
     /// Everything, followed: the modes in force now.
     now: Tracker,
     dropped: u64,
+    /// Where clears of the screen start, as offsets into all the output
+    /// ever pushed, oldest first: found once, as bytes come in, so a cut on
+    /// the alternate screen needn't search for one. At most one per
+    /// `CLEAR_GAP` bytes, which bounds the list.
+    clears: VecDeque<u64>,
+    /// The last bytes pushed, for a clear split across two pushes.
+    tail: [u8; 3],
 }
 
 /// How far past the cut a clear of the alternate screen is looked for.
 const CLEAR_SEARCH: usize = 256 << 10;
 /// How far the cut moves on to get out of an escape sequence or a string.
 const GROUND_SEARCH: usize = 64 << 10;
+/// Clears this close after the last one noted aren't noted: a cut may then
+/// move on that much further than it had to.
+const CLEAR_GAP: u64 = 4 << 10;
+const CLEAR: &[u8; 4] = b"\x1b[2J";
 
 impl Ring {
     pub fn new(cap: usize) -> Ring {
-        Ring { buf: VecDeque::new(), cap, base: Tracker::default(), now: Tracker::default(), dropped: 0 }
+        Ring { buf: VecDeque::new(), cap, base: Tracker::default(), now: Tracker::default(), dropped: 0, clears: VecDeque::new(), tail: [0; 3] }
+    }
+
+    /// Offset of the first byte kept, into all the output ever pushed.
+    fn start(&self) -> u64 {
+        self.dropped
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
         self.now.feed(bytes);
+        self.note_clears(bytes);
         let over = (self.buf.len() + bytes.len()).saturating_sub(self.cap);
         if over == 0 {
             self.buf.extend(bytes);
@@ -182,30 +199,71 @@ impl Ring {
         self.settle();
     }
 
+    /// Note where in `bytes`, about to be pushed, the screen is cleared.
+    fn note_clears(&mut self, bytes: &[u8]) {
+        let at = self.dropped + self.buf.len() as u64;
+        // `tail` then `bytes`, without copying them together.
+        let tail = self.tail;
+        let byte = |i: usize| if i < 3 { tail[i] } else { bytes[i - 3] };
+        let n = bytes.len() + 3;
+        let mut i = 0;
+        while i + 4 <= n {
+            if (0..4).all(|k| byte(i + k) == CLEAR[k]) {
+                // Where it starts, as an offset (the tail's bytes are before `at`).
+                let pos = (at + i as u64).saturating_sub(3);
+                if self.clears.back().is_none_or(|&last| pos >= last + CLEAR_GAP) {
+                    self.clears.push_back(pos);
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        self.tail = [byte(n - 3), byte(n - 2), byte(n - 1)];
+    }
+
     /// Move the cut on to a better place to start a replay.
     fn settle(&mut self) {
         let near = self.buf.len().min(LINE_SEARCH);
         if let Some(nl) = self.buf.range(..near).position(|&b| b == b'\n') {
             self.take(nl + 1);
         }
-        let mut n = 0;
-        while !self.base.ground() && !self.buf.is_empty() && n < GROUND_SEARCH {
-            self.take(1);
-            n += 1;
+        if !self.base.ground() {
+            // Byte by byte until out of the sequence: followed as they go,
+            // dropped all at once.
+            let mut n = 0;
+            for &b in self.buf.iter().take(GROUND_SEARCH) {
+                self.base.feed(&[b]);
+                n += 1;
+                if self.base.ground() {
+                    break;
+                }
+            }
+            self.buf.drain(..n);
+            self.dropped += n as u64;
+        }
+        let start = self.start();
+        while self.clears.front().is_some_and(|&c| c < start) {
+            self.clears.pop_front();
         }
         if self.base.ground()
             && self.base.modes().alt.is_some()
-            && let Some(at) = find(self.buf.range(..self.buf.len().min(CLEAR_SEARCH)), b"\x1b[2J")
-            && at > 0
+            && let Some(&c) = self.clears.front()
+            && c > start
+            && c - start <= CLEAR_SEARCH as u64
         {
-            self.take(at);
+            self.take((c - start) as usize);
         }
     }
 
     /// Drop the oldest `n` bytes, following them.
     fn take(&mut self, n: usize) {
-        let gone: Vec<u8> = self.buf.drain(..n).collect();
-        self.base.feed(&gone);
+        let n = n.min(self.buf.len());
+        let (a, b) = self.buf.as_slices();
+        let in_a = n.min(a.len());
+        self.base.feed(&a[..in_a]);
+        self.base.feed(&b[..n - in_a]);
+        self.buf.drain(..n);
         self.dropped += n as u64;
     }
 
@@ -233,21 +291,6 @@ impl Ring {
         let (a, b) = self.buf.as_slices();
         [a, b].concat()
     }
-}
-
-/// Where `pat` first starts in `hay`.
-fn find<'a>(hay: impl Iterator<Item = &'a u8>, pat: &[u8]) -> Option<usize> {
-    let mut window: VecDeque<u8> = VecDeque::with_capacity(pat.len());
-    for (i, &b) in hay.enumerate() {
-        if window.len() == pat.len() {
-            window.pop_front();
-        }
-        window.push_back(b);
-        if window.len() == pat.len() && window.iter().eq(pat.iter()) {
-            return Some(i + 1 - pat.len());
-        }
-    }
-    None
 }
 
 // ───────────────────────────── what's said ─────────────────────────────
@@ -1091,6 +1134,41 @@ pub(crate) mod tests {
         }
         assert_eq!(r.modes().alt, Some(1049));
         assert!(r.replay().starts_with(b"\x1b[?1049h"));
+    }
+
+    #[test]
+    fn a_clear_is_found_once_even_split_across_pushes() {
+        let mut r = Ring::new(1 << 20);
+        r.push(b"\x1b[?1049hsetup");
+        r.push(b"text\x1b[");
+        r.push(b"2Jframe one");
+        assert_eq!(r.clears, [17], "where the split clear starts");
+        // Clears closer than CLEAR_GAP to the last noted aren't noted.
+        r.push(b"\x1b[2Jframe two");
+        assert_eq!(r.clears.len(), 1);
+        r.push(&vec![b'x'; CLEAR_GAP as usize]);
+        r.push(b"\x1b[2Jframe three");
+        assert_eq!(r.clears.len(), 2);
+    }
+
+    #[test]
+    fn trimming_on_the_alternate_screen_starts_at_a_clear_without_searching() {
+        let mut r = Ring::new(64 << 10);
+        r.push(b"\x1b[?1049h");
+        let frame = |n: usize| {
+            let mut f = format!("\x1b[H\x1b[2Jframe {n}\r\n").into_bytes();
+            f.extend(std::iter::repeat_n(b'.', 6000));
+            f
+        };
+        for n in 0..200 {
+            r.push(&frame(n));
+        }
+        let kept = r.bytes();
+        assert!(kept.starts_with(b"\x1b[2Jframe "), "{:?}", String::from_utf8_lossy(&kept[..40]));
+        assert!(r.clears.len() <= 64 << 10 >> 12, "a short list: {}", r.clears.len());
+        assert!(r.clears.iter().all(|&c| c >= r.start()), "none from before the cut");
+        let replay = r.replay();
+        assert!(replay.starts_with(b"\x1b[?1049h"), "the preamble puts the screen back");
     }
 
     pub(crate) fn spec(program: &str, args: &[&str]) -> Spec {
