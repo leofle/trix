@@ -147,6 +147,30 @@ pub fn foreground_group(pty: &impl AsRawFd) -> Option<i32> {
     (g > 0).then_some(g)
 }
 
+/// The foreground process group of `pid`'s controlling terminal, asked
+/// through the process rather than the terminal: for a PTY a holder has.
+#[cfg(target_os = "linux")]
+pub fn foreground_group_of(pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid pgrp session tty_nr tpgid …`
+    let g: i32 = stat.rsplit_once(')')?.1.split_whitespace().nth(5)?.parse().ok()?;
+    (g > 0).then_some(g)
+}
+
+#[cfg(target_os = "macos")]
+pub fn foreground_group_of(pid: u32) -> Option<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    let g = info.e_tpgid as i32;
+    (n == size && g > 0).then_some(g)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn foreground_group_of(_pid: u32) -> Option<i32> {
+    None
+}
+
 /// A process's current working folder.
 #[cfg(target_os = "linux")]
 pub fn cwd_of(pid: u32) -> Option<PathBuf> {
@@ -171,16 +195,17 @@ pub fn cwd_of(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// A process's parent.
+/// A process's parent. `None` if it isn't running, or there's no way to
+/// ask here.
 #[cfg(target_os = "linux")]
-fn parent_of(pid: u32) -> Option<u32> {
+pub fn parent_of(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `pid (comm) state ppid …`, and the name may hold anything, ")" too.
     stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
 #[cfg(target_os = "macos")]
-fn parent_of(pid: u32) -> Option<u32> {
+pub fn parent_of(pid: u32) -> Option<u32> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let n = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
@@ -188,7 +213,7 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn parent_of(_pid: u32) -> Option<u32> {
+pub fn parent_of(_pid: u32) -> Option<u32> {
     None
 }
 

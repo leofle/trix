@@ -1,5 +1,10 @@
 //! One agent = one PTY + one terminal emulator + a state machine that turns
 //! hook reports and screen/activity signals into a human-readable status.
+//!
+//! The PTY is normally held by a process of the agent's own (`holder`), so the
+//! program keeps running when the server goes; the emulator and the state
+//! machine are here. Without a holder (tests, or when one can't start) the
+//! PTY is the server's own, run by alacritty's event loop.
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -8,10 +13,14 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
+use alacritty_terminal::vte::ansi;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
@@ -152,16 +161,32 @@ impl State {
             State::Exited => "exited",
         }
     }
+
+    pub fn from_label(s: &str) -> Option<State> {
+        [State::Starting, State::Idle, State::Working, State::Blocked, State::Done, State::Exited].into_iter().find(|st| st.label() == s)
+    }
 }
 
 #[derive(Clone)]
 pub struct Listener {
     id: u32,
     tx: Sender<AppEvent>,
+    /// Replaying what a holder kept: the program asked its questions (and
+    /// rang its bells) long ago, so the emulator's answers and the bells
+    /// must not go out again now.
+    muted: Arc<AtomicBool>,
 }
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
+        if self.muted.load(Ordering::Relaxed)
+            && matches!(
+                event,
+                TermEvent::PtyWrite(_) | TermEvent::TextAreaSizeRequest(_) | TermEvent::ColorRequest(..) | TermEvent::ClipboardStore(..) | TermEvent::Bell
+            )
+        {
+            return;
+        }
         let ev = match event {
             TermEvent::Wakeup => AppEvent::Output(self.id),
             TermEvent::PtyWrite(s) => AppEvent::PtyWrite(self.id, s),
@@ -217,7 +242,7 @@ pub struct Agent {
     #[allow(dead_code)]
     pub command_line: String,
     pub term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
+    io: Io,
     /// Writes due later, sent in order by one thread (see `submit`).
     later: Sender<(Instant, Cow<'static, [u8]>)>,
     /// When the last submission's Enter goes out.
@@ -234,9 +259,17 @@ pub struct Agent {
     /// The folder its process was last seen in, for once it has exited.
     last_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
-    /// process group is in the foreground.
-    pty: std::fs::File,
+    /// process group is in the foreground. None when a holder has the PTY.
+    pty: Option<std::fs::File>,
     pub pid: u32,
+    /// The pid of the holder process that has its PTY, if one has.
+    pub holder: Option<u32>,
+    /// The notes last sent to its holder (`Meta`), to send only changes.
+    meta_sent: String,
+    /// Put back as working by a reattach, and neither heard from (a hook)
+    /// nor typed to since. If it goes quiet now, its turn ended while no
+    /// server was listening for the hook that says so: nobody interrupted it.
+    away: bool,
     pub size: (u16, u16),
 
     pub state: State,
@@ -322,15 +355,104 @@ const HOOK_REORDER_US: u64 = 5_000_000;
 /// How long a program may take to exit once hung up on, and then once told
 /// to terminate, before it's made to.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
+/// What an agent did whose turn ended while no server heard its hook.
+const ENDED_AWAY: &str = "finished while trix was away";
+/// How long a holder told to stop gets to stop its program (which takes up
+/// to twice `STOP_GRACE`) and end, before the server stops both itself.
+pub const HOLDER_GRACE: Duration = Duration::from_secs(5);
+
+/// Where an agent's input, resizes and hang-up go: alacritty's event loop
+/// on a PTY of the server's own, or the writer thread to its holder.
+#[derive(Clone)]
+enum Io {
+    Local(EventLoopSender),
+    Held(Sender<crate::holder::Req>),
+}
+
+impl Io {
+    fn input(&self, bytes: Cow<'static, [u8]>) -> bool {
+        match self {
+            Io::Local(s) => s.send(Msg::Input(bytes)).is_ok(),
+            Io::Held(s) => s.send(crate::holder::Req::Input(bytes)).is_ok(),
+        }
+    }
+
+    fn resize(&self, size: (u16, u16)) {
+        let _ = match self {
+            Io::Local(s) => s.send(Msg::Resize(window_size(size))).is_ok(),
+            Io::Held(s) => s.send(crate::holder::Req::Resize(size.0, size.1)).is_ok(),
+        };
+    }
+
+    /// Hang up: close a local PTY, or tell the holder to stop its program
+    /// and itself.
+    fn stop(&self) {
+        let _ = match self {
+            Io::Local(s) => s.send(Msg::Shutdown).is_ok(),
+            Io::Held(s) => s.send(crate::holder::Req::Kill).is_ok(),
+        };
+    }
+}
+
+/// What the server tells an agent's holder about it, and reads back from a
+/// holder it finds at start (`App::reattach`): enough to put the agent back
+/// as it was. Kept by the holder as it is; only the server reads it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Meta {
+    pub kind: String,
+    pub name: String,
+    /// The folder it was started in.
+    pub cwd: PathBuf,
+    /// What Enter-to-restart runs: the spec's command.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_line: String,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub session_named_by_trix: bool,
+    /// Its place in the list, and whether it had the focus.
+    #[serde(default)]
+    pub pos: usize,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    /// Restored stopped, waiting for an Enter.
+    #[serde(default)]
+    pub parked: bool,
+    #[serde(default)]
+    pub hooked: bool,
+    #[serde(default)]
+    pub reported: bool,
+    #[serde(default)]
+    pub turn_seen: bool,
+    #[serde(default)]
+    pub asked: bool,
+    #[serde(default)]
+    pub managed_by: Option<String>,
+    #[serde(default)]
+    pub transcript: Option<PathBuf>,
+    /// Where it was at (`State::label`), what it was doing, and whether
+    /// that was news nobody had looked at: put back on reattach, so an agent
+    /// that needed you still says so.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub activity: String,
+    #[serde(default)]
+    pub unseen: bool,
+}
 
 /// One thread per agent that sends each write when it's due, in the order
 /// queued. It ends when the agent (the only sender) goes away.
-fn delayed_writer(sender: EventLoopSender) -> Sender<(Instant, Cow<'static, [u8]>)> {
+fn delayed_writer(io: Io) -> Sender<(Instant, Cow<'static, [u8]>)> {
     let (tx, rx) = mpsc::channel::<(Instant, Cow<'static, [u8]>)>();
     let _ = std::thread::Builder::new().name("trix-later".into()).spawn(move || {
         for (due, bytes) in rx {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
-            if sender.send(Msg::Input(bytes)).is_err() {
+            if !io.input(bytes) {
                 break;
             }
         }
@@ -338,7 +460,151 @@ fn delayed_writer(sender: EventLoopSender) -> Sender<(Instant, Cow<'static, [u8]
     tx
 }
 
+/// The server's line to a holder, as the thread reading it needs it.
+struct HeldLine {
+    stream: std::os::unix::net::UnixStream,
+    /// The holder's socket, to attach again.
+    path: PathBuf,
+    /// The writer thread's queue, to hand it a new stream.
+    writer: Sender<crate::holder::Req>,
+    /// A `KILL` went out: the holder going away is expected.
+    killed: Arc<AtomicBool>,
+}
+
+/// Read what a holder sends, into the emulator: output, and the program's
+/// exit. If the holder hangs up without saying why (it let this server go,
+/// having waited on it too long), attach again, once, and carry on from
+/// what it kept. Otherwise the end of the stream with no exit before it
+/// means the holder itself went (killed from outside, or another server
+/// took over, `BYE`): the agent has, for this server, too.
+fn read_holder(line: HeldLine, term: Arc<FairMutex<Term<Listener>>>, listener: Listener, mut parser: ansi::Processor) {
+    use crate::holder::{BYE, EXIT, Frames, OUTPUT};
+    let HeldLine { mut stream, path, writer, killed } = line;
+    let _ = std::thread::Builder::new().name("trix-held-read".into()).spawn(move || {
+        let mut frames = Frames::default();
+        let mut buf = vec![0u8; 64 << 10];
+        let mut exited = false;
+        let mut bye = false;
+        loop {
+            // A synchronized update that never ends is drawn anyway once
+            // its time is up, as alacritty's own loop does.
+            let sync = parser.sync_timeout().sync_timeout().map(|t| t.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
+            let _ = stream.set_read_timeout(sync);
+            let ended = match stream.read(&mut buf) {
+                Ok(0) => true,
+                Ok(n) => {
+                    frames.feed(&buf[..n]);
+                    false
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    parser.stop_sync(&mut *term.lock());
+                    listener.send_event(TermEvent::Wakeup);
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => true,
+            };
+            if ended {
+                if exited || bye || killed.load(Ordering::SeqCst) {
+                    break;
+                }
+                match reattach_line(&path, &term, &listener, &writer) {
+                    Some(back) => {
+                        stream = back.stream;
+                        parser = back.parser;
+                        frames = Frames::default();
+                        // Its program ended while this server wasn't
+                        // reading: the holder had nobody to tell.
+                        if let Some(code) = back.ended {
+                            exited = true;
+                            let _ = listener.tx.send(AppEvent::Exit(listener.id, code));
+                            listener.send_event(TermEvent::Wakeup);
+                        }
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            loop {
+                match frames.next_frame() {
+                    Ok(Some((OUTPUT, bytes))) => {
+                        parser.advance(&mut *term.lock(), &bytes);
+                        listener.send_event(TermEvent::Wakeup);
+                    }
+                    Ok(Some((EXIT, code))) => {
+                        exited = true;
+                        let code = serde_json::from_slice::<Option<i32>>(&code).ok().flatten();
+                        let _ = listener.tx.send(AppEvent::Exit(listener.id, code));
+                        listener.send_event(TermEvent::Wakeup);
+                    }
+                    Ok(Some((BYE, _))) => bye = true,
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => return,
+                }
+            }
+        }
+        if !exited {
+            let _ = listener.tx.send(AppEvent::Exit(listener.id, None));
+        }
+    });
+}
+
+/// A holder attached again (`reattach_line`).
+struct Reattached {
+    stream: std::os::unix::net::UnixStream,
+    /// The parser that has read the replay.
+    parser: ansi::Processor,
+    /// Its program ended meanwhile, with this code.
+    ended: Option<Option<i32>>,
+}
+
+/// Attach again to the holder at `path`, which let this server go, and
+/// redraw the emulator from what it kept; `None` if the holder is gone or
+/// won't have it. A program that ended meanwhile is attached to as well:
+/// its last output and exit code are the holder's to give, and the line is
+/// how the holder hears it may go (`KILL`).
+fn reattach_line(
+    path: &std::path::Path,
+    term: &Arc<FairMutex<Term<Listener>>>,
+    listener: &Listener,
+    writer: &Sender<crate::holder::Req>,
+) -> Option<Reattached> {
+    let att = match crate::holder::attach(path) {
+        Ok(att) if att.hello.compatible() => att,
+        Ok(_) => return None,
+        Err(e) => {
+            eprintln!("trix: agent {}'s holder hung up, and attaching again failed: {e}", listener.id);
+            return None;
+        }
+    };
+    // Writes go to the new line first, with what waited for one, and the
+    // size this server has (it may have changed meanwhile).
+    let w = att.stream.try_clone().ok()?;
+    let _ = writer.send(crate::holder::Req::Stream(w));
+    let size = {
+        let t = term.lock();
+        (t.columns() as u16, t.screen_lines() as u16)
+    };
+    let _ = writer.send(crate::holder::Req::Resize(size.0, size.1));
+    eprintln!("trix: agent {}'s holder hung up (this server fell behind); attached again", listener.id);
+    let mut parser = ansi::Processor::new();
+    listener.muted.store(true, Ordering::Relaxed);
+    {
+        let mut t = term.lock();
+        // A full reset first: the replay redraws what it kept from scratch.
+        parser.advance(&mut *t, b"\x1bc");
+        parser.advance(&mut *t, &att.replay);
+    }
+    listener.muted.store(false, Ordering::Relaxed);
+    listener.send_event(TermEvent::Wakeup);
+    let ended = att.hello.exited.then_some(att.hello.code);
+    Some(Reattached { stream: att.stream, parser, ended })
+}
+
 impl Agent {
+    /// An agent whose PTY is the server's own (no holder): for tests.
+    #[cfg(test)]
     pub fn spawn(
         id: u32,
         spec: Spawn,
@@ -347,6 +613,23 @@ impl Agent {
         socket: &std::path::Path,
         integrations: &Integrations,
         exe: &std::path::Path,
+    ) -> anyhow::Result<Agent> {
+        Agent::spawn_in(id, spec, size, tx, socket, integrations, exe, false)
+    }
+
+    /// `spawn`, under a holder of its own when `held` (`trix holder`, run as
+    /// `exe`). A holder that can't start leaves the PTY to the server, as
+    /// without one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_in(
+        id: u32,
+        spec: Spawn,
+        size: (u16, u16),
+        tx: Sender<AppEvent>,
+        socket: &std::path::Path,
+        integrations: &Integrations,
+        exe: &std::path::Path,
+        held: bool,
     ) -> anyhow::Result<Agent> {
         // A sliver of a window gives a pane with no rows or columns, and the
         // terminal grid can't be made that small: same floor as `resize`.
@@ -413,46 +696,227 @@ impl Agent {
             env.insert(k.into(), v.into());
         }
 
-        let opts = tty::Options {
-            shell: Some(tty::Shell::new(program, args)),
-            working_directory: Some(spec.cwd.clone()),
-            drain_on_exit: true,
-            env,
+        let mut a = None;
+        if held {
+            let meta = Meta {
+                kind: spec.kind.label().into(),
+                name: spec.name.clone(),
+                cwd: spec.cwd.clone(),
+                command: spec.command.clone(),
+                command_line: command_line.clone(),
+                session: spec.resume.clone().or_else(|| fresh.clone()),
+                pos: usize::MAX,
+                asked: first_prompt,
+                ..Meta::default()
+            };
+            let hspec = crate::holder::Spec {
+                session: crate::session::name().into(),
+                id,
+                program: program.clone(),
+                args: args.clone(),
+                cwd: spec.cwd.clone(),
+                env: env.clone(),
+                cols: size.0,
+                rows: size.1,
+                meta: serde_json::to_string(&meta).unwrap_or_default(),
+            };
+            match crate::holder::launch(exe, &hspec) {
+                Ok((path, holder)) => match crate::holder::attach(&path) {
+                    Ok(att) => a = Some(Agent::held(id, spec.name.clone(), spec.kind, spec.cwd.clone(), command_line.clone(), att, tx.clone())),
+                    Err(e) => {
+                        // Up, but not answering: it mustn't keep the program.
+                        crate::holder::abandon(holder, &path);
+                        eprintln!("trix: {}'s holder did not answer ({e}); its terminal stays in the server", spec.name);
+                    }
+                },
+                Err(crate::holder::LaunchError::Program(e)) => anyhow::bail!(e),
+                Err(e) => eprintln!("trix: no holder for {} ({e}); its terminal stays in the server", spec.name),
+            }
+        }
+        let mut a = match a {
+            Some(a) => a,
+            None => {
+                let opts = tty::Options {
+                    shell: Some(tty::Shell::new(program, args)),
+                    working_directory: Some(spec.cwd.clone()),
+                    drain_on_exit: true,
+                    env,
+                };
+                let pty = tty::new(&opts, window_size(size), id as u64)?;
+                let pid = pty.child().id();
+                let master = pty.file().try_clone()?;
+                let listener = Listener { id, tx, muted: Arc::new(AtomicBool::new(false)) };
+                let term = new_term(size, listener.clone());
+                let ev = EventLoop::new(term.clone(), listener, pty, true, false)?;
+                let sender = ev.channel();
+                ev.spawn();
+                Agent::assemble(Parts { id, name: spec.name, kind: spec.kind, cwd: spec.cwd, command_line, term, io: Io::Local(sender), pty: Some(master), pid, holder: None, size })
+            }
         };
-        let ws = window_size(size);
-        let pty = tty::new(&opts, ws, id as u64)?;
-        let pid = pty.child().id();
-        let master = pty.file().try_clone()?;
+        a.asked = first_prompt;
+        a.activity = installing.clone().or(spec.branch_note).unwrap_or_else(|| "launching".into());
+        a.last_prompt = spec.prompt;
+        // Copilot is restored with `--session-id`, which resumes the
+        // conversation or starts one under that id: always worth saving.
+        a.session_named_by_trix = fresh.is_some() && spec.kind == Kind::Grok;
+        a.session = spec.resume.or(fresh);
+        a.prompted = first_prompt.then(Instant::now);
+        a.installing = installing;
+        Ok(a)
+    }
 
-        let listener = Listener { id, tx };
-        let config = Config { scrolling_history: 10_000, ..Config::default() };
-        let tsize = TermSize { cols: size.0 as usize, lines: size.1 as usize };
-        let term = Arc::new(FairMutex::new(Term::new(config, &tsize, listener.clone())));
-        let ev = EventLoop::new(term.clone(), listener, pty, true, false)?;
-        let sender = ev.channel();
-        ev.spawn();
-        let later = delayed_writer(sender.clone());
+    /// An agent on the holder just attached (`att`): its emulator rebuilt
+    /// from what the holder kept, at the size that was drawn at.
+    fn held(id: u32, name: String, kind: Kind, cwd: PathBuf, command_line: String, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
+        let crate::holder::Attached { hello, replay, stream, path } = att;
+        let size = (hello.cols.max(2), hello.rows.max(1));
+        let muted = Arc::new(AtomicBool::new(true));
+        let listener = Listener { id, tx, muted: muted.clone() };
+        let term = new_term(size, listener.clone());
+        let mut parser = ansi::Processor::new();
+        parser.advance(&mut *term.lock(), &replay);
+        muted.store(false, Ordering::Relaxed);
+        let killed = Arc::new(AtomicBool::new(false));
+        let writer = match stream.try_clone() {
+            Ok(w) => crate::holder::writer(w, killed.clone()),
+            // No way to write to it: the writer side is a dead end, and the
+            // reader below reports the agent gone when the holder is.
+            Err(_) => mpsc::channel().0,
+        };
+        let io = Io::Held(writer.clone());
+        read_holder(HeldLine { stream, path, writer, killed }, term.clone(), listener, parser);
+        let mut a = Agent::assemble(Parts { id, name, kind, cwd, command_line, term, io, pty: None, pid: hello.pid, holder: Some(hello.holder), size });
+        if hello.exited {
+            a.exit_code = hello.code;
+            a.state = State::Exited;
+            a.activity = match hello.code {
+                Some(0) | None => "exited".into(),
+                Some(c) => format!("exited with code {c}"),
+            };
+        }
+        a
+    }
 
+    /// Put back an agent whose holder outlived the last server, from the
+    /// notes it kept (`meta`) and the output it buffered.
+    pub fn reattach(id: u32, kind: Kind, name: String, meta: &Meta, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
+        let quiet = Duration::from_millis(att.hello.quiet_ms);
+        let mut a = Agent::held(id, name, kind, meta.cwd.clone(), meta.command_line.clone(), att, tx);
+        a.meta_sent = serde_json::to_string(meta).unwrap_or_default();
+        a.session = meta.session.clone();
+        a.session_named_by_trix = meta.session_named_by_trix;
+        a.pinned = meta.pinned;
+        a.hooked = meta.hooked;
+        a.reported = meta.reported;
+        a.turn_seen = meta.turn_seen;
+        a.asked = meta.asked;
+        a.managed_by = meta.managed_by.clone();
+        a.transcript = meta.transcript.clone();
+        if a.state != State::Exited {
+            a.restore_state(meta, quiet);
+        }
+        a
+    }
+
+    /// Where an agent that kept running without a server is at, from where
+    /// it was (`meta`), how long it has been quiet, and its screen. Never
+    /// starting: it has been running all along.
+    fn restore_state(&mut self, meta: &Meta, quiet: Duration) {
+        let was = State::from_label(&meta.state);
+        // An agent that reports its turns ended this one with a hook nobody
+        // heard, if it has gone quiet: it finished, and that is news. Nobody
+        // was there to interrupt it. OpenCode can be at work without a word.
+        let reports = self.hooked && self.kind != Kind::OpenCode;
+        let (state, activity) = match was {
+            // Waiting on you is waiting until you answer.
+            Some(State::Blocked) => (State::Blocked, meta.activity.clone()),
+            // Done and not looked at yet is still news.
+            Some(State::Done) => (State::Done, meta.activity.clone()),
+            // Still at it, by its output. If that stops with no hook heard,
+            // the turn had ended already (`heuristics`).
+            Some(State::Working) if quiet < Duration::from_secs(5) => {
+                self.away = reports;
+                (State::Working, meta.activity.clone())
+            }
+            Some(State::Working) if reports => (State::Done, ENDED_AWAY.into()),
+            // Whatever else it was doing, nothing says how that went.
+            _ => (State::Idle, "reattached".into()),
+        };
+        let ended_away = was == Some(State::Working) && state == State::Done;
+        self.state = state;
+        self.activity = if activity.is_empty() { "reattached".into() } else { activity };
+        self.unseen = ended_away || (meta.unseen && matches!(state, State::Blocked | State::Done));
+        // What came up while no server watched: a question on its screen.
+        if state != State::Blocked && self.kind.is_agent() && self.screen_needs_input() {
+            self.state = State::Blocked;
+            self.activity = "waiting for an answer".into();
+            self.unseen = true;
+        }
+        if self.state == State::Blocked {
+            self.unseen = true;
+        }
+    }
+
+    /// Its notes for its holder (`Meta`), at place `pos` in the list.
+    pub fn meta(&self, pos: usize, focused: bool, command: Option<String>, parked: bool) -> Meta {
+        Meta {
+            kind: self.kind.label().into(),
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            command,
+            command_line: self.command_line.clone(),
+            session: self.session.clone(),
+            session_named_by_trix: self.session_named_by_trix,
+            pos,
+            focused,
+            pinned: self.pinned,
+            parked,
+            hooked: self.hooked,
+            reported: self.reported,
+            turn_seen: self.turn_seen,
+            asked: self.asked,
+            managed_by: self.managed_by.clone(),
+            transcript: self.transcript.clone(),
+            state: self.state.label().into(),
+            activity: self.activity.clone(),
+            unseen: self.unseen,
+        }
+    }
+
+    /// Send its holder `meta` if it changed since last time.
+    pub fn send_meta(&mut self, meta: &Meta) {
+        let Io::Held(tx) = &self.io else { return };
+        let Ok(json) = serde_json::to_string(meta) else { return };
+        if json != self.meta_sent && tx.send(crate::holder::Req::Meta(json.clone())).is_ok() {
+            self.meta_sent = json;
+        }
+    }
+
+    fn assemble(p: Parts) -> Agent {
+        let later = delayed_writer(p.io.clone());
         let now = Instant::now();
         let mut spark = VecDeque::with_capacity(SPARK_LEN);
         spark.extend(std::iter::repeat_n(0, SPARK_LEN));
-        Ok(Agent {
-            id,
-            name: spec.name,
-            kind: spec.kind,
-            cwd: spec.cwd,
-            command_line,
-            term,
-            sender,
+        Agent {
+            id: p.id,
+            name: p.name,
+            kind: p.kind,
+            cwd: p.cwd,
+            command_line: p.command_line,
+            term: p.term,
+            io: p.io,
             later,
             submit_free: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             screen_seen: std::cell::Cell::new(None),
             stopping: std::cell::Cell::new(false),
-            asked: first_prompt,
+            asked: false,
             last_cwd: std::cell::RefCell::new(None),
-            pty: master,
-            pid,
-            size,
+            pty: p.pty,
+            pid: p.pid,
+            holder: p.holder,
+            meta_sent: String::new(),
+            away: false,
+            size: p.size,
             state: State::Starting,
             state_since: now,
             created: now,
@@ -461,12 +925,10 @@ impl Agent {
             reported: false,
             dismissed_at: None,
             last_resize: now,
-            activity: installing.clone().or(spec.branch_note).unwrap_or_else(|| "launching".into()),
-            last_prompt: spec.prompt,
-            // Copilot is restored with `--session-id`, which resumes the
-            // conversation or starts one under that id: always worth saving.
-            session_named_by_trix: fresh.is_some() && spec.kind == Kind::Grok,
-            session: spec.resume.or(fresh),
+            activity: "launching".into(),
+            last_prompt: None,
+            session_named_by_trix: false,
+            session: None,
             title: None,
             exit_code: None,
             last_output: now,
@@ -480,23 +942,23 @@ impl Agent {
             diff: None,
             transcript: None,
             context: None,
-            prompted: first_prompt.then(Instant::now),
+            prompted: None,
             turn_seen: false,
             managed_by: None,
             pinned: false,
             last_hook_seq: 0,
             title_attention: None,
             changes: Vec::new(),
-            installing,
+            installing: None,
             amp_welcome_at: None,
             pending_tool: None,
-        })
+        }
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let b = bytes.into();
         if !b.is_empty() {
-            let _ = self.sender.send(Msg::Input(b));
+            self.io.input(b);
         }
     }
 
@@ -509,6 +971,7 @@ impl Agent {
         const GAP: Duration = Duration::from_millis(30);
         let now = Instant::now();
         self.last_input = now;
+        self.away = false;
         self.note_asked();
         let start = now.max(self.submit_free + GAP);
         let enter = start + ENTER_AFTER;
@@ -527,6 +990,7 @@ impl Agent {
 
     pub fn user_input(&mut self, bytes: Vec<u8>) {
         self.last_input = Instant::now();
+        self.away = false;
         self.note_asked();
         self.write(bytes);
     }
@@ -538,26 +1002,32 @@ impl Agent {
         }
         self.size = (cols, lines);
         self.last_resize = Instant::now();
-        let _ = self.sender.send(Msg::Resize(window_size((cols, lines))));
+        self.io.resize((cols, lines));
         self.term.lock().resize(TermSize { cols: cols as usize, lines: lines as usize });
     }
 
     /// Stop it: hang up, and if its program ignores that, end it anyway in
-    /// the background (see `platform::stop`).
+    /// the background (see `platform::stop`). A holder does that itself.
     pub fn shutdown(&self) {
-        if self.hang_up() {
-            let pid = self.pid;
-            let _ = std::thread::Builder::new().name("trix-stop".into()).spawn(move || crate::platform::stop(&[pid], STOP_GRACE));
+        if !self.hang_up() {
+            return;
         }
+        let pid = self.pid;
+        let holder = self.holder;
+        let _ = std::thread::Builder::new().name("trix-stop".into()).spawn(move || match holder {
+            // It stops its program; if it can't (or didn't hear), it's made to.
+            Some(h) => crate::holder::see_stopped(&[(h, pid)], HOLDER_GRACE),
+            None => crate::platform::stop(&[pid], STOP_GRACE),
+        });
     }
 
-    /// Close its terminal, which hangs up on its program. False if that
-    /// was done already.
+    /// Close its terminal, which hangs up on its program (a holder is told
+    /// to, and then ends). False if that was done already.
     pub fn hang_up(&self) -> bool {
         if self.stopping.replace(true) {
             return false;
         }
-        let _ = self.sender.send(Msg::Shutdown);
+        self.io.stop();
         true
     }
 
@@ -568,6 +1038,7 @@ impl Agent {
         let prev = self.state;
         self.state = s;
         self.state_since = Instant::now();
+        self.away = false;
         // Bounded: without subscribers, nothing drains it but the server loop.
         if self.changes.len() >= 64 {
             self.changes.remove(0);
@@ -665,6 +1136,8 @@ impl Agent {
             }
             self.last_hook_seq = msg.seq;
         }
+        // Heard from: what it does next, it says.
+        self.away = false;
         // `/clear` and friends start a new conversation: always track the latest.
         if let Some(id) = msg.session.as_ref().filter(|id| conversation_id_ok(id)) {
             self.session = Some(id.clone());
@@ -986,6 +1459,13 @@ impl Agent {
                     self.activity = "waiting for an answer".into();
                     return self.set_state(State::Blocked, focused);
                 }
+                // Back from a reattach and silent since: its turn ended
+                // while no server heard the hook, which is news, not an
+                // interruption (nobody has typed to it).
+                if self.away {
+                    self.activity = ENDED_AWAY.into();
+                    return self.set_state(State::Done, focused);
+                }
                 self.activity = "interrupted".into();
                 return self.set_state(State::Idle, focused);
             }
@@ -1198,7 +1678,12 @@ impl Agent {
     /// terminal's foreground process group says: the shell's own while at the
     /// prompt, the command's while one runs.
     pub fn running_command(&self) -> bool {
-        crate::platform::foreground_group(&self.pty).is_some_and(|g| g != self.pid as i32)
+        let group = match &self.pty {
+            Some(pty) => crate::platform::foreground_group(pty),
+            // A holder has the terminal: ask about it through the process.
+            None => crate::platform::foreground_group_of(self.pid),
+        };
+        group.is_some_and(|g| g != self.pid as i32)
     }
 
     /// Where its process is now. Once it has exited, its pid may be another
@@ -1226,11 +1711,36 @@ impl Agent {
 /// An agent that goes away takes its process and terminal with it. The app
 /// shuts agents down before it drops them anyway; this covers the rest
 /// (tests above all), where the event loop would otherwise keep the PTY
-/// open until the program inside exits on its own.
+/// open until the program inside exits on its own. Not an agent with a
+/// holder: a server that is going down (a panic unwinding, say) leaves those
+/// running for the next one, and only an explicit stop ends them.
 impl Drop for Agent {
     fn drop(&mut self) {
-        self.shutdown();
+        if self.holder.is_none() {
+            self.shutdown();
+        }
     }
+}
+
+/// Everything `Agent::assemble` needs that differs between agents.
+struct Parts {
+    id: u32,
+    name: String,
+    kind: Kind,
+    cwd: PathBuf,
+    command_line: String,
+    term: Arc<FairMutex<Term<Listener>>>,
+    io: Io,
+    pty: Option<std::fs::File>,
+    pid: u32,
+    holder: Option<u32>,
+    size: (u16, u16),
+}
+
+fn new_term(size: (u16, u16), listener: Listener) -> Arc<FairMutex<Term<Listener>>> {
+    let config = Config { scrolling_history: 10_000, ..Config::default() };
+    let tsize = TermSize { cols: size.0 as usize, lines: size.1 as usize };
+    Arc::new(FairMutex::new(Term::new(config, &tsize, listener)))
 }
 
 /// Does this screen text show an approval prompt or a question?
@@ -1485,7 +1995,7 @@ fn muse_settings_manage_hooks(settings: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(settings).is_ok_and(|v| v.get("managed_hooks_path").is_some_and(|p| !p.is_null()))
 }
 
-fn window_size((cols, lines): (u16, u16)) -> WindowSize {
+pub(crate) fn window_size((cols, lines): (u16, u16)) -> WindowSize {
     WindowSize { num_cols: cols, num_lines: lines, cell_width: 9, cell_height: 18 }
 }
 
@@ -1890,6 +2400,260 @@ mod tests {
         }
         assert!(a.running_command(), "sleep is in the foreground, not the shell");
         a.shutdown();
+    }
+
+    #[test]
+    fn a_held_terminal_works_like_a_local_one() {
+        let dir = std::env::temp_dir().join(format!("trix-test-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("bash", &["--norc", "--noprofile", "-i"]), &path).unwrap();
+        let notes = held.notes();
+        let serving = std::thread::spawn(move || held.serve());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let att = crate::holder::attach(&path).unwrap();
+        let mut a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "bash".into(), att, tx);
+        assert_eq!(a.holder, Some(std::process::id()), "this test is its own holder");
+        assert!(eventually(Duration::from_secs(5), || a.screen_text().contains('$')), "at the prompt");
+        assert!(!a.running_command(), "at the prompt");
+        a.resize(100, 30);
+        a.write(&b"stty size; sleep 5\r"[..]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !a.running_command() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.running_command(), "the foreground job, asked through the process");
+        assert!(a.screen_text().contains("30 100"), "resized through the holder: {:?}", a.screen_text());
+        // Its notes go to the holder, once per change.
+        let meta = a.meta(2, true, None, false);
+        a.send_meta(&meta);
+        let sent = a.meta_sent.clone();
+        a.send_meta(&meta);
+        assert_eq!(a.meta_sent, sent);
+        // Dropped without a stop (a server going down): the holder stays.
+        let pid = a.pid;
+        drop(a);
+        assert!(crate::platform::alive(pid), "detaching isn't stopping");
+        // The notes go out on the writer's thread.
+        assert!(eventually(Duration::from_secs(5), || serde_json::from_str::<Meta>(&notes()).ok() == Some(meta.clone())), "the holder has the notes");
+        let att = crate::holder::attach(&path).unwrap();
+        assert_eq!(serde_json::from_str::<Meta>(&att.hello.meta).unwrap(), meta, "the notes came back");
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "bash".into(), att, std::sync::mpsc::channel().0);
+        assert!(a.screen_text().contains("30 100"), "and the screen, from the replay");
+        a.shutdown();
+        serving.join().unwrap();
+        // Stopped by then, but reaped a moment later (the holder's own thread).
+        crate::holder::wait_gone(&[pid], Duration::from_secs(2));
+        assert!(!crate::platform::alive(pid));
+        drop(rx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Poll `f` until it holds, or `limit` passes. Whether it held.
+    fn eventually(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn held_dir(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trix-test-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_server_its_holder_let_go_attaches_again() {
+        let dir = held_dir("let-go");
+        let path = dir.join("h.sock");
+        let stop = dir.join("stop");
+        let script = format!("while [ ! -e {} ]; do yes flood-flood-flood | head -c 1000000; done; echo; echo flooded; while read l; do echo \"got $l\"; done", stop.display());
+        let held = crate::holder::Held::start_with(&crate::holder::tests::spec("/bin/sh", &["-c", &script]), &path, Duration::from_millis(200)).unwrap();
+        let pid = held.pid;
+        let attaches = held.attaches();
+        let serving = std::thread::spawn(move || held.serve());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let att = crate::holder::attach(&path).unwrap();
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "sh".into(), att, tx);
+        // The server stalls (its emulator busy, say) while the program floods:
+        // the holder lets it go rather than stall the program.
+        {
+            let _busy = a.term.lock();
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        assert!(eventually(Duration::from_secs(10), || attaches() == 2), "attached again");
+        std::fs::write(&stop, "").unwrap();
+        assert!(eventually(Duration::from_secs(20), || a.screen_text().contains("flooded")), "and caught up: {:?}", a.screen_text());
+        a.write(&b"ping\r"[..]);
+        assert!(eventually(Duration::from_secs(5), || a.screen_text().contains("got ping")), "typing goes to the new connection: {:?}", { let t = a.screen_text(); t[t.len().saturating_sub(300)..].to_string() });
+        assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::Exit(..))), "never reported gone");
+        a.shutdown();
+        serving.join().unwrap();
+        // Stopped by then, but reaped a moment later (the holder's own thread).
+        crate::holder::wait_gone(&[pid], Duration::from_secs(2));
+        assert!(!crate::platform::alive(pid));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_program_that_ended_while_its_server_fell_behind_is_heard_of() {
+        let dir = held_dir("ended-behind");
+        let path = dir.join("h.sock");
+        let stop = dir.join("stop");
+        let script = format!("while [ ! -e {} ]; do yes flood-flood-flood | head -c 1000000; done; echo; echo last words; exit 7", stop.display());
+        let held = crate::holder::Held::start_with(&crate::holder::tests::spec("/bin/sh", &["-c", &script]), &path, Duration::from_millis(200)).unwrap();
+        let (attaches, ended_alone) = (held.attaches(), held.ended_alone());
+        let serving = std::thread::spawn(move || held.serve());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let att = crate::holder::attach(&path).unwrap();
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "sh".into(), att, tx);
+        // The server stalls while the program floods, is let go, and the
+        // program ends before it is back: the holder has nobody to tell.
+        {
+            let _busy = a.term.lock();
+            std::thread::sleep(Duration::from_millis(600));
+            std::fs::write(&stop, "").unwrap();
+            assert!(eventually(Duration::from_secs(20), &ended_alone), "ended with no server attached");
+        }
+        // Attached again, it gets the program's last output and how it ended.
+        let mut code = None;
+        assert!(eventually(Duration::from_secs(20), || {
+            code = code.or(rx.try_iter().find_map(|e| if let AppEvent::Exit(1, c) = e { Some(c) } else { None }));
+            code.is_some()
+        }));
+        assert_eq!(code, Some(Some(7)), "its exit code, not a holder gone");
+        assert!(a.screen_text().contains("last words"), "{:?}", { let t = a.screen_text(); t[t.len().saturating_sub(300)..].to_string() });
+        assert_eq!(attaches(), 2);
+        // And the line is there for the holder to hear that it may go.
+        a.shutdown();
+        assert!(eventually(Duration::from_secs(5), || serving.is_finished()), "the holder heard the KILL");
+        assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::Exit(..))), "reported once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reattached_agent_is_where_it_was() {
+        let dir = held_dir("where");
+        let path = dir.join("h.sock");
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("/bin/sh", &["-c", "echo working away; exec sleep 30"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let attach = || {
+            let mut att = None;
+            assert!(eventually(Duration::from_secs(5), || {
+                let a = crate::holder::attach(&path).unwrap();
+                let ok = String::from_utf8_lossy(&a.replay).contains("working away");
+                att = Some(a);
+                ok
+            }));
+            att.unwrap()
+        };
+        let back = |meta: &Meta, quiet_ms: u64, kind: Kind| {
+            let mut att = attach();
+            att.hello.quiet_ms = quiet_ms;
+            Agent::reattach(1, kind, "t".into(), meta, att, std::sync::mpsc::channel().0)
+        };
+        let mut meta = Meta { kind: "claude".into(), name: "t".into(), state: "needs you".into(), activity: "Bash: rm -rf build".into(), ..Meta::default() };
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Blocked, "Bash: rm -rf build", true), "it still needs you");
+        meta.state = "working".into();
+        let a = back(&meta, 100, Kind::Claude);
+        assert_eq!(a.state, State::Working, "still writing: still working");
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"), "quiet for a minute, and it never reported its turns: no telling");
+        // One that reports its turns ended this one, with a hook no server
+        // heard: it finished, which is news. Nobody was there to interrupt it.
+        meta.hooked = true;
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Done, ENDED_AWAY, true), "quiet for a minute: its turn ended unheard");
+        let a = back(&meta, 60_000, Kind::OpenCode);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"), "OpenCode works without a word");
+        // Still writing as the server came, then silent: the turn had just
+        // ended. The same news, not "interrupted".
+        let mut a = back(&meta, 100, Kind::Claude);
+        assert_eq!(a.state, State::Working);
+        a.last_output = ago(Duration::from_secs(3));
+        assert_eq!(a.heuristics(false), None, "spinner pauses happen");
+        a.last_output = ago(Duration::from_secs(7));
+        assert_eq!(a.heuristics(false), Some(State::Working));
+        assert_eq!((a.state, a.activity.as_str(), a.unseen), (State::Done, ENDED_AWAY, true));
+        // Typed to since (an Esc, say): a silence is an interruption again.
+        let mut a = back(&meta, 100, Kind::Claude);
+        a.user_input(vec![0x1b]);
+        a.last_output = ago(Duration::from_secs(7));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        // And so it is once it has been heard from: its hooks get here.
+        let mut a = back(&meta, 100, Kind::Claude);
+        a.on_hook(&hook("claude", "PostToolUse", Some("Bash"), None), false);
+        a.last_output = ago(Duration::from_secs(7));
+        a.heuristics(false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "interrupted"));
+        meta.hooked = false;
+        meta.state = "done".into();
+        meta.unseen = true;
+        let a = back(&meta, 60_000, Kind::Claude);
+        assert_eq!((a.state, a.unseen), (State::Done, true), "news nobody saw is still news");
+        // Notes from before states were kept: as before.
+        let a = back(&Meta::default(), 60_000, Kind::Shell);
+        assert_eq!((a.state, a.activity.as_str()), (State::Idle, "reattached"));
+        // The notes it sends carry where it is.
+        assert_eq!(a.meta(0, false, None, false).state, "idle");
+        a.shutdown();
+        serving.join().unwrap();
+
+        // A question that came up while no server watched is flagged too.
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("/bin/sh", &["-c", "echo 'Do you want to proceed? (y/n)'; exec sleep 30"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let mut att = None;
+        assert!(eventually(Duration::from_secs(5), || {
+            let a = crate::holder::attach(&path).unwrap();
+            let ok = String::from_utf8_lossy(&a.replay).contains("proceed");
+            att = Some(a);
+            ok
+        }));
+        let meta = Meta { state: "working".into(), ..Meta::default() };
+        let a = Agent::reattach(1, Kind::Claude, "t".into(), &meta, att.unwrap(), std::sync::mpsc::channel().0);
+        assert_eq!((a.state, a.unseen), (State::Blocked, true), "{:?}", a.screen_text());
+        a.shutdown();
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_replay_does_not_answer_old_questions() {
+        let dir = std::env::temp_dir().join(format!("trix-test-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        // Asks the terminal what it is (DA1), long before this server came.
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("/bin/sh", &["-c", "printf 'asking\\033[c'; exec sleep 30"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let att = loop {
+            let att = crate::holder::attach(&path).unwrap();
+            if att.replay.ends_with(b"\x1b[c") || Instant::now() > deadline {
+                break att;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(att.replay.ends_with(b"\x1b[c"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "sh".into(), att, tx);
+        assert!(a.screen_text().contains("asking"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::PtyWrite(..))), "the emulator's answer isn't typed into the program again");
+        a.shutdown();
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

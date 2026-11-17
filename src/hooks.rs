@@ -86,6 +86,76 @@ pub fn runtime_dir() -> PathBuf {
     dir
 }
 
+/// The longest path a Unix socket can have: `sun_path`, less its NUL.
+#[cfg(target_os = "linux")]
+const SUN_PATH: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const SUN_PATH: usize = 103;
+
+/// No socket trix makes has a longer file name than this (`holder.rs`,
+/// `session.rs`): long session names are hashed down to fit.
+pub const MAX_SOCKET_NAME: usize = 48;
+
+/// Where the socket called `name` goes: the runtime folder, unless that
+/// makes too long a path (macOS's `$TMPDIR` is long), and then a short
+/// private one, `/tmp/trix-<uid>`. The same answer for every trix of this
+/// user and runtime folder, so a server and its clients agree.
+pub fn socket_in(name: &str) -> PathBuf {
+    socket_path_in(&runtime_dir(), short_dir, name)
+}
+
+fn socket_path_in(dir: &Path, short: impl FnOnce() -> Option<PathBuf>, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    if fits(&path) {
+        return path;
+    }
+    match short().map(|d| d.join(name)) {
+        Some(p) if fits(&p) => p,
+        // Nowhere it fits: binding says so.
+        _ => path,
+    }
+}
+
+/// Short enough to bind and connect to.
+pub fn fits(path: &Path) -> bool {
+    path.as_os_str().len() <= SUN_PATH
+}
+
+/// The short socket folder, made (0700) if it isn't there. None when it's
+/// not private: another user made it first in the shared /tmp.
+fn short_dir() -> Option<PathBuf> {
+    let dir = short_dir_path();
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+    check_private(&dir).ok().map(|()| dir)
+}
+
+fn short_dir_path() -> PathBuf {
+    PathBuf::from(format!("/tmp/trix-{}", unsafe { libc::getuid() }))
+}
+
+/// Every folder sockets may be in (`socket_in`), to look for them.
+pub fn socket_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![runtime_dir()];
+    let short = short_dir_path();
+    if !dirs.contains(&short) && check_private(&short).is_ok() {
+        dirs.push(short);
+    }
+    dirs
+}
+
+/// A short stable name for `s`, for socket names: 12 hex digits of its
+/// FNV-1a hash. Not std's hasher, which may change between Rust releases:
+/// a holder and the trix after an upgrade must agree.
+pub fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:012x}", h >> 16)
+}
+
 /// The runtime folder must be a real folder that only we can get into.
 fn check_private(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
@@ -104,8 +174,11 @@ fn check_private(dir: &Path) -> Result<(), String> {
 }
 
 /// Remove sockets / settings left behind by trix processes that died hard.
+/// Not the settings and plugins while a holder lives: its agent was started
+/// with them, by the server that died, and may read them again.
 pub fn sweep_stale() {
     let Ok(entries) = std::fs::read_dir(runtime_dir()) else { return };
+    let holders = !crate::holder::discover_all().is_empty();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let pid = name
@@ -118,6 +191,9 @@ pub fn sweep_stale() {
             .split('.')
             .next()
             .and_then(|p| p.parse::<u32>().ok());
+        if holders && !name.ends_with(".sock") {
+            continue;
+        }
         if pid.is_some_and(|pid| !crate::platform::alive(pid)) {
             if e.file_type().is_ok_and(|t| t.is_dir()) {
                 let _ = std::fs::remove_dir_all(e.path());
@@ -128,8 +204,11 @@ pub fn sweep_stale() {
     }
 }
 
+/// Where agents report (`TRIX_SOCKET`): one per session, not per server, so
+/// an agent still reaches the server that took over from the one that
+/// started it (`App::reattach`).
 pub fn socket_path() -> PathBuf {
-    runtime_dir().join(format!("trix-{}.sock", std::process::id()))
+    crate::session::hooks_path()
 }
 
 /// Start the listener thread. Each connection carries one or more JSON lines.
@@ -1419,6 +1498,32 @@ mod tests {
 
     fn c(v: Value) -> HookMsg {
         condense(7, "claude", &v)
+    }
+
+    #[test]
+    fn sockets_go_where_their_path_fits() {
+        let short = || Some(PathBuf::from("/tmp/trix-501"));
+        let name = "holder.0123456789ab.4294967295.4294967295.sock";
+        assert!(name.len() <= MAX_SOCKET_NAME);
+        // A runtime folder like macOS's: $TMPDIR is long.
+        let mac = PathBuf::from(format!("/var/folders/zz/{}/T/trix-501", "x".repeat(40)));
+        let p = socket_path_in(&mac, short, name);
+        assert_eq!(p, PathBuf::from("/tmp/trix-501").join(name), "too long there: the short folder");
+        assert!(p.as_os_str().len() < 104);
+        assert_eq!(socket_path_in(Path::new("/run/user/1000/trix"), short, name), Path::new("/run/user/1000/trix").join(name), "fits: where it always was");
+        assert_eq!(socket_path_in(Path::new("/run/user/1000/trix"), short, "session.sock"), Path::new("/run/user/1000/trix/session.sock"));
+        // No short folder to be had (another user's): the long path, and binding says why.
+        assert_eq!(socket_path_in(&mac, || None, name), mac.join(name));
+    }
+
+    #[test]
+    fn short_hashes_are_stable_and_short() {
+        assert_eq!(short_hash("default"), short_hash("default"));
+        assert_eq!(short_hash("default").len(), 12);
+        assert_eq!(short_hash(&"x".repeat(200)).len(), 12);
+        assert_ne!(short_hash("work"), short_hash("work2"));
+        // The same on every machine and Rust release: holders outlive upgrades.
+        assert_eq!(short_hash(""), "cbf29ce48422");
     }
 
     #[test]
