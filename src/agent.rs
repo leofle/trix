@@ -1,5 +1,10 @@
 //! One agent = one PTY + one terminal emulator + a state machine that turns
 //! hook reports and screen/activity signals into a human-readable status.
+//!
+//! The PTY is normally held by a process of the agent's own (`holder`), so the
+//! program keeps running when the server goes; the emulator and the state
+//! machine are here. Without a holder (tests, or when one can't start) the
+//! PTY is the server's own, run by alacritty's event loop.
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -8,10 +13,14 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
+use alacritty_terminal::vte::ansi;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
@@ -158,10 +167,22 @@ impl State {
 pub struct Listener {
     id: u32,
     tx: Sender<AppEvent>,
+    /// Replaying what a holder kept: the program asked its questions (and
+    /// rang its bells) long ago, so the emulator's answers and the bells
+    /// must not go out again now.
+    muted: Arc<AtomicBool>,
 }
 
 impl EventListener for Listener {
     fn send_event(&self, event: TermEvent) {
+        if self.muted.load(Ordering::Relaxed)
+            && matches!(
+                event,
+                TermEvent::PtyWrite(_) | TermEvent::TextAreaSizeRequest(_) | TermEvent::ColorRequest(..) | TermEvent::ClipboardStore(..) | TermEvent::Bell
+            )
+        {
+            return;
+        }
         let ev = match event {
             TermEvent::Wakeup => AppEvent::Output(self.id),
             TermEvent::PtyWrite(s) => AppEvent::PtyWrite(self.id, s),
@@ -217,7 +238,7 @@ pub struct Agent {
     #[allow(dead_code)]
     pub command_line: String,
     pub term: Arc<FairMutex<Term<Listener>>>,
-    sender: EventLoopSender,
+    io: Io,
     /// Writes due later, sent in order by one thread (see `submit`).
     later: Sender<(Instant, Cow<'static, [u8]>)>,
     /// When the last submission's Enter goes out.
@@ -234,9 +255,13 @@ pub struct Agent {
     /// The folder its process was last seen in, for once it has exited.
     last_cwd: std::cell::RefCell<Option<PathBuf>>,
     /// Our own handle on the PTY's master side, to ask the terminal which
-    /// process group is in the foreground.
-    pty: std::fs::File,
+    /// process group is in the foreground. None when a holder has the PTY.
+    pty: Option<std::fs::File>,
     pub pid: u32,
+    /// The pid of the holder process that has its PTY, if one has.
+    pub holder: Option<u32>,
+    /// The notes last sent to its holder (`Meta`), to send only changes.
+    meta_sent: String,
     pub size: (u16, u16),
 
     pub state: State,
@@ -323,14 +348,89 @@ const HOOK_REORDER_US: u64 = 5_000_000;
 /// to terminate, before it's made to.
 pub const STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// Where an agent's input, resizes and hang-up go: alacritty's event loop
+/// on a PTY of the server's own, or the writer thread to its holder.
+#[derive(Clone)]
+enum Io {
+    Local(EventLoopSender),
+    Held(Sender<crate::holder::Req>),
+}
+
+impl Io {
+    fn input(&self, bytes: Cow<'static, [u8]>) -> bool {
+        match self {
+            Io::Local(s) => s.send(Msg::Input(bytes)).is_ok(),
+            Io::Held(s) => s.send(crate::holder::Req::Input(bytes)).is_ok(),
+        }
+    }
+
+    fn resize(&self, size: (u16, u16)) {
+        let _ = match self {
+            Io::Local(s) => s.send(Msg::Resize(window_size(size))).is_ok(),
+            Io::Held(s) => s.send(crate::holder::Req::Resize(size.0, size.1)).is_ok(),
+        };
+    }
+
+    /// Hang up: close a local PTY, or tell the holder to stop its program
+    /// and itself.
+    fn stop(&self) {
+        let _ = match self {
+            Io::Local(s) => s.send(Msg::Shutdown).is_ok(),
+            Io::Held(s) => s.send(crate::holder::Req::Kill).is_ok(),
+        };
+    }
+}
+
+/// What the server tells an agent's holder about it, and reads back from a
+/// holder it finds at start (`App::reattach`): enough to put the agent back
+/// as it was. Kept by the holder as it is; only the server reads it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Meta {
+    pub kind: String,
+    pub name: String,
+    /// The folder it was started in.
+    pub cwd: PathBuf,
+    /// What Enter-to-restart runs: the spec's command.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub command_line: String,
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub session_named_by_trix: bool,
+    /// Its place in the list, and whether it had the focus.
+    #[serde(default)]
+    pub pos: usize,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    /// Restored stopped, waiting for an Enter.
+    #[serde(default)]
+    pub parked: bool,
+    #[serde(default)]
+    pub hooked: bool,
+    #[serde(default)]
+    pub reported: bool,
+    #[serde(default)]
+    pub turn_seen: bool,
+    #[serde(default)]
+    pub asked: bool,
+    #[serde(default)]
+    pub managed_by: Option<String>,
+    #[serde(default)]
+    pub transcript: Option<PathBuf>,
+}
+
 /// One thread per agent that sends each write when it's due, in the order
 /// queued. It ends when the agent (the only sender) goes away.
-fn delayed_writer(sender: EventLoopSender) -> Sender<(Instant, Cow<'static, [u8]>)> {
+fn delayed_writer(io: Io) -> Sender<(Instant, Cow<'static, [u8]>)> {
     let (tx, rx) = mpsc::channel::<(Instant, Cow<'static, [u8]>)>();
     let _ = std::thread::Builder::new().name("trix-later".into()).spawn(move || {
         for (due, bytes) in rx {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
-            if sender.send(Msg::Input(bytes)).is_err() {
+            if !io.input(bytes) {
                 break;
             }
         }
@@ -338,7 +438,58 @@ fn delayed_writer(sender: EventLoopSender) -> Sender<(Instant, Cow<'static, [u8]
     tx
 }
 
+/// Read what a holder sends, into the emulator: output, and the program's
+/// exit. The end of the stream with no exit before it means the holder
+/// itself went (killed from outside): the agent has, too.
+fn read_holder(mut stream: std::os::unix::net::UnixStream, term: Arc<FairMutex<Term<Listener>>>, listener: Listener, mut parser: ansi::Processor) {
+    use crate::holder::{EXIT, Frames, OUTPUT};
+    let _ = std::thread::Builder::new().name("trix-held-read".into()).spawn(move || {
+        let mut frames = Frames::default();
+        let mut buf = vec![0u8; 64 << 10];
+        let mut exited = false;
+        loop {
+            // A synchronized update that never ends is drawn anyway once
+            // its time is up, as alacritty's own loop does.
+            let sync = parser.sync_timeout().sync_timeout().map(|t| t.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
+            let _ = stream.set_read_timeout(sync);
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => frames.feed(&buf[..n]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    parser.stop_sync(&mut *term.lock());
+                    listener.send_event(TermEvent::Wakeup);
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+            loop {
+                match frames.next_frame() {
+                    Ok(Some((OUTPUT, bytes))) => {
+                        parser.advance(&mut *term.lock(), &bytes);
+                        listener.send_event(TermEvent::Wakeup);
+                    }
+                    Ok(Some((EXIT, code))) => {
+                        exited = true;
+                        let code = serde_json::from_slice::<Option<i32>>(&code).ok().flatten();
+                        let _ = listener.tx.send(AppEvent::Exit(listener.id, code));
+                        listener.send_event(TermEvent::Wakeup);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => return,
+                }
+            }
+        }
+        if !exited {
+            let _ = listener.tx.send(AppEvent::Exit(listener.id, None));
+        }
+    });
+}
+
 impl Agent {
+    /// An agent whose PTY is the server's own (no holder): for tests.
+    #[cfg(test)]
     pub fn spawn(
         id: u32,
         spec: Spawn,
@@ -347,6 +498,23 @@ impl Agent {
         socket: &std::path::Path,
         integrations: &Integrations,
         exe: &std::path::Path,
+    ) -> anyhow::Result<Agent> {
+        Agent::spawn_in(id, spec, size, tx, socket, integrations, exe, false)
+    }
+
+    /// `spawn`, under a holder of its own when `held` (`trix holder`, run as
+    /// `exe`). A holder that can't start leaves the PTY to the server, as
+    /// without one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_in(
+        id: u32,
+        spec: Spawn,
+        size: (u16, u16),
+        tx: Sender<AppEvent>,
+        socket: &std::path::Path,
+        integrations: &Integrations,
+        exe: &std::path::Path,
+        held: bool,
     ) -> anyhow::Result<Agent> {
         // A sliver of a window gives a pane with no rows or columns, and the
         // terminal grid can't be made that small: same floor as `resize`.
@@ -413,46 +581,183 @@ impl Agent {
             env.insert(k.into(), v.into());
         }
 
-        let opts = tty::Options {
-            shell: Some(tty::Shell::new(program, args)),
-            working_directory: Some(spec.cwd.clone()),
-            drain_on_exit: true,
-            env,
+        let mut a = None;
+        if held {
+            let meta = Meta {
+                kind: spec.kind.label().into(),
+                name: spec.name.clone(),
+                cwd: spec.cwd.clone(),
+                command: spec.command.clone(),
+                command_line: command_line.clone(),
+                session: spec.resume.clone().or_else(|| fresh.clone()),
+                pos: usize::MAX,
+                asked: first_prompt,
+                ..Meta::default()
+            };
+            let hspec = crate::holder::Spec {
+                session: crate::session::name().into(),
+                id,
+                program: program.clone(),
+                args: args.clone(),
+                cwd: spec.cwd.clone(),
+                env: env.clone(),
+                cols: size.0,
+                rows: size.1,
+                meta: serde_json::to_string(&meta).unwrap_or_default(),
+            };
+            match crate::holder::launch(exe, &hspec) {
+                Ok((path, holder)) => match crate::holder::attach(&path) {
+                    Ok(att) => a = Some(Agent::held(id, spec.name.clone(), spec.kind, spec.cwd.clone(), command_line.clone(), att, tx.clone())),
+                    Err(e) => {
+                        // Up, but not answering: it mustn't keep the program.
+                        unsafe { libc::kill(holder as libc::pid_t, libc::SIGTERM) };
+                        eprintln!("trix: {}'s holder did not answer ({e}); its terminal stays in the server", spec.name);
+                    }
+                },
+                Err(crate::holder::LaunchError::Program(e)) => anyhow::bail!(e),
+                Err(e) => eprintln!("trix: no holder for {} ({e}); its terminal stays in the server", spec.name),
+            }
+        }
+        let mut a = match a {
+            Some(a) => a,
+            None => {
+                let opts = tty::Options {
+                    shell: Some(tty::Shell::new(program, args)),
+                    working_directory: Some(spec.cwd.clone()),
+                    drain_on_exit: true,
+                    env,
+                };
+                let pty = tty::new(&opts, window_size(size), id as u64)?;
+                let pid = pty.child().id();
+                let master = pty.file().try_clone()?;
+                let listener = Listener { id, tx, muted: Arc::new(AtomicBool::new(false)) };
+                let term = new_term(size, listener.clone());
+                let ev = EventLoop::new(term.clone(), listener, pty, true, false)?;
+                let sender = ev.channel();
+                ev.spawn();
+                Agent::assemble(Parts { id, name: spec.name, kind: spec.kind, cwd: spec.cwd, command_line, term, io: Io::Local(sender), pty: Some(master), pid, holder: None, size })
+            }
         };
-        let ws = window_size(size);
-        let pty = tty::new(&opts, ws, id as u64)?;
-        let pid = pty.child().id();
-        let master = pty.file().try_clone()?;
+        a.asked = first_prompt;
+        a.activity = installing.clone().or(spec.branch_note).unwrap_or_else(|| "launching".into());
+        a.last_prompt = spec.prompt;
+        // Copilot is restored with `--session-id`, which resumes the
+        // conversation or starts one under that id: always worth saving.
+        a.session_named_by_trix = fresh.is_some() && spec.kind == Kind::Grok;
+        a.session = spec.resume.or(fresh);
+        a.prompted = first_prompt.then(Instant::now);
+        a.installing = installing;
+        Ok(a)
+    }
 
-        let listener = Listener { id, tx };
-        let config = Config { scrolling_history: 10_000, ..Config::default() };
-        let tsize = TermSize { cols: size.0 as usize, lines: size.1 as usize };
-        let term = Arc::new(FairMutex::new(Term::new(config, &tsize, listener.clone())));
-        let ev = EventLoop::new(term.clone(), listener, pty, true, false)?;
-        let sender = ev.channel();
-        ev.spawn();
-        let later = delayed_writer(sender.clone());
+    /// An agent on the holder just attached (`att`): its emulator rebuilt
+    /// from what the holder kept, at the size that was drawn at.
+    fn held(id: u32, name: String, kind: Kind, cwd: PathBuf, command_line: String, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
+        let crate::holder::Attached { hello, replay, stream } = att;
+        let size = (hello.cols.max(2), hello.rows.max(1));
+        let muted = Arc::new(AtomicBool::new(true));
+        let listener = Listener { id, tx, muted: muted.clone() };
+        let term = new_term(size, listener.clone());
+        let mut parser = ansi::Processor::new();
+        parser.advance(&mut *term.lock(), &replay);
+        muted.store(false, Ordering::Relaxed);
+        let io = match stream.try_clone() {
+            Ok(w) => Io::Held(crate::holder::writer(w)),
+            // No way to write to it: the writer side is a dead end, and the
+            // reader below reports the agent gone when the holder is.
+            Err(_) => Io::Held(mpsc::channel().0),
+        };
+        read_holder(stream, term.clone(), listener, parser);
+        let mut a = Agent::assemble(Parts { id, name, kind, cwd, command_line, term, io, pty: None, pid: hello.pid, holder: Some(hello.holder), size });
+        if hello.exited {
+            a.exit_code = hello.code;
+            a.state = State::Exited;
+            a.activity = match hello.code {
+                Some(0) | None => "exited".into(),
+                Some(c) => format!("exited with code {c}"),
+            };
+        }
+        a
+    }
 
+    /// Put back an agent whose holder outlived the last server, from the
+    /// notes it kept (`meta`) and the output it buffered.
+    pub fn reattach(id: u32, kind: Kind, name: String, meta: &Meta, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
+        let mut a = Agent::held(id, name, kind, meta.cwd.clone(), meta.command_line.clone(), att, tx);
+        a.meta_sent = serde_json::to_string(meta).unwrap_or_default();
+        a.session = meta.session.clone();
+        a.session_named_by_trix = meta.session_named_by_trix;
+        a.pinned = meta.pinned;
+        a.hooked = meta.hooked;
+        a.reported = meta.reported;
+        a.turn_seen = meta.turn_seen;
+        a.asked = meta.asked;
+        a.managed_by = meta.managed_by.clone();
+        a.transcript = meta.transcript.clone();
+        if a.state != State::Exited {
+            // It has been running all along: not starting, whatever it's at.
+            a.state = State::Idle;
+            a.activity = "reattached".into();
+        }
+        a
+    }
+
+    /// Its notes for its holder (`Meta`), at place `pos` in the list.
+    pub fn meta(&self, pos: usize, focused: bool, command: Option<String>, parked: bool) -> Meta {
+        Meta {
+            kind: self.kind.label().into(),
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            command,
+            command_line: self.command_line.clone(),
+            session: self.session.clone(),
+            session_named_by_trix: self.session_named_by_trix,
+            pos,
+            focused,
+            pinned: self.pinned,
+            parked,
+            hooked: self.hooked,
+            reported: self.reported,
+            turn_seen: self.turn_seen,
+            asked: self.asked,
+            managed_by: self.managed_by.clone(),
+            transcript: self.transcript.clone(),
+        }
+    }
+
+    /// Send its holder `meta` if it changed since last time.
+    pub fn send_meta(&mut self, meta: &Meta) {
+        let Io::Held(tx) = &self.io else { return };
+        let Ok(json) = serde_json::to_string(meta) else { return };
+        if json != self.meta_sent && tx.send(crate::holder::Req::Meta(json.clone())).is_ok() {
+            self.meta_sent = json;
+        }
+    }
+
+    fn assemble(p: Parts) -> Agent {
+        let later = delayed_writer(p.io.clone());
         let now = Instant::now();
         let mut spark = VecDeque::with_capacity(SPARK_LEN);
         spark.extend(std::iter::repeat_n(0, SPARK_LEN));
-        Ok(Agent {
-            id,
-            name: spec.name,
-            kind: spec.kind,
-            cwd: spec.cwd,
-            command_line,
-            term,
-            sender,
+        Agent {
+            id: p.id,
+            name: p.name,
+            kind: p.kind,
+            cwd: p.cwd,
+            command_line: p.command_line,
+            term: p.term,
+            io: p.io,
             later,
             submit_free: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             screen_seen: std::cell::Cell::new(None),
             stopping: std::cell::Cell::new(false),
-            asked: first_prompt,
+            asked: false,
             last_cwd: std::cell::RefCell::new(None),
-            pty: master,
-            pid,
-            size,
+            pty: p.pty,
+            pid: p.pid,
+            holder: p.holder,
+            meta_sent: String::new(),
+            size: p.size,
             state: State::Starting,
             state_since: now,
             created: now,
@@ -461,12 +766,10 @@ impl Agent {
             reported: false,
             dismissed_at: None,
             last_resize: now,
-            activity: installing.clone().or(spec.branch_note).unwrap_or_else(|| "launching".into()),
-            last_prompt: spec.prompt,
-            // Copilot is restored with `--session-id`, which resumes the
-            // conversation or starts one under that id: always worth saving.
-            session_named_by_trix: fresh.is_some() && spec.kind == Kind::Grok,
-            session: spec.resume.or(fresh),
+            activity: "launching".into(),
+            last_prompt: None,
+            session_named_by_trix: false,
+            session: None,
             title: None,
             exit_code: None,
             last_output: now,
@@ -480,23 +783,23 @@ impl Agent {
             diff: None,
             transcript: None,
             context: None,
-            prompted: first_prompt.then(Instant::now),
+            prompted: None,
             turn_seen: false,
             managed_by: None,
             pinned: false,
             last_hook_seq: 0,
             title_attention: None,
             changes: Vec::new(),
-            installing,
+            installing: None,
             amp_welcome_at: None,
             pending_tool: None,
-        })
+        }
     }
 
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let b = bytes.into();
         if !b.is_empty() {
-            let _ = self.sender.send(Msg::Input(b));
+            self.io.input(b);
         }
     }
 
@@ -538,26 +841,26 @@ impl Agent {
         }
         self.size = (cols, lines);
         self.last_resize = Instant::now();
-        let _ = self.sender.send(Msg::Resize(window_size((cols, lines))));
+        self.io.resize((cols, lines));
         self.term.lock().resize(TermSize { cols: cols as usize, lines: lines as usize });
     }
 
     /// Stop it: hang up, and if its program ignores that, end it anyway in
-    /// the background (see `platform::stop`).
+    /// the background (see `platform::stop`). A holder does that itself.
     pub fn shutdown(&self) {
-        if self.hang_up() {
+        if self.hang_up() && self.holder.is_none() {
             let pid = self.pid;
             let _ = std::thread::Builder::new().name("trix-stop".into()).spawn(move || crate::platform::stop(&[pid], STOP_GRACE));
         }
     }
 
-    /// Close its terminal, which hangs up on its program. False if that
-    /// was done already.
+    /// Close its terminal, which hangs up on its program (a holder is told
+    /// to, and then ends). False if that was done already.
     pub fn hang_up(&self) -> bool {
         if self.stopping.replace(true) {
             return false;
         }
-        let _ = self.sender.send(Msg::Shutdown);
+        self.io.stop();
         true
     }
 
@@ -1198,7 +1501,12 @@ impl Agent {
     /// terminal's foreground process group says: the shell's own while at the
     /// prompt, the command's while one runs.
     pub fn running_command(&self) -> bool {
-        crate::platform::foreground_group(&self.pty).is_some_and(|g| g != self.pid as i32)
+        let group = match &self.pty {
+            Some(pty) => crate::platform::foreground_group(pty),
+            // A holder has the terminal: ask about it through the process.
+            None => crate::platform::foreground_group_of(self.pid),
+        };
+        group.is_some_and(|g| g != self.pid as i32)
     }
 
     /// Where its process is now. Once it has exited, its pid may be another
@@ -1226,11 +1534,36 @@ impl Agent {
 /// An agent that goes away takes its process and terminal with it. The app
 /// shuts agents down before it drops them anyway; this covers the rest
 /// (tests above all), where the event loop would otherwise keep the PTY
-/// open until the program inside exits on its own.
+/// open until the program inside exits on its own. Not an agent with a
+/// holder: a server that is going down (a panic unwinding, say) leaves those
+/// running for the next one, and only an explicit stop ends them.
 impl Drop for Agent {
     fn drop(&mut self) {
-        self.shutdown();
+        if self.holder.is_none() {
+            self.shutdown();
+        }
     }
+}
+
+/// Everything `Agent::assemble` needs that differs between agents.
+struct Parts {
+    id: u32,
+    name: String,
+    kind: Kind,
+    cwd: PathBuf,
+    command_line: String,
+    term: Arc<FairMutex<Term<Listener>>>,
+    io: Io,
+    pty: Option<std::fs::File>,
+    pid: u32,
+    holder: Option<u32>,
+    size: (u16, u16),
+}
+
+fn new_term(size: (u16, u16), listener: Listener) -> Arc<FairMutex<Term<Listener>>> {
+    let config = Config { scrolling_history: 10_000, ..Config::default() };
+    let tsize = TermSize { cols: size.0 as usize, lines: size.1 as usize };
+    Arc::new(FairMutex::new(Term::new(config, &tsize, listener)))
 }
 
 /// Does this screen text show an approval prompt or a question?
@@ -1485,7 +1818,7 @@ fn muse_settings_manage_hooks(settings: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(settings).is_ok_and(|v| v.get("managed_hooks_path").is_some_and(|p| !p.is_null()))
 }
 
-fn window_size((cols, lines): (u16, u16)) -> WindowSize {
+pub(crate) fn window_size((cols, lines): (u16, u16)) -> WindowSize {
     WindowSize { num_cols: cols, num_lines: lines, cell_width: 9, cell_height: 18 }
 }
 
@@ -1890,6 +2223,78 @@ mod tests {
         }
         assert!(a.running_command(), "sleep is in the foreground, not the shell");
         a.shutdown();
+    }
+
+    #[test]
+    fn a_held_terminal_works_like_a_local_one() {
+        let dir = std::env::temp_dir().join(format!("trix-test-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("bash", &["--norc", "--noprofile", "-i"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let att = crate::holder::attach(&path).unwrap();
+        let mut a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "bash".into(), att, tx);
+        assert_eq!(a.holder, Some(std::process::id()), "this test is its own holder");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!a.running_command(), "at the prompt");
+        a.resize(100, 30);
+        a.write(&b"stty size; sleep 5\r"[..]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !a.running_command() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.running_command(), "the foreground job, asked through the process");
+        assert!(a.screen_text().contains("30 100"), "resized through the holder: {:?}", a.screen_text());
+        // Its notes go to the holder, once per change.
+        let meta = a.meta(2, true, None, false);
+        a.send_meta(&meta);
+        let sent = a.meta_sent.clone();
+        a.send_meta(&meta);
+        assert_eq!(a.meta_sent, sent);
+        // Dropped without a stop (a server going down): the holder stays.
+        let pid = a.pid;
+        drop(a);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(crate::platform::alive(pid), "detaching isn't stopping");
+        let att = crate::holder::attach(&path).unwrap();
+        assert_eq!(serde_json::from_str::<Meta>(&att.hello.meta).unwrap(), meta, "the notes came back");
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "bash".into(), att, std::sync::mpsc::channel().0);
+        assert!(a.screen_text().contains("30 100"), "and the screen, from the replay");
+        a.shutdown();
+        serving.join().unwrap();
+        assert!(!crate::platform::alive(pid));
+        drop(rx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_replay_does_not_answer_old_questions() {
+        let dir = std::env::temp_dir().join(format!("trix-test-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        // Asks the terminal what it is (DA1), long before this server came.
+        let held = crate::holder::Held::start(&crate::holder::tests::spec("/bin/sh", &["-c", "printf 'asking\\033[c'; exec sleep 30"]), &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let att = loop {
+            let att = crate::holder::attach(&path).unwrap();
+            if att.replay.ends_with(b"\x1b[c") || Instant::now() > deadline {
+                break att;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(att.replay.ends_with(b"\x1b[c"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = Agent::held(1, "t".into(), Kind::Shell, std::env::temp_dir(), "sh".into(), att, tx);
+        assert!(a.screen_text().contains("asking"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rx.try_iter().all(|e| !matches!(e, AppEvent::PtyWrite(..))), "the emulator's answer isn't typed into the program again");
+        a.shutdown();
+        serving.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

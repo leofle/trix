@@ -104,8 +104,11 @@ fn check_private(dir: &Path) -> Result<(), String> {
 }
 
 /// Remove sockets / settings left behind by trix processes that died hard.
+/// Not the settings and plugins while a holder lives: its agent was started
+/// with them, by the server that died, and may read them again.
 pub fn sweep_stale() {
     let Ok(entries) = std::fs::read_dir(runtime_dir()) else { return };
+    let holders = !crate::holder::discover_all().is_empty();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let pid = name
@@ -118,6 +121,9 @@ pub fn sweep_stale() {
             .split('.')
             .next()
             .and_then(|p| p.parse::<u32>().ok());
+        if holders && !name.ends_with(".sock") {
+            continue;
+        }
         if pid.is_some_and(|pid| !crate::platform::alive(pid)) {
             if e.file_type().is_ok_and(|t| t.is_dir()) {
                 let _ = std::fs::remove_dir_all(e.path());
@@ -130,7 +136,7 @@ pub fn sweep_stale() {
 
 /// Where agents report (`TRIX_SOCKET`): one per session, not per server, so
 /// an agent still reaches the server that took over from the one that
-/// started it.
+/// started it (`App::reattach`).
 pub fn socket_path() -> PathBuf {
     crate::session::hooks_path()
 }

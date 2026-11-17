@@ -426,6 +426,9 @@ pub struct App {
     socket: PathBuf,
     integrations: crate::hooks::Integrations,
     exe: PathBuf,
+    /// Agents get a holder process of their own for their PTY (`holder`),
+    /// so they outlive this server. The server turns it on; tests don't.
+    pub holders: bool,
     pub term_focused: bool,
     next_id: u32,
     pub toast: Option<Toast>,
@@ -522,6 +525,7 @@ impl App {
             socket,
             integrations,
             exe,
+            holders: false,
             term_focused: true,
             next_id: 1,
             toast: None,
@@ -1276,11 +1280,94 @@ impl App {
     fn start(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
-        let agent = Agent::spawn(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe)?;
+        let agent = Agent::spawn_in(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe, self.holders)?;
         self.specs.insert(id, keep);
         self.agents.push(agent);
         self.sync_git_targets();
+        self.sync_holders();
         Ok(id)
+    }
+
+    /// Put back the agents whose holders outlived the last server (a crash,
+    /// a `kill -9`): their programs never stopped, and their screens come
+    /// back from the output the holders kept. Saved agents they cover are
+    /// dropped from the restore offer. How many came back.
+    pub fn reattach(&mut self) -> usize {
+        self.reattach_from(crate::holder::discover(crate::session::name()))
+    }
+
+    /// `reattach`, to the holders at these sockets: (agent id, socket).
+    fn reattach_from(&mut self, holders: Vec<(u32, PathBuf)>) -> usize {
+        let mut found = Vec::new();
+        for (id, path) in holders {
+            // A holder this server has already (ids are unique per session).
+            if self.agents.iter().any(|a| a.id == id) {
+                continue;
+            }
+            match crate::holder::attach(&path) {
+                Ok(att) => {
+                    let meta: crate::agent::Meta = serde_json::from_str(&att.hello.meta).unwrap_or_default();
+                    found.push((id, meta, att));
+                }
+                Err(e) => eprintln!("trix: could not reattach {}: {e}", path.display()),
+            }
+        }
+        found.sort_by_key(|(id, m, _)| (m.pos, *id));
+        let mut focus = None;
+        let n = found.len();
+        for (id, meta, att) in found {
+            // Notes from a newer trix, or none: still a terminal worth having.
+            let kind = Kind::from_label(&meta.kind).unwrap_or(Kind::Custom);
+            let base = if meta.name.is_empty() { kind.label() } else { meta.name.as_str() };
+            let name = self.unique_name(base);
+            let agent = Agent::reattach(id, kind, name, &meta, att, self.tx.clone());
+            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt: None, branch_note: None, resume: None };
+            if meta.parked && agent.state == State::Exited {
+                self.parked.insert(id);
+            }
+            self.specs.insert(id, spec);
+            self.agents.push(agent);
+            self.next_id = self.next_id.max(id.saturating_add(1));
+            if meta.focused {
+                focus = Some(self.agents.len() - 1);
+            }
+        }
+        if n == 0 {
+            return 0;
+        }
+        for i in 0..self.agents.len() {
+            if self.parked.contains(&self.agents[i].id) {
+                self.agents[i].activity = "restored · enter to start".into();
+            }
+        }
+        self.set_focus(focus.unwrap_or(0));
+        let names: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
+        if let Some(p) = &mut self.pending_restore {
+            let focused = p.agents.get(p.focus).filter(|s| !names.contains(&s.name)).map(|s| s.name.clone());
+            p.agents.retain(|s| !names.contains(&s.name));
+            p.focus = focused.and_then(|f| p.agents.iter().position(|s| s.name == f)).unwrap_or(0);
+            if p.agents.is_empty() {
+                self.pending_restore = None;
+            }
+        }
+        self.sync_git_targets();
+        self.sync_holders();
+        self.dirty = true;
+        n
+    }
+
+    /// Tell each agent's holder what a new server would need to put it back
+    /// (`agent::Meta`), when that changed.
+    pub fn sync_holders(&mut self) {
+        let focus = self.focus;
+        for (i, a) in self.agents.iter_mut().enumerate() {
+            if a.holder.is_none() {
+                continue;
+            }
+            let command = self.specs.get(&a.id).and_then(|s| s.command.clone());
+            let meta = a.meta(i, i == focus, command, self.parked.contains(&a.id));
+            a.send_meta(&meta);
+        }
     }
 
     fn launch_form(&mut self) {
@@ -1376,7 +1463,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let size = self.agents[idx].size;
-        match Agent::spawn(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, &self.integrations, &self.exe) {
+        match Agent::spawn_in(id, clone_spec(&spec), size, self.tx.clone(), &self.socket, &self.integrations, &self.exe, self.holders) {
             Ok(a) => {
                 self.agents[idx].shutdown();
                 self.agents[idx] = a;
@@ -1690,6 +1777,7 @@ impl App {
         }
         self.sync_git_targets();
         self.persist();
+        self.sync_holders();
         self.reload_config();
         // The clock and the timers: redraw when what they show changed.
         let shown = crate::ui::times_shown(self);
@@ -2807,10 +2895,13 @@ impl App {
 
     /// Stop every agent, and wait until each has. The server exits right
     /// after, and a program that ignores the hang-up (OpenCode 2) would
-    /// outlive it.
+    /// outlive it. Holders are told to stop theirs, and waited for: they
+    /// stop their program the same way, then end.
     pub fn shutdown_all(&mut self) {
-        let pids: Vec<u32> = self.agents.iter().filter(|a| a.hang_up()).map(|a| a.pid).collect();
+        let pids: Vec<u32> = self.agents.iter().filter(|a| a.hang_up() && a.holder.is_none()).map(|a| a.pid).collect();
+        let holders: Vec<u32> = self.agents.iter().filter_map(|a| a.holder).collect();
         crate::platform::stop(&pids, crate::agent::STOP_GRACE);
+        crate::holder::wait_gone(&holders, crate::agent::STOP_GRACE * 2 + Duration::from_secs(1));
     }
 }
 
@@ -3110,6 +3201,60 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_whose_holders_outlived_the_server_come_back() {
+        let dir = std::env::temp_dir().join(format!("trix-test-reattach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let mut spec = crate::holder::tests::spec("/bin/sh", &["-c", "echo before; while read l; do echo \"after $l\"; done"]);
+        spec.id = 7;
+        let meta = crate::agent::Meta {
+            kind: "shell".into(),
+            name: "counter".into(),
+            cwd: std::env::temp_dir(),
+            pos: 0,
+            focused: true,
+            pinned: true,
+            ..Default::default()
+        };
+        spec.meta = serde_json::to_string(&meta).unwrap();
+        let held = crate::holder::Held::start(&spec, &path).unwrap();
+        let pid = held.pid;
+        let serving = std::thread::spawn(move || held.serve());
+        // Its first output is in the holder's buffer before any server comes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !String::from_utf8_lossy(&crate::holder::attach(&path).unwrap().replay).contains("before") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut app = test_app();
+        let saved = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: "/tmp".into(), command: None, session: None, pinned: false };
+        app.pending_restore = Some(Saved::new(1, vec![saved("counter"), saved("other")]));
+        assert_eq!(app.reattach_from(vec![(7, path.clone())]), 1);
+        let a = &app.agents[0];
+        assert_eq!((a.id, a.name.as_str(), a.kind, a.pid, a.pinned, a.state), (7, "counter", Kind::Shell, pid, true, State::Idle));
+        assert!(a.screen_text().contains("before"), "the screen comes back from the replay: {:?}", a.screen_text());
+        assert_eq!(app.next_id, 8, "new agents can't take its id (its hooks report it)");
+        let offer: Vec<&str> = app.pending_restore.as_ref().unwrap().agents.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(offer, ["other"], "what came back isn't offered again");
+
+        // Typing reaches the program through the holder, and its answer the screen.
+        app.agents[0].write(&b"x\r"[..]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.agents[0].screen_text().contains("after x") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.agents[0].screen_text().contains("after x"));
+
+        // Closing it is the end of it: holder and program.
+        app.close(7);
+        serving.join().unwrap();
+        assert!(!crate::platform::alive(pid));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn test_app() -> App {
         let (tx, _rx) = std::sync::mpsc::channel();

@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod control;
 mod events;
+mod holder;
 mod hooks;
 mod input;
 mod install;
@@ -92,6 +93,7 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
                             (internal) install a missing agent in its pane, then
                             run it, with <text> as what it reads on stdin first
   trix server               (internal) the background workspace
+  trix holder               (internal) holds one agent's terminal for the server
 
   -s, --session <name>      work with a named session instead of the default
                             one, e.g. `trix -s work`, `trix ls -s work`
@@ -157,6 +159,9 @@ fn main() -> anyhow::Result<()> {
     }
     // Check the runtime folder now, while the terminal is still normal.
     hooks::runtime_dir();
+    if args.first().map(String::as_str) == Some("holder") {
+        std::process::exit(holder::main());
+    }
     // Before the session flags: everything after `--` is the agent's.
     if args.first().map(String::as_str) == Some("install") {
         std::process::exit(install::run(&args[1..]));
@@ -254,7 +259,9 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                if killed == 0 {
+                // And whatever servers that died hard left running.
+                let orphans = holder::kill_orphans(None);
+                if killed == 0 && orphans == 0 {
                     eprintln!("trix: no workspace running");
                     std::process::exit(1);
                 }
@@ -262,6 +269,8 @@ fn main() -> anyhow::Result<()> {
             }
             match session::send_once(session::name(), &ClientMsg::Kill) {
                 Ok(true) => {}
+                // No server, but maybe agents one that died hard left behind.
+                Ok(false) if holder::kill_orphans(Some(session::name())) > 0 => {}
                 Ok(false) => {
                     eprintln!("{}", missing());
                     std::process::exit(1);
@@ -421,6 +430,12 @@ fn server() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(RemoteBackend::new(out.clone()))?;
     let mut app = App::new(tx.clone(), socket.clone(), integrations.clone(), exe, out.clone());
     app.term_focused = false;
+    app.holders = true;
+    // Agents the last server left running (it crashed, or was killed).
+    let back = app.reattach();
+    if back > 0 {
+        eprintln!("trix: reattached {back} agent{} left running", if back == 1 { "" } else { "s" });
+    }
 
     const FRAME: Duration = Duration::from_millis(8); // ~120 fps ceiling
     const ANIM: Duration = Duration::from_millis(90);

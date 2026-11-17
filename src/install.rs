@@ -1,6 +1,6 @@
 //! Agents that aren't installed yet install in their own pane, then start.
 //!
-//! When an agent's command isn't on `PATH`, `Agent::spawn` runs
+//! When an agent's command isn't on `PATH`, `Agent::spawn_in` runs
 //! `trix install <kind> -- <command> <args…>` in the pane instead. That
 //! installs the agent with the first tool you have (mise, Homebrew, npm, then
 //! the vendor's own install script), with its output on screen, tells the
