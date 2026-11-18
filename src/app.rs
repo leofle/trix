@@ -1908,10 +1908,7 @@ impl App {
             let now = Instant::now();
             if completion_sound_due(*last, now) {
                 *last = Some(now);
-                match tone {
-                    crate::config::Tone::File(p) => crate::platform::play_file(&p),
-                    _ => play_completion_sound(),
-                }
+                play_sound(&tone);
             }
         }
         if bell {
@@ -2195,7 +2192,7 @@ impl App {
     /// Change a setting to the next value along, or with `forward` false
     /// the one before. The theme opens its list instead.
     fn change_setting(&mut self, row: Row, forward: bool) {
-        use crate::config::Tone;
+        use crate::config::{Builtin, Tone};
         let n = self.config.notify.clone();
         match row {
             Row::Theme => self.open_picker(),
@@ -2245,15 +2242,11 @@ impl App {
                 let needs_you = row == Row::SoundNeedsYou;
                 let (now, file) = if needs_you { (&self.config.sound.needs_you, &s.files[0]) } else { (&self.config.sound.done, &s.files[1]) };
                 let next = crate::settings::next_tone(now, file.as_deref(), forward);
-                let (key, default) = if needs_you { ("needs_you", Tone::Off) } else { ("done", Tone::Chime) };
+                let (key, default) = if needs_you { ("needs_you", Tone::Off) } else { ("done", Tone::Builtin(Builtin::Chime)) };
                 let text = crate::settings::tone_text(&next);
                 // Hear what it is now.
                 if self.set_config("sound", key, text.into(), next == default) && !cfg!(test) && std::env::var_os("TRIX_NO_SOUND").is_none() {
-                    match &next {
-                        Tone::Chime => play_completion_sound(),
-                        Tone::File(p) => crate::platform::play_file(p),
-                        Tone::Off => {}
-                    }
+                    play_sound(&next);
                 }
             }
         }
@@ -3246,15 +3239,19 @@ fn parse_shortstat(s: &str) -> (u32, u32, u32) {
     r
 }
 
-/// A burst of completions gets one chime, without delaying the workspace.
+/// A burst of completions gets one sound, without delaying the workspace.
 fn completion_sound_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2))
 }
 
-fn play_completion_sound() {
-    // Embed the approved chime so installed binaries need no asset directory.
-    const CHIME: &[u8] = include_bytes!("../assets/task-complete.wav");
-    crate::platform::play(CHIME);
+/// Play a sound once, in the background.
+fn play_sound(tone: &crate::config::Tone) {
+    use crate::config::Tone;
+    match tone {
+        Tone::Off => {}
+        Tone::Builtin(b) => crate::platform::play(b.name(), b.wav()),
+        Tone::File(p) => crate::platform::play_file(p),
+    }
 }
 
 fn desktop_notify(title: &str, body: &str, urgent: bool) {
@@ -4472,8 +4469,13 @@ mod tests {
         app.change_setting(Row::NotifyDone, true);
         assert!(app.config.notify.needs_you && !app.config.notify.done);
         assert!(std::fs::read_to_string(&path).unwrap().contains("on = [\"needs-you\"]"));
-        // Round the sounds: done is the chime, then off.
+        // Round the sounds: done is the chime, then the bell; back past
+        // the chime is off.
         app.change_setting(Row::SoundDone, true);
+        assert_eq!(app.config.sound.done, crate::config::Tone::Builtin(crate::config::Builtin::Bell));
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("[sound]\ndone = \"bell\"\n"));
+        app.change_setting(Row::SoundDone, false);
+        app.change_setting(Row::SoundDone, false);
         assert_eq!(app.config.sound.done, crate::config::Tone::Off);
         assert!(std::fs::read_to_string(&path).unwrap().ends_with("[sound]\ndone = \"off\"\n"));
         // The watcher reading it back finds nothing new to say.

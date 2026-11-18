@@ -331,12 +331,13 @@ fn osascript_notify(title: &str, body: &str) {
     }
 }
 
-/// Play a WAV file's bytes once, in the background.
-pub fn play(wav: &'static [u8]) {
+/// Play a WAV file's bytes once, in the background. `name` names its copy
+/// on macOS, so each sound needs its own.
+pub fn play(name: &'static str, wav: &'static [u8]) {
     if cfg!(target_os = "macos") {
-        // afplay only reads files: keep one copy next to the sockets.
+        // afplay only reads files: keep a copy of each next to the sockets.
         std::thread::spawn(move || {
-            let path = crate::hooks::runtime_dir().join("chime.wav");
+            let path = crate::hooks::runtime_dir().join(format!("{name}.wav"));
             if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(wav.len() as u64) && std::fs::write(&path, wav).is_err() {
                 return;
             }

@@ -8,7 +8,7 @@
 //! every running trix follows within a second.
 
 use crate::agent::Kind;
-use crate::config::{Paint, Restore, Tone};
+use crate::config::{Builtin, Paint, Restore, Tone};
 use crate::theme::Choice;
 use std::path::{Path, PathBuf};
 
@@ -93,7 +93,7 @@ pub struct Settings {
     /// The theme's name, as of opening or the last pick.
     pub theme: String,
     /// The sound files in the config when they opened, needs-you's and
-    /// done's: going round chime and off comes back to them.
+    /// done's: going round trix's own and off comes back to them.
     pub files: [Option<PathBuf>; 2],
     /// The strip's color when they opened, if it was a `#rrggbb` of
     /// yours: the same, for it.
@@ -164,7 +164,7 @@ pub fn restore_label(r: Restore) -> &'static str {
 pub fn tone_text(t: &Tone) -> String {
     match t {
         Tone::Off => "off".into(),
-        Tone::Chime => "chime".into(),
+        Tone::Builtin(b) => b.name().into(),
         Tone::File(p) => crate::app::tilde(p),
     }
 }
@@ -177,9 +177,10 @@ pub fn tone_label(t: &Tone) -> String {
     }
 }
 
-/// The next sound along: chime, off, and the file there was, if any.
+/// The next sound along: trix's own, off, and the file there was, if any.
 pub fn next_tone(now: &Tone, file: Option<&Path>, forward: bool) -> Tone {
-    let mut all = vec![Tone::Chime, Tone::Off];
+    let mut all: Vec<Tone> = Builtin::ALL.into_iter().map(Tone::Builtin).collect();
+    all.push(Tone::Off);
     all.extend(file.map(|f| Tone::File(f.to_path_buf())));
     cycle(&all, now, forward)
 }
@@ -274,11 +275,25 @@ mod tests {
     #[test]
     fn sounds_go_round() {
         let f = PathBuf::from("/x/ding.wav");
-        assert_eq!(next_tone(&Tone::Chime, None, true), Tone::Off);
-        assert_eq!(next_tone(&Tone::Off, None, true), Tone::Chime);
-        assert_eq!(next_tone(&Tone::Off, Some(&f), true), Tone::File(f.clone()), "back to the file there was");
-        assert_eq!(next_tone(&Tone::File(f.clone()), Some(&f), true), Tone::Chime);
-        assert_eq!(next_tone(&Tone::Chime, Some(&f), false), Tone::File(f.clone()));
+        let b = Tone::Builtin;
+        let round = |file: Option<&Path>, forward: bool| {
+            let mut seen = vec![b(Builtin::Chime)];
+            loop {
+                let next = next_tone(seen.last().unwrap(), file, forward);
+                if next == seen[0] {
+                    return seen.iter().map(tone_label).collect::<Vec<_>>();
+                }
+                seen.push(next);
+            }
+        };
+        assert_eq!(round(None, true), ["chime", "bell", "drop", "knock", "marimba", "off"]);
+        assert_eq!(round(None, false), ["chime", "off", "marimba", "knock", "drop", "bell"]);
+        assert_eq!(round(Some(&f), true), ["chime", "bell", "drop", "knock", "marimba", "off", "ding.wav"], "back to the file there was");
+        assert_eq!(round(Some(&f), false), ["chime", "ding.wav", "off", "marimba", "knock", "drop", "bell"]);
+        assert_eq!(next_tone(&Tone::File(PathBuf::from("/y/gone.wav")), Some(&f), true), b(Builtin::Chime), "one not in the round starts it");
+        assert_eq!(tone_text(&b(Builtin::Marimba)), "marimba", "as config.toml spells it");
+        assert_eq!(tone_text(&Tone::Off), "off");
+        assert_eq!(tone_text(&Tone::File(f.clone())), "/x/ding.wav");
         assert_eq!(tone_label(&Tone::File(f)), "ding.wav");
     }
 

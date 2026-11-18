@@ -136,9 +136,46 @@ impl Default for Notify {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tone {
     Off,
-    /// The built-in rising chime.
-    Chime,
+    /// One of trix's own sounds.
+    Builtin(Builtin),
     File(PathBuf),
+}
+
+/// trix's own sounds, in the binary so an install needs no asset folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Builtin {
+    /// Rising, the default for done.
+    Chime,
+    Bell,
+    Drop,
+    Knock,
+    Marimba,
+}
+
+impl Builtin {
+    /// In the order the settings go round them.
+    pub const ALL: [Builtin; 5] = [Builtin::Chime, Builtin::Bell, Builtin::Drop, Builtin::Knock, Builtin::Marimba];
+
+    /// As `config.toml` and the settings name it, and its file in `assets/`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Builtin::Chime => "chime",
+            Builtin::Bell => "bell",
+            Builtin::Drop => "drop",
+            Builtin::Knock => "knock",
+            Builtin::Marimba => "marimba",
+        }
+    }
+
+    pub fn wav(self) -> &'static [u8] {
+        match self {
+            Builtin::Chime => include_bytes!("../assets/chime.wav"),
+            Builtin::Bell => include_bytes!("../assets/bell.wav"),
+            Builtin::Drop => include_bytes!("../assets/drop.wav"),
+            Builtin::Knock => include_bytes!("../assets/knock.wav"),
+            Builtin::Marimba => include_bytes!("../assets/marimba.wav"),
+        }
+    }
 }
 
 impl Tone {
@@ -158,7 +195,7 @@ pub struct Sound {
 
 impl Default for Sound {
     fn default() -> Sound {
-        Sound { done: Tone::Chime, needs_you: Tone::Off, mute: Vec::new() }
+        Sound { done: Tone::Builtin(Builtin::Chime), needs_you: Tone::Off, mute: Vec::new() }
     }
 }
 
@@ -373,15 +410,21 @@ fn paint(what: &str, s: &str) -> Result<Paint, String> {
     }
 }
 
+/// A built-in sound's name is always that sound, even with a file of
+/// that name next to the config: `./bell` is the file.
 fn tone(what: &str, s: &str, dir: &Path) -> Result<Tone, String> {
-    match s.trim() {
+    let s = s.trim();
+    if let Some(&b) = Builtin::ALL.iter().find(|b| b.name() == s) {
+        return Ok(Tone::Builtin(b));
+    }
+    match s {
         "off" | "none" | "" => Ok(Tone::Off),
-        "chime" => Ok(Tone::Chime),
         p => {
             let p = crate::app::expand(p);
             let p = if p.is_absolute() { p } else { dir.join(p) };
             if !p.is_file() {
-                return Err(format!("{what}: no file at {}", crate::app::tilde(&p)));
+                let names: Vec<&str> = Builtin::ALL.iter().map(|b| b.name()).collect();
+                return Err(format!("{what}: no file at {}: use a sound file, or one of trix's ({}) or \"off\"", crate::app::tilde(&p), names.join(", ")));
             }
             Ok(Tone::File(p))
         }
@@ -873,6 +916,39 @@ mod tests {
         assert!(err("[notify]\non = [\"finished\"]").contains("'finished' is not an event"));
         assert!(err("[notify]\ncommand = \"\"").contains("empty"));
         assert!(err("[sound]\ndone = \"nope.wav\"").contains("no file at"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn built_in_sounds() {
+        let dir = std::env::temp_dir().join(format!("trix-config-sounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sound = |text: &str| parse(text, &dir).map(|c| c.sound);
+        let d = Sound::default();
+        assert_eq!((d.done, d.needs_you), (Tone::Builtin(Builtin::Chime), Tone::Off), "the defaults stay");
+        let names: Vec<&str> = Builtin::ALL.iter().map(|b| b.name()).collect();
+        assert_eq!(names, ["chime", "bell", "drop", "knock", "marimba"]);
+        for b in Builtin::ALL {
+            let s = sound(&format!("[sound]\ndone = \"{}\"\nneeds_you = \" {} \"\n", b.name(), b.name())).unwrap();
+            assert_eq!((s.done, s.needs_you), (Tone::Builtin(b), Tone::Builtin(b)), "{}", b.name());
+            // A WAV like the chime: 44.1 kHz, mono, 16-bit.
+            let w = b.wav();
+            assert!(w.starts_with(b"RIFF") && &w[8..16] == b"WAVEfmt ", "{}", b.name());
+            assert_eq!((u16::from_le_bytes([w[22], w[23]]), u32::from_le_bytes([w[24], w[25], w[26], w[27]]), u16::from_le_bytes([w[34], w[35]])), (1, 44100, 16), "{}", b.name());
+        }
+        let s = sound("[sound]\ndone = \"marimba\"\nneeds_you = \"knock\"\n").unwrap();
+        assert_eq!((s.done, s.needs_you), (Tone::Builtin(Builtin::Marimba), Tone::Builtin(Builtin::Knock)));
+        assert!(sound("[sound]\ndone = \"Bell\"\n").is_err(), "names are lowercase, as written");
+        // A file named like one is still the built-in one; its path is the file.
+        std::fs::write(dir.join("bell"), b"RIFF").unwrap();
+        assert_eq!(sound("[sound]\ndone = \"bell\"\n").unwrap().done, Tone::Builtin(Builtin::Bell));
+        assert_eq!(sound("[sound]\ndone = \"./bell\"\n").unwrap().done, Tone::File(dir.join("./bell")));
+        for off in ["off", "none", ""] {
+            assert_eq!(sound(&format!("[sound]\ndone = \"{off}\"\n")).unwrap().done, Tone::Off);
+        }
+        // A name trix doesn't have is looked for as a file, and the error names trix's.
+        let e = sound("[sound]\nneeds_you = \"marimbo\"\n").unwrap_err();
+        assert!(e.starts_with("sound.needs_you: no file at ") && e.contains("marimbo") && e.contains("chime, bell, drop, knock, marimba") && e.contains("off"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
