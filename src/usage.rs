@@ -26,8 +26,6 @@ const STANDARD: u64 = 200_000;
 const LONG: u64 = 1_000_000;
 /// How much of a log to read at a time.
 const CHUNK: u64 = 4 << 20;
-/// A Claude prompt past this many tokens is a long one (Haiku 5.5 charges more).
-const LONG_PROMPT: u64 = 100_000;
 /// How soon to look again for a log that wasn't there.
 const RELOOK: Duration = Duration::from_secs(10);
 
@@ -77,13 +75,14 @@ pub struct Target {
 
 pub type Targets = Arc<Mutex<Vec<Target>>>;
 
-/// One kind of model call, as it's priced: which model, in fast mode or not,
-/// with a long prompt or not.
+/// One kind of model call, as it's priced: which model, in fast mode or
+/// not, and how long its prompt was (`cost::tier`: some models charge more
+/// past a size).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bucket {
     pub model: String,
     pub fast: bool,
-    pub long: bool,
+    pub prompt: u32,
 }
 
 /// Tokens used, by how they're charged.
@@ -188,7 +187,7 @@ pub fn claude_spend(v: &Value) -> Option<(Option<String>, Bucket, Tokens)> {
     let bucket = Bucket {
         model: model.to_string(),
         fast: u.get("speed").and_then(Value::as_str) == Some("fast"),
-        long: t.input + t.cache_write() + t.cache_read > LONG_PROMPT,
+        prompt: crate::cost::tier(t.input + t.cache_write() + t.cache_read),
     };
     let id = msg.get("id").and_then(Value::as_str).map(str::to_string);
     Some((id, bucket, t))
@@ -205,6 +204,11 @@ pub fn codex_total(v: &Value) -> Option<Tokens> {
     let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
     let (read, written) = (n("cached_input_tokens"), n("cache_write_input_tokens"));
     Some(Tokens { input: n("input_tokens").saturating_sub(read + written), cache_write_5m: written, cache_write_1h: 0, cache_read: read, output: n("output_tokens") })
+}
+
+/// How long a Codex count's last prompt was.
+pub fn codex_prompt(v: &Value) -> u64 {
+    v.pointer("/payload/info/last_token_usage/input_tokens").and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// The model a Codex turn runs on, from its `turn_context` line.
@@ -323,7 +327,8 @@ impl Log {
             self.codex_total = total;
             if new.total() > 0 {
                 let model = self.codex_model.clone().unwrap_or_else(|| "unknown".into());
-                self.spend.entry(Bucket { model, fast: false, long: false }).or_default().add(&new);
+                let prompt = crate::cost::tier(codex_prompt(&v));
+                self.spend.entry(Bucket { model, fast: false, prompt }).or_default().add(&new);
             }
         }
     }
@@ -618,7 +623,7 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         let mut log = Log::new(path.clone());
         log.advance();
-        let b = Bucket { model: "claude-opus-5-5".into(), fast: false, long: false };
+        let b = Bucket { model: "claude-opus-5-5".into(), fast: false, prompt: 0 };
         assert_eq!(log.spend.get(&b), Some(&Tokens { input: 20, cache_write_5m: 200, cache_write_1h: 400, cache_read: 2000, output: 8 }));
         // Fast mode and long prompts are priced apart; subagents count.
         let mut fast = turn("c", 1);
@@ -627,7 +632,7 @@ mod tests {
         fast["message"]["usage"]["cache_read_input_tokens"] = json!(200_000);
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(line(&fast).as_bytes()).unwrap();
         log.advance();
-        assert_eq!(log.spend.get(&Bucket { fast: true, long: true, ..b.clone() }).map(|t| t.cache_read), Some(200_000));
+        assert_eq!(log.spend.get(&Bucket { fast: true, prompt: 200, ..b.clone() }).map(|t| t.cache_read), Some(200_000));
         // No breakdown by TTL: a 5-minute write.
         let (_, _, t) = claude_spend(&json!({"type": "assistant", "message": {"model": "m", "usage": {"cache_creation_input_tokens": 9}}})).unwrap();
         assert_eq!((t.cache_write_5m, t.cache_write_1h), (9, 0));
@@ -648,7 +653,7 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         let mut log = Log::new(path);
         log.advance();
-        let b = |m: &str| Bucket { model: m.into(), fast: false, long: false };
+        let b = |m: &str| Bucket { model: m.into(), fast: false, prompt: 0 };
         assert_eq!(log.spend.get(&b("gpt-5-codex")), Some(&Tokens { input: 400, cache_read: 600, output: 50, ..Default::default() }), "a count repeated isn't more");
         assert_eq!(log.spend.get(&b("gpt-5.2")), Some(&Tokens { input: 600, cache_read: 1400, output: 30, ..Default::default() }), "what was added since");
         let _ = std::fs::remove_dir_all(dir);

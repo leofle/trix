@@ -47,6 +47,8 @@ pub enum AppEvent {
     Context(u32, Option<crate::usage::Context>),
     /// An agent's tokens so far changed.
     Spend(u32, crate::usage::Spend),
+    /// The live price list: read from the cache, fetched, or failed to be.
+    Prices(crate::prices::Feed),
     /// Attach / detach / control traffic; handled by the server loop.
     Session(SessionEvent),
 }
@@ -494,6 +496,9 @@ pub struct App {
     closed_spend: crate::usage::Spend,
     /// How near the workspace's budget it was last told to be.
     budget_level: u8,
+    /// The live price list, and the fetcher's settings (the config's).
+    pub price_feed: crate::prices::Feed,
+    price_settings: Arc<Mutex<crate::prices::Settings>>,
     pub last_title: String,
     pub pane_size: (u16, u16),
     /// Read-only terminals watching (`trix view`).
@@ -552,6 +557,11 @@ impl App {
         } else {
             (crate::config::path(), crate::theme::own_path())
         };
+        let price_settings = Arc::new(Mutex::new(crate::prices::Settings { enabled: config.cost.live_prices, url: config.cost.prices_url.clone() }));
+        // Tests never go online, nor read the developer's cached prices.
+        if !cfg!(test) {
+            crate::prices::spawn_fetcher(price_settings.clone(), tx.clone());
+        }
         let mut app = App {
             agents: Vec::new(),
             specs: HashMap::new(),
@@ -596,6 +606,8 @@ impl App {
             usage_targets,
             closed_spend: Default::default(),
             budget_level: 0,
+            price_feed: Default::default(),
+            price_settings,
             last_title: String::new(),
             pane_size: (80, 24),
             viewers: 0,
@@ -681,6 +693,7 @@ impl App {
             Ok(c) => {
                 self.config = c;
                 self.sync_agent_themes();
+                *self.price_settings.lock().unwrap() = crate::prices::Settings { enabled: self.config.cost.live_prices, url: self.config.cost.prices_url.clone() };
                 // A budget the new settings put spend past says so, with the reload.
                 match self.check_budgets() {
                     Some(said) => self.toast(format!("config reloaded · {said}"), self.toast.as_ref().map_or(ToastKind::Info, |t| t.kind)),
@@ -931,7 +944,12 @@ impl App {
     }
 
     pub fn cost_of(&self, spend: &crate::usage::Spend) -> crate::cost::Cost {
-        crate::cost::cost(spend, &self.config.cost.prices)
+        crate::cost::cost(spend, &self.config.cost.prices, self.live_prices())
+    }
+
+    /// The live price list, unless the config turned it off.
+    pub fn live_prices(&self) -> Option<&crate::prices::Live> {
+        self.price_feed.live.as_deref().filter(|_| self.config.cost.live_prices)
     }
 
     /// The workspace's level (`cost::level`) against its budget, and one agent's against its.
@@ -1902,6 +1920,11 @@ impl App {
                     self.agents[i].context = ctx;
                     self.dirty = true;
                 }
+            }
+            AppEvent::Prices(feed) => {
+                self.price_feed = feed;
+                let _ = self.check_budgets();
+                self.dirty = true;
             }
             AppEvent::Spend(id, spend) => {
                 if let Some(i) = self.index_of(id) {
@@ -3461,7 +3484,7 @@ mod tests {
     }
 
     fn spend_of(model: &str, input: u64, output: u64) -> crate::usage::Spend {
-        crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, long: false }, crate::usage::Tokens { input, output, ..Default::default() })])
+        crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, prompt: 0 }, crate::usage::Tokens { input, output, ..Default::default() })])
     }
 
     #[test]

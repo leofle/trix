@@ -2937,7 +2937,7 @@ mod tests {
     }
 
     fn spend_of(model: &str, input: u64, output: u64) -> crate::usage::Spend {
-        crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, long: false }, crate::usage::Tokens { input, output, ..Default::default() })])
+        crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, prompt: 0 }, crate::usage::Tokens { input, output, ..Default::default() })])
     }
 
     #[test]

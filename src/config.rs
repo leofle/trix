@@ -38,13 +38,16 @@ pub struct CostOpts {
     pub agent_budget: Option<f64>,
     /// Warn this far into a budget, in percent.
     pub warn_at: u8,
-    /// Per model: added to trix's own prices, or put in their place.
+    /// Per model: ahead of the live list and trix's own prices.
     pub prices: BTreeMap<String, crate::cost::Price>,
+    /// Fetch the live price list (and use it).
+    pub live_prices: bool,
+    pub prices_url: String,
 }
 
 impl Default for CostOpts {
     fn default() -> CostOpts {
-        CostOpts { budget: None, agent_budget: None, warn_at: 80, prices: BTreeMap::new() }
+        CostOpts { budget: None, agent_budget: None, warn_at: 80, prices: BTreeMap::new(), live_prices: true, prices_url: crate::prices::DEFAULT_URL.into() }
     }
 }
 
@@ -285,6 +288,8 @@ struct FileCost {
     warn_at: Option<i64>,
     #[serde(default)]
     prices: BTreeMap<String, FilePrice>,
+    live_prices: Option<bool>,
+    prices_url: Option<String>,
 }
 
 /// USD per million tokens.
@@ -460,11 +465,15 @@ fn cost_opts(f: FileCost) -> Result<CostOpts, String> {
             cache_read: p.cache_read.unwrap_or(p.input / 10.0),
             cache_write,
             cache_write_1h: p.cache_write_1h.unwrap_or(cache_write),
-            long: 1.0,
         };
         prices.insert(model, price);
     }
-    Ok(CostOpts { budget: money("budget", f.budget)?, agent_budget: money("agent_budget", f.agent_budget)?, warn_at, prices })
+    let prices_url = match f.prices_url.as_deref().map(str::trim) {
+        None => crate::prices::DEFAULT_URL.to_string(),
+        Some(u) if u.starts_with("https://") || u.starts_with("http://") => u.to_string(),
+        Some(u) => return Err(format!("cost.prices_url: '{u}' is not an http(s) URL")),
+    };
+    Ok(CostOpts { budget: money("budget", f.budget)?, agent_budget: money("agent_budget", f.agent_budget)?, warn_at, prices, live_prices: f.live_prices.unwrap_or(true), prices_url })
 }
 
 fn paint(what: &str, s: &str) -> Result<Paint, String> {
@@ -881,6 +890,11 @@ mod tests {
         assert!(read("[cost.prices.x]\ninput = 3\n").unwrap_err().contains("output"));
         assert!(read("[cost.prices.x]\ninput = 3\noutput = -1\n").unwrap_err().contains("0 or more"));
         assert!(read("[cost]\nlimit = 3\n").unwrap_err().contains("limit"));
+        let c = read("").unwrap().cost;
+        assert_eq!((c.live_prices, c.prices_url.as_str()), (true, crate::prices::DEFAULT_URL), "fetched by default");
+        let c = read("[cost]\nlive_prices = false\nprices_url = \"https://example.com/p.json\"\n").unwrap().cost;
+        assert_eq!((c.live_prices, c.prices_url.as_str()), (false, "https://example.com/p.json"));
+        assert!(read("[cost]\nprices_url = \"file:///etc/passwd\"\n").unwrap_err().contains("http(s)"));
     }
 
     #[test]

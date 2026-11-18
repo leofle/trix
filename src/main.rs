@@ -14,6 +14,7 @@ mod modes;
 #[cfg(target_os = "macos")]
 mod notifier;
 mod platform;
+mod prices;
 mod search;
 mod session;
 mod settings;
