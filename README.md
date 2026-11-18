@@ -113,8 +113,8 @@ trix kill --all           # stop every running session
 - `s` sends every note to the agent as one prompt: each one with its file, line number and the line itself, then what you wrote. It's guarded like `trix send`: an agent that needs you, a shell or one still starting isn't typed into, and the notes are kept.
 - `C` stages everything and commits it with the message you type. If the commit fails (a hook says no, say), what was staged before is put back. `P` pushes the branch to `origin` (or the only remote) under its own name, so a branch that tracks `origin/main` doesn't push to main. `O` pushes and runs `gh pr create --fill`.
 - `M` merges a worktree's branch into the branch the main checkout is on, there (`--no-ff`), or with `g` merges its pull request instead (`gh pr merge --merge`), offered once the branch has been pushed. It refuses while there are uncommitted changes, when the main checkout has uncommitted changes of its own, or when there's nothing to merge; a merge that conflicts is aborted, so nothing changes, and the files that conflicted are named.
-- `X` cleans up a worktree: it closes the agent, then `git worktree remove` and `git branch -d`. Neither is forced: a worktree with changes is refused before anything happens, and a branch that isn't merged yet is kept.
-- Push, PR, merge and clean up ask first. Every step runs in the background and says how it went at the foot of the review, or as a toast once it's closed. git and gh are never left waiting on a password prompt.
+- `X` cleans up a worktree: it closes the agent, then `git worktree remove` and `git branch -d`. Neither is forced: a worktree with changes is refused before anything happens, and the branch is deleted only once the main checkout's branch has it, so a branch that's pushed but not merged there is kept.
+- Each git key looks again at the branch and remotes first, so a remote added while the review is open counts without a reload. Push, PR, merge and clean up ask first. Every step runs in the background and says how it went at the foot of the review, or as a toast once it's closed. git and gh are never left waiting on a password prompt.
 
 ### Agent control
 

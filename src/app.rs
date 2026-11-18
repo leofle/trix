@@ -3067,6 +3067,9 @@ impl App {
                             'M' => Op::Merge,
                             _ => Op::Cleanup,
                         };
+                        if r.busy.is_none() {
+                            r.refresh_place();
+                        }
                         if let Some(busy) = &r.busy {
                             r.status = Some((format!("still {}…", busy.doing()), false));
                         } else if let Some(why) = r.refusal(&op) {
@@ -4079,6 +4082,24 @@ mod tests {
         app.handle(ev);
         assert!(!wt.exists());
         assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("removed the worktree")), "{:?}", app.toast.as_ref().map(|t| &t.text));
+    }
+
+    #[test]
+    fn a_remote_added_while_the_review_is_open_counts_at_once() {
+        let (mut app, _rx, _keep, wt) = review_app("app-remote");
+        let url = crate::review::git(&wt, &["remote", "get-url", "origin"]).unwrap();
+        crate::review::git(&wt, &["remote", "remove", "origin"]).unwrap();
+        hit(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT);
+        assert!(review_of(&app).status.as_ref().unwrap().0.starts_with("no remote"));
+        // Added with the review still open: P asks to push, no reload needed.
+        crate::review::git(&wt, &["remote", "add", "origin", &url]).unwrap();
+        hit(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT);
+        assert!(matches!(review_of(&app).mode, crate::review::Mode::Confirm(crate::review::Op::Push, 0)));
+        hit(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        hit(&mut app, KeyCode::Char('O'), KeyModifiers::SHIFT);
+        assert!(matches!(review_of(&app).mode, crate::review::Mode::Confirm(crate::review::Op::Pr, 0)));
+        // The diff isn't read again: notes and the cursor stay.
+        assert!(!review_of(&app).files.is_empty());
     }
 
     #[test]

@@ -353,6 +353,15 @@ impl Review {
         })
     }
 
+    /// Look again at where the folder sits (its branch, remote, what's
+    /// pushed and merged), keeping the diff: before a git step, so a remote
+    /// added since the review opened counts.
+    pub fn refresh_place(&mut self) {
+        if let Ok(p) = place(&self.dir) {
+            self.place = p;
+        }
+    }
+
     /// Read the diff again, and put the notes back on their lines.
     pub fn reload(&mut self) -> Result<(), String> {
         self.place = place(&self.dir)?;
@@ -585,9 +594,17 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
             }
             // No --force: git keeps a worktree with changes in it.
             git(&p.main, &["worktree", "remove", &top.display().to_string()])?;
+            // `branch -d` also takes a branch merged into its upstream, so a
+            // pushed branch would go though the main checkout never got it.
+            // Only the main checkout's branch decides.
+            let kept = |why: String| Ok(format!("removed the worktree; kept {branch}, {why}"));
+            let Some(base) = &p.base else { return kept("as the main checkout has no branch to tell if it's merged".into()) };
+            if git(&p.main, &["merge-base", "--is-ancestor", &branch, base]).is_err() {
+                return kept(if p.pushed { format!("pushed but not merged into {base}") } else { format!("which isn't merged into {base} yet") });
+            }
             match git(&p.main, &["branch", "-d", &branch]) {
                 Ok(_) => Ok(format!("removed the worktree and {branch}")),
-                Err(_) => Ok(format!("removed the worktree; kept {branch}, which isn't merged yet")),
+                Err(e) => kept(format!("as git wouldn't delete it: {e}")),
             }
         }
     }
@@ -849,7 +866,7 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(sh(&main, &["rev-parse", "HEAD"]), head);
         assert_eq!(sh(&main, &["status", "--porcelain", "--untracked-files=no"]), "");
         // Cleaning up keeps the branch git won't delete safely.
-        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w, which isn't merged yet");
+        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w, which isn't merged into main yet");
         assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_ok());
     }
 
@@ -892,6 +909,18 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(keys(&r), ["l", "esc"]);
         assert!(r.refusal(&Op::Push).unwrap().starts_with("no remote"));
         assert!(r.refusal(&Op::Pr).unwrap().starts_with("no remote"));
+    }
+
+    #[test]
+    fn a_pushed_branch_main_never_got_is_kept() {
+        let (_keep, main, wt) = repo("pushed-unmerged");
+        std::fs::write(wt.join("c.txt"), "c\n").unwrap();
+        perform(&Op::Commit("c".into()), &wt).unwrap();
+        perform(&Op::Push, &wt).unwrap();
+        // Merged into its upstream, so `branch -d` alone would take it.
+        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w, pushed but not merged into main");
+        assert!(!wt.exists());
+        assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_ok());
     }
 
     #[test]
