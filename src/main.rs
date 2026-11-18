@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod config;
+mod cost;
 mod control;
 mod events;
 mod folders;
@@ -13,6 +14,7 @@ mod modes;
 #[cfg(target_os = "macos")]
 mod notifier;
 mod platform;
+mod prices;
 mod search;
 mod session;
 mod settings;

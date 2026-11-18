@@ -649,6 +649,74 @@ struct JsonAgent<'a> {
     managed_by: Option<&'a str>,
     /// How full its context window is (Claude and Codex), when known.
     context: Option<JsonContext>,
+    /// Its tokens and what they cost (Claude and Codex), once it has used any.
+    spend: Option<JsonSpend>,
+}
+
+#[derive(Serialize)]
+struct JsonPrices {
+    /// "live": the fetched list, ahead of trix's own; "built-in": trix's
+    /// own only. `[cost.prices]` in config.toml comes first either way.
+    source: &'static str,
+    /// The list is fetched (`[cost] live_prices`).
+    fetching: bool,
+    url: String,
+    /// When the list in use was fetched (Unix seconds), and how long ago.
+    fetched_at: Option<u64>,
+    age_seconds: Option<u64>,
+    models: Option<usize>,
+    /// The last fetch's failure, until one succeeds; the last good list stays in use.
+    last_error: Option<String>,
+}
+
+impl JsonPrices {
+    fn new(app: &App) -> JsonPrices {
+        let c = &app.config.cost;
+        let live = app.live_prices();
+        JsonPrices {
+            source: if live.is_some() { "live" } else { "built-in" },
+            fetching: c.live_prices,
+            url: live.map_or(c.prices_url.clone(), |l| l.url.clone()),
+            fetched_at: live.map(|l| l.fetched_at),
+            age_seconds: live.map(|l| crate::prices::now().saturating_sub(l.fetched_at)),
+            models: live.map(|l| l.models.len()),
+            last_error: app.price_feed.error.clone().filter(|_| c.live_prices),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct JsonSpend {
+    input_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    /// At list prices; for a subscription, what the same work would cost.
+    cost_usd: f64,
+    /// False when some tokens are from a model with no price: they're
+    /// counted, and left out of the cost.
+    cost_complete: bool,
+    budget_usd: Option<f64>,
+    over_budget: bool,
+}
+
+impl JsonSpend {
+    fn new(app: &App, spend: &crate::usage::Spend, budget: Option<f64>) -> JsonSpend {
+        let t = crate::usage::total(spend);
+        let c = app.cost_of(spend);
+        JsonSpend {
+            input_tokens: t.input,
+            cache_write_tokens: t.cache_write(),
+            cache_read_tokens: t.cache_read,
+            output_tokens: t.output,
+            total_tokens: t.total(),
+            cost_usd: (c.usd * 10_000.0).round() / 10_000.0,
+            cost_complete: c.unpriced == 0,
+            budget_usd: budget,
+            over_budget: budget.is_some_and(|b| c.usd >= b),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -673,6 +741,10 @@ struct JsonDiff {
 struct JsonList<'a> {
     session: &'a str,
     viewers: usize,
+    /// Every agent's spend added up, agents closed since the server started too.
+    totals: JsonSpend,
+    /// Where model prices come from.
+    prices: JsonPrices,
     agents: Vec<JsonAgent<'a>>,
 }
 
@@ -702,9 +774,12 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
             exit_code: a.exit_code,
             managed_by: a.managed_by.as_deref(),
             context: a.context.map(|c| JsonContext { used: c.used, window: c.window, left: c.left(), used_percent: c.used_percent(), window_exact: c.exact }),
+            spend: (crate::usage::total(&a.spend).total() > 0).then(|| JsonSpend::new(app, &a.spend, app.config.cost.agent_budget)),
         })
         .collect();
-    let mut s = serde_json::to_string_pretty(&JsonList { session: session::name(), viewers: app.viewers, agents }).unwrap_or_default();
+    let totals = JsonSpend::new(app, &app.totals(), app.config.cost.budget);
+    let prices = JsonPrices::new(app);
+    let mut s = serde_json::to_string_pretty(&JsonList { session: session::name(), viewers: app.viewers, totals, prices, agents }).unwrap_or_default();
     s.push('\n');
     s
 }
@@ -713,6 +788,53 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
 mod tests {
     use super::*;
     use crate::agent::test_agent;
+
+    #[test]
+    fn ls_json_has_spend_and_totals() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.config.cost.budget = Some(5.0);
+        for (id, model) in [(1, "claude-opus-5-5"), (2, "gpt-6.1-sol"), (3, "")] {
+            let mut a = test_agent(Kind::Claude);
+            a.id = id;
+            if !model.is_empty() {
+                let b = crate::usage::Bucket { model: model.into(), fast: false, prompt: 0 };
+                a.spend.insert(b, crate::usage::Tokens { input: 1_000_000, cache_read: 500_000, cache_write_1h: 10_000, output: 100_000, ..Default::default() });
+            }
+            app.agents.push(a);
+        }
+        let v: serde_json::Value = serde_json::from_str(&listing_json(&app, None)).unwrap();
+        let s = &v["agents"][0]["spend"];
+        // 4 + 0.1 + 0.08 + 2.
+        assert_eq!(s["cost_usd"], 6.18);
+        assert_eq!((s["input_tokens"].as_u64(), s["cache_read_tokens"].as_u64(), s["cache_write_tokens"].as_u64(), s["output_tokens"].as_u64()), (Some(1_000_000), Some(500_000), Some(10_000), Some(100_000)));
+        assert_eq!((s["total_tokens"].as_u64(), s["cost_complete"].as_bool(), s["budget_usd"].is_null()), (Some(1_610_000), Some(true), true));
+        assert_eq!(v["agents"][1]["spend"]["cost_complete"], false, "no price for its model");
+        assert!(v["agents"][2]["spend"].is_null(), "nothing spent yet");
+        let t = &v["totals"];
+        assert_eq!((t["total_tokens"].as_u64(), t["cost_usd"].as_f64()), (Some(3_220_000), Some(6.18)));
+        assert_eq!((t["cost_complete"].as_bool(), t["budget_usd"].as_f64(), t["over_budget"].as_bool()), (Some(false), Some(5.0), Some(true)));
+        let p = &v["prices"];
+        assert_eq!((p["source"].as_str(), p["fetching"].as_bool(), p["fetched_at"].is_null()), (Some("built-in"), Some(true), true), "nothing fetched yet");
+        // A list arrives: gpt-6.1-sol gets its price, and the source says so.
+        let sol = crate::cost::Tiered { base: crate::cost::Price::openai(2.0, 10.0, 0.1), above: vec![] };
+        let fetched = crate::prices::now() - 3600;
+        let live = crate::prices::Live::from_models("https://example.com/p.json", fetched, [("gpt-6.1-sol".to_string(), sol)]);
+        app.handle(crate::app::AppEvent::Prices(crate::prices::Feed { live: Some(std::sync::Arc::new(live)), error: Some("curl: (6) Could not resolve host".into()) }));
+        let v: serde_json::Value = serde_json::from_str(&listing_json(&app, None)).unwrap();
+        let p = &v["prices"];
+        assert_eq!((p["source"].as_str(), p["url"].as_str(), p["fetched_at"].as_u64(), p["models"].as_u64()), (Some("live"), Some("https://example.com/p.json"), Some(fetched), Some(1)));
+        assert!(p["age_seconds"].as_u64().is_some_and(|a| (3600..3700).contains(&a)), "{p}");
+        assert_eq!(p["last_error"], "curl: (6) Could not resolve host", "the last good list stays in use");
+        // 2 + 0.05 + 0.02 + 1.
+        assert_eq!((v["agents"][1]["spend"]["cost_usd"].as_f64(), v["agents"][1]["spend"]["cost_complete"].as_bool()), (Some(3.07), Some(true)));
+        // Turned off: trix's own prices only.
+        app.config.cost.live_prices = false;
+        let v: serde_json::Value = serde_json::from_str(&listing_json(&app, None)).unwrap();
+        assert_eq!((v["prices"]["source"].as_str(), v["prices"]["fetching"].as_bool(), v["prices"]["last_error"].is_null()), (Some("built-in"), Some(false), true));
+        assert_eq!(v["agents"][1]["spend"]["cost_complete"], false);
+    }
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()

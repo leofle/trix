@@ -308,6 +308,10 @@ pub struct Agent {
     pub transcript: Option<PathBuf>,
     /// How full its context window is, from that log.
     pub context: Option<crate::usage::Context>,
+    /// Its tokens so far, from that log (and its subagents').
+    pub spend: crate::usage::Spend,
+    /// How near its budget it was last told to be (`cost::level`).
+    pub budget_level: u8,
     /// A prompt is on its way in (`trix send`, or a first prompt at launch)
     /// and no turn has visibly started since. `trix wait` treats that as
     /// work, so the end of the previous turn, or `SessionStart`, isn't taken
@@ -942,6 +946,8 @@ impl Agent {
             diff: None,
             transcript: None,
             context: None,
+            spend: Default::default(),
+            budget_level: 0,
             prompted: None,
             turn_seen: false,
             managed_by: None,
