@@ -282,7 +282,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 
 | key | action |
 | --- | --- |
-| `alt+n` | new agent (kind, folder, first prompt, worktree). The kind row has claude · codex · shell · custom command, then *more ▸*, which opens in place as `→` reaches it: grok · opencode · cursor · copilot · muse · gemini · antigravity · amp (the row scrolls to the ones that don't fit). A kind picked from *more* shows in its place. `c` `x` `g` `o` `u` `p` `m` `i` `a` `e` `s` pick claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell, under *more* or not. `[new] kinds` sets the row (see [Config](#config)) |
+| `alt+n` | new agent (kind, folder, first prompt, worktree). The kind row has claude · codex · shell · custom command, then *more ▸*, which opens in place as `→` reaches it: grok · opencode · cursor · copilot · muse · gemini · antigravity · amp (the row scrolls to the ones that don't fit). A kind picked from *more* shows in its place. `c` `x` `g` `o` `u` `p` `m` `i` `a` `e` `s` pick claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell, under *more* or not. `[new] kinds` sets the row (see [Config](#config)). The Folder field lists folders under it: the ones that complete the path you type (`tab` completes, as a shell does), and ones proposed before you type, which a word narrows: where agents are open, where you started some before, and the git repositories beside this one. `↑↓` pick, `enter` or a click takes one |
 | `alt+1…9` / `alt+j` `alt+k` | jump / next / previous |
 | `alt+a` | next agent that needs you |
 | `alt+g` | grid ⇄ focus |
