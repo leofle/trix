@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod control;
 mod events;
+mod folders;
 mod holder;
 mod hooks;
 mod input;
