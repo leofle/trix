@@ -15,6 +15,7 @@ mod modes;
 mod notifier;
 mod platform;
 mod prices;
+mod review;
 mod search;
 mod session;
 mod settings;

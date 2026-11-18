@@ -171,6 +171,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             backdrop(f.buffer_mut(), area, &t);
         }
         settings(f, app, area, &t);
+    } else if matches!(app.modal, Some(Modal::Review(_))) {
+        backdrop(f.buffer_mut(), area, &t);
+        review(f, app, area, &t);
     } else if app.modal.is_some() {
         backdrop(f.buffer_mut(), area, &t);
         let mut hits = Vec::new();
@@ -307,7 +310,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> (Vec<(Rect, Ac
     let mut spans = vec![Span::raw(" ")];
     let hints: Vec<(String, String, Option<Action>)> = if app.modal.is_some() {
         // A list or a page of help has nothing to cancel.
-        let leaves = matches!(app.modal, Some(Modal::Help | Modal::Settings(_) | Modal::Search(_) | Modal::Menu(_)));
+        let leaves = matches!(app.modal, Some(Modal::Help | Modal::Settings(_) | Modal::Search(_) | Modal::Menu(_) | Modal::Review(_)));
         vec![("esc".into(), (if leaves { "close" } else { "cancel" }).into(), None)]
     } else {
         let n = app.selected.len();
@@ -657,6 +660,13 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, size: S
     }
     spans.push(Span::styled(git, Style::new().fg(t.dim)));
     if let Some((ad, de)) = diff {
+        // A click on the count opens the review.
+        let x = spans.iter().map(|s| s.width()).sum::<usize>() as u16;
+        let width = (ad.width() + de.width()) as u16;
+        if x < r.width {
+            let hit = Rect { x: r.x + x, y: r.y + 2, width: width.min(r.width - x), height: 1 };
+            app.hits.diffs.borrow_mut().push((hit, a.id));
+        }
         spans.push(Span::styled(ad, Style::new().fg(mix(t.green, t.dim, 0.2))));
         spans.push(Span::styled(de, Style::new().fg(mix(t.red, t.dim, 0.2))));
     }
@@ -1549,7 +1559,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
     app.dialog_hidden.set(false);
     let Some(m) = &app.modal else { return };
     match m {
-        Modal::Menu(_) | Modal::Settings(_) => {}
+        Modal::Menu(_) | Modal::Settings(_) | Modal::Review(_) => {}
         Modal::Search(s) => search_box(f, app, s, area, t, hits),
         Modal::New(form) => {
             // The kind row keeps the main kinds and "more ▸", so new kinds
@@ -2099,6 +2109,224 @@ fn agent_menu(f: &mut Frame, app: &mut App, m: crate::app::Menu, area: Rect, t: 
     }
 }
 
+// ───────────────────────────── review ─────────────────────────────
+
+/// A row of the review: a line of the diff, or the note under one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ReviewRow {
+    Line(usize),
+    Note(usize),
+}
+
+/// The review's rows, in order: each line, and under a line with a note
+/// (or the one being written) the note.
+pub fn review_rows(r: &crate::review::Review) -> Vec<ReviewRow> {
+    let writing = matches!(r.mode, crate::review::Mode::Note(_)).then_some(r.cursor);
+    let mut rows = Vec::with_capacity(r.lines.len() + r.notes.len());
+    for i in 0..r.lines.len() {
+        rows.push(ReviewRow::Line(i));
+        if writing == Some(i) || r.note_at(i).is_some() {
+            rows.push(ReviewRow::Note(i));
+        }
+    }
+    rows
+}
+
+/// A diff line's text as one row of cells: tabs as spaces, no controls.
+fn diff_text(s: &str) -> String {
+    s.replace('\t', "    ").chars().filter(|c| !c.is_control()).collect()
+}
+
+fn review(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
+    use crate::review::{Kind as L, Mode};
+    let Some(Modal::Review(rv)) = &app.modal else { return };
+    let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
+    if r.width < 20 || r.height < 8 {
+        return;
+    }
+    f.render_widget(Clear, r);
+    let name = app.agents.iter().find(|a| a.id == rv.agent).map(|a| a.name.clone()).unwrap_or_default();
+    let title = if name.is_empty() { "Review".to_string() } else { format!("Review · {name}") };
+    let block = modal_block(&title, t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let inner = Rect { x: inner.x + 1, width: inner.width.saturating_sub(2), ..inner };
+    let w = inner.width as usize;
+
+    // The head: where it is, what changed, how many notes.
+    let p = &rv.place;
+    let mut head = vec![Span::styled(p.branch.clone().unwrap_or_else(|| "detached HEAD".into()), Style::new().fg(t.magenta).add_modifier(Modifier::BOLD))];
+    if let Some(base) = &p.base {
+        head.push(Span::styled(format!(" → {base}"), Style::new().fg(t.dim)));
+        if let Some(n) = p.ahead {
+            head.push(Span::styled(format!(" · {n} commit{} ahead", if n == 1 { "" } else { "s" }), Style::new().fg(t.dim)));
+        }
+    }
+    head.push(Span::styled("   ", Style::new()));
+    if rv.files.is_empty() {
+        head.push(Span::styled("nothing uncommitted", Style::new().fg(t.dim)));
+    } else {
+        let n = rv.files.len();
+        head.push(Span::styled(format!("{n} file{} ", if n == 1 { "" } else { "s" }), Style::new().fg(t.fg)));
+        head.push(Span::styled(format!("+{}", rv.added()), Style::new().fg(t.green)));
+        head.push(Span::styled(format!(" −{}", rv.removed()), Style::new().fg(t.red)));
+    }
+    if !rv.notes.is_empty() {
+        let n = rv.notes.len();
+        head.push(Span::styled(format!("   ● {n} note{}", if n == 1 { "" } else { "s" }), Style::new().fg(t.yellow)));
+    }
+    f.render_widget(Paragraph::new(TLine::from(head)), Rect { height: 1, ..inner });
+
+    // The diff, between the head and the foot.
+    let body = Rect { y: inner.y + 2, height: inner.height.saturating_sub(6), ..inner };
+    let rows = review_rows(rv);
+    let fit = body.height as usize;
+    rv.page.set(fit.saturating_sub(2).max(1));
+    let cur = rows.iter().position(|&x| x == ReviewRow::Line(rv.cursor)).unwrap_or(0);
+    // The cursor's line and its note stay on screen; the view scrolls only
+    // when they'd leave it.
+    let last = cur + usize::from(rows.get(cur + 1) == Some(&ReviewRow::Note(rv.cursor)));
+    let mut top = rv.top.get().min(rows.len().saturating_sub(fit));
+    if cur < top {
+        top = cur;
+    } else if last >= top + fit {
+        top = last + 1 - fit;
+    }
+    rv.top.set(top);
+    let mut hits = Vec::new();
+    let mut cursor_at = None;
+    if rows.is_empty() {
+        let text = "Nothing uncommitted here. Commits not merged yet can still be pushed, opened as a PR or merged.";
+        f.render_widget(Paragraph::new(Span::styled(trunc(text, w), Style::new().fg(t.dim))), Rect { height: 1, ..body });
+    }
+    let num = |n: Option<u32>| n.map(|n| format!("{n:>4}")).unwrap_or_else(|| "    ".into());
+    for (k, row) in rows.iter().skip(top).take(fit).enumerate() {
+        let y = body.y + k as u16;
+        let rect = Rect { y, height: 1, ..body };
+        match *row {
+            ReviewRow::Line(i) => {
+                let l = &rv.lines[i];
+                let on = i == rv.cursor;
+                let noted = rv.note_at(i).is_some();
+                let mark = Span::styled(if noted { "●" } else if on { "›" } else { " " }, Style::new().fg(if noted { t.yellow } else { t.accent }));
+                let (band, spans) = match l.kind {
+                    L::File => {
+                        let file = &rv.files[l.file];
+                        let mut v = vec![mark, Span::styled(format!(" {}", l.text), Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD))];
+                        if !file.status.is_empty() {
+                            v.push(Span::styled(format!("  {}", file.status), Style::new().fg(t.cyan)));
+                        }
+                        v.push(Span::styled(format!("  +{}", file.added), Style::new().fg(t.green)));
+                        v.push(Span::styled(format!(" −{}", file.removed), Style::new().fg(t.red)));
+                        (Some(t.surface_hi), v)
+                    }
+                    L::Hunk => (None, vec![mark, Span::styled(format!("           {}", diff_text(&l.text)), Style::new().fg(t.magenta))]),
+                    L::Meta => (None, vec![mark, Span::styled(format!("           {}", diff_text(&l.text)), Style::new().fg(t.dim).add_modifier(Modifier::ITALIC))]),
+                    kind => {
+                        let (sign, c, bg) = match kind {
+                            L::Add => ("+", t.green, Some(mix(t.green, t.surface, 0.88))),
+                            L::Del => ("-", t.red, Some(mix(t.red, t.surface, 0.88))),
+                            _ => (" ", t.fg, None),
+                        };
+                        let gutter = format!("{} {} ", num(l.old), num(l.new));
+                        let text = trunc(&diff_text(&l.text), w.saturating_sub(13));
+                        (bg, vec![mark, Span::styled(gutter, Style::new().fg(t.muted)), Span::styled(format!("{sign} {text}"), Style::new().fg(c))])
+                    }
+                };
+                let band = if on { Some(t.selection) } else { band };
+                let style = band.map(|b| Style::new().bg(b)).unwrap_or_default();
+                f.render_widget(Paragraph::new(TLine::from(spans)).style(style), rect);
+                hits.push((rect, i));
+            }
+            ReviewRow::Note(i) => {
+                let lead = Span::styled("            ↳ ", Style::new().fg(t.yellow));
+                let room = w.saturating_sub(15);
+                match &rv.mode {
+                    Mode::Note(inp) if i == rv.cursor => {
+                        let (spans, cur) = input_spans(inp, true, "your note for the agent · enter keeps it, esc drops it", t, room);
+                        let mut line = vec![lead];
+                        line.extend(spans);
+                        f.render_widget(Paragraph::new(TLine::from(line)).style(Style::new().bg(t.surface_hi)), rect);
+                        cursor_at = cur.map(|cx| (rect.x + 14 + cx, y));
+                    }
+                    _ => {
+                        let body = rv.note_at(i).map(|n| n.body.as_str()).unwrap_or("");
+                        let line = vec![lead, Span::styled(trunc(body, room), Style::new().fg(t.yellow))];
+                        f.render_widget(Paragraph::new(TLine::from(line)), rect);
+                    }
+                }
+                hits.push((rect, i));
+            }
+        }
+    }
+
+    // The foot: the review's keys, git's, then what's going on or the
+    // commit message.
+    let foot = Rect { y: inner.bottom().saturating_sub(3), height: 1, ..inner };
+    type Keys = &'static [(&'static str, &'static str)];
+    let (keys, git): (Keys, Keys) = match rv.mode {
+        Mode::Browse => (
+            &[("↑↓", "move"), ("[ ]", "file"), ("enter", "note"), ("x", "drop note"), ("n", "next note"), ("s", "send notes to the agent")],
+            &[("C", "commit all"), ("P", "push"), ("O", "open PR"), ("M", "merge"), ("X", "clean up worktree"), ("r", "reload")],
+        ),
+        Mode::Note(_) => (&[("enter", "keep note"), ("esc", "drop it")], &[]),
+        Mode::Commit(_) => (&[("enter", "stage everything and commit"), ("esc", "cancel")], &[]),
+        Mode::Confirm(..) => (&[("enter", "choose"), ("esc", "keep")], &[]),
+    };
+    f.render_widget(Paragraph::new(key_help(keys, t)), foot);
+    f.render_widget(Paragraph::new(key_help(git, t)), Rect { y: foot.y + 1, ..foot });
+    let under = Rect { y: foot.y + 2, ..foot };
+    match &rv.mode {
+        Mode::Commit(inp) => {
+            let label = "commit message › ";
+            let (spans, cur) = input_spans(inp, true, "what this commit does", t, w.saturating_sub(label.len() + 1));
+            let mut line = vec![Span::styled(label, Style::new().fg(t.accent))];
+            line.extend(spans);
+            f.render_widget(Paragraph::new(TLine::from(line)), under);
+            cursor_at = cur.map(|cx| (under.x + label.chars().count() as u16 + cx, under.y));
+        }
+        _ => {
+            let (text, color) = match &rv.status {
+                Some((s, ok)) => (s.clone(), if rv.busy.is_some() { t.accent } else if *ok { t.green } else { t.red }),
+                None => (format!("notes go to {name} as one prompt · {}", crate::app::tilde(&rv.dir)), t.muted),
+            };
+            f.render_widget(Paragraph::new(Span::styled(trunc(&text, w), Style::new().fg(color))), under);
+        }
+    }
+
+    let mut dialog = Vec::new();
+    if let Mode::Confirm(op, sel) = &rv.mode {
+        let branch = p.branch.clone().unwrap_or_default();
+        let (title, text) = match op {
+            crate::review::Op::Push => ("Push".to_string(), format!("Push {branch} to the remote?")),
+            crate::review::Op::Pr => ("Open a pull request".into(), format!("Push {branch} and open a pull request with gh?")),
+            crate::review::Op::Merge => ("Merge".into(), format!("Merge {branch} into {} in {}?", p.base.clone().unwrap_or_default(), crate::app::tilde(&p.main))),
+            _ => ("Clean up".into(), format!("Close {name}, remove {} and delete {branch} if it's merged?", crate::app::tilde(&p.top))),
+        };
+        let all: &[(&str, &str)] = if *op == crate::review::Op::Merge { &crate::app::MERGE_BUTTONS } else { &crate::app::CONFIRM_BUTTONS };
+        let first = if matches!(op, crate::review::Op::Cleanup) { t.red } else { t.green };
+        let b = centered(area, (text.width() as u16 + 8).max(56), 7);
+        f.render_widget(Clear, b);
+        let block = modal_block(&title, t);
+        let bi = block.inner(b);
+        f.render_widget(block, b);
+        let lines = Rows::new(bi, 0, false).fit(&[0, 2, 1, 3]);
+        if let Some(row) = lines[1] {
+            f.render_widget(Paragraph::new(Span::styled(text.clone(), Style::new().fg(t.fg))).alignment(Alignment::Center), row);
+        }
+        if let Some(row) = lines[3] {
+            buttons(f, row, t, all, *sel, first, &mut dialog);
+        }
+        cursor_at = None;
+    }
+    if let Some(at) = cursor_at {
+        f.set_cursor_position(at);
+    }
+    app.hits.review = Some(r);
+    app.hits.review_rows = hits;
+    app.hits.dialog = dialog;
+}
+
 // ───────────────────────────── settings ─────────────────────────────
 
 fn settings(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
@@ -2409,7 +2637,7 @@ fn key_pair(a: &str, b: &str) -> String {
 }
 
 fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
-    let r = centered(area, 82, 19);
+    let r = centered(area, 82, 20);
     f.render_widget(Clear, r);
     let block = modal_block("Keys", t);
     let inner = block.inner(r);
@@ -2423,6 +2651,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Attention), "next one that needs you"),
         (k(Action::Broadcast), "broadcast a prompt"),
         (k(Action::Search), "search all scrollback"),
+        (k(Action::Review), "review diff, then merge"),
         (k(Action::Rename), "rename · double-click"),
         (k(Action::Close), "close"),
         (k(Action::Menu), "menu · or right-click"),
@@ -2517,6 +2746,39 @@ mod tests {
 
     fn keys(app: &mut App) {
         app.modal = Some(Modal::Help);
+    }
+
+    #[test]
+    fn the_review_shows_the_diff_its_notes_and_its_steps() {
+        let (_keep, _main, wt) = crate::review::tests::repo("ui");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\n").unwrap();
+        let open = |mode: fn(&mut crate::review::Review)| {
+            let wt = wt.clone();
+            move |app: &mut App| {
+                let mut r = crate::review::Review::open(9, &wt).unwrap();
+                let add = r.lines.iter().position(|l| l.kind == crate::review::Kind::Add).unwrap();
+                r.set_note(add, "keep it lower case");
+                mode(&mut r);
+                app.modal = Some(Modal::Review(Box::new(r)));
+            }
+        };
+        let lines = dialog(open(|_| {}), 100, 30);
+        let all = lines.join("\n");
+        for want in ["Review", "trix/w → main · 0 commits ahead", "1 file +1 −1", "● 1 note", "a.txt", "@@ -1,2 +1,2 @@", "    2      - two", "●        2 + TWO", "↳ keep it lower case", "s send notes", "M merge", "X clean up"] {
+            assert!(all.contains(want), "{want:?} missing:\n{all}");
+        }
+        // The note sits right under its line.
+        let at = lines.iter().position(|l| l.contains("+ TWO")).unwrap();
+        assert!(lines[at + 1].contains("↳ keep it lower case"), "{all}");
+        // Writing a commit message, and asking before a merge.
+        let lines = dialog(open(|r| r.mode = crate::review::Mode::Commit(TextInput::new("Shout"))), 100, 30);
+        assert!(lines.iter().any(|l| l.contains("commit message › Shout")), "{lines:#?}");
+        let lines = dialog(open(|r| r.mode = crate::review::Mode::Confirm(crate::review::Op::Merge, 0)), 100, 30);
+        let all = lines.join("\n");
+        assert!(all.contains("Merge trix/w into main in") && all.contains("merge locally") && all.contains("merge the PR"), "{all}");
+        // Too small a window draws nothing rather than a broken panel.
+        let lines = dialog(open(|_| {}), 18, 6);
+        assert!(!lines.join("").contains("Review"));
     }
 
     /// The rows from a dialog's top border to its bottom one, and the rest.

@@ -43,6 +43,8 @@ pub enum AppEvent {
     Clipboard(String),
     Hook(HookMsg),
     Git(u32, Option<String>, Option<(u32, u32, u32)>),
+    /// A review's git step finished: the agent, the step, what came of it.
+    Review(u32, crate::review::Op, crate::review::Outcome),
     /// An agent's context use changed (`None`: a fresh conversation, nothing yet).
     Context(u32, Option<crate::usage::Context>),
     /// An agent's tokens so far changed.
@@ -294,6 +296,8 @@ pub enum Modal {
     Menu(Menu),
     /// alt+, or "settings" in the bottom bar.
     Settings(Settings),
+    /// alt+v: an agent's diff, its notes, and the git steps after it.
+    Review(Box<crate::review::Review>),
 }
 
 /// One agent's menu: right-click it, or the menu key for the focused one.
@@ -310,6 +314,8 @@ pub struct Menu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuItem {
     Rename,
+    /// Its diff, to review, commit and merge.
+    Review,
     Restart,
     CopyPath,
     Close,
@@ -321,6 +327,7 @@ impl MenuItem {
     pub fn label(self) -> &'static str {
         match self {
             MenuItem::Rename => "Rename",
+            MenuItem::Review => "Review diff",
             MenuItem::Restart => "Restart",
             MenuItem::CopyPath => "Copy folder path",
             MenuItem::Close => "Close",
@@ -332,6 +339,7 @@ impl MenuItem {
     pub fn letter(self) -> char {
         match self {
             MenuItem::Rename => 'r',
+            MenuItem::Review => 'v',
             MenuItem::Restart => 's',
             MenuItem::CopyPath => 'f',
             MenuItem::Close => 'c',
@@ -343,6 +351,7 @@ impl MenuItem {
     pub fn action(self) -> Option<Action> {
         match self {
             MenuItem::Rename => Some(Action::Rename),
+            MenuItem::Review => Some(Action::Review),
             MenuItem::Close => Some(Action::Close),
             MenuItem::Select => Some(Action::Select),
             MenuItem::Restart | MenuItem::CopyPath => None,
@@ -397,6 +406,12 @@ pub struct HitMap {
     pub settings_rows: Vec<(Rect, usize)>,
     /// What can be clicked in an open dialog.
     pub dialog: Vec<(Rect, DialogHit)>,
+    /// Each card's diff count: click it to review that diff. Cards are
+    /// drawn from `&App`, hence the cell.
+    pub diffs: std::cell::RefCell<Vec<(Rect, u32)>>,
+    /// The review's diff, and each line on screen, by number.
+    pub review: Option<Rect>,
+    pub review_rows: Vec<(Rect, usize)>,
 }
 
 /// Something in a dialog a click works.
@@ -421,6 +436,8 @@ pub enum DialogHit {
 /// The buttons of the yes/no dialogs, left to right: the label, and the key
 /// that presses it. The first is the one Enter presses when the dialog opens.
 pub const CONFIRM_BUTTONS: [(&str, &str); 2] = [("y", "yes"), ("esc", "keep")];
+/// A review's merge: here, on GitHub, or not at all.
+pub const MERGE_BUTTONS: [(&str, &str); 3] = [("l", "merge locally"), ("g", "merge the PR"), ("esc", "keep")];
 pub const RESTORE_BUTTONS: [(&str, &str); 3] = [("y", "restore"), ("n", "start fresh"), ("esc", "later")];
 
 struct Drag {
@@ -1037,7 +1054,7 @@ impl App {
             items.extend([MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
             return items;
         }
-        let mut items = vec![MenuItem::Rename];
+        let mut items = vec![MenuItem::Rename, MenuItem::Review];
         if a.state == State::Exited {
             items.push(MenuItem::Restart);
         }
@@ -1062,7 +1079,7 @@ impl App {
             MenuItem::CopyPath => format!("Copy {} folder path{}", n, if n == 1 { "" } else { "s" }),
             MenuItem::Close => format!("Close {}", agents(n)),
             MenuItem::Select => "Unselect all".into(),
-            MenuItem::Rename => item.label().into(),
+            MenuItem::Rename | MenuItem::Review => item.label().into(),
         }
     }
 
@@ -1099,7 +1116,7 @@ impl App {
         let Some(i) = self.index_of(id) else { return };
         if self.menu_is_bulk(id) {
             match item {
-                MenuItem::Rename => {}
+                MenuItem::Rename | MenuItem::Review => {}
                 MenuItem::Restart => self.restart_selected(),
                 MenuItem::CopyPath => {
                     let paths: Vec<String> = self.selected_agents().map(|a| a.live_cwd().display().to_string()).collect();
@@ -1113,6 +1130,7 @@ impl App {
         }
         match item {
             MenuItem::Rename => self.start_rename(id),
+            MenuItem::Review => self.open_review(id),
             MenuItem::Restart => self.restart(i),
             MenuItem::CopyPath => {
                 // Where it is now: a shell may have moved since it started.
@@ -1676,7 +1694,9 @@ impl App {
             a.shutdown();
             crate::usage::merge(&mut self.closed_spend, &a.spend);
             // A menu or dialog about it has nothing left to act on.
-            if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent, _)) if agent == id) {
+            if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent, _)) if agent == id)
+                || matches!(&self.modal, Some(Modal::Review(r)) if r.agent == id)
+            {
                 self.modal = None;
             }
             self.selected.retain(|&s| s != id);
@@ -1940,6 +1960,7 @@ impl App {
                     self.dirty = true;
                 }
             }
+            AppEvent::Review(id, op, outcome) => self.review_done(id, op, outcome),
         }
     }
 
@@ -2119,6 +2140,10 @@ impl App {
                     self.start_rename(id);
                 }
             }
+            Action::Review => match self.focused().map(|a| a.id) {
+                Some(id) => self.open_review(id),
+                None => self.toast("no agent to review yet", ToastKind::Info),
+            },
             Action::Close => {
                 if !self.selected.is_empty() {
                     self.ask_close_selected();
@@ -2636,6 +2661,10 @@ impl App {
             self.settings_key(k);
             return;
         }
+        if matches!(self.modal, Some(Modal::Review(_))) {
+            self.review_key(k);
+            return;
+        }
         let Some(modal) = &mut self.modal else { return };
         if k.code == KeyCode::Esc {
             // With a folder chosen on the form's list, esc first puts it
@@ -2651,7 +2680,7 @@ impl App {
         }
         match modal {
             // Handled above.
-            Modal::Menu(_) | Modal::Settings(_) => {}
+            Modal::Menu(_) | Modal::Settings(_) | Modal::Review(_) => {}
             Modal::Help => self.modal = None,
             Modal::Search(s) => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -2920,6 +2949,266 @@ impl App {
         self.dirty = true;
     }
 
+    /// Open an agent's diff for review (alt+v, its menu, a click on its
+    /// diff count).
+    pub fn open_review(&mut self, id: u32) {
+        let Some(i) = self.index_of(id) else { return };
+        let a = &self.agents[i];
+        let (name, dir) = (a.name.clone(), a.live_cwd());
+        match crate::review::Review::open(id, &dir) {
+            Ok(r) => self.modal = Some(Modal::Review(Box::new(r))),
+            Err(e) => self.toast(format!("{name}: {e}"), ToastKind::Info),
+        }
+        self.dirty = true;
+    }
+
+    fn review_key(&mut self, k: KeyEvent) {
+        use crate::review::{Mode, Op};
+        self.dirty = true;
+        let Some(Modal::Review(r)) = &mut self.modal else { return };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match &mut r.mode {
+            Mode::Note(t) | Mode::Commit(t) if k.code == KeyCode::Esc => {
+                let _ = t;
+                r.mode = Mode::Browse;
+            }
+            Mode::Note(t) => match k.code {
+                KeyCode::Enter => {
+                    let body = t.text.clone();
+                    let at = r.cursor;
+                    r.set_note(at, &body);
+                    r.mode = Mode::Browse;
+                }
+                _ => {
+                    t.key(&k);
+                }
+            },
+            Mode::Commit(t) => match k.code {
+                KeyCode::Enter if !t.text.trim().is_empty() => {
+                    let op = Op::Commit(t.text.trim().to_string());
+                    r.mode = Mode::Browse;
+                    self.start_review_op(op);
+                }
+                KeyCode::Enter => {}
+                _ => {
+                    t.key(&k);
+                }
+            },
+            Mode::Confirm(op, sel) => {
+                let merge = *op == Op::Merge;
+                let n = if merge { MERGE_BUTTONS.len() } else { CONFIRM_BUTTONS.len() };
+                let pick = match k.code {
+                    KeyCode::Esc => Some(n - 1),
+                    KeyCode::Char('c' | 'g') if ctrl => Some(n - 1),
+                    KeyCode::Char('y') if !merge => Some(0),
+                    KeyCode::Char('l') if merge => Some(0),
+                    KeyCode::Char('g') if merge => Some(1),
+                    KeyCode::Char('n') => Some(n - 1),
+                    KeyCode::Enter | KeyCode::Char(' ') => Some(*sel),
+                    KeyCode::Left | KeyCode::BackTab => {
+                        *sel = (*sel + n - 1) % n;
+                        None
+                    }
+                    KeyCode::Right | KeyCode::Tab => {
+                        *sel = (*sel + 1) % n;
+                        None
+                    }
+                    _ => None,
+                };
+                let Some(pick) = pick else { return };
+                let op = op.clone();
+                r.mode = Mode::Browse;
+                match (pick, merge) {
+                    (p, _) if p == n - 1 => {}
+                    (1, true) => self.start_review_op(Op::MergePr),
+                    _ if op == Op::Cleanup => self.clean_up_worktree(),
+                    _ => self.start_review_op(op),
+                }
+            }
+            Mode::Browse => {
+                let page = r.page.get().max(1) as isize;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
+                    KeyCode::Char('c' | 'g') if ctrl => self.modal = None,
+                    KeyCode::Down | KeyCode::Char('j') => r.step(1),
+                    KeyCode::Up | KeyCode::Char('k') => r.step(-1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => r.step(page),
+                    KeyCode::PageUp => r.step(-page),
+                    KeyCode::Char('d') if ctrl => r.step(page / 2),
+                    KeyCode::Char('u') if ctrl => r.step(-page / 2),
+                    KeyCode::Home | KeyCode::Char('g') => r.cursor = 0,
+                    KeyCode::End | KeyCode::Char('G') => r.step(isize::MAX / 2),
+                    KeyCode::Char(']') | KeyCode::Tab => r.next_file(true),
+                    KeyCode::Char('[') | KeyCode::BackTab => r.next_file(false),
+                    KeyCode::Char('n') => r.next_note(true),
+                    KeyCode::Char('N') => r.next_note(false),
+                    KeyCode::Enter | KeyCode::Char('c') if !r.lines.is_empty() => {
+                        let have = r.note_at(r.cursor).map(|n| n.body.clone()).unwrap_or_default();
+                        r.mode = Mode::Note(TextInput::new(&have));
+                    }
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        let at = r.cursor;
+                        r.set_note(at, "");
+                    }
+                    KeyCode::Char('s') => self.send_review_notes(),
+                    KeyCode::Char('r') => {
+                        let res = r.reload();
+                        r.status = Some(match res {
+                            Ok(()) => ("read the diff again".into(), true),
+                            Err(e) => (e, false),
+                        });
+                    }
+                    KeyCode::Char(c @ ('C' | 'P' | 'O' | 'M' | 'X')) => {
+                        let op = match c {
+                            'C' => Op::Commit(String::new()),
+                            'P' => Op::Push,
+                            'O' => Op::Pr,
+                            'M' => Op::Merge,
+                            _ => Op::Cleanup,
+                        };
+                        if let Some(busy) = &r.busy {
+                            r.status = Some((format!("still {}…", busy.doing()), false));
+                        } else if let Some(why) = r.refusal(&op) {
+                            r.status = Some((why, false));
+                        } else if matches!(op, Op::Commit(_)) {
+                            r.mode = Mode::Commit(TextInput::default());
+                        } else {
+                            r.mode = Mode::Confirm(op, 0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn review_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        let row = self.hits.review_rows.iter().find(|(r, _)| inside(r)).map(|&(_, i)| i);
+        let dialog = self.hits.dialog.iter().find(|(r, _)| inside(r)).map(|&(_, h)| h);
+        let Some(Modal::Review(r)) = &mut self.modal else { return };
+        match m.kind {
+            MouseEventKind::ScrollDown => r.step(3),
+            MouseEventKind::ScrollUp => r.step(-3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let (crate::review::Mode::Confirm(_, sel), Some(DialogHit::Button(b))) = (&mut r.mode, dialog) {
+                    *sel = b;
+                    self.review_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    return;
+                }
+                if let (crate::review::Mode::Browse, Some(i)) = (&r.mode, row) {
+                    r.cursor = i;
+                } else if !self.hits.review.is_some_and(|r| inside(&r)) && matches!(r.mode, crate::review::Mode::Browse) {
+                    self.modal = None;
+                }
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
+    /// Type the review's notes into its agent as one prompt, guarded the
+    /// way `trix send` is: never into a prompt it's waiting on.
+    fn send_review_notes(&mut self) {
+        let Some(Modal::Review(r)) = &mut self.modal else { return };
+        if r.notes.is_empty() {
+            r.status = Some(("no notes to send: enter or c on a line leaves one".into(), false));
+            return;
+        }
+        let (id, text, n) = (r.agent, r.feedback(), r.notes.len());
+        let Some(i) = self.index_of(id) else { return };
+        if let Some(why) = crate::control::send_refusal(&self.agents[i]) {
+            let why = why.replace(" (--force to type it anyway)", "").replace(" — leave it to the human, or --force", "");
+            if let Some(Modal::Review(r)) = &mut self.modal {
+                r.status = Some((format!("not sent, notes kept: {why}"), false));
+            }
+            return;
+        }
+        let a = &mut self.agents[i];
+        let mode = *a.term.lock().mode();
+        a.submit(input::encode_paste(&text, mode));
+        a.prompted = Some(Instant::now());
+        let name = a.name.clone();
+        self.modal = None;
+        self.toast(format!("sent {n} review note{} to {name}", if n == 1 { "" } else { "s" }), ToastKind::Good);
+    }
+
+    /// Start a review's git step in the background.
+    fn start_review_op(&mut self, op: crate::review::Op) {
+        let Some(Modal::Review(r)) = &mut self.modal else { return };
+        if r.busy.is_some() {
+            return;
+        }
+        let (id, dir) = (r.agent, r.dir.clone());
+        r.status = Some((format!("{}…", op.doing()), true));
+        r.busy = Some(op.clone());
+        self.run_review_op(id, dir, op);
+    }
+
+    fn run_review_op(&mut self, id: u32, dir: PathBuf, op: crate::review::Op) {
+        let tx = self.tx.clone();
+        let started = std::thread::Builder::new().name("trix-review".into()).spawn(move || {
+            let outcome = crate::review::perform(&op, &dir);
+            let _ = tx.send(AppEvent::Review(id, op, outcome));
+        });
+        if started.is_err() {
+            if let Some(Modal::Review(r)) = &mut self.modal {
+                r.busy = None;
+            }
+            self.toast("couldn't start git", ToastKind::Bad);
+        }
+    }
+
+    /// The worktree is done with: close its agent, then remove the folder
+    /// and its branch (`git worktree remove` and `branch -d`, never forced).
+    fn clean_up_worktree(&mut self) {
+        let Some(Modal::Review(r)) = &self.modal else { return };
+        let (id, dir) = (r.agent, r.dir.clone());
+        let Some(i) = self.index_of(id) else { return };
+        let a = &self.agents[i];
+        if matches!(a.state, State::Working | State::Blocked | State::Starting) {
+            let what = if a.state == State::Blocked { "needs you" } else { "is still working" };
+            let why = format!("{} {what}: wait for it, or close it first", a.name);
+            if let Some(Modal::Review(r)) = &mut self.modal {
+                r.status = Some((why, false));
+            }
+            return;
+        }
+        self.modal = None;
+        self.close(id);
+        self.run_review_op(id, dir, crate::review::Op::Cleanup);
+    }
+
+    /// A review's git step came back: say so in the review if it's still
+    /// open, or as a toast if not.
+    fn review_done(&mut self, id: u32, op: crate::review::Op, outcome: crate::review::Outcome) {
+        use crate::review::Op;
+        self.dirty = true;
+        let name = self.index_of(id).map(|i| self.agents[i].name.clone()).unwrap_or_default();
+        let ok = outcome.is_ok();
+        let text = match outcome {
+            Ok(t) | Err(t) => t,
+        };
+        if let Some(Modal::Review(r)) = &mut self.modal
+            && r.agent == id
+        {
+            r.busy = None;
+            if op == Op::Cleanup && ok {
+                // Its folder is gone: nothing left to review.
+                self.modal = None;
+            } else {
+                // A step changes what there is to show (a commit empties the
+                // diff, a merge moves the base).
+                let _ = r.reload();
+                r.status = Some((text.clone(), ok));
+                return;
+            }
+        }
+        let text = if name.is_empty() { text } else { format!("{name}: {text}") };
+        self.toast(text, if ok { ToastKind::Good } else { ToastKind::Bad });
+    }
+
     fn broadcast(&mut self, text: &str, target: BroadcastTarget) {
         if text.trim().is_empty() {
             return;
@@ -2956,6 +3245,10 @@ impl App {
         }
         if matches!(self.modal, Some(Modal::Settings(_))) {
             self.settings_mouse(m);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Review(_))) {
+            self.review_mouse(m);
             return;
         }
         if self.modal.is_some() {
@@ -3003,6 +3296,12 @@ impl App {
                 if let Some(&(_, id)) = self.hits.pins.iter().find(|(r, _)| inside(r)) {
                     self.last_click = None;
                     self.toggle_pin(id);
+                    return;
+                }
+                let diff = self.hits.diffs.borrow().iter().find(|(r, _)| inside(r)).map(|&(_, id)| id);
+                if let Some(id) = diff {
+                    self.last_click = None;
+                    self.open_review(id);
                     return;
                 }
                 // The strip jumps, and its agent's own title takes its place:
@@ -3676,16 +3975,132 @@ mod tests {
         }
     }
 
+    /// `menu_app`'s agents, with a review open on a worktree whose
+    /// `a.txt` changed; and the channel its git steps report on.
+    fn review_app(tag: &str) -> (App, std::sync::mpsc::Receiver<AppEvent>, crate::review::tests::Repo, PathBuf) {
+        let (keep, _main, wt) = crate::review::tests::repo(tag);
+        std::fs::write(wt.join("a.txt"), "one\nTWO\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        app.agents = std::mem::take(&mut menu_app().agents);
+        let r = crate::review::Review::open(1, &wt).unwrap();
+        app.modal = Some(Modal::Review(Box::new(r)));
+        (app, rx, keep, wt)
+    }
+
+    fn review_of(app: &App) -> &crate::review::Review {
+        match &app.modal {
+            Some(Modal::Review(r)) => r,
+            _ => panic!("no review open"),
+        }
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            hit(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn a_note_left_in_the_review_goes_to_the_agent_as_a_prompt() {
+        let (mut app, _rx, _keep, _wt) = review_app("app-notes");
+        // To the added line, and a note on it.
+        let add = review_of(&app).lines.iter().position(|l| l.kind == crate::review::Kind::Add).unwrap();
+        for _ in 0..add {
+            hit(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        }
+        hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        typed(&mut app, "keep it lower case");
+        hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(review_of(&app).note_at(add).map(|n| n.body.as_str()), Some("keep it lower case"));
+        // Esc while writing drops what's typed, and leaves the review open.
+        hit(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        hit(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        typed(&mut app, "never mind");
+        hit(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(review_of(&app).notes.len(), 1);
+        // An agent waiting on a prompt isn't typed into: the notes stay.
+        app.agents[0].set_state(State::Blocked, false);
+        hit(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        let status = review_of(&app).status.clone().unwrap();
+        assert!(!status.1 && status.0.starts_with("not sent, notes kept") && status.0.contains("needs you"), "{status:?}");
+        assert_eq!(review_of(&app).notes.len(), 1);
+        // Free again, it gets them, and the review closes.
+        app.agents[0].set_state(State::Idle, false);
+        hit(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(app.modal.is_none());
+        assert!(app.agents[0].prompted.is_some());
+        assert_eq!(app.toast.as_ref().map(|t| t.text.as_str()), Some("sent 1 review note to a"));
+    }
+
+    #[test]
+    fn the_review_commits_and_refuses_what_cannot_work() {
+        let (mut app, rx, _keep, wt) = review_app("app-commit");
+        // Merging with changes uncommitted says why instead of asking.
+        hit(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+        assert!(review_of(&app).status.as_ref().unwrap().0.contains("uncommitted"));
+        assert!(matches!(review_of(&app).mode, crate::review::Mode::Browse));
+        // Commit: a message, then enter; no message, no commit.
+        hit(&mut app, KeyCode::Char('C'), KeyModifiers::SHIFT);
+        hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(review_of(&app).mode, crate::review::Mode::Commit(_)));
+        typed(&mut app, "Shout two");
+        hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(review_of(&app).busy, Some(crate::review::Op::Commit("Shout two".into())));
+        let ev = rx.recv_timeout(Duration::from_secs(10)).expect("the commit reports back");
+        app.handle(ev);
+        let r = review_of(&app);
+        assert!(r.busy.is_none());
+        assert!(r.status.as_ref().is_some_and(|(s, ok)| *ok && s.ends_with("Shout two")), "{:?}", r.status);
+        assert!(r.files.is_empty(), "the diff was read again");
+        assert_eq!(r.place.ahead, Some(1));
+        // Merging asks first: here or on GitHub; esc keeps everything.
+        hit(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+        assert!(matches!(review_of(&app).mode, crate::review::Mode::Confirm(crate::review::Op::Merge, 0)));
+        hit(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(review_of(&app).mode, crate::review::Mode::Browse));
+        assert!(review_of(&app).busy.is_none());
+        // Cleaning up won't pull a working agent's folder from under it.
+        app.agents[0].set_state(State::Working, false);
+        hit(&mut app, KeyCode::Char('X'), KeyModifiers::SHIFT);
+        hit(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(review_of(&app).status.as_ref().unwrap().0.contains("still working"));
+        assert!(wt.exists());
+        assert_eq!(app.agents.len(), 2);
+        // Done, it closes the agent, and the folder goes.
+        app.agents[0].set_state(State::Done, false);
+        hit(&mut app, KeyCode::Char('X'), KeyModifiers::SHIFT);
+        hit(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.modal.is_none());
+        assert_eq!(app.agents.len(), 1);
+        let ev = rx.recv_timeout(Duration::from_secs(10)).expect("the clean-up reports back");
+        app.handle(ev);
+        assert!(!wt.exists());
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("removed the worktree")), "{:?}", app.toast.as_ref().map(|t| &t.text));
+    }
+
+    #[test]
+    fn a_folder_outside_git_has_no_review() {
+        let mut app = menu_app();
+        app.open_review(1);
+        assert!(app.modal.is_none());
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.ends_with("not a git repository")), "{:?}", app.toast.as_ref().map(|t| &t.text));
+        // Its menu offers it, and alt+v is the key.
+        assert_eq!(MenuItem::Review.action(), Some(Action::Review));
+        assert_eq!(app.config.keys.label(Action::Review).as_deref(), Some("alt+v"));
+    }
+
     #[test]
     fn right_click_opens_that_agents_menu() {
         let mut app = menu_app();
         click(&mut app, MouseButton::Right, 3, 6);
         assert_eq!(menu_of(&app), Some(Menu { agent: 2, at: Some((3, 6)), sel: MenuItem::Rename }));
         assert_eq!(app.focus, 0, "a menu doesn't move the focus");
-        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
-        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
-        hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Review, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+        for _ in 0..4 {
+            hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        }
         assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close));
         hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Rename), "it wraps");
@@ -3763,7 +4178,7 @@ mod tests {
         app.modal = None;
         // An exited agent can be restarted, and closes without asking.
         app.agents[1].set_state(State::Exited, false);
-        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Review, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
         app.open_menu(2, None);
         hit(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
         assert_eq!(app.agents.len(), 1);
