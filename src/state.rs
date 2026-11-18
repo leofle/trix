@@ -146,9 +146,25 @@ pub struct Prefs {
     /// The kind of agent started last from alt+n, for `[new] agent = "last"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_agent: Option<String>,
+    /// The folders agents were started in from alt+n, the latest first: the
+    /// form's Folder field proposes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_dirs: Vec<String>,
     /// Claude context windows learned per model (see usage.rs).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context_windows: std::collections::BTreeMap<String, u64>,
+}
+
+impl Prefs {
+    /// An agent was started in `dir`: it goes to the front of the recent
+    /// folders, which keep the last `RECENT_DIRS`.
+    pub fn used_dir(&mut self, dir: &Path) {
+        const RECENT_DIRS: usize = 12;
+        let dir = dir.display().to_string();
+        self.recent_dirs.retain(|d| *d != dir);
+        self.recent_dirs.insert(0, dir);
+        self.recent_dirs.truncate(RECENT_DIRS);
+    }
 }
 
 fn prefs_path() -> PathBuf {
@@ -270,6 +286,20 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left.len(), 2, "only sub/ and blocked/: {left:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recent_folders_keep_the_latest_first_and_each_once() {
+        let mut prefs = Prefs::default();
+        for d in ["/a", "/b", "/a"] {
+            prefs.used_dir(Path::new(d));
+        }
+        assert_eq!(prefs.recent_dirs, ["/a", "/b"]);
+        for n in 0..20 {
+            prefs.used_dir(Path::new(&format!("/dir{n}")));
+        }
+        assert_eq!(prefs.recent_dirs.len(), 12, "the oldest drop off");
+        assert_eq!(prefs.recent_dirs[0], "/dir19");
     }
 
     #[test]

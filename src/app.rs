@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::{Agent, Kind, Spawn, State};
 use crate::config::Action;
+use crate::folders::{Folders, Tab};
 use crate::hooks::HookMsg;
 use crate::input;
 use crate::search::{self, Hit};
@@ -160,6 +161,8 @@ pub struct NewForm {
     pub name: TextInput,
     pub name_touched: bool,
     pub dir: TextInput,
+    /// What the Folder field offers under it: completions and proposals.
+    pub folders: Folders,
     pub prompt: TextInput,
     pub worktree: bool,
     pub args: TextInput,
@@ -169,6 +172,47 @@ pub struct NewForm {
 pub const NEW_FIELDS: [&str; 6] = ["Agent", "Folder", "Name", "Prompt", "Worktree", "Args"];
 
 impl NewForm {
+    /// The Folder field's text changed: its list follows, and the name
+    /// suggested with it, until you type one.
+    fn dir_changed(&mut self) {
+        self.folders.edited(&self.dir.text);
+        if self.name_touched {
+            return;
+        }
+        let suggested = self.folders.resolve(&self.dir.text).file_name().map(|s| slug(&s.to_string_lossy())).unwrap_or_default();
+        if !suggested.is_empty() {
+            self.name = TextInput::new(&suggested);
+        }
+    }
+
+    /// The field takes a folder from its list, or tab's completion.
+    fn fill_dir(&mut self, text: &str) {
+        self.dir = TextInput::new(text);
+        self.dir_changed();
+    }
+
+    /// The keys the Folder field's list takes before the form does: ↑↓
+    /// through it, enter for the folder chosen, tab to complete. False for
+    /// a key that is still the form's.
+    fn folder_key(&mut self, k: &KeyEvent) -> bool {
+        let fill = match k.code {
+            KeyCode::Down => return self.folders.step(true),
+            KeyCode::Up => return self.folders.step(false),
+            KeyCode::Enter => match self.folders.chosen() {
+                Some(s) => s.text.clone(),
+                None => return false,
+            },
+            KeyCode::Tab => match self.folders.tab(&self.dir.text) {
+                Tab::Fill(text) => text,
+                Tab::Chose => return true,
+                Tab::Next => return false,
+            },
+            _ => return false,
+        };
+        self.fill_dir(&fill);
+        true
+    }
+
     /// The kinds under "more ▸": every one not on the main row, so a kind
     /// trix adds later lands here until `[new] kinds` names it.
     pub fn more_kinds(&self) -> Vec<Kind> {
@@ -366,6 +410,8 @@ pub enum DialogHit {
     Kind(Option<Kind>),
     /// A search result, by number.
     Result(usize),
+    /// A folder on the form's Folder list, by number.
+    Folder(usize),
 }
 
 /// The buttons of the yes/no dialogs, left to right: the label, and the key
@@ -1227,7 +1273,11 @@ impl App {
             .map(|a| a.live_cwd())
             .unwrap_or_else(|| self.start_dir.clone());
         let new = &self.config.new;
-        let kind = new.agent.or_else(|| state::load_prefs().last_agent.and_then(|k| Kind::from_label(&k))).unwrap_or(Kind::Claude);
+        let prefs = state::load_prefs();
+        let kind = new.agent.or_else(|| prefs.last_agent.and_then(|k| Kind::from_label(&k))).unwrap_or(Kind::Claude);
+        // The focused agent's folder is in the field: the others' first.
+        let open: Vec<PathBuf> = self.agents.iter().filter(|a| a.state != State::Exited).map(|a| a.live_cwd()).collect();
+        let proposals = crate::folders::proposals(&dir, &open, &prefs.recent_dirs);
         let mut f = NewForm {
             kind,
             main: new.kinds.clone(),
@@ -1237,6 +1287,7 @@ impl App {
             name: TextInput::default(),
             name_touched: false,
             dir: TextInput::new(&tilde(&dir)),
+            folders: Folders::new(dir.clone(), proposals, &tilde(&dir)),
             prompt: TextInput::default(),
             worktree: new.worktree,
             args: TextInput::default(),
@@ -1391,8 +1442,10 @@ impl App {
     fn launch_form(&mut self) {
         let Some(Modal::New(f)) = &mut self.modal else { return };
         let kind = f.kind;
-        let mut cwd = expand(&f.dir.text);
-        if !cwd.is_dir() {
+        // A relative path starts where the form opened, as its completions do.
+        let mut cwd = f.folders.resolve(&f.dir.text);
+        let chosen = cwd.clone();
+        if f.dir.text.trim().is_empty() || !cwd.is_dir() {
             f.error = Some(format!("folder not found: {}", f.dir.text));
             return;
         }
@@ -1453,18 +1506,22 @@ impl App {
         };
         self.modal = None;
         match self.spawn(spec) {
-            Ok(_) => self.remember_agent(kind),
+            Ok(_) => self.remember_launch(kind, &chosen),
             Err(e) => self.toast(format!("could not start: {e}"), ToastKind::Bad),
         }
     }
 
-    /// For `[new] agent = "last"`: the kind alt+n started last.
-    fn remember_agent(&mut self, kind: Kind) {
-        let mut prefs = state::load_prefs();
-        if prefs.last_agent.as_deref() == Some(kind.label()) {
+    /// What alt+n started last: the kind, for `[new] agent = "last"`, and
+    /// the folder (the one chosen, not the worktree made in it), for the
+    /// form to propose.
+    fn remember_launch(&mut self, kind: Kind, dir: &Path) {
+        let was = state::load_prefs();
+        let mut prefs = was.clone();
+        prefs.last_agent = Some(kind.label().into());
+        prefs.used_dir(dir);
+        if prefs == was {
             return;
         }
-        prefs.last_agent = Some(kind.label().into());
         if let Err(e) = state::store_prefs(&prefs) {
             self.toast(format!("couldn't remember the agent you started: {e}"), ToastKind::Bad);
         }
@@ -2072,7 +2129,10 @@ impl App {
                 Modal::New(f) => {
                     let first = s.lines().next().unwrap_or("");
                     match f.field {
-                        1 => f.dir.insert(first),
+                        1 => {
+                            f.dir.insert(first);
+                            f.dir_changed();
+                        }
                         2 => f.name.insert(first),
                         3 => f.prompt.insert(&s.replace('\n', " ")),
                         5 => f.args.insert(first),
@@ -2421,8 +2481,15 @@ impl App {
                     }
                 }
             }
+            (DialogHit::Folder(i), Some(Modal::New(f))) => {
+                if let Some(s) = f.folders.list.get(i) {
+                    let text = s.text.clone();
+                    f.fill_dir(&text);
+                }
+            }
             (DialogHit::Field(i), Some(Modal::New(f))) => {
                 f.error = None;
+                f.folders.sel = None;
                 // The worktree row is a switch: a click flips it.
                 if i == 4 {
                     f.worktree = !f.worktree;
@@ -2452,6 +2519,14 @@ impl App {
         }
         let Some(modal) = &mut self.modal else { return };
         if k.code == KeyCode::Esc {
+            // With a folder chosen on the form's list, esc first puts it
+            // down: the form, and what's typed in it, stay.
+            if let Modal::New(f) = modal
+                && f.field == 1
+                && f.folders.sel.take().is_some()
+            {
+                return;
+            }
             self.modal = None;
             return;
         }
@@ -2592,6 +2667,9 @@ impl App {
             },
             Modal::New(f) => {
                 f.error = None;
+                if f.field == 1 && f.folder_key(&k) {
+                    return;
+                }
                 let n = NEW_FIELDS.len();
                 match k.code {
                     KeyCode::Enter => {
@@ -2606,6 +2684,9 @@ impl App {
                 if f.field != 0 {
                     f.more = false;
                 }
+                if f.field != 1 {
+                    f.folders.sel = None;
+                }
                 match f.field {
                     0 => match k.code {
                         KeyCode::Left | KeyCode::Char('h') => f.step(false),
@@ -2618,15 +2699,9 @@ impl App {
                         _ => {}
                     },
                     1 => {
-                        if k.code == KeyCode::Tab {
-                        } else if f.dir.key(&k) && !f.name_touched {
-                            let suggested = {
-                                let d = expand(&f.dir.text);
-                                d.file_name().map(|s| slug(&s.to_string_lossy())).unwrap_or_default()
-                            };
-                            if !suggested.is_empty() {
-                                f.name = TextInput::new(&suggested);
-                            }
+                        let was = f.dir.text.clone();
+                        if k.code != KeyCode::Tab && f.dir.key(&k) && f.dir.text != was {
+                            f.dir_changed();
                         }
                     }
                     2 => {
@@ -3913,6 +3988,62 @@ mod tests {
     }
 
     #[test]
+    fn the_folder_field_completes_and_picks_from_its_list() {
+        use crate::folders::Why;
+        let root = test_dir();
+        for d in ["alpha", "alps", "beta"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let at = root.display().to_string();
+        let mut app = test_app();
+        app.open_new();
+        let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+        f.field = 1;
+        f.dir = TextInput::new(&at);
+        f.folders = Folders::new(root.clone(), vec![(root.join("beta"), Why::Recent)], &at);
+        let key = |app: &mut App, code| app.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+        let form = |app: &App| match &app.modal {
+            Some(Modal::New(f)) => (f.field, f.dir.text.clone(), f.name.text.clone(), f.folders.sel),
+            _ => panic!("the form stays open"),
+        };
+        // The folder it opened on, untouched: tab is still the next field.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(form(&app).0, 2);
+        app.modal_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        // Typed at, tab completes it, and the name follows the folder.
+        key(&mut app, KeyCode::Char('/'));
+        key(&mut app, KeyCode::Char('b'));
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(form(&app), (1, format!("{at}/beta/"), "beta".into(), None));
+        // Nothing listed under it: ↓ is the next field, as it was.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(form(&app).0, 2);
+        key(&mut app, KeyCode::Up);
+        // ↓ onto a folder proposed and enter takes it; nothing launches.
+        app.modal_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(form(&app).3, Some(0));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(form(&app), (1, format!("{at}/beta"), "beta".into(), None));
+        assert!(app.agents.is_empty());
+        // Esc with one chosen puts it down; only the next closes the form.
+        app.modal_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(form(&app).3, None);
+        // A relative path launches from where the form opened, not from
+        // wherever trix runs.
+        for c in "alpha".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let Some(Modal::New(f)) = &app.modal else { panic!("no form") };
+        assert_eq!(f.folders.resolve(&f.dir.text), root.join("alpha"));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn kind_letters_pick_their_kind() {
         let mut app = test_app();
         for (c, kind) in [('c', Kind::Claude), ('x', Kind::Codex), ('g', Kind::Grok), ('o', Kind::OpenCode), ('u', Kind::Cursor), ('p', Kind::Copilot), ('m', Kind::Muse), ('i', Kind::Gemini), ('a', Kind::Antigravity), ('e', Kind::Amp), ('s', Kind::Shell)] {
@@ -4007,7 +4138,7 @@ mod tests {
         app.agents.push(a);
         let tmp = std::env::temp_dir();
         let form = |name: &str, touched: bool| {
-            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
+            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), folders: Folders::new(tmp.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
             f.args = TextInput::new("exec sleep 60");
             Modal::New(f)
         };

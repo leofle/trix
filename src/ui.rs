@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
 use crate::app::{App, BroadcastTarget, CONFIRM_BUTTONS, DialogHit, MenuItem, Modal, NEW_FIELDS, RESTORE_BUTTONS, Search, SidebarSize, TextInput, ToastKind, View, tilde};
+use crate::folders::Folders;
 use crate::settings::{Picker, Row, Settings};
 use crate::theme::{Source as ThemeSource, Theme, contrast, mix};
 
@@ -700,6 +701,27 @@ fn sparkline(a: &Agent, width: usize, color: Color, base: Color) -> Vec<Span<'st
         }
     }
     out
+}
+
+/// `trunc` from the other end: the last `max` cells of `s`, after an ellipsis.
+fn trunc_start(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = Vec::new();
+    let mut w = 0;
+    for ch in s.chars().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw + 1 > max {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out.into_iter().rev().collect()
 }
 
 fn trunc(s: &str, max: usize) -> String {
@@ -1417,6 +1439,52 @@ fn input_spans(inp: &TextInput, active: bool, placeholder: &str, t: &Theme, max:
     (vec![Span::styled(shown, Style::new().fg(if active { t.fg_bright } else { t.fg }))], active.then_some(before as u16))
 }
 
+/// The Folder field's list, hung under it over the fields below, labels
+/// and all, so a folder never reads as another field's value: as many
+/// folders as `room` has lines, scrolled only to keep the chosen one in
+/// sight, each `indent` in, under the field's text, with why it's there
+/// on the right.
+fn folder_list(f: &mut Frame, folders: &Folders, room: Rect, indent: usize, t: &Theme, hits: &mut Vec<(Rect, DialogHit)>) {
+    let n = folders.list.len();
+    let fit = (room.height as usize).min(n).min(FOLDER_LINES);
+    if fit == 0 || (room.width as usize) < indent + 12 {
+        return;
+    }
+    let mut top = folders.top.get().min(n - fit);
+    if let Some(sel) = folders.sel {
+        top = top.clamp((sel + 1).saturating_sub(fit), sel);
+    }
+    folders.top.set(top);
+    let area = Rect { height: fit as u16, ..room };
+    f.render_widget(Clear, area);
+    f.buffer_mut().set_style(area, Style::new().bg(t.surface_hi));
+    for (i, s) in folders.list.iter().enumerate().skip(top).take(fit) {
+        let row = Rect { y: room.y + (i - top) as u16, height: 1, ..room };
+        hits.push((row, DialogHit::Folder(i)));
+        let chosen = folders.sel == Some(i);
+        let (fg, note) = if chosen { (t.bg, t.bg) } else { (t.fg, t.muted) };
+        if chosen {
+            f.buffer_mut().set_style(row, Style::new().bg(t.accent).add_modifier(Modifier::BOLD));
+        }
+        // More above or below is said at the list's corners.
+        let more = if i == top && top > 0 {
+            " ▲"
+        } else if i + 1 == top + fit && top + fit < n {
+            " ▼"
+        } else {
+            ""
+        };
+        let why = format!("{}{more} ", s.why.label());
+        // A path's end says more than its start.
+        let path = trunc_start(&s.text, (row.width as usize).saturating_sub(indent + why.width() + 1));
+        f.render_widget(Paragraph::new(Span::styled(format!("{:indent$}{path}", ""), Style::new().fg(fg))), row);
+        f.render_widget(Paragraph::new(Span::styled(why, Style::new().fg(note))).alignment(Alignment::Right), row);
+    }
+}
+
+/// The most folders the Folder field's list shows at once.
+const FOLDER_LINES: usize = 8;
+
 /// The chips `from..to` of a row too long for `room` cells: as many as fit,
 /// scrolled only as far as it takes to keep `sel` in sight.
 fn chip_window(widths: &[usize], sel: usize, room: usize) -> (usize, usize) {
@@ -1474,6 +1542,10 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
             let label_w = 11u16;
             let field_w = rows.area.width.saturating_sub(label_w) as usize;
             let mut cursor = None;
+            // The Folder field's line, for its list to hang under, and where
+            // the list's clicks go: before the fields it covers.
+            let mut folder_row = None;
+            let under = hits.len();
             for (i, name) in NEW_FIELDS.iter().enumerate().skip(first).take(fit) {
                 let Some(row) = (if on_foot { rows.foot() } else { rows.at(pad + (i - first) as u16 * step) }) else { break };
                 let y = row.y;
@@ -1539,6 +1611,9 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
                         input_spans(&form.args, active, ph, t, field_w)
                     }
                 };
+                if i == 1 && active && !on_foot {
+                    folder_row = Some(row);
+                }
                 // After the kind chips: those are found first.
                 hits.push((row, DialogHit::Field(i)));
                 let mut line = vec![lab];
@@ -1551,6 +1626,13 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
                     cursor = Some((row.x + label_w + 1 + cx, y));
                 }
             }
+            let picking = folder_row.is_some_and(|row| {
+                let room = Rect { y: row.y + 1, height: rows.end.saturating_sub(row.y + 1), ..row };
+                let mut over = Vec::new();
+                folder_list(f, &form.folders, room, label_w as usize + 1, t, &mut over);
+                hits.splice(under..under, over);
+                form.folders.sel.is_some()
+            });
             // Fields out of sight are marked on the border, which costs no line.
             if first > 0 {
                 border_note(f, r, true, "▲ more", t);
@@ -1561,6 +1643,9 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
             let foot_w = r.width.saturating_sub(4) as usize;
             let foot = if let Some(e) = &form.error {
                 TLine::from(Span::styled(trunc(&format!("✕ {e}"), foot_w), Style::new().fg(t.red)))
+            } else if form.field == 1 {
+                // Short of room, pick goes first, then complete.
+                fit_hints(&[("tab", "complete"), ("↑↓", "pick"), ("enter", if picking { "choose" } else { "launch" })], &[1, 0], foot_w, true, t)
             } else {
                 // Short of room, toggle goes first, then agent, then next.
                 fit_hints(&[("tab", "next"), ("←→", "agent"), ("space", "toggle"), ("enter", "launch")], &[2, 1, 0, 3], foot_w, true, t)
@@ -3812,6 +3897,67 @@ mod tests {
         click_on(&mut app, "beta line");
         assert!(app.modal.is_none(), "the click went there");
         assert_eq!(app.toast.take().map(|t| t.text).as_deref(), Some("that agent is gone"), "the one clicked, not the one selected");
+    }
+
+    #[test]
+    fn the_folder_list_hangs_under_its_field_and_takes_clicks() {
+        use crate::folders::{Folders, Why};
+        use std::path::PathBuf;
+        let mut app = clickable_app();
+        let known = || vec![(PathBuf::from("/srv/atlas"), Why::Open), (PathBuf::from("/srv/notes"), Why::Recent), (PathBuf::from("/srv/zeta"), Why::Repo)];
+        let open = |app: &mut App, field: usize| {
+            app.open_new();
+            let Some(Modal::New(f)) = &mut app.modal else { panic!("no form") };
+            f.field = field;
+            f.dir = TextInput::new("/srv");
+            f.folders = Folders::new("/srv".into(), known(), "/srv");
+        };
+        let text = |buf: &ratatui::buffer::Buffer, y: u16| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        // On another field, no list: the form as it was.
+        open(&mut app, 0);
+        let buf = frame(&mut app);
+        assert!((0..32).all(|y| !text(&buf, y).contains("/srv/atlas")));
+        // On Folder: each folder with why it's there, from the line under
+        // the field, over the fields below.
+        open(&mut app, 1);
+        let buf = frame(&mut app);
+        let (x, y) = spot(&buf, "/srv/atlas");
+        assert_eq!(spot(&buf, "› Folder").1 + 1, y);
+        for (dy, path, why) in [(0, "/srv/atlas", "open"), (1, "/srv/notes", "recent"), (2, "/srv/zeta", "repo")] {
+            let line = text(&buf, y + dy);
+            assert!(line.contains(path) && line.contains(why) && !line.contains("Name"), "{line:?}");
+        }
+        assert!((0..32).any(|y| text(&buf, y).contains("tab complete   ↑↓ pick   enter launch")));
+        // ↓ chooses one, and enter is then for it.
+        press(&mut app, KeyCode::Down);
+        let buf = frame(&mut app);
+        assert!((0..32).any(|y| text(&buf, y).contains("enter choose")));
+        // A click on one takes it, though a field is under it.
+        app.handle(AppEvent::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x + 2, row: y + 1, modifiers: KeyModifiers::NONE }));
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert_eq!((f.field, f.dir.text.as_str(), f.name.text.as_str()), (1, "/srv/notes", "notes"));
+        // A terminal too short for the fields has no room for a list
+        // either: nothing is drawn over the hint or the border.
+        for h in [6, 8, 10, 12] {
+            open(&mut app, 1);
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, h)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let lines: Vec<String> = (0..h).map(|y| text(&buf, y)).collect();
+            let bottom = lines.iter().rposition(|l| l.contains('╰')).expect("a bottom border");
+            assert!(!lines[bottom].contains("/srv"), "at {h} rows: {lines:#?}");
+            assert!(lines.iter().any(|l| l.contains("› Folder")), "at {h} rows: {lines:#?}");
+            if let Some(hint) = lines.iter().find(|l| l.contains("enter launch")) {
+                assert!(!hint.contains("/srv/"), "at {h} rows: {lines:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trunc_start_keeps_a_paths_end() {
+        assert_eq!(trunc_start("~/a/b", 10), "~/a/b");
+        assert_eq!(trunc_start("~/projects/trix", 8), "…ts/trix");
+        assert_eq!(trunc_start("abc", 0), "");
     }
 
     #[test]
