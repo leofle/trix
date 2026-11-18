@@ -543,6 +543,7 @@ pub enum Action {
     Compact,
     Search,
     Broadcast,
+    Review,
     Rename,
     Close,
     Menu,
@@ -554,7 +555,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -566,6 +567,7 @@ impl Action {
         Action::Compact,
         Action::Search,
         Action::Broadcast,
+        Action::Review,
         Action::Rename,
         Action::Close,
         Action::Menu,
@@ -589,6 +591,7 @@ impl Action {
             Action::Compact => "compact",
             Action::Search => "search",
             Action::Broadcast => "broadcast",
+            Action::Review => "review",
             Action::Rename => "rename",
             Action::Close => "close",
             Action::Menu => "menu",
@@ -613,6 +616,7 @@ impl Action {
             Action::Compact => &["alt+c"],
             Action::Search => &["alt+f"],
             Action::Broadcast => &["alt+b"],
+            Action::Review => &["alt+v"],
             Action::Rename => &["alt+r"],
             Action::Close => &["alt+w"],
             Action::Menu => &["alt+o"],
