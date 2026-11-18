@@ -1003,6 +1003,9 @@ fn report(source: &str, v: &Value, seq: Option<u64>) {
         return;
     };
     let Ok(agent) = id.parse::<u32>() else { return };
+    if source == "codex" && codex_title_turn(v) {
+        return;
+    }
     let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let mut msg = condense(agent, source, v);
     // OpenCode's plugin stamps each event as it happens: the processes it
@@ -1031,6 +1034,24 @@ fn send(sock: &str, msg: &HookMsg) {
             let _ = stream.write_all(b"\n");
         }
     }
+}
+
+/// Codex's TUI names a new thread with a side turn on a thread of its own,
+/// and `notify` reports that turn's end like any other: asked for a title
+/// above the user's prompt, it "replied" `{"title":"…"}`. That isn't the
+/// agent finishing, its last message or its conversation, and it can land
+/// before or after the report of the turn the user asked for.
+fn codex_title_turn(v: &Value) -> bool {
+    if v.get("type").and_then(Value::as_str) != Some("agent-turn-complete") {
+        return false;
+    }
+    let asked = match v.get("input-messages").and_then(Value::as_array).map(Vec::as_slice) {
+        Some([m]) => m.as_str().is_some_and(|m| m.contains("\n\nUser prompt:\n")),
+        _ => false,
+    };
+    let reply = v.get("last-assistant-message").and_then(Value::as_str).and_then(|m| serde_json::from_str::<Value>(m).ok());
+    let titled = reply.as_ref().and_then(Value::as_object).is_some_and(|o| o.len() == 1 && o.get("title").is_some_and(Value::is_string));
+    asked && titled
 }
 
 fn condense(agent: u32, source: &str, v: &Value) -> HookMsg {
@@ -1654,6 +1675,29 @@ mod tests {
         assert_eq!(m.event, "agent-turn-complete");
         assert_eq!(m.detail.as_deref(), Some("All tests pass."));
         assert_eq!(m.session.as_deref(), Some("t-9"));
+    }
+
+    /// Both payloads as codex-tui 0.167.2 sent them for one prompt: the
+    /// thread's title first, on its own thread, then the turn itself.
+    #[test]
+    fn codex_title_turn_is_not_the_agents() {
+        let prompt = "Run the shell command 'ls -la' and then reply with exactly: PONG";
+        let title = json!({"type": "agent-turn-complete", "thread-id": "01a1ec66-c15d-7ff2-9543-d9e5b10670cb", "turn-id": "01a1ec66-c18c-7aa3-a4c4-b15762ed26ff",
+            "cwd": "/w", "client": "codex-tui",
+            "input-messages": [format!("Generate a concise, single-line task title of at most 36 characters and under five words where possible. Do not answer the request.\n\nUser prompt:\n{prompt}")],
+            "last-assistant-message": "{\"title\":\"Run ls -la\"}"});
+        assert!(codex_title_turn(&title));
+        let turn = json!({"type": "agent-turn-complete", "thread-id": "01a1ec66-3137-7a81-a308-f99859601004", "turn-id": "01a1ec66-befb-7a41-b39f-e9ac914ad367",
+            "cwd": "/w", "client": "codex-tui", "input-messages": [prompt], "last-assistant-message": "PONG"});
+        assert!(!codex_title_turn(&turn));
+        // A reply that is such JSON because the user asked for it is theirs.
+        let asked_for = json!({"type": "agent-turn-complete", "input-messages": ["Name this as JSON"], "last-assistant-message": "{\"title\":\"Fix login\"}"});
+        assert!(!codex_title_turn(&asked_for));
+        // As is one to a prompt that only looks like the title request.
+        let quoted = json!({"type": "agent-turn-complete", "input-messages": [format!("What does this do?\n\nUser prompt:\n{prompt}")], "last-assistant-message": "It asks for a title."});
+        assert!(!codex_title_turn(&quoted));
+        assert!(!codex_title_turn(&json!({"type": "agent-turn-complete", "thread-id": "t-9", "last-assistant-message": "All tests pass."})));
+        assert!(!codex_title_turn(&json!({"hook_event_name": "Stop", "last-assistant-message": "{\"title\":\"x\"}"})));
     }
 
     #[test]
