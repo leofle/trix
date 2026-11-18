@@ -234,6 +234,24 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         View::Grid => "grid",
     };
     let mut right: Vec<(u8, Vec<Span>)> = Vec::new();
+    // What every agent has spent: "$4.21 of $25 · 3.1M tok".
+    let spent = app.totals();
+    let tokens = crate::usage::total(&spent).total();
+    if tokens > 0 {
+        let c = app.cost_of(&spent);
+        let color = budget_color(t, app.budget_levels().0);
+        let mut spans = vec![];
+        if c.usd > 0.0 || c.unpriced == 0 {
+            spans.push(Span::styled(crate::cost::label(&c), Style::new().fg(color)));
+            if let Some(b) = app.config.cost.budget {
+                spans.push(Span::styled(format!(" of {}", crate::cost::usd(b)), Style::new().fg(t.dim)));
+            }
+            spans.push(Span::styled(" · ", Style::new().fg(t.muted)));
+        }
+        spans.push(Span::styled(format!("{} tok", crate::usage::tokens(tokens)), Style::new().fg(t.dim)));
+        spans.push(Span::styled("  ·  ", Style::new().fg(t.muted)));
+        right.push((4, spans));
+    }
     if app.viewers > 0 {
         right.push((5, vec![
             Span::styled("◉ ", Style::new().fg(t.accent)),
@@ -656,6 +674,25 @@ fn context_color(t: &Theme, used: f32) -> Option<Color> {
     }
 }
 
+/// Spend's color: plain, then yellow past the warning, red over budget.
+fn budget_color(t: &Theme, level: u8) -> Color {
+    match level {
+        0 => t.dim,
+        1 => t.yellow,
+        _ => t.red,
+    }
+}
+
+/// "$1.23 · 4.1M tok": for the pane's bottom border. Tokens alone for a
+/// model with no price.
+pub fn spend_label(c: &crate::cost::Cost, tokens: u64) -> String {
+    if c.usd == 0.0 && c.unpriced > 0 {
+        format!("{} tok", crate::usage::tokens(tokens))
+    } else {
+        format!("{} · {} tok", crate::cost::label(c), crate::usage::tokens(tokens))
+    }
+}
+
 /// "context 31% · ~691k left": for the pane's bottom border.
 fn context_label(c: &crate::usage::Context) -> String {
     format!("context {}% · {}{} left", c.used_percent(), if c.exact { "" } else { "~" }, crate::usage::tokens(c.left()))
@@ -872,6 +909,13 @@ fn pane_block<'a>(app: &App, a: &Agent, focused: bool, width: u16, compact: bool
     if let Some(c) = a.context.filter(|_| !compact) {
         let color = context_color(t, c.used_frac()).unwrap_or(t.dim);
         status.push(Span::styled(format!(" {} ", context_label(&c)), Style::new().fg(color)));
+        status.push(Span::styled("·", Style::new().fg(t.muted)));
+    }
+    let tokens = crate::usage::total(&a.spend).total();
+    if tokens > 0 && !compact {
+        let c = app.cost_of(&a.spend);
+        let level = crate::cost::level(c.usd, app.config.cost.agent_budget, app.config.cost.warn_at);
+        status.push(Span::styled(format!(" {} ", spend_label(&c, tokens)), Style::new().fg(budget_color(t, level))));
         status.push(Span::styled("·", Style::new().fg(t.muted)));
     }
     status.push(Span::styled(format!(" {} ", a.state.label()), Style::new().fg(sc)));
@@ -2890,6 +2934,54 @@ mod tests {
             let text: Vec<String> = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect();
             assert!(text.iter().any(|l| l.contains(note)), "{note}:\n{}", text.join("\n"));
         }
+    }
+
+    fn spend_of(model: &str, input: u64, output: u64) -> crate::usage::Spend {
+        crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, long: false }, crate::usage::Tokens { input, output, ..Default::default() })])
+    }
+
+    #[test]
+    fn spend_on_the_pane_and_totals_in_the_top_bar() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        let rows = |app: &mut App, w: u16| {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 24)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let b = term.backend().buffer().clone();
+            let text: Vec<String> = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol().to_string()).collect()).collect();
+            let bottom = text.iter().find(|l| l.contains('╰')).cloned().unwrap_or_default();
+            (text[0].clone(), bottom, b)
+        };
+        let mut a = crate::agent::test_agent(crate::agent::Kind::Claude);
+        a.set_state(State::Idle, false);
+        app.agents.push(a);
+        let (top, bottom, _) = rows(&mut app, 120);
+        assert!(!top.contains("tok") && !bottom.contains("tok"), "nothing spent, nothing shown: {top}\n{bottom}");
+        // Opus 5.5: 1M in, 100k out = $4 + $2.
+        app.agents[0].spend = spend_of("claude-opus-5-5", 1_000_000, 100_000);
+        let (top, bottom, _) = rows(&mut app, 120);
+        assert!(bottom.contains("$6.00 · 1.1M tok · idle"), "{bottom}");
+        assert!(top.contains("$6.00 · 1.1M tok"), "{top}");
+        app.config.cost.budget = Some(7.0);
+        app.config.cost.agent_budget = Some(5.0);
+        let (top, bottom, buf) = rows(&mut app, 120);
+        assert!(top.contains("$6.00 of $7.00 · 1.1M tok"), "{top}");
+        let at = |row: &str, y: u16, s: &str| {
+            let x = row.find(s).map(|b| row[..b].chars().count()).unwrap() as u16;
+            buf[(x, y)].fg
+        };
+        let t = &app.theme;
+        assert_eq!(at(&top, 0, "$6.00"), t.yellow, "past 80% of the budget");
+        let y = (0..24).find(|&y| (0..120).any(|x| buf[(x, y)].symbol() == "╰")).unwrap();
+        assert_eq!(at(&bottom, y, "$6.00"), t.red, "over the agent's own");
+        // No price for the model: tokens only.
+        app.agents[0].spend = spend_of("gpt-6.1-sol", 2_000, 0);
+        let (top, bottom, _) = rows(&mut app, 120);
+        assert!(bottom.contains(" 2k tok · idle") && !bottom.contains('$'), "{bottom}");
+        assert!(top.contains("2k tok") && !top.contains("$0"), "{top}");
+        let (top, _, _) = rows(&mut app, 34);
+        assert!(top.contains("trix") && !top.contains("tok"), "goes before the clock when narrow: {top}");
     }
 
     #[test]

@@ -26,6 +26,26 @@ pub struct Config {
     pub theme: ThemeOpts,
     pub ui: Ui,
     pub workspace: Workspace,
+    pub cost: CostOpts,
+}
+
+/// What agents spend: the budgets to hold it to, and prices of your own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostOpts {
+    /// USD for the whole workspace, every agent's spend added up.
+    pub budget: Option<f64>,
+    /// USD for each agent.
+    pub agent_budget: Option<f64>,
+    /// Warn this far into a budget, in percent.
+    pub warn_at: u8,
+    /// Per model: added to trix's own prices, or put in their place.
+    pub prices: BTreeMap<String, crate::cost::Price>,
+}
+
+impl Default for CostOpts {
+    fn default() -> CostOpts {
+        CostOpts { budget: None, agent_budget: None, warn_at: 80, prices: BTreeMap::new() }
+    }
 }
 
 /// How trix draws its own icons.
@@ -253,6 +273,29 @@ struct File {
     ui: FileUi,
     #[serde(default)]
     workspace: FileWorkspace,
+    #[serde(default)]
+    cost: FileCost,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileCost {
+    budget: Option<f64>,
+    agent_budget: Option<f64>,
+    warn_at: Option<i64>,
+    #[serde(default)]
+    prices: BTreeMap<String, FilePrice>,
+}
+
+/// USD per million tokens.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePrice {
+    input: f64,
+    output: f64,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    cache_write_1h: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -389,7 +432,39 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         Some(s) => Restore::ALL.into_iter().find(|r| r.name() == s).ok_or_else(|| format!("workspace.restore: '{s}' is not ask, always or never"))?,
     };
     let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false) };
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore } })
+    let cost = cost_opts(f.cost)?;
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost })
+}
+
+fn cost_opts(f: FileCost) -> Result<CostOpts, String> {
+    let money = |what: &str, v: Option<f64>| match v {
+        Some(x) if !(x.is_finite() && x > 0.0) => Err(format!("cost.{what}: {x} is not an amount (USD, more than 0)")),
+        v => Ok(v),
+    };
+    let warn_at = match f.warn_at {
+        None => 80,
+        Some(n @ 1..=100) => n as u8,
+        Some(n) => return Err(format!("cost.warn_at: {n} is not a percent from 1 to 100")),
+    };
+    let mut prices = BTreeMap::new();
+    for (model, p) in f.prices {
+        let rates = [Some(p.input), Some(p.output), p.cache_read, p.cache_write, p.cache_write_1h];
+        if rates.iter().flatten().any(|r| !(r.is_finite() && *r >= 0.0)) {
+            return Err(format!("cost.prices.\"{model}\": prices are USD per million tokens, 0 or more"));
+        }
+        // Left out: a cache read is input at a tenth, a write plain input.
+        let cache_write = p.cache_write.unwrap_or(p.input);
+        let price = crate::cost::Price {
+            input: p.input,
+            output: p.output,
+            cache_read: p.cache_read.unwrap_or(p.input / 10.0),
+            cache_write,
+            cache_write_1h: p.cache_write_1h.unwrap_or(cache_write),
+            long: 1.0,
+        };
+        prices.insert(model, price);
+    }
+    Ok(CostOpts { budget: money("budget", f.budget)?, agent_budget: money("agent_budget", f.agent_budget)?, warn_at, prices })
 }
 
 fn paint(what: &str, s: &str) -> Result<Paint, String> {
@@ -788,6 +863,24 @@ mod tests {
         assert_ne!(stamp_of(&link), Some(before));
         assert_eq!(stamp_of(&dir.join("missing.toml")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cost_budgets_and_prices() {
+        let read = |s: &str| parse(s, Path::new("/"));
+        assert_eq!(read("").unwrap().cost, CostOpts::default());
+        let c = read("[cost]\nbudget = 20\nagent_budget = 2.5\nwarn_at = 90\n[cost.prices.\"gpt-6.1-sol\"]\ninput = 2\noutput = 10\ncache_read = 0.1\n").unwrap().cost;
+        assert_eq!((c.budget, c.agent_budget, c.warn_at), (Some(20.0), Some(2.5), 90), "whole dollars read as amounts too");
+        let p = c.prices["gpt-6.1-sol"];
+        assert_eq!((p.input, p.output, p.cache_read, p.cache_write, p.cache_write_1h), (2.0, 10.0, 0.1, 2.0, 2.0));
+        let p = read("[cost.prices.x]\ninput = 3\noutput = 15\n").unwrap().cost.prices["x"];
+        assert_eq!(p.cache_read, 0.3, "a cache read is a tenth of input unless said");
+        assert!(read("[cost]\nbudget = 0\n").unwrap_err().contains("cost.budget"));
+        assert!(read("[cost]\nagent_budget = -1\n").unwrap_err().contains("cost.agent_budget"));
+        assert!(read("[cost]\nwarn_at = 120\n").unwrap_err().contains("1 to 100"));
+        assert!(read("[cost.prices.x]\ninput = 3\n").unwrap_err().contains("output"));
+        assert!(read("[cost.prices.x]\ninput = 3\noutput = -1\n").unwrap_err().contains("0 or more"));
+        assert!(read("[cost]\nlimit = 3\n").unwrap_err().contains("limit"));
     }
 
     #[test]

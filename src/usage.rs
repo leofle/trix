@@ -1,8 +1,10 @@
-//! Context gauge: how full each agent's context window is.
+//! Context gauge and token counts: how full each agent's context window is,
+//! and how many tokens it has used.
 //!
 //! Claude and Codex both log every turn's token usage in their conversation
 //! file. A background thread follows those files, reading only what was
-//! appended since the last look, and reports each agent's latest figure.
+//! appended since the last look, and reports each agent's latest figure and
+//! its running total (priced in `cost.rs`).
 //!
 //! - Codex logs the window too (`model_context_window`), so its gauge is exact.
 //! - Claude doesn't. trix assumes 200K, and learns 1M for a model once any of
@@ -22,8 +24,10 @@ use crate::app::AppEvent;
 
 const STANDARD: u64 = 200_000;
 const LONG: u64 = 1_000_000;
-/// How much of a long log to read the first time: the latest turn is at the end.
-const TAIL: u64 = 4 << 20;
+/// How much of a log to read at a time.
+const CHUNK: u64 = 4 << 20;
+/// A Claude prompt past this many tokens is a long one (Haiku 5.5 charges more).
+const LONG_PROMPT: u64 = 100_000;
 /// How soon to look again for a log that wasn't there.
 const RELOOK: Duration = Duration::from_secs(10);
 
@@ -73,6 +77,72 @@ pub struct Target {
 
 pub type Targets = Arc<Mutex<Vec<Target>>>;
 
+/// One kind of model call, as it's priced: which model, in fast mode or not,
+/// with a long prompt or not.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Bucket {
+    pub model: String,
+    pub fast: bool,
+    pub long: bool,
+}
+
+/// Tokens used, by how they're charged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tokens {
+    /// Input that wasn't read from the prompt cache or written to it.
+    pub input: u64,
+    /// Written to the cache: for 5 minutes (Claude), or at all (Codex).
+    pub cache_write_5m: u64,
+    /// Written to the cache for an hour (Claude).
+    pub cache_write_1h: u64,
+    pub cache_read: u64,
+    pub output: u64,
+}
+
+impl Tokens {
+    pub fn total(&self) -> u64 {
+        self.input + self.cache_write() + self.cache_read + self.output
+    }
+    pub fn cache_write(&self) -> u64 {
+        self.cache_write_5m + self.cache_write_1h
+    }
+    fn add(&mut self, o: &Tokens) {
+        self.input += o.input;
+        self.cache_write_5m += o.cache_write_5m;
+        self.cache_write_1h += o.cache_write_1h;
+        self.cache_read += o.cache_read;
+        self.output += o.output;
+    }
+    fn sub(&mut self, o: &Tokens) {
+        self.input = self.input.saturating_sub(o.input);
+        self.cache_write_5m = self.cache_write_5m.saturating_sub(o.cache_write_5m);
+        self.cache_write_1h = self.cache_write_1h.saturating_sub(o.cache_write_1h);
+        self.cache_read = self.cache_read.saturating_sub(o.cache_read);
+        self.output = self.output.saturating_sub(o.output);
+    }
+    fn covers(&self, o: &Tokens) -> bool {
+        self.input >= o.input && self.cache_write_5m >= o.cache_write_5m && self.cache_write_1h >= o.cache_write_1h && self.cache_read >= o.cache_read && self.output >= o.output
+    }
+}
+
+/// An agent's tokens so far, per kind of call.
+pub type Spend = BTreeMap<Bucket, Tokens>;
+
+/// Every kind of call's tokens added up.
+pub fn total(s: &Spend) -> Tokens {
+    let mut t = Tokens::default();
+    for v in s.values() {
+        t.add(v);
+    }
+    t
+}
+
+pub fn merge(into: &mut Spend, from: &Spend) {
+    for (b, t) in from {
+        into.entry(b.clone()).or_default().add(t);
+    }
+}
+
 // ───────────────────────────── reading logs ─────────────────────────────
 
 /// The latest usage in a Claude log line: (tokens in context, model).
@@ -89,6 +159,60 @@ pub fn claude_line(v: &Value) -> Option<(u64, String)> {
     let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
     let used = n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens") + n("output_tokens");
     (used > 0).then(|| (used, model.to_string()))
+}
+
+/// A Claude log line's model call, to count: its message id (Claude writes a
+/// line per content block, each with the message's usage), how it's priced
+/// and its tokens. Subagents' turns count too: they're spent all the same.
+pub fn claude_spend(v: &Value) -> Option<(Option<String>, Bucket, Tokens)> {
+    if v.get("type")?.as_str()? != "assistant" {
+        return None;
+    }
+    let msg = v.get("message")?;
+    let model = msg.get("model")?.as_str()?;
+    if model.starts_with('<') {
+        return None;
+    }
+    let u = msg.get("usage")?;
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let written = n(u, "cache_creation_input_tokens");
+    let (mut w5, w1) = match u.get("cache_creation") {
+        Some(c) => (n(c, "ephemeral_5m_input_tokens"), n(c, "ephemeral_1h_input_tokens")),
+        None => (written, 0),
+    };
+    w5 += written.saturating_sub(w5 + w1);
+    let t = Tokens { input: n(u, "input_tokens"), cache_write_5m: w5, cache_write_1h: w1, cache_read: n(u, "cache_read_input_tokens"), output: n(u, "output_tokens") };
+    if t.total() == 0 {
+        return None;
+    }
+    let bucket = Bucket {
+        model: model.to_string(),
+        fast: u.get("speed").and_then(Value::as_str) == Some("fast"),
+        long: t.input + t.cache_write() + t.cache_read > LONG_PROMPT,
+    };
+    let id = msg.get("id").and_then(Value::as_str).map(str::to_string);
+    Some((id, bucket, t))
+}
+
+/// A Codex log line's running total for the conversation. Codex counts
+/// cached input as part of input; here it's apart.
+pub fn codex_total(v: &Value) -> Option<Tokens> {
+    let p = v.get("payload")?;
+    if p.get("type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let u = p.get("info")?.get("total_token_usage")?;
+    let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let (read, written) = (n("cached_input_tokens"), n("cache_write_input_tokens"));
+    Some(Tokens { input: n("input_tokens").saturating_sub(read + written), cache_write_5m: written, cache_write_1h: 0, cache_read: read, output: n("output_tokens") })
+}
+
+/// The model a Codex turn runs on, from its `turn_context` line.
+pub fn codex_model(v: &Value) -> Option<String> {
+    if v.get("type")?.as_str()? != "turn_context" {
+        return None;
+    }
+    Some(v.get("payload")?.get("model")?.as_str()?.to_string())
 }
 
 /// The latest usage in a Codex log line: (tokens in context, window).
@@ -125,6 +249,14 @@ struct Log {
     partial: Vec<u8>,
     claude: Option<(u64, String)>,
     codex: Option<(u64, u64)>,
+    /// Every turn's tokens so far.
+    spend: Spend,
+    /// Claude: each message's tokens as counted, so a message logged again
+    /// (a line per content block) replaces itself rather than adding up.
+    messages: HashMap<String, (Bucket, Tokens)>,
+    /// Codex: the running total as of the last count, and the model in use.
+    codex_total: Tokens,
+    codex_model: Option<String>,
 }
 
 impl Log {
@@ -132,42 +264,68 @@ impl Log {
         Log { path, ..Log::default() }
     }
 
-    /// Read what was appended since last time. False when the file is gone.
+    /// Read what was appended since last time, a piece at a time. False
+    /// when the file is gone.
     fn advance(&mut self) -> bool {
         let Ok(mut f) = std::fs::File::open(&self.path) else { return false };
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         if len < self.offset {
             *self = Log::new(std::mem::take(&mut self.path)); // rewritten
         }
-        let first = self.offset == 0 && self.partial.is_empty();
-        if first && len > TAIL {
-            self.offset = len - TAIL;
+        while self.offset < len {
+            if f.seek(SeekFrom::Start(self.offset)).is_err() {
+                return true;
+            }
+            let mut buf = Vec::new();
+            if (&mut f).take((len - self.offset).min(CHUNK)).read_to_end(&mut buf).is_err() || buf.is_empty() {
+                return true;
+            }
+            self.offset += buf.len() as u64;
+            let mut data = std::mem::take(&mut self.partial);
+            data.extend_from_slice(&buf);
+            let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+            let rest = lines.pop().unwrap_or_default().to_vec();
+            for line in lines {
+                self.line(line);
+            }
+            self.partial = rest;
         }
-        if len == self.offset || f.seek(SeekFrom::Start(self.offset)).is_err() {
-            return true;
+        true
+    }
+
+    fn line(&mut self, line: &[u8]) {
+        // Most of a log is messages and tool output: only usage is parsed.
+        let has = |w: &[u8]| line.windows(w.len()).any(|x| x == w);
+        if !has(b"usage") && !has(b"turn_context") {
+            return;
         }
-        let mut buf = Vec::new();
-        if f.take(len - self.offset).read_to_end(&mut buf).is_err() {
-            return true;
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
+        if let Some(c) = claude_line(&v) {
+            self.claude = Some(c);
+        } else if let Some(c) = codex_line(&v) {
+            self.codex = Some(c);
         }
-        self.offset += buf.len() as u64;
-        let mut data = std::mem::take(&mut self.partial);
-        data.extend_from_slice(&buf);
-        let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
-        let rest = lines.pop().unwrap_or_default().to_vec();
-        if first && self.offset > buf.len() as u64 && !lines.is_empty() {
-            lines.remove(0); // started mid-line
-        }
-        for line in lines {
-            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
-            if let Some(c) = claude_line(&v) {
-                self.claude = Some(c);
-            } else if let Some(c) = codex_line(&v) {
-                self.codex = Some(c);
+        if let Some((id, bucket, t)) = claude_spend(&v) {
+            if let Some(id) = id
+                && let Some((b, old)) = self.messages.insert(id, (bucket.clone(), t))
+            {
+                self.spend.entry(b).or_default().sub(&old);
+            }
+            self.spend.entry(bucket).or_default().add(&t);
+        } else if let Some(m) = codex_model(&v) {
+            self.codex_model = Some(m);
+        } else if let Some(total) = codex_total(&v) {
+            // A count lower than the last one started over.
+            let mut new = total;
+            if total.covers(&self.codex_total) {
+                new.sub(&self.codex_total);
+            }
+            self.codex_total = total;
+            if new.total() > 0 {
+                let model = self.codex_model.clone().unwrap_or_else(|| "unknown".into());
+                self.spend.entry(Bucket { model, fast: false, long: false }).or_default().add(&new);
             }
         }
-        self.partial = rest;
-        true
     }
 }
 
@@ -226,23 +384,77 @@ fn locate(t: &Target) -> Option<PathBuf> {
     }
 }
 
-/// Follow every target's log; report each agent's context when it changes.
+/// Claude's subagents log apart, next to the conversation:
+/// `<session>.jsonl` and `<session>/subagents/agent-*.jsonl`.
+fn subagent_logs(main: &Path) -> Vec<PathBuf> {
+    let dir = main.with_extension("").join("subagents");
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "jsonl")).collect();
+    v.sort();
+    v
+}
+
+/// One agent's logs being followed.
+struct Watched {
+    /// What the log was found from: a path, or a conversation id.
+    key: Option<String>,
+    log: Log,
+    subagents: BTreeMap<PathBuf, Log>,
+    /// Spent in the agent's earlier conversations (before a `/clear`).
+    earlier: Spend,
+}
+
+impl Watched {
+    fn spend(&self) -> Spend {
+        let mut s = self.earlier.clone();
+        merge(&mut s, &self.log.spend);
+        for l in self.subagents.values() {
+            merge(&mut s, &l.spend);
+        }
+        s
+    }
+
+    /// The agent is in another conversation now: what it spent in the one
+    /// before stays its own.
+    fn switch(&mut self, key: Option<String>, path: PathBuf) {
+        if path != self.log.path {
+            self.earlier = self.spend();
+            self.subagents.clear();
+            self.log = Log::new(path);
+        }
+        self.key = key;
+    }
+
+    fn advance(&mut self, kind: Kind) {
+        self.log.advance();
+        if kind == Kind::Claude {
+            for p in subagent_logs(&self.log.path) {
+                self.subagents.entry(p.clone()).or_insert_with(|| Log::new(p));
+            }
+            self.subagents.retain(|_, l| l.advance());
+        }
+    }
+}
+
+/// Follow every target's log; report each agent's context and spend when
+/// they change.
 pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
     let overridden = std::env::var("TRIX_CLAUDE_CONTEXT").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0);
     let _ = std::thread::Builder::new().name("trix-usage".into()).spawn(move || {
         let mut learned = crate::state::load_prefs().context_windows;
-        let mut logs: HashMap<u32, (Option<String>, Log)> = HashMap::new();
+        let mut logs: HashMap<u32, Watched> = HashMap::new();
         let mut sent: HashMap<u32, Option<Context>> = HashMap::new();
+        let mut sent_spend: HashMap<u32, Spend> = HashMap::new();
         // Logs looked for and not found: what was looked for, and when.
         let mut missed: HashMap<u32, (Option<String>, Instant)> = HashMap::new();
         loop {
             let list = targets.lock().unwrap().clone();
             logs.retain(|id, _| list.iter().any(|t| t.id == *id));
             sent.retain(|id, _| list.iter().any(|t| t.id == *id));
+            sent_spend.retain(|id, _| list.iter().any(|t| t.id == *id));
             missed.retain(|id, _| list.iter().any(|t| t.id == *id));
             for t in list.iter().filter(|t| matches!(t.kind, Kind::Claude | Kind::Codex)) {
                 let key = t.transcript.as_ref().map(|p| p.display().to_string()).or_else(|| t.session.clone());
-                let stale = logs.get(&t.id).is_none_or(|(k, log)| *k != key || !log.path.is_file());
+                let stale = logs.get(&t.id).is_none_or(|w| w.key != key || !w.log.path.is_file());
                 if stale {
                     // Finding a log by its id reads every Claude project, or
                     // every day of Codex sessions: not every 2 seconds. (A
@@ -255,10 +467,16 @@ pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
                         continue;
                     };
                     missed.remove(&t.id);
-                    logs.insert(t.id, (key, Log::new(path)));
+                    match logs.get_mut(&t.id) {
+                        Some(w) => w.switch(key, path),
+                        None => {
+                            logs.insert(t.id, Watched { key, log: Log::new(path), subagents: BTreeMap::new(), earlier: Spend::new() });
+                        }
+                    }
                 }
-                let (_, log) = logs.get_mut(&t.id).unwrap();
-                log.advance();
+                let w = logs.get_mut(&t.id).unwrap();
+                w.advance(t.kind);
+                let log = &w.log;
                 let ctx = match t.kind {
                     Kind::Codex => log.codex.map(|(used, window)| Context { used, window, exact: true }),
                     _ => log.claude.as_ref().map(|(used, model)| {
@@ -275,6 +493,13 @@ pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
                 if sent.get(&t.id) != Some(&ctx) {
                     sent.insert(t.id, ctx);
                     if tx.send(AppEvent::Context(t.id, ctx)).is_err() {
+                        return;
+                    }
+                }
+                let spend = w.spend();
+                if sent_spend.get(&t.id) != Some(&spend) {
+                    sent_spend.insert(t.id, spend.clone());
+                    if tx.send(AppEvent::Spend(t.id, spend)).is_err() {
                         return;
                     }
                 }
@@ -358,20 +583,103 @@ mod tests {
     }
 
     #[test]
-    fn long_logs_are_read_from_the_tail() {
+    fn long_logs_are_read_whole_a_piece_at_a_time() {
         let dir = tmp();
         let path = dir.join("big.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         let filler = format!("{{\"type\":\"user\",\"pad\":\"{}\"}}\n", "x".repeat(1000));
-        writeln!(f, "{}", codex_turn(1, 1)).unwrap(); // only in the skipped head
-        for _ in 0..(TAIL / 1000 + 100) {
+        writeln!(f, "{}", claude_turn(10_000, "m")).unwrap(); // long before the last piece
+        for _ in 0..(CHUNK / 1000 + 100) {
             f.write_all(filler.as_bytes()).unwrap();
         }
-        writeln!(f, "{}", codex_turn(42_000, 258_400)).unwrap();
+        writeln!(f, "{}", claude_turn(42_000, "m")).unwrap();
         let mut log = Log::new(path);
         log.advance();
-        assert_eq!(log.codex, Some((42_000, 258_400)));
+        assert_eq!(log.claude.as_ref().map(|c| c.0), Some(42_000), "the latest turn");
+        assert_eq!(total(&log.spend).total(), 52_000, "and every turn counted");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn line(v: &Value) -> String {
+        format!("{v}\n")
+    }
+
+    #[test]
+    fn claude_turns_add_up_once_each() {
+        let dir = tmp();
+        let path = dir.join("s.jsonl");
+        let turn = |id: &str, out: u64| {
+            json!({"type": "assistant", "message": {"id": id, "model": "claude-opus-5-5", "usage": {
+                "input_tokens": 10, "cache_creation_input_tokens": 300, "cache_read_input_tokens": 1000, "output_tokens": out,
+                "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200}}}})
+        };
+        // A message logged once per content block, its output growing.
+        let text = [turn("a", 5), turn("a", 7), turn("b", 1)].iter().map(line).collect::<String>();
+        std::fs::write(&path, text).unwrap();
+        let mut log = Log::new(path.clone());
+        log.advance();
+        let b = Bucket { model: "claude-opus-5-5".into(), fast: false, long: false };
+        assert_eq!(log.spend.get(&b), Some(&Tokens { input: 20, cache_write_5m: 200, cache_write_1h: 400, cache_read: 2000, output: 8 }));
+        // Fast mode and long prompts are priced apart; subagents count.
+        let mut fast = turn("c", 1);
+        fast["message"]["usage"]["speed"] = json!("fast");
+        fast["isSidechain"] = json!(true);
+        fast["message"]["usage"]["cache_read_input_tokens"] = json!(200_000);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(line(&fast).as_bytes()).unwrap();
+        log.advance();
+        assert_eq!(log.spend.get(&Bucket { fast: true, long: true, ..b.clone() }).map(|t| t.cache_read), Some(200_000));
+        // No breakdown by TTL: a 5-minute write.
+        let (_, _, t) = claude_spend(&json!({"type": "assistant", "message": {"model": "m", "usage": {"cache_creation_input_tokens": 9}}})).unwrap();
+        assert_eq!((t.cache_write_5m, t.cache_write_1h), (9, 0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_totals_go_to_the_model_in_use() {
+        let dir = tmp();
+        let path = dir.join("r.jsonl");
+        let ctx = |m: &str| json!({"type": "turn_context", "payload": {"model": m}});
+        let count = |input: u64, cached: u64, output: u64| {
+            json!({"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": 0, "output_tokens": output, "total_tokens": input + output},
+                "last_token_usage": {"total_tokens": 1}, "model_context_window": 100}}})
+        };
+        let text = [ctx("gpt-5-codex"), count(1000, 600, 50), count(1000, 600, 50), ctx("gpt-5.2"), count(3000, 2000, 80)].iter().map(line).collect::<String>();
+        std::fs::write(&path, text).unwrap();
+        let mut log = Log::new(path);
+        log.advance();
+        let b = |m: &str| Bucket { model: m.into(), fast: false, long: false };
+        assert_eq!(log.spend.get(&b("gpt-5-codex")), Some(&Tokens { input: 400, cache_read: 600, output: 50, ..Default::default() }), "a count repeated isn't more");
+        assert_eq!(log.spend.get(&b("gpt-5.2")), Some(&Tokens { input: 600, cache_read: 1400, output: 30, ..Default::default() }), "what was added since");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_agent_keeps_what_it_spent_before() {
+        let root = tmp();
+        let first = root.join("s1.jsonl");
+        std::fs::write(&first, line(&claude_turn(1_000, "m"))).unwrap();
+        let subs = root.join("s1/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let mut side = claude_turn(500, "m");
+        side["isSidechain"] = json!(true);
+        std::fs::write(subs.join("agent-a1.jsonl"), line(&side)).unwrap();
+        std::fs::write(subs.join("agent-a1.meta.json"), "{}").unwrap();
+        let mut w = Watched { key: None, log: Log::new(first.clone()), subagents: BTreeMap::new(), earlier: Spend::new() };
+        w.advance(Kind::Claude);
+        assert_eq!(total(&w.spend()).total(), 1_500, "its subagents' too");
+        assert_eq!(w.log.claude.as_ref().map(|c| c.0), Some(1_000), "but not in its context");
+        // `/clear`: a new conversation, a new log.
+        let second = root.join("s2.jsonl");
+        std::fs::write(&second, line(&claude_turn(2_000, "m"))).unwrap();
+        w.switch(Some("s2".into()), second);
+        w.advance(Kind::Claude);
+        assert_eq!(total(&w.spend()).total(), 3_500);
+        // The same log found again isn't counted twice.
+        w.switch(Some("again".into()), root.join("s2.jsonl"));
+        w.advance(Kind::Claude);
+        assert_eq!(total(&w.spend()).total(), 3_500);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

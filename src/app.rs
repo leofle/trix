@@ -45,6 +45,8 @@ pub enum AppEvent {
     Git(u32, Option<String>, Option<(u32, u32, u32)>),
     /// An agent's context use changed (`None`: a fresh conversation, nothing yet).
     Context(u32, Option<crate::usage::Context>),
+    /// An agent's tokens so far changed.
+    Spend(u32, crate::usage::Spend),
     /// Attach / detach / control traffic; handled by the server loop.
     Session(SessionEvent),
 }
@@ -488,6 +490,10 @@ pub struct App {
     drag: Option<Drag>,
     git_targets: Arc<Mutex<GitTargets>>,
     usage_targets: crate::usage::Targets,
+    /// What agents closed since this server started had spent.
+    closed_spend: crate::usage::Spend,
+    /// How near the workspace's budget it was last told to be.
+    budget_level: u8,
     pub last_title: String,
     pub pane_size: (u16, u16),
     /// Read-only terminals watching (`trix view`).
@@ -588,6 +594,8 @@ impl App {
             drag: None,
             git_targets,
             usage_targets,
+            closed_spend: Default::default(),
+            budget_level: 0,
             last_title: String::new(),
             pane_size: (80, 24),
             viewers: 0,
@@ -673,6 +681,7 @@ impl App {
             Ok(c) => {
                 self.config = c;
                 self.sync_agent_themes();
+                self.check_budgets();
                 self.toast("config reloaded", ToastKind::Good);
             }
             Err(e) => self.toast(format!("config: {e} — kept the previous settings"), ToastKind::Bad),
@@ -885,6 +894,12 @@ impl App {
         if self.viewers > 0 {
             out.insert_str(out.len() - 1, &format!(" · {} watching", self.viewers));
         }
+        let spent = self.totals();
+        if crate::usage::total(&spent).total() > 0 {
+            let c = self.cost_of(&spent);
+            let budget = self.config.cost.budget.map(|b| format!(" of {}", crate::cost::usd(b))).unwrap_or_default();
+            out.insert_str(out.len() - 1, &format!(" · {}{budget} · {} tokens", crate::cost::label(&c), crate::usage::tokens(crate::usage::total(&spent).total())));
+        }
         let w = self.agents.iter().map(|a| a.name.chars().count()).max().unwrap_or(0);
         for (i, a) in self.agents.iter().enumerate() {
             let since = crate::ui::fmt_dur(a.state_since.elapsed());
@@ -901,6 +916,77 @@ impl App {
             ));
         }
         out
+    }
+
+    /// Every agent's spend added up, those closed since the server started too.
+    pub fn totals(&self) -> crate::usage::Spend {
+        let mut s = self.closed_spend.clone();
+        for a in &self.agents {
+            crate::usage::merge(&mut s, &a.spend);
+        }
+        s
+    }
+
+    pub fn cost_of(&self, spend: &crate::usage::Spend) -> crate::cost::Cost {
+        crate::cost::cost(spend, &self.config.cost.prices)
+    }
+
+    /// The workspace's level (`cost::level`) against its budget, and one agent's against its.
+    pub fn budget_levels(&self) -> (u8, Vec<u8>) {
+        let c = &self.config.cost;
+        let total = crate::cost::level(self.cost_of(&self.totals()).usd, c.budget, c.warn_at);
+        (total, self.agents.iter().map(|a| crate::cost::level(self.cost_of(&a.spend).usd, c.agent_budget, c.warn_at)).collect())
+    }
+
+    /// Say so once when the workspace, or an agent, gets near its budget
+    /// and again when it goes over. Falling back below (a budget raised)
+    /// makes it say so again next time.
+    fn check_budgets(&mut self) {
+        let (total, each) = self.budget_levels();
+        let c = self.config.cost.clone();
+        let mut alerts: Vec<(String, bool)> = Vec::new();
+        if total > self.budget_level
+            && let Some(b) = c.budget
+        {
+            let spent = crate::cost::usd(self.cost_of(&self.totals()).usd);
+            alerts.push(match total {
+                2 => (format!("over budget: {spent} spent, the budget is {}", crate::cost::usd(b)), true),
+                _ => (format!("{spent} spent, {}% of the {} budget", c.warn_at, crate::cost::usd(b)), false),
+            });
+        }
+        self.budget_level = total;
+        for (i, level) in each.into_iter().enumerate() {
+            let a = &self.agents[i];
+            if level > a.budget_level
+                && let Some(b) = c.agent_budget
+            {
+                let spent = crate::cost::usd(self.cost_of(&a.spend).usd);
+                alerts.push(match level {
+                    2 => (format!("{} is over its budget: {spent} of {}", a.name, crate::cost::usd(b)), true),
+                    _ => (format!("{} has spent {spent}, {}% of its {} budget", a.name, c.warn_at, crate::cost::usd(b)), false),
+                });
+            }
+            self.agents[i].budget_level = level;
+        }
+        for (text, over) in alerts {
+            self.toast(text.clone(), if over { ToastKind::Bad } else { ToastKind::Info });
+            if over {
+                self.budget_alert(&text);
+            }
+        }
+    }
+
+    /// Over a budget: a desktop notification and the bell, as the
+    /// notification settings have them.
+    fn budget_alert(&mut self, body: &str) {
+        let title = if crate::session::is_default() { "trix: over budget".to_string() } else { format!("trix: over budget · {}", crate::session::name()) };
+        let n = &self.config.notify;
+        if n.desktop && !cfg!(test) {
+            desktop_notify(&title, body, true);
+        }
+        if n.bell && !self.term_focused {
+            self.out.send_all(b"\x07");
+        }
     }
 
     pub fn focused(&self) -> Option<&Agent> {
@@ -1561,6 +1647,7 @@ impl App {
         if let Some(i) = self.index_of(id) {
             let a = self.agents.remove(i);
             a.shutdown();
+            crate::usage::merge(&mut self.closed_spend, &a.spend);
             // A menu or dialog about it has nothing left to act on.
             if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent, _)) if agent == id) {
                 self.modal = None;
@@ -1804,6 +1891,13 @@ impl App {
             AppEvent::Context(id, ctx) => {
                 if let Some(i) = self.index_of(id) {
                     self.agents[i].context = ctx;
+                    self.dirty = true;
+                }
+            }
+            AppEvent::Spend(id, spend) => {
+                if let Some(i) = self.index_of(id) {
+                    self.agents[i].spend = spend;
+                    self.check_budgets();
                     self.dirty = true;
                 }
             }
@@ -3355,6 +3449,57 @@ mod tests {
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
+    }
+
+    fn spend_of(model: &str, input: u64, output: u64) -> crate::usage::Spend {
+        crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, long: false }, crate::usage::Tokens { input, output, ..Default::default() })])
+    }
+
+    #[test]
+    fn budgets_warn_once_then_say_when_over() {
+        let mut app = test_app();
+        app.config.cost.budget = Some(10.0);
+        app.config.cost.agent_budget = Some(6.0);
+        for (id, name) in [(1, "web"), (2, "api")] {
+            let mut a = crate::agent::test_agent(Kind::Claude);
+            a.id = id;
+            a.name = name.into();
+            app.agents.push(a);
+        }
+        let (web, api) = (app.agents[0].id, app.agents[1].id);
+        let toast = |app: &App| app.toast.as_ref().map(|t| (t.text.clone(), t.kind == ToastKind::Bad));
+        // Opus 5.5 at $4 per million in.
+        app.handle(AppEvent::Spend(web, spend_of("claude-opus-5-5", 1_000_000, 0)));
+        assert_eq!(toast(&app), None, "$4 of 10: nothing to say");
+        app.handle(AppEvent::Spend(api, spend_of("claude-opus-5-5", 1_000_000, 0)));
+        assert_eq!(toast(&app), Some(("$8.00 spent, 80% of the $10.00 budget".into(), false)));
+        app.toast = None;
+        app.handle(AppEvent::Spend(api, spend_of("claude-opus-5-5", 1_100_000, 0)));
+        assert_eq!(toast(&app), None, "warned once");
+        app.handle(AppEvent::Spend(web, spend_of("claude-opus-5-5", 1_600_000, 0)));
+        let (text, bad) = toast(&app).unwrap();
+        assert!(bad && text.contains("web is over its budget: $6.40 of $6.00"), "{text}");
+        assert_eq!(app.budget_levels(), (2, vec![2, 0]), "api: $4.40 of 6, under 80%");
+        // A budget raised: under again, and told again next time.
+        app.apply_config(crate::config::parse("[cost]\nbudget = 100\n", Path::new("/")));
+        assert_eq!(app.budget_levels(), (0, vec![0, 0]));
+        assert_eq!(app.budget_level, 0);
+    }
+
+    #[test]
+    fn closed_agents_still_count_in_the_totals() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.name = "web".into();
+        app.agents.push(a);
+        let id = app.agents[0].id;
+        assert!(!app.listing().lines().next().unwrap().contains('$'), "nothing spent yet");
+        app.handle(AppEvent::Spend(id, spend_of("claude-sonnet-5-5", 500_000, 100_000)));
+        assert!(app.listing().lines().next().unwrap().ends_with(" · $2.00 · 600k tokens"), "{}", app.listing());
+        app.close(id);
+        assert!(app.agents.is_empty());
+        assert_eq!(crate::usage::total(&app.totals()).total(), 600_000);
+        assert!((app.cost_of(&app.totals()).usd - 2.0).abs() < 1e-9);
     }
 
     #[test]

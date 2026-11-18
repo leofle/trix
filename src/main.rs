@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod config;
+mod cost;
 mod control;
 mod events;
 mod folders;
