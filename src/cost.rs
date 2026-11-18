@@ -137,9 +137,20 @@ pub fn cost(spend: &Spend, own: &BTreeMap<String, Price>) -> Cost {
     c
 }
 
-/// "$0.42", "$12.40", "$1234".
+/// "$0.0042", "$0.42", "$12.40", "$1234". Under a dollar, at least two
+/// significant digits (up to six decimals), so a small amount isn't "$0.00".
 pub fn usd(x: f64) -> String {
-    if x < 100.0 { format!("${x:.2}") } else { format!("${}", x.round() as u64) }
+    if x >= 100.0 {
+        return format!("${}", x.round() as u64);
+    }
+    if x <= 0.0 || x >= 1.0 {
+        return format!("${:.2}", x.max(0.0));
+    }
+    let decimals = ((-x.log10()).ceil() as usize + 1).clamp(2, 6);
+    let s = format!("{x:.decimals$}");
+    // Zeros past the cents say nothing: "$0.020" is "$0.02".
+    let keep = s.trim_end_matches('0').len().max(s.find('.').unwrap() + 3);
+    format!("${}", &s[..keep])
 }
 
 /// The cost as the screen shows it: a `+` when some tokens had no price.
@@ -210,7 +221,16 @@ mod tests {
 
     #[test]
     fn money_and_budget_levels() {
-        assert_eq!(usd(0.004), "$0.00");
+        assert_eq!(usd(0.0), "$0.00");
+        assert_eq!(usd(0.02), "$0.02", "not $0.020");
+        assert_eq!(usd(0.004), "$0.004");
+        assert_eq!(usd(0.0042), "$0.0042");
+        assert_eq!(usd(0.01), "$0.01");
+        assert_eq!(usd(0.015), "$0.015");
+        assert_eq!(usd(0.123), "$0.12");
+        assert_eq!(usd(0.999), "$1.00");
+        assert_eq!(usd(0.000_000_4), "$0.00", "past six decimals");
+        assert_eq!(format!("{} of {}", usd(0.0042), usd(0.02)), "$0.0042 of $0.02");
         assert_eq!(usd(12.4), "$12.40");
         assert_eq!(usd(1234.4), "$1234");
         assert_eq!(level(5.0, None, 80), 0);

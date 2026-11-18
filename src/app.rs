@@ -681,8 +681,11 @@ impl App {
             Ok(c) => {
                 self.config = c;
                 self.sync_agent_themes();
-                self.check_budgets();
-                self.toast("config reloaded", ToastKind::Good);
+                // A budget the new settings put spend past says so, with the reload.
+                match self.check_budgets() {
+                    Some(said) => self.toast(format!("config reloaded · {said}"), self.toast.as_ref().map_or(ToastKind::Info, |t| t.kind)),
+                    None => self.toast("config reloaded", ToastKind::Good),
+                }
             }
             Err(e) => self.toast(format!("config: {e} — kept the previous settings"), ToastKind::Bad),
         }
@@ -940,8 +943,9 @@ impl App {
 
     /// Say so once when the workspace, or an agent, gets near its budget
     /// and again when it goes over. Falling back below (a budget raised)
-    /// makes it say so again next time.
-    fn check_budgets(&mut self) {
+    /// makes it say so again next time. Returns the last thing said, which
+    /// is the toast on screen.
+    fn check_budgets(&mut self) -> Option<String> {
         let (total, each) = self.budget_levels();
         let c = self.config.cost.clone();
         let mut alerts: Vec<(String, bool)> = Vec::new();
@@ -968,12 +972,17 @@ impl App {
             }
             self.agents[i].budget_level = level;
         }
+        // The one that matters most goes last, so it's the toast that stays.
+        alerts.sort_by_key(|(_, over)| *over);
+        let mut said = None;
         for (text, over) in alerts {
             self.toast(text.clone(), if over { ToastKind::Bad } else { ToastKind::Info });
             if over {
                 self.budget_alert(&text);
             }
+            said = Some(text);
         }
+        said
     }
 
     /// Over a budget: a desktop notification and the bell, as the
@@ -1897,7 +1906,7 @@ impl App {
             AppEvent::Spend(id, spend) => {
                 if let Some(i) = self.index_of(id) {
                     self.agents[i].spend = spend;
-                    self.check_budgets();
+                    let _ = self.check_budgets();
                     self.dirty = true;
                 }
             }
@@ -3484,6 +3493,24 @@ mod tests {
         app.apply_config(crate::config::parse("[cost]\nbudget = 100\n", Path::new("/")));
         assert_eq!(app.budget_levels(), (0, vec![0, 0]));
         assert_eq!(app.budget_level, 0);
+        assert_eq!(toast(&app), Some(("config reloaded".into(), false)));
+    }
+
+    #[test]
+    fn a_reload_that_puts_spend_over_budget_says_so() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.name = "web".into();
+        app.agents.push(a);
+        let id = app.agents[0].id;
+        app.handle(AppEvent::Spend(id, spend_of("claude-opus-5-5", 1_000_000, 0)));
+        app.apply_config(crate::config::parse("[cost]\nbudget = 2\n", Path::new("/")));
+        let t = app.toast.as_ref().unwrap();
+        assert_eq!(t.text, "config reloaded · over budget: $4.00 spent, the budget is $2.00", "not covered by the reload's toast");
+        assert!(t.kind == ToastKind::Bad);
+        // Near it and over the agent's own at once: being over is what shows.
+        app.apply_config(crate::config::parse("[cost]\nbudget = 4.5\nagent_budget = 3\n", Path::new("/")));
+        assert_eq!(app.toast.as_ref().unwrap().text, "config reloaded · web is over its budget: $4.00 of $3.00");
     }
 
     #[test]
