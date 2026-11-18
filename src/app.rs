@@ -436,8 +436,6 @@ pub enum DialogHit {
 /// The buttons of the yes/no dialogs, left to right: the label, and the key
 /// that presses it. The first is the one Enter presses when the dialog opens.
 pub const CONFIRM_BUTTONS: [(&str, &str); 2] = [("y", "yes"), ("esc", "keep")];
-/// A review's merge: here, on GitHub, or not at all.
-pub const MERGE_BUTTONS: [(&str, &str); 3] = [("l", "merge locally"), ("g", "merge the PR"), ("esc", "keep")];
 pub const RESTORE_BUTTONS: [(&str, &str); 3] = [("y", "restore"), ("n", "start fresh"), ("esc", "later")];
 
 struct Drag {
@@ -2967,6 +2965,11 @@ impl App {
         self.dirty = true;
         let Some(Modal::Review(r)) = &mut self.modal else { return };
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        // A question's buttons, worked out before its mode is borrowed.
+        let all = match &r.mode {
+            Mode::Confirm(op, _) => r.buttons(op),
+            _ => Vec::new(),
+        };
         match &mut r.mode {
             Mode::Note(t) | Mode::Commit(t) if k.code == KeyCode::Esc => {
                 let _ = t;
@@ -2995,15 +2998,13 @@ impl App {
                 }
             },
             Mode::Confirm(op, sel) => {
-                let merge = *op == Op::Merge;
-                let n = if merge { MERGE_BUTTONS.len() } else { CONFIRM_BUTTONS.len() };
+                let n = all.len();
+                let by_key = |c: char| all.iter().position(|b| b.0.len() == 1 && b.0.starts_with(c));
                 let pick = match k.code {
                     KeyCode::Esc => Some(n - 1),
                     KeyCode::Char('c' | 'g') if ctrl => Some(n - 1),
-                    KeyCode::Char('y') if !merge => Some(0),
-                    KeyCode::Char('l') if merge => Some(0),
-                    KeyCode::Char('g') if merge => Some(1),
                     KeyCode::Char('n') => Some(n - 1),
+                    KeyCode::Char(c) if by_key(c).is_some() => by_key(c),
                     KeyCode::Enter | KeyCode::Char(' ') => Some(*sel),
                     KeyCode::Left | KeyCode::BackTab => {
                         *sel = (*sel + n - 1) % n;
@@ -3016,11 +3017,11 @@ impl App {
                     _ => None,
                 };
                 let Some(pick) = pick else { return };
-                let op = op.clone();
+                let (op, key) = (op.clone(), all[pick.min(n - 1)].0);
                 r.mode = Mode::Browse;
-                match (pick, merge) {
-                    (p, _) if p == n - 1 => {}
-                    (1, true) => self.start_review_op(Op::MergePr),
+                match key {
+                    "esc" => {}
+                    "g" => self.start_review_op(Op::MergePr),
                     _ if op == Op::Cleanup => self.clean_up_worktree(),
                     _ => self.start_review_op(op),
                 }

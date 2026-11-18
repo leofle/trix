@@ -1903,6 +1903,11 @@ fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str, sel: u
 /// A yes/no dialog's buttons, centred on `row`: each its key and what it
 /// does. The active one (`sel`, the one enter presses) is lit, the first in
 /// `first`'s colour and the others in the accent; each can be clicked.
+/// How wide `buttons` draws these, gaps included.
+fn buttons_width(all: &[(&str, &str)]) -> usize {
+    all.iter().map(|(k, l)| k.width() + l.width() + 3).sum::<usize>() + 5 * all.len().saturating_sub(1)
+}
+
 fn buttons(f: &mut Frame, row: Rect, t: &Theme, all: &[(&str, &str)], sel: usize, first: Color, hits: &mut Vec<(Rect, DialogHit)>) {
     const GAP: usize = 5;
     let mut spans = Vec::new();
@@ -2140,7 +2145,9 @@ fn diff_text(s: &str) -> String {
 fn review(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
     use crate::review::{Kind as L, Mode};
     let Some(Modal::Review(rv)) = &app.modal else { return };
-    let r = Rect { x: area.x + 2, y: area.y + 1, width: area.width.saturating_sub(4), height: area.height.saturating_sub(2) };
+    // Edge to edge between the bars: a margin would show the pane's own
+    // border beside the review's, a second edge.
+    let r = Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height.saturating_sub(2) };
     if r.width < 20 || r.height < 8 {
         return;
     }
@@ -2303,9 +2310,11 @@ fn review(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             crate::review::Op::Merge => ("Merge".into(), format!("Merge {branch} into {} in {}?", p.base.clone().unwrap_or_default(), crate::app::tilde(&p.main))),
             _ => ("Clean up".into(), format!("Close {name}, remove {} and delete {branch} if it's merged?", crate::app::tilde(&p.top))),
         };
-        let all: &[(&str, &str)] = if *op == crate::review::Op::Merge { &crate::app::MERGE_BUTTONS } else { &crate::app::CONFIRM_BUTTONS };
+        let all = rv.buttons(op);
         let first = if matches!(op, crate::review::Op::Cleanup) { t.red } else { t.green };
-        let b = centered(area, (text.width() as u16 + 8).max(56), 7);
+        // As wide as the question or the buttons, whichever is wider, with
+        // room to spare on both sides.
+        let b = centered(area, (text.width().max(buttons_width(&all)) as u16 + 8).max(44), 7);
         f.render_widget(Clear, b);
         let block = modal_block(&title, t);
         let bi = block.inner(b);
@@ -2315,7 +2324,7 @@ fn review(f: &mut Frame, app: &mut App, area: Rect, t: &Theme) {
             f.render_widget(Paragraph::new(Span::styled(text.clone(), Style::new().fg(t.fg))).alignment(Alignment::Center), row);
         }
         if let Some(row) = lines[3] {
-            buttons(f, row, t, all, *sel, first, &mut dialog);
+            buttons(f, row, t, &all, *sel, first, &mut dialog);
         }
         cursor_at = None;
     }
@@ -2775,7 +2784,17 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("commit message › Shout")), "{lines:#?}");
         let lines = dialog(open(|r| r.mode = crate::review::Mode::Confirm(crate::review::Op::Merge, 0)), 100, 30);
         let all = lines.join("\n");
-        assert!(all.contains("Merge trix/w into main in") && all.contains("merge locally") && all.contains("merge the PR"), "{all}");
+        assert!(all.contains("Merge trix/w into main in") && all.contains("merge locally"), "{all}");
+        // Not pushed: there's no pull request to offer.
+        assert!(!all.contains("merge the PR"), "{all}");
+        // The buttons keep clear of the dialog's border.
+        let row = lines.iter().find(|l| l.contains("esc  keep")).expect("the buttons");
+        assert!(row.contains("esc  keep  ") && row.contains("  l  merge locally"), "{row:?}");
+        // One edge on the right, the review's own: no pane border beside it.
+        let lines = dialog(open(|_| {}), 100, 30);
+        for l in &lines[1..29] {
+            assert!(!l.contains("╮╮") && !l.contains("││") && !l.ends_with("│ │"), "a second edge: {l:?}");
+        }
         // Too small a window draws nothing rather than a broken panel.
         let lines = dialog(open(|_| {}), 18, 6);
         assert!(!lines.join("").contains("Review"));

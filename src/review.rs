@@ -205,6 +205,11 @@ pub struct Place {
     pub worktree: bool,
     /// Commits on `branch` that `base` doesn't have.
     pub ahead: Option<u32>,
+    /// The remote a push goes to: `origin`, or the only one there is.
+    pub remote: Option<String>,
+    /// `branch` has been pushed there (as far as the last fetch or push
+    /// knows; nothing here asks the network).
+    pub pushed: bool,
 }
 
 pub fn place(dir: &Path) -> Result<Place, String> {
@@ -220,7 +225,18 @@ pub fn place(dir: &Path) -> Result<Place, String> {
         (Some(base), Some(_)) => git(&top, &["rev-list", "--count", &format!("{base}..HEAD")]).ok().and_then(|n| n.parse().ok()),
         _ => None,
     };
-    Ok(Place { top, main, branch, base, worktree, ahead })
+    let remote = remote_of(&top);
+    let pushed = match (&remote, &branch) {
+        (Some(r), Some(b)) => git(&top, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{r}/{b}")]).is_ok(),
+        _ => false,
+    };
+    Ok(Place { top, main, branch, base, worktree, ahead, remote, pushed })
+}
+
+/// `origin` if there is one, else the first remote.
+fn remote_of(top: &Path) -> Option<String> {
+    let remotes = git(top, &["remote"]).ok()?;
+    if remotes.lines().any(|r| r == "origin") { Some("origin".into()) } else { remotes.lines().next().map(String::from) }
 }
 
 /// Everything uncommitted in `dir`, against HEAD, untracked files included.
@@ -461,12 +477,25 @@ impl Review {
         s.trim_end().to_string()
     }
 
+    /// The buttons a step's question offers, left to right: each its key
+    /// and what it does. The last is always esc. A merge offers the pull
+    /// request only when there can be one: the branch is on a remote.
+    pub fn buttons(&self, op: &Op) -> Vec<(&'static str, &'static str)> {
+        match op {
+            Op::Merge if self.refusal(&Op::MergePr).is_none() => vec![("l", "merge locally"), ("g", "merge the PR"), ("esc", "keep")],
+            Op::Merge => vec![("l", "merge locally"), ("esc", "keep")],
+            _ => vec![("y", "yes"), ("esc", "keep")],
+        }
+    }
+
     /// Why a step can't be taken here, before asking about it.
     pub fn refusal(&self, op: &Op) -> Option<String> {
         let p = &self.place;
         let Some(branch) = &p.branch else { return Some("HEAD is detached: check out a branch first".into()) };
         match op {
             Op::Commit(_) => self.files.is_empty().then(|| "nothing to commit".into()),
+            Op::Push | Op::Pr if p.remote.is_none() => Some("no remote to push to: add one with git remote add".into()),
+            Op::MergePr if !p.pushed => Some(format!("{branch} isn't pushed, so it has no pull request to merge")),
             Op::Push | Op::Pr | Op::MergePr => None,
             Op::Merge | Op::Cleanup if !p.worktree => {
                 Some(format!("{} is the main checkout, not a worktree: {branch} has no checkout here to merge into", crate::app::tilde(&p.top)))
@@ -497,8 +526,20 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
             if msg.trim().is_empty() {
                 return Err("the commit needs a message".into());
             }
+            // What was staged before, to put back if the commit fails (a
+            // hook says no, no identity…): `git add -A` mustn't outlive it.
+            let before = git(top, &["write-tree"]).ok();
             git(top, &["add", "-A"])?;
-            git(top, &["commit", "-q", "-m", msg.trim()])?;
+            if let Err(e) = git(top, &["commit", "-q", "-m", msg.trim()]) {
+                let undone = match &before {
+                    Some(tree) => git(top, &["read-tree", tree]),
+                    None => git(top, &["reset", "-q"]),
+                };
+                return Err(match undone {
+                    Ok(_) => format!("commit failed, staging put back as it was: {e}"),
+                    Err(_) => format!("commit failed, and everything is still staged: {e}"),
+                });
+            }
             let head = git(top, &["log", "-1", "--format=%h %s"])?;
             Ok(format!("committed {head}"))
         }
@@ -525,8 +566,16 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
             }
             let msg = format!("Merge branch '{branch}'");
             if let Err(e) = git(&p.main, &["merge", "--no-ff", "--no-edit", "-m", &msg, &branch]) {
+                // git's last word may be rerere's "Recorded preimage…": name
+                // the conflicts instead.
+                let conflicts = git(&p.main, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
                 let _ = git(&p.main, &["merge", "--abort"]);
-                return Err(format!("merge stopped, nothing changed: {e}"));
+                let files: Vec<&str> = conflicts.lines().filter(|l| !l.is_empty()).collect();
+                return Err(if files.is_empty() {
+                    format!("merge failed, nothing changed: {e}")
+                } else {
+                    format!("merge conflicted in {}: aborted, nothing changed", files.join(", "))
+                });
             }
             Ok(format!("merged {branch} into {base}"))
         }
@@ -545,8 +594,8 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
 }
 
 fn push(top: &Path, branch: &str) -> Outcome {
-    let remotes = git(top, &["remote"])?;
-    let remote = if remotes.lines().any(|r| r == "origin") { "origin" } else { remotes.lines().next().ok_or("no remote to push to")? };
+    let remote = remote_of(top).ok_or("no remote to push to")?;
+    let remote = remote.as_str();
     // Named both sides: a branch that tracks another (origin/main) still
     // goes to its own name.
     git(top, &["push", "-u", remote, &format!("{branch}:{branch}")])?;
@@ -613,7 +662,7 @@ Binary files a/logo.png and b/logo.png differ
 
     fn review(patch: &str) -> Review {
         let (files, lines) = parse(patch);
-        let place = Place { top: "/r".into(), main: "/r".into(), branch: Some("trix/x".into()), base: None, worktree: false, ahead: None };
+        let place = Place { top: "/r".into(), main: "/r".into(), branch: Some("trix/x".into()), base: None, worktree: false, ahead: None, remote: None, pushed: false };
         Review {
             agent: 1,
             dir: "/r".into(),
@@ -793,13 +842,56 @@ Binary files a/logo.png and b/logo.png differ
         std::fs::write(main.join("a.txt"), "one\nmain\n").unwrap();
         sh(&main, &["commit", "-q", "-am", "ours"]);
         let head = sh(&main, &["rev-parse", "HEAD"]);
+        // rerere's last word mustn't stand in for the conflict.
+        sh(&main, &["config", "rerere.enabled", "true"]);
         let err = perform(&Op::Merge, &wt).unwrap_err();
-        assert!(err.starts_with("merge stopped, nothing changed"), "{err}");
+        assert_eq!(err, "merge conflicted in a.txt: aborted, nothing changed");
         assert_eq!(sh(&main, &["rev-parse", "HEAD"]), head);
         assert_eq!(sh(&main, &["status", "--porcelain", "--untracked-files=no"]), "");
         // Cleaning up keeps the branch git won't delete safely.
         assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w, which isn't merged yet");
         assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_ok());
+    }
+
+    #[test]
+    fn a_commit_that_fails_leaves_the_staging_as_it_was() {
+        let (_keep, _main, wt) = repo("commit-fails");
+        std::fs::write(wt.join("a.txt"), "staged\n").unwrap();
+        sh(&wt, &["add", "a.txt"]);
+        std::fs::write(wt.join("a.txt"), "staged, then changed\n").unwrap();
+        std::fs::write(wt.join("b.txt"), "untracked\n").unwrap();
+        let before = sh(&wt, &["status", "--porcelain"]);
+        // A pre-commit hook that says no (in the shared hooks folder).
+        let hooks = PathBuf::from(sh(&wt, &["rev-parse", "--git-common-dir"])).join("hooks");
+        let hooks = if hooks.is_absolute() { hooks } else { wt.join(hooks) };
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'not today' >&2\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = perform(&Op::Commit("nope".into()), &wt).unwrap_err();
+        assert_eq!(err, "commit failed, staging put back as it was: not today");
+        assert_eq!(sh(&wt, &["status", "--porcelain"]), before);
+    }
+
+    #[test]
+    fn the_pull_request_is_offered_only_for_a_pushed_branch() {
+        let (_keep, main, wt) = repo("buttons");
+        std::fs::write(wt.join("c.txt"), "c\n").unwrap();
+        perform(&Op::Commit("c".into()), &wt).unwrap();
+        let keys = |r: &Review| r.buttons(&Op::Merge).iter().map(|b| b.0).collect::<Vec<_>>();
+        let mut r = Review::open(1, &wt).unwrap();
+        assert_eq!(r.place.remote.as_deref(), Some("origin"));
+        assert_eq!(keys(&r), ["l", "esc"], "not pushed: no PR to merge");
+        perform(&Op::Push, &wt).unwrap();
+        r.reload().unwrap();
+        assert_eq!(keys(&r), ["l", "g", "esc"]);
+        // No remote at all: nothing to push to, nor a PR.
+        sh(&main, &["remote", "remove", "origin"]);
+        r.reload().unwrap();
+        assert_eq!(keys(&r), ["l", "esc"]);
+        assert!(r.refusal(&Op::Push).unwrap().starts_with("no remote"));
+        assert!(r.refusal(&Op::Pr).unwrap().starts_with("no remote"));
     }
 
     #[test]
