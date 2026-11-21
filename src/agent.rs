@@ -232,6 +232,16 @@ pub struct Spawn {
     pub branch_note: Option<String>,
     /// Conversation to resume (Claude / Codex) instead of starting a new one.
     pub resume: Option<String>,
+    /// What its worktree adds: ports, and a setup to run first.
+    pub runtime: crate::worktree::Runtime,
+}
+
+impl Meta {
+    /// The setup still to get through. One that finished while no server was
+    /// there to hear has its mark in the worktree's git folder.
+    pub fn pending_setup(&self) -> Option<&crate::worktree::Setup> {
+        self.setup.as_ref().filter(|s| !s.finished())
+    }
 }
 
 pub struct Agent {
@@ -426,6 +436,13 @@ pub struct Meta {
     /// Restored stopped, waiting for an Enter.
     #[serde(default)]
     pub parked: bool,
+    /// The worktree's setup, while it hasn't got as far as the agent, and
+    /// the first prompt waiting behind it. A new server needs both to run
+    /// it again if it fails.
+    #[serde(default)]
+    pub setup: Option<crate::worktree::Setup>,
+    #[serde(default)]
+    pub first_prompt: Option<String>,
     #[serde(default)]
     pub hooked: bool,
     #[serde(default)]
@@ -666,7 +683,16 @@ impl Agent {
         // So does one that reads its first prompt from stdin: `trix install`
         // hands it over as it becomes the agent, installed already or not.
         let stdin = stdin_prompt(&spec);
-        let (program, args) = if installing.is_some() || stdin.is_some() { crate::install::wrap(exe, spec.kind, stdin, program, args) } else { (program, args) };
+        let installs = installing.is_some() || stdin.is_some();
+        let (program, args) = if installs { crate::install::wrap(exe, spec.kind, stdin, program, args) } else { (program, args) };
+        // The worktree's setup goes first, in the pane, where you can watch it.
+        let (program, args, installing) = match &spec.runtime.setup {
+            Some(s) => {
+                let (program, args) = crate::worktree::wrap(exe, s, installs, program, args);
+                (program, args, Some("setting up the worktree".to_string()))
+            }
+            None => (program, args, installing),
+        };
 
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -677,6 +703,12 @@ impl Agent {
         env.insert("TRIX_AGENT_ID".into(), id.to_string());
         env.insert("TRIX_AGENT_NAME".into(), spec.name.clone());
         env.insert("TRIX_SESSION".into(), crate::session::name().into());
+        if let Some(ports) = spec.runtime.ports {
+            env.extend(ports.env().map(|(k, v)| (k.to_string(), v)));
+        }
+        if let Some(s) = &spec.runtime.setup {
+            env.insert("TRIX_ROOT".into(), s.root.display().to_string());
+        }
         if spec.kind == Kind::Codex
             && let Some(chain) = codex_user_notify()
         {
@@ -819,6 +851,16 @@ impl Agent {
         if a.state != State::Exited {
             a.restore_state(meta, quiet);
         }
+        // Still in the setup, or it failed with nobody there: the same hold
+        // as before the crash, and Enter runs it again.
+        if meta.pending_setup().is_some() {
+            a.installing = Some("setting up the worktree".into());
+            if a.state != State::Exited {
+                a.state = State::Starting;
+                a.activity = "setting up the worktree".into();
+                a.unseen = false;
+            }
+        }
         a
     }
 
@@ -875,6 +917,8 @@ impl Agent {
             focused,
             pinned: self.pinned,
             parked,
+            setup: None,
+            first_prompt: None,
             hooked: self.hooked,
             reported: self.reported,
             turn_seen: self.turn_seen,
@@ -2360,6 +2404,7 @@ pub(crate) fn test_agent_on(kind: Kind, tx: Sender<AppEvent>) -> Agent {
         prompt: None,
         branch_note: None,
         resume: None,
+        runtime: Default::default(),
     };
     let sock = std::env::temp_dir().join("trix-test.sock");
     let mut a = Agent::spawn(1, spec, (80, 24), tx, &sock, &Integrations::default(), std::path::Path::new("/bin/true")).unwrap();
@@ -2390,7 +2435,7 @@ mod tests {
         Instant::now().checked_sub(d).expect("uptime")
     }
     fn spec(kind: Kind) -> Spawn {
-        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None }
+        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() }
     }
 
     #[test]
