@@ -551,20 +551,35 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
     };
     let mut cwd = cwd;
     let mut note = None;
+    let mut runtime = crate::worktree::Runtime::default();
+    let mut warning = String::new();
     if worktree {
+        let repo = match crate::worktree::RepoConfig::load(&cwd) {
+            Ok(r) => r,
+            Err(e) => return Reply::fail(e),
+        };
         match app::make_worktree(&cwd, &app::slug(&name)) {
             Ok((path, branch, reused)) => {
                 if let Some(other) = app.agents.iter().find(|a| a.cwd == path) {
                     return Reply::fail(format!("{branch} is already {}'s worktree — pick another --name", other.name));
                 }
+                // Trust is only ever given in the new-agent form: a script
+                // or an agent gets the worktree, and is told what didn't run.
+                let ready = crate::worktree::prepare(&path, repo.as_ref(), reused, false, &app.config.worktree);
                 cwd = path;
-                note = Some(format!("{} worktree on {branch}", if reused { "reusing" } else { "new" }));
+                let made = format!("{} worktree on {branch}", if reused { "reusing" } else { "new" });
+                note = Some(ready.note.map_or(made.clone(), |n| format!("{made} · {n}")));
+                runtime = ready.runtime;
+                if let Some(w) = ready.warning {
+                    app.toast(format!("{name}: {w}"), ToastKind::Bad);
+                    warning = w;
+                }
             }
             Err(e) => return Reply::fail(e.to_string()),
         }
     }
     let by = caller_name(app, from);
-    let spec = Spawn { kind, name: name.clone(), cwd: cwd.clone(), command, prompt, branch_note: note, resume: None };
+    let spec = Spawn { kind, name: name.clone(), cwd: cwd.clone(), command, prompt, branch_note: note, resume: None, runtime };
     match app.spawn_quiet(spec) {
         Ok(id) => {
             if let Some(a) = app.agents.iter_mut().find(|a| a.id == id) {
@@ -572,7 +587,7 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
             }
             let who = by.unwrap_or_else(|| "trix spawn".into());
             app.toast(format!("{who} started {name}"), ToastKind::Info);
-            Reply::ok(format!("{name}\t{}\n", app::tilde(&cwd)))
+            Reply { err: warning, ..Reply::ok(format!("{name}\t{}\n", app::tilde(&cwd))) }
         }
         Err(e) => Reply::fail(format!("could not start {}: {e}", kind.label())),
     }
@@ -884,6 +899,33 @@ mod tests {
             p(&["spawn", "shell"]),
             Ok(Request::Spawn { kind: "shell".into(), name: None, cwd: "/work".into(), command: None, prompt: None, worktree: false })
         );
+    }
+
+    #[test]
+    fn a_spawn_into_an_untrusted_repo_warns_and_runs_nothing() {
+        let dir = std::env::temp_dir().join(format!("trix-control-untrusted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join(".gitignore"), ".env\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join(".env"), "A=1\n").unwrap();
+        std::fs::write(dir.join(".trix.toml"), "[worktree]\nsetup = 'touch ran'\ncopy = ['.env']\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        let r = spawn(&mut app, None, "custom", Some("w".into()), dir.clone(), Some("exec sleep 60".into()), None, true);
+        assert!(r.err.contains("isn't trusted"), "{}", r.err);
+        assert!(app.agents[0].installing.is_none(), "no setup is held in front of it");
+        assert!(!dir.join(".trix/worktrees/w/.env").exists());
+        app.agents[0].shutdown();
     }
 
     #[test]

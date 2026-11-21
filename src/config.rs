@@ -27,6 +27,23 @@ pub struct Config {
     pub ui: Ui,
     pub workspace: Workspace,
     pub cost: CostOpts,
+    pub worktree: WorktreeOpts,
+}
+
+/// The ports each of trix's worktrees gets (`TRIX_PORT`…).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorktreeOpts {
+    pub ports: bool,
+    /// Where blocks start. Below the range systems hand out on their own.
+    pub port_base: u16,
+    /// A block's size, unless the repository's `.trix.toml` says.
+    pub port_count: u16,
+}
+
+impl Default for WorktreeOpts {
+    fn default() -> WorktreeOpts {
+        WorktreeOpts { ports: true, port_base: 20000, port_count: 10 }
+    }
 }
 
 /// What agents spend: the budgets to hold it to, and prices of your own.
@@ -278,6 +295,16 @@ struct File {
     workspace: FileWorkspace,
     #[serde(default)]
     cost: FileCost,
+    #[serde(default)]
+    worktree: FileWorktree,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileWorktree {
+    ports: Option<bool>,
+    port_base: Option<i64>,
+    port_count: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -438,7 +465,24 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
     };
     let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false) };
     let cost = cost_opts(f.cost)?;
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost })
+    let worktree = worktree_opts(f.worktree)?;
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree })
+}
+
+fn worktree_opts(f: FileWorktree) -> Result<WorktreeOpts, String> {
+    let d = WorktreeOpts::default();
+    let base = f.port_base.unwrap_or(d.port_base as i64);
+    if !(1024..=65535).contains(&base) {
+        return Err(format!("worktree.port_base: {base} is not a port from 1024 to 65535"));
+    }
+    let count = f.port_count.unwrap_or(d.port_count as i64);
+    if !(1..=100).contains(&count) {
+        return Err(format!("worktree.port_count: {count} is not from 1 to 100"));
+    }
+    if base + count - 1 > 65535 {
+        return Err(format!("worktree.port_count: {count} ports from {base} go past 65535"));
+    }
+    Ok(WorktreeOpts { ports: f.ports.unwrap_or(d.ports), port_base: base as u16, port_count: count as u16 })
 }
 
 fn cost_opts(f: FileCost) -> Result<CostOpts, String> {

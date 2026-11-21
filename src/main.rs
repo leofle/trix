@@ -23,6 +23,7 @@ mod state;
 mod theme;
 mod ui;
 mod usage;
+mod worktree;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
@@ -56,7 +57,8 @@ agent control (for scripts, and for agents managing other agents):
   trix spawn <kind> [--name N] [--cwd DIR] [--worktree] [--prompt P] [--args A]
                             start claude, codex, grok, opencode, cursor (cursor-agent),
                             copilot, muse, gemini, antigravity, amp, shell or custom; prints
-                            its name
+                            its name. --worktree uses the repo's .trix.toml only
+                            once it's trusted in the new-agent form (alt+n)
   trix send <agent> <prompt…>
                             type a prompt into an agent and submit it (prompt
                             from stdin when omitted). Refuses agents that need
@@ -97,6 +99,9 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
   trix install <kind> [--stdin <text>] -- <command…>
                             (internal) install a missing agent in its pane, then
                             run it, with <text> as what it reads on stdin first
+  trix worktree-setup <tell|quiet> <done-file> <script> -- <command…>
+                            (internal) run a repo's trusted .trix.toml setup in
+                            a new worktree's pane, then run the agent
   trix server               (internal) the background workspace
   trix holder               (internal) holds one agent's terminal for the server
 
@@ -170,6 +175,9 @@ fn main() -> anyhow::Result<()> {
     // Before the session flags: everything after `--` is the agent's.
     if args.first().map(String::as_str) == Some("install") {
         std::process::exit(install::run(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("worktree-setup") {
+        std::process::exit(worktree::run_setup(&args[1..]));
     }
     let flag = match take_session(&mut args) {
         Ok(f) => f,
@@ -547,6 +555,7 @@ fn server() -> anyhow::Result<()> {
 
     // Save before stopping: the agents' exits must not read as "closed".
     app.persist();
+    app.release_unsaved_ports();
     control::stop_all(&mut app, "the workspace stopped");
     app.shutdown_all();
     let _ = std::fs::remove_file(&control);
@@ -592,7 +601,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
             }
             for label in spawn {
                 let Some(kind) = Kind::from_label(&label) else { continue };
-                let spec = Spawn { kind, name: app.unique_name(kind.label()), cwd: cwd.clone(), command: None, prompt: None, branch_note: None, resume: None };
+                let spec = Spawn { kind, name: app.unique_name(kind.label()), cwd: cwd.clone(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() };
                 if let Err(e) = app.spawn(spec) {
                     app.toast(format!("could not start {}: {e}", kind.label()), app::ToastKind::Bad);
                 }
