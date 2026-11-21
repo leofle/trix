@@ -3978,7 +3978,8 @@ mod tests {
 
     fn test_app() -> App {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        // A worktree setup really launches this. macOS has no /bin/true.
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/usr/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
         app
     }
