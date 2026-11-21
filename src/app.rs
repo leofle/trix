@@ -4198,6 +4198,21 @@ mod tests {
         }
     }
 
+    /// Run the app's events up to the report of the review's git step. Other
+    /// threads share the channel: closing an agent wakes the git poller, whose
+    /// `AppEvent::Git` can land first.
+    fn handle_until_review(app: &mut App, rx: &std::sync::mpsc::Receiver<AppEvent>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ev = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("the git step reports back");
+            let done = matches!(ev, AppEvent::Review(..));
+            app.handle(ev);
+            if done {
+                return;
+            }
+        }
+    }
+
     fn typed(app: &mut App, text: &str) {
         for c in text.chars() {
             hit(app, KeyCode::Char(c), KeyModifiers::NONE);
@@ -4250,8 +4265,7 @@ mod tests {
         typed(&mut app, "Shout two");
         hit(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(review_of(&app).busy, Some(crate::review::Op::Commit("Shout two".into())));
-        let ev = rx.recv_timeout(Duration::from_secs(10)).expect("the commit reports back");
-        app.handle(ev);
+        handle_until_review(&mut app, &rx);
         let r = review_of(&app);
         assert!(r.busy.is_none());
         assert!(r.status.as_ref().is_some_and(|(s, ok)| *ok && s.ends_with("Shout two")), "{:?}", r.status);
@@ -4276,8 +4290,7 @@ mod tests {
         hit(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
         assert!(app.modal.is_none());
         assert_eq!(app.agents.len(), 1);
-        let ev = rx.recv_timeout(Duration::from_secs(10)).expect("the clean-up reports back");
-        app.handle(ev);
+        handle_until_review(&mut app, &rx);
         assert!(!wt.exists());
         assert!(app.toast.as_ref().is_some_and(|t| t.text.contains("removed the worktree")), "{:?}", app.toast.as_ref().map(|t| &t.text));
     }

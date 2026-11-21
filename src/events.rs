@@ -576,8 +576,13 @@ mod tests {
         let c = listen(&mut app, &[]);
         assert_eq!(app.subscribers.len(), 1);
         drop(c);
-        std::thread::sleep(Duration::from_millis(50));
-        prune(&mut app);
+        // A child a parallel test is forking may hold a copy of the socket
+        // until it execs, and the hang-up only shows once that's closed too.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.subscribers.is_empty() && Instant::now() < deadline {
+            prune(&mut app);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(app.subscribers.is_empty());
     }
 

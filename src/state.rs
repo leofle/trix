@@ -116,6 +116,10 @@ fn load_from(path: &Path) -> Option<Saved> {
 /// Write atomically, so a crash mid-write never leaves half a file. An empty
 /// workspace removes the file: there is nothing to offer next time.
 pub fn store(saved: &Saved) -> std::io::Result<()> {
+    // A test's empty workspace would remove the developer's saved one.
+    if cfg!(test) {
+        return Ok(());
+    }
     store_at(&path(), saved)
 }
 
