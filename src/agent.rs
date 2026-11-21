@@ -2477,11 +2477,9 @@ mod tests {
         assert!(!a.running_command(), "at the prompt");
         a.resize(100, 30);
         a.write(&b"stty size; sleep 5\r"[..]);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !a.running_command() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(a.running_command(), "the foreground job, asked through the process");
+        // Seen once is enough: between `stty` and `sleep` the shell has the
+        // terminal back for a moment.
+        assert!(eventually(Duration::from_secs(3), || a.running_command()), "the foreground job, asked through the process");
         // What `stty` wrote comes through the holder, after the shell has
         // gone on to `sleep`: it may not be on the screen yet.
         assert!(eventually(Duration::from_secs(5), || a.screen_text().contains("30 100")), "resized through the holder: {:?}", a.screen_text());
