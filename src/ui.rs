@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{Agent, Kind, SPARK_LEN, State};
-use crate::app::{App, BroadcastTarget, CONFIRM_BUTTONS, DialogHit, MenuItem, Modal, NEW_FIELDS, RESTORE_BUTTONS, Search, SidebarSize, TextInput, ToastKind, View, tilde};
+use crate::app::{App, BroadcastTarget, CONFIRM_BUTTONS, DialogHit, MenuItem, Modal, NEW_FIELDS, RESTORE_BUTTONS, Search, SidebarSize, TRUST_BUTTONS, TextInput, ToastKind, TrustAsk, View, tilde};
 use crate::folders::Folders;
 use crate::settings::{Picker, Row, Settings};
 use crate::theme::{Source as ThemeSource, Theme, contrast, mix};
@@ -1861,7 +1861,56 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
             let summary = app.pending_restore.as_ref().map(|p| p.summary()).unwrap_or_default();
             restore_prompt(f, area, t, &summary, *sel, &app.dialog_hidden, hits);
         }
+        Modal::TrustSetup(ask) => app.dialog_hidden.set(trust_prompt(f, area, t, ask, hits)),
     }
+}
+
+/// `lines`, each cut to `width` cells. Nothing is dropped: a long command
+/// reads on the next row.
+fn wrapped(lines: &[String], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in lines {
+        let (mut row, mut w) = (String::new(), 0);
+        for c in line.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w + cw > width {
+                out.push(std::mem::take(&mut row));
+                w = 0;
+            }
+            row.push(c);
+            w += cw;
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// What a repository's `.trix.toml` would do, all of it, or no buttons: you
+/// can't say yes to commands the window is too small to show. True when the
+/// buttons aren't there.
+fn trust_prompt(f: &mut Frame, area: Rect, t: &Theme, ask: &TrustAsk, hits: &mut Vec<(Rect, DialogHit)>) -> bool {
+    let text = ask.repo.describe();
+    let widest = text.iter().map(|l| l.width()).max().unwrap_or(0).max(buttons_width(&TRUST_BUTTONS));
+    let w = (widest as u16 + 6).min(area.width.saturating_sub(2));
+    let rows = wrapped(&text, w.saturating_sub(4) as usize);
+    let r = centered(area, w, rows.len() as u16 + 6);
+    f.render_widget(Clear, r);
+    let block = modal_block("Trust this repository's worktree setup?", t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let fits = inner.height as usize >= rows.len() + 3 && inner.width >= 3;
+    if !fits {
+        let say = Paragraph::new(Span::styled("Too small to show what would run: make the window bigger. esc goes back.", Style::new().fg(t.fg))).wrap(ratatui::widgets::Wrap { trim: true });
+        f.render_widget(say, inner);
+        return true;
+    }
+    let body = Rect { x: inner.x + 1, y: inner.y + 1, width: inner.width - 2, height: rows.len() as u16 };
+    let lines: Vec<TLine> = rows.into_iter().map(|l| TLine::from(Span::styled(l, Style::new().fg(t.fg)))).collect();
+    f.render_widget(Paragraph::new(lines), body);
+    let row = Rect { y: inner.bottom() - 1, height: 1, ..inner };
+    buttons(f, row, t, &TRUST_BUTTONS, ask.sel, t.red, hits);
+    false
 }
 
 fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str, sel: usize, hidden: &std::cell::Cell<bool>, hits: &mut Vec<(Rect, DialogHit)>) {

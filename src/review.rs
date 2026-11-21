@@ -594,6 +594,7 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
             }
             // No --force: git keeps a worktree with changes in it.
             git(&p.main, &["worktree", "remove", &top.display().to_string()])?;
+            crate::worktree::forget(top);
             // `branch -d` also takes a branch merged into its upstream, so a
             // pushed branch would go though the main checkout never got it.
             // Only the main checkout's branch decides.
@@ -849,6 +850,17 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree and trix/w");
         assert!(!wt.exists());
         assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_err());
+    }
+
+    #[test]
+    fn a_worktree_with_copied_ignored_files_is_still_cleaned_up_unforced() {
+        let (_keep, main, wt) = repo("copied");
+        std::fs::write(main.join(".git/info/exclude"), ".trix/\n.env\n").unwrap();
+        std::fs::write(main.join(".env"), "A=1\n").unwrap();
+        assert_eq!(crate::worktree::copy_files(&main, &wt, &[".env".into()]).files, 1);
+        assert!(wt.join(".env").exists());
+        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree and trix/w");
+        assert!(!wt.exists());
     }
 
     #[test]

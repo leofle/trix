@@ -267,7 +267,7 @@ pub fn spec_for(a: &LayoutAgent, resume: bool) -> Result<Spawn, String> {
         return Err("custom agent without a command (args)".into());
     }
     let resume = a.session.clone().filter(|_| resume && kind.resumes());
-    Ok(Spawn { kind, name: a.name.clone(), cwd, command, prompt: None, branch_note: None, resume })
+    Ok(Spawn { kind, name: a.name.clone(), cwd, command, prompt: None, branch_note: None, resume, runtime: Default::default() })
 }
 
 /// A layout's folder: `~` expanded, and a relative one taken from the home

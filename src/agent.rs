@@ -232,6 +232,8 @@ pub struct Spawn {
     pub branch_note: Option<String>,
     /// Conversation to resume (Claude / Codex) instead of starting a new one.
     pub resume: Option<String>,
+    /// What its worktree adds: ports, and a setup to run first.
+    pub runtime: crate::worktree::Runtime,
 }
 
 pub struct Agent {
@@ -666,7 +668,16 @@ impl Agent {
         // So does one that reads its first prompt from stdin: `trix install`
         // hands it over as it becomes the agent, installed already or not.
         let stdin = stdin_prompt(&spec);
-        let (program, args) = if installing.is_some() || stdin.is_some() { crate::install::wrap(exe, spec.kind, stdin, program, args) } else { (program, args) };
+        let installs = installing.is_some() || stdin.is_some();
+        let (program, args) = if installs { crate::install::wrap(exe, spec.kind, stdin, program, args) } else { (program, args) };
+        // The worktree's setup goes first, in the pane, where you can watch it.
+        let (program, args, installing) = match &spec.runtime.setup {
+            Some(s) => {
+                let (program, args) = crate::worktree::wrap(exe, &s.script, installs, program, args);
+                (program, args, Some("setting up the worktree".to_string()))
+            }
+            None => (program, args, installing),
+        };
 
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
@@ -677,6 +688,12 @@ impl Agent {
         env.insert("TRIX_AGENT_ID".into(), id.to_string());
         env.insert("TRIX_AGENT_NAME".into(), spec.name.clone());
         env.insert("TRIX_SESSION".into(), crate::session::name().into());
+        if let Some(ports) = spec.runtime.ports {
+            env.extend(ports.env().map(|(k, v)| (k.to_string(), v)));
+        }
+        if let Some(s) = &spec.runtime.setup {
+            env.insert("TRIX_ROOT".into(), s.root.display().to_string());
+        }
         if spec.kind == Kind::Codex
             && let Some(chain) = codex_user_notify()
         {
@@ -2360,6 +2377,7 @@ pub(crate) fn test_agent_on(kind: Kind, tx: Sender<AppEvent>) -> Agent {
         prompt: None,
         branch_note: None,
         resume: None,
+        runtime: Default::default(),
     };
     let sock = std::env::temp_dir().join("trix-test.sock");
     let mut a = Agent::spawn(1, spec, (80, 24), tx, &sock, &Integrations::default(), std::path::Path::new("/bin/true")).unwrap();
@@ -2390,7 +2408,7 @@ mod tests {
         Instant::now().checked_sub(d).expect("uptime")
     }
     fn spec(kind: Kind) -> Spawn {
-        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None }
+        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() }
     }
 
     #[test]
