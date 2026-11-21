@@ -1080,7 +1080,11 @@ mod tests {
         let (locks, served) = claim_in(&dir, None);
         assert!(locks.is_empty());
         assert_eq!(served, [DEFAULT, "work"], "every session: both are taken, one by a server, one claimed above");
-        // The server died: its session is there to be cleared up.
+        // The server died: its session is there to be cleared up. Unlocked
+        // rather than just dropped: a flock lasts until every copy of the
+        // descriptor is closed, and a child another test is spawning has a
+        // copy until its exec.
+        assert_eq!(unsafe { libc::flock(server.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(server);
         let (locks, served) = claim_in(&dir, None);
         assert_eq!((locks.len(), served), (1, vec![DEFAULT.to_string()]));
