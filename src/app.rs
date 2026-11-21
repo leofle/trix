@@ -761,6 +761,7 @@ impl App {
                 crate::config::Restore::Always => self.restore_saved(),
                 crate::config::Restore::Never => {
                     self.pending_restore = None;
+                    self.release_unheld_ports();
                     self.toast("starting fresh, as your settings say", ToastKind::Info);
                 }
             }
@@ -915,6 +916,32 @@ impl App {
             msg.push_str(&format!(" · skipped {} (folder gone)", skipped.join(", ")));
         }
         self.toast(msg, if skipped.is_empty() { ToastKind::Good } else { ToastKind::Info });
+        self.release_unheld_ports();
+    }
+
+    /// A holder this server didn't take on (from a newer trix) is an agent
+    /// it can't see the folder of: its worktree may be one of these.
+    fn holders_unseen(&self) -> bool {
+        !cfg!(test) && crate::holder::discover(crate::session::name()).len() > self.agents.iter().filter(|a| a.holder.is_some()).count()
+    }
+
+    /// The saved workspace is settled: only worktrees with an agent open now
+    /// keep their ports.
+    fn release_unheld_ports(&self) {
+        if self.holders_unseen() {
+            return;
+        }
+        let open = self.agents.iter().map(|a| self.specs.get(&a.id).map_or(a.cwd.clone(), |s| s.cwd.clone()));
+        crate::worktree::keep_only(open.collect::<Vec<_>>());
+    }
+
+    /// The server is stopping: only worktrees a restore can come back to
+    /// keep their ports. A pane left exited isn't one of them.
+    pub fn release_unsaved_ports(&self) {
+        if self.holders_unseen() {
+            return;
+        }
+        crate::worktree::keep_only(self.snapshot().agents.into_iter().map(|a| a.cwd).collect::<Vec<_>>());
     }
 
     /// Nobody is looking any more: every state change becomes a notification.
@@ -1478,6 +1505,9 @@ impl App {
         // worktree's ports, and the same ones it had.
         if run.runtime.ports.is_none() {
             run.runtime.ports = crate::worktree::lease(&run.cwd, &self.config.worktree, None);
+            if let Some(w) = crate::worktree::no_ports(&run.cwd, &self.config.worktree, run.runtime.ports) {
+                self.toast(format!("{}: {w}", run.name), ToastKind::Bad);
+            }
         }
         keep.runtime = run.runtime.clone();
         let id = self.next_id;
@@ -1541,7 +1571,11 @@ impl App {
             let base = if meta.name.is_empty() { kind.label() } else { meta.name.as_str() };
             let name = self.unique_name(base);
             let agent = Agent::reattach(id, kind, name, &meta, att, self.tx.clone());
-            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+            // A setup that hadn't finished comes back with what it was for.
+            let setup = meta.pending_setup().cloned();
+            let prompt = setup.as_ref().and(meta.first_prompt.clone());
+            let runtime = crate::worktree::Runtime { ports: None, setup };
+            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt, branch_note: None, resume: None, runtime };
             if meta.parked && agent.state == State::Exited {
                 self.parked.insert(id);
             }
@@ -1585,7 +1619,13 @@ impl App {
                 continue;
             }
             let command = self.specs.get(&a.id).and_then(|s| s.command.clone());
-            let meta = a.meta(i, i == focus, command, self.parked.contains(&a.id));
+            let mut meta = a.meta(i, i == focus, command, self.parked.contains(&a.id));
+            if a.installing.is_some()
+                && let Some(spec) = self.specs.get(&a.id)
+            {
+                meta.setup = spec.runtime.setup.clone();
+                meta.first_prompt = spec.runtime.setup.as_ref().and(spec.prompt.clone());
+            }
             a.send_meta(&meta);
         }
     }
@@ -1715,11 +1755,17 @@ impl App {
             spec.prompt = None;
             spec.runtime.setup = None;
         }
+        // It passed, and what failed came after it (`trix install`): only
+        // that runs again, and the prompt is still to come.
+        if spec.runtime.setup.as_ref().is_some_and(crate::worktree::Setup::finished) {
+            spec.runtime.setup = None;
+        }
         spec.resume = None;
         // Reattached after a crash, it has no record of them.
         if spec.runtime.ports.is_none() {
             spec.runtime.ports = crate::worktree::lease(&spec.cwd, &self.config.worktree, None);
         }
+        let no_ports = crate::worktree::no_ports(&spec.cwd, &self.config.worktree, spec.runtime.ports);
         self.parked.remove(&old_id);
         // A fresh id, so late hook / exit events from the old process can't
         // land on the new one.
@@ -1734,9 +1780,14 @@ impl App {
                     *s = id;
                 }
                 crate::events::restarted(self, old_id, id);
-                self.toast(format!("restarted {}", spec.name), ToastKind::Good);
+                match no_ports {
+                    Some(w) => self.toast(format!("restarted {}: {w}", spec.name), ToastKind::Bad),
+                    None => self.toast(format!("restarted {}", spec.name), ToastKind::Good),
+                }
                 self.specs.insert(id, spec);
                 self.sync_git_targets();
+                // A crash from here on still knows what's pending.
+                self.sync_holders();
             }
             Err(e) => {
                 self.specs.insert(old_id, spec);
@@ -2837,6 +2888,7 @@ impl App {
                     Some(1) => {
                         self.modal = None;
                         self.pending_restore = None;
+                        self.release_unheld_ports();
                         self.toast("starting fresh", ToastKind::Info);
                     }
                     // "later", as esc.
@@ -3272,6 +3324,19 @@ impl App {
         }
     }
 
+    /// This session's other agents in `tree`, by where they started or where
+    /// they are now (a shell that cd'd in). Exited ones too: Enter on one
+    /// would start it in a folder that's gone.
+    fn others_in(&self, tree: &Path, id: u32) -> Vec<String> {
+        let inside = |p: &Path| p.starts_with(tree) || p.canonicalize().is_ok_and(|c| c.starts_with(tree));
+        self.agents
+            .iter()
+            .filter(|a| a.id != id)
+            .filter(|a| self.specs.get(&a.id).is_some_and(|s| inside(&s.cwd)) || inside(&a.live_cwd()))
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
     /// The worktree is done with: close its agent, then remove the folder
     /// and its branch (`git worktree remove` and `branch -d`, never forced).
     fn clean_up_worktree(&mut self) {
@@ -3282,6 +3347,16 @@ impl App {
         if matches!(a.state, State::Working | State::Blocked | State::Starting) {
             let what = if a.state == State::Blocked { "needs you" } else { "is still working" };
             let why = format!("{} {what}: wait for it, or close it first", a.name);
+            if let Some(Modal::Review(r)) = &mut self.modal {
+                r.status = Some((why, false));
+            }
+            return;
+        }
+        // Removing the folder gives its ports away: not from under anyone.
+        let tree = git(&dir, &["rev-parse", "--show-toplevel"]).map_or_else(|| dir.clone(), PathBuf::from);
+        let here = self.others_in(&tree, id);
+        let refused = if here.is_empty() { crate::worktree::used_elsewhere(&tree) } else { Some(format!("{} also in this worktree: close {} first", here.join(", "), if here.len() == 1 { "it" } else { "them" })) };
+        if let Some(why) = refused {
             if let Some(Modal::Review(r)) = &mut self.modal {
                 r.status = Some((why, false));
             }
@@ -5021,10 +5096,137 @@ mod tests {
         assert_eq!(crate::worktree::leased(&tree), None);
     }
 
+    /// A worktree folder under `.trix/worktrees`, its own for each test.
+    fn managed_tree(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("trix-app-tree-{tag}-{}", std::process::id()));
+        let tree = root.join(".trix/worktrees/w");
+        std::fs::create_dir_all(&tree).unwrap();
+        tree.canonicalize().unwrap()
+    }
+
+    fn sleeper(name: &str, cwd: &Path) -> Spawn {
+        Spawn { kind: Kind::Custom, name: name.into(), cwd: cwd.to_path_buf(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() }
+    }
+
+    #[test]
+    fn cleanup_is_refused_while_another_agent_is_in_the_worktree() {
+        let (_keep, wt) = {
+            let dir = repo_with_setup("cleanup");
+            let wt = worktree_path(&dir, "w");
+            let out = Command::new("git").arg("-C").arg(&dir).args(["worktree", "add", "-q", "-b", "trix/w"]).arg(&wt).output().unwrap();
+            assert!(out.status.success());
+            (dir, wt.canonicalize().unwrap())
+        };
+        let mut app = test_app();
+        let ra = app.spawn_quiet(sleeper("ra", &wt)).unwrap();
+        let rb = app.spawn_quiet(sleeper("rb", &wt)).unwrap();
+        let ports = app.specs[&rb].runtime.ports.expect("a block");
+        for a in &mut app.agents {
+            a.set_state(State::Idle, false);
+        }
+        app.modal = Some(Modal::Review(Box::new(crate::review::Review::open(ra, &wt).unwrap())));
+        app.clean_up_worktree();
+        let Some(Modal::Review(r)) = &app.modal else { panic!("the review stays open") };
+        assert!(r.status.as_ref().unwrap().0.contains("rb also in this worktree"), "{:?}", r.status);
+        assert_eq!(app.agents.len(), 2, "nobody was closed");
+        assert!(wt.exists());
+        assert_eq!(crate::worktree::leased(&wt), Some(ports), "its ports are still held");
+        stop_all(&app);
+    }
+
+    #[test]
+    fn a_setup_interrupted_by_a_crash_comes_back_pending() {
+        let dir = std::env::temp_dir().join(format!("trix-reattach-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("done");
+        let setup = crate::worktree::Setup { script: "false".into(), root: dir.clone(), done: Some(done.clone()) };
+        let path = dir.join("h.sock");
+        let mut spec = crate::holder::tests::spec("/bin/sh", &["-c", "exit 9"]);
+        spec.session = crate::session::name().into();
+        spec.id = 7;
+        let meta = crate::agent::Meta { kind: "custom".into(), name: "w".into(), cwd: dir.clone(), command: Some("exec sleep 60".into()), setup: Some(setup.clone()), first_prompt: Some("first".into()), ..Default::default() };
+        spec.meta = serde_json::to_string(&meta).unwrap();
+        let held = crate::holder::Held::start(&spec, &path).unwrap();
+        let serving = std::thread::spawn(move || held.serve());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::holder::attach(&path).is_ok_and(|a| !a.hello.exited) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut app = test_app();
+        assert_eq!(app.reattach_from(vec![(7, path.clone())]), 1);
+        assert_eq!(app.agents[0].state, State::Exited);
+        assert!(app.agents[0].installing.is_some(), "Enter means the setup");
+        assert_eq!(app.specs[&7].runtime.setup, Some(setup.clone()));
+        assert_eq!(app.specs[&7].prompt.as_deref(), Some("first"));
+        app.restart(0);
+        let id = app.agents[0].id;
+        assert_eq!(app.specs[&id].runtime.setup, Some(setup.clone()), "it runs again");
+        assert_eq!(app.specs[&id].prompt.as_deref(), Some("first"), "and the prompt still follows");
+        stop_all(&app);
+        let _ = serving.join();
+
+        // One that finished while no server heard isn't pending.
+        std::fs::write(&done, "").unwrap();
+        assert!(meta.pending_setup().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_setup_that_passed_is_not_run_again_when_the_install_after_it_failed() {
+        let dir = std::env::temp_dir().join(format!("trix-setup-passed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("done");
+        std::fs::write(&done, "").unwrap();
+        let setup = crate::worktree::Setup { script: "false".into(), root: dir.clone(), done: Some(done) };
+        let mut app = test_app();
+        let mut spec = sleeper("s", &dir);
+        spec.prompt = Some("first".into());
+        spec.runtime.setup = Some(setup);
+        app.spawn_quiet(spec).unwrap();
+        app.agents[0].set_state(State::Exited, false);
+        app.restart(0);
+        let id = app.agents[0].id;
+        assert_eq!(app.specs[&id].runtime.setup, None);
+        assert_eq!(app.specs[&id].prompt.as_deref(), Some("first"));
+        stop_all(&app);
+    }
+
+    #[test]
+    fn starting_fresh_gives_back_the_saved_worktrees_ports() {
+        let tree = managed_tree("fresh");
+        let opts = crate::config::WorktreeOpts::default();
+        assert!(crate::worktree::lease(&tree, &opts, None).is_some());
+        let mut app = test_app();
+        app.pending_restore = Some(Saved::new(0, vec![SavedAgent { kind: "shell".into(), name: "w".into(), cwd: tree.clone(), command: None, session: None, pinned: false }]));
+        app.modal = Some(Modal::Restore(0));
+        app.dialog_hidden.set(false);
+        trust_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(crate::worktree::leased(&tree), None);
+    }
+
+    #[test]
+    fn a_quit_keeps_ports_only_for_what_a_restore_brings_back() {
+        let (saved, failed) = (managed_tree("quit-saved"), managed_tree("quit-failed"));
+        let mut app = test_app();
+        let a = app.spawn_quiet(sleeper("kept", &saved)).unwrap();
+        let b = app.spawn_quiet(sleeper("failed", &failed)).unwrap();
+        let ports = app.specs[&a].runtime.ports;
+        assert!(ports.is_some() && app.specs[&b].runtime.ports.is_some());
+        let i = app.index_of(b).unwrap();
+        app.agents[i].set_state(State::Exited, false);
+        app.release_unsaved_ports();
+        assert_eq!(crate::worktree::leased(&saved), ports, "a restore comes back to it");
+        assert_eq!(crate::worktree::leased(&failed), None, "nothing will");
+        stop_all(&app);
+        crate::worktree::forget(&saved);
+    }
+
     #[test]
     fn enter_on_a_failed_setup_runs_it_again_with_the_prompt() {
         let mut app = test_app();
-        let setup = crate::worktree::Setup { script: "false".into(), root: std::env::temp_dir() };
+        let setup = crate::worktree::Setup { script: "false".into(), root: std::env::temp_dir(), done: None };
         let spec = Spawn { kind: Kind::Custom, name: "s".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 60".into()), prompt: Some("first".into()), branch_note: None, resume: None, runtime: crate::worktree::Runtime { ports: None, setup: Some(setup.clone()) } };
         let id = app.spawn_quiet(spec).unwrap();
         assert!(app.agents[0].installing.is_some(), "held in starting");

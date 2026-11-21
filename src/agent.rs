@@ -236,6 +236,14 @@ pub struct Spawn {
     pub runtime: crate::worktree::Runtime,
 }
 
+impl Meta {
+    /// The setup still to get through. One that finished while no server was
+    /// there to hear has its mark in the worktree's git folder.
+    pub fn pending_setup(&self) -> Option<&crate::worktree::Setup> {
+        self.setup.as_ref().filter(|s| !s.finished())
+    }
+}
+
 pub struct Agent {
     pub id: u32,
     pub name: String,
@@ -428,6 +436,13 @@ pub struct Meta {
     /// Restored stopped, waiting for an Enter.
     #[serde(default)]
     pub parked: bool,
+    /// The worktree's setup, while it hasn't got as far as the agent, and
+    /// the first prompt waiting behind it. A new server needs both to run
+    /// it again if it fails.
+    #[serde(default)]
+    pub setup: Option<crate::worktree::Setup>,
+    #[serde(default)]
+    pub first_prompt: Option<String>,
     #[serde(default)]
     pub hooked: bool,
     #[serde(default)]
@@ -673,7 +688,7 @@ impl Agent {
         // The worktree's setup goes first, in the pane, where you can watch it.
         let (program, args, installing) = match &spec.runtime.setup {
             Some(s) => {
-                let (program, args) = crate::worktree::wrap(exe, &s.script, installs, program, args);
+                let (program, args) = crate::worktree::wrap(exe, s, installs, program, args);
                 (program, args, Some("setting up the worktree".to_string()))
             }
             None => (program, args, installing),
@@ -836,6 +851,16 @@ impl Agent {
         if a.state != State::Exited {
             a.restore_state(meta, quiet);
         }
+        // Still in the setup, or it failed with nobody there: the same hold
+        // as before the crash, and Enter runs it again.
+        if meta.pending_setup().is_some() {
+            a.installing = Some("setting up the worktree".into());
+            if a.state != State::Exited {
+                a.state = State::Starting;
+                a.activity = "setting up the worktree".into();
+                a.unseen = false;
+            }
+        }
         a
     }
 
@@ -892,6 +917,8 @@ impl Agent {
             focused,
             pinned: self.pinned,
             parked,
+            setup: None,
+            first_prompt: None,
             hooked: self.hooked,
             reported: self.reported,
             turn_seen: self.turn_seen,

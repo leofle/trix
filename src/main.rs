@@ -99,7 +99,7 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
   trix install <kind> [--stdin <text>] -- <command…>
                             (internal) install a missing agent in its pane, then
                             run it, with <text> as what it reads on stdin first
-  trix worktree-setup <tell|quiet> <script> -- <command…>
+  trix worktree-setup <tell|quiet> <done-file> <script> -- <command…>
                             (internal) run a repo's trusted .trix.toml setup in
                             a new worktree's pane, then run the agent
   trix server               (internal) the background workspace
@@ -555,6 +555,7 @@ fn server() -> anyhow::Result<()> {
 
     // Save before stopping: the agents' exits must not read as "closed".
     app.persist();
+    app.release_unsaved_ports();
     control::stop_all(&mut app, "the workspace stopped");
     app.shutdown_all();
     let _ = std::fs::remove_file(&control);

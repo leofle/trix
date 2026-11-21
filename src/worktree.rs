@@ -18,8 +18,11 @@
 //! in a ledger every session shares, for as long as an agent is in it.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsString;
+use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -44,11 +47,21 @@ pub struct Runtime {
     pub setup: Option<Setup>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Setup {
     pub script: String,
     /// The main checkout, as `TRIX_ROOT`.
     pub root: PathBuf,
+    /// Written when the script succeeds, in the worktree's own git folder.
+    /// It outlasts a server that died meanwhile and never heard.
+    #[serde(default)]
+    pub done: Option<PathBuf>,
+}
+
+impl Setup {
+    pub fn finished(&self) -> bool {
+        self.done.as_deref().is_some_and(Path::exists)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,19 +246,20 @@ fn glob(pattern: &[char], name: &[char]) -> bool {
 /// folders aren't looked in.
 fn expand(root: &Path, rel: PathBuf, parts: &[&str], out: &mut Vec<PathBuf>) {
     let Some((head, rest)) = parts.split_first() else { return };
-    let names: Vec<String> = if head.contains(['*', '?']) {
+    // Names needn't be UTF-8: a wildcard matches them as they'd be shown.
+    let names: Vec<OsString> = if head.contains(['*', '?']) {
         let want: Vec<char> = head.chars().collect();
-        let mut found: Vec<String> = std::fs::read_dir(root.join(&rel))
+        let mut found: Vec<OsString> = std::fs::read_dir(root.join(&rel))
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| glob(&want, &n.chars().collect::<Vec<_>>()))
+            .map(|e| e.file_name())
+            .filter(|n| glob(&want, &n.to_string_lossy().chars().collect::<Vec<_>>()))
             .collect();
         found.sort();
         found
     } else {
-        vec![head.to_string()]
+        vec![OsString::from(head)]
     };
     for name in names {
         if name == ".git" || name == ".trix" {
@@ -278,6 +292,39 @@ fn ignored(root: &Path, rel: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Which of `paths` git ignores in `dir`, in one git process: this runs on
+/// the server's thread. A path git refuses outright (inside a submodule, say)
+/// fails the whole batch, so then each is asked about alone.
+fn ignored_among(dir: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
+    if paths.is_empty() {
+        return HashSet::new();
+    }
+    let batch = || {
+        let mut child = Command::new("git").arg("-C").arg(dir).args(["check-ignore", "-z", "--stdin"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        let mut stdin = child.stdin.take()?;
+        let input: Vec<u8> = paths.iter().flat_map(|p| p.as_os_str().as_bytes().iter().copied().chain([0])).collect();
+        // Written beside the read: git answers as it goes, and a full pipe
+        // each way would leave both waiting.
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        let out = child.wait_with_output().ok()?;
+        let _ = writer.join();
+        // 0: some are ignored. 1: none are. Anything else is a failure.
+        matches!(out.status.code(), Some(0 | 1)).then(|| out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p))).collect::<HashSet<_>>())
+    };
+    batch().unwrap_or_else(|| paths.iter().filter(|p| ignored(dir, p)).cloned().collect())
+}
+
+/// Something other than a folder is on the way to `rel` under `dest`.
+fn parents_blocked(dest: &Path, rel: &Path) -> bool {
+    let mut at = dest.to_path_buf();
+    rel.parent().into_iter().flat_map(Path::components).any(|part| {
+        at.push(part);
+        std::fs::symlink_metadata(&at).is_ok_and(|m| !m.is_dir())
+    })
+}
+
 /// Make `rel`'s folders under `dest`, refusing to go through a symlink.
 fn make_parents(dest: &Path, rel: &Path) -> std::io::Result<()> {
     let mut at = dest.to_path_buf();
@@ -295,7 +342,8 @@ fn make_parents(dest: &Path, rel: &Path) -> std::io::Result<()> {
 /// Copy what the patterns name from `root` to `dest`. Only files git ignores
 /// on both sides: anything else is either in the worktree already or would
 /// end up in the agent's commit, as one ignored only by an uncommitted
-/// `.gitignore` in the main checkout would. A file already there is kept.
+/// `.gitignore` in the main checkout would. A file already there is kept. A
+/// tracked file a wide pattern also names is no news, and counts for nothing.
 pub fn copy_files(root: &Path, dest: &Path, patterns: &[String]) -> Copied {
     let mut found = Vec::new();
     for p in patterns {
@@ -305,24 +353,36 @@ pub fn copy_files(root: &Path, dest: &Path, patterns: &[String]) -> Copied {
     found.sort();
     found.dedup();
     let mut done = Copied::default();
+    let there = |rel: &Path| std::fs::symlink_metadata(dest.join(rel)).is_ok();
+    let in_root = ignored_among(root, &found);
+    let mut wanted = Vec::new();
+    for rel in found {
+        if in_root.contains(&rel) {
+            if parents_blocked(dest, &rel) {
+                done.skipped.push(format!("{}: a file or symlink is in the way", rel.display()));
+            } else {
+                wanted.push(rel);
+            }
+        } else if !there(&rel) {
+            done.skipped.push(format!("{}: git doesn't ignore it", rel.display()));
+        }
+    }
+    let in_dest = ignored_among(dest, &wanted);
     let mut bytes = 0u64;
-    for (i, rel) in found.iter().enumerate() {
+    for rel in &wanted {
         let shown = rel.display();
-        if i >= MAX_FILES {
-            done.skipped.push(format!("{shown}: over {MAX_FILES} files"));
+        if !in_dest.contains(rel) {
+            if !there(rel) {
+                done.skipped.push(format!("{shown}: git doesn't ignore it in the new worktree, so it could be committed"));
+            }
             continue;
         }
-        if !ignored(root, rel) {
-            done.skipped.push(format!("{shown}: git doesn't ignore it"));
-            continue;
-        }
-        if !ignored(dest, rel) {
-            done.skipped.push(format!("{shown}: git doesn't ignore it in the new worktree, so it could be committed"));
-            continue;
-        }
-        let to = dest.join(rel);
-        if std::fs::symlink_metadata(&to).is_ok() {
+        if there(rel) {
             done.skipped.push(format!("{shown}: already there"));
+            continue;
+        }
+        if done.files >= MAX_FILES {
+            done.skipped.push(format!("{shown}: over {MAX_FILES} files"));
             continue;
         }
         let size = std::fs::metadata(root.join(rel)).map_or(0, |m| m.len());
@@ -330,7 +390,7 @@ pub fn copy_files(root: &Path, dest: &Path, patterns: &[String]) -> Copied {
             done.skipped.push(format!("{shown}: over {} MB in all", MAX_BYTES / (1024 * 1024)));
             continue;
         }
-        match make_parents(dest, rel).and_then(|()| std::fs::copy(root.join(rel), &to)) {
+        match make_parents(dest, rel).and_then(|()| std::fs::copy(root.join(rel), dest.join(rel))) {
             Ok(n) => {
                 bytes += n;
                 done.files += 1;
@@ -339,6 +399,16 @@ pub fn copy_files(root: &Path, dest: &Path, patterns: &[String]) -> Copied {
         }
     }
     done
+}
+
+/// What was left behind, short enough for a toast.
+fn skipped_note(skipped: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut note = format!("not copied: {}", skipped[..skipped.len().min(SHOWN)].join("; "));
+    if skipped.len() > SHOWN {
+        note.push_str(&format!("; and {} more", skipped.len() - SHOWN));
+    }
+    note
 }
 
 // ───────────────────────────── ports ─────────────────────────────
@@ -444,6 +514,27 @@ fn release_in(dir: &Path, worktree: &Path, session: &str) -> std::io::Result<()>
     write_ledger(dir, &ledger)
 }
 
+/// This session now holds only the worktrees in `keep`: what it had in the
+/// rest went with a workspace that won't come back.
+fn keep_only_in(dir: &Path, session: &str, keep: &BTreeSet<PathBuf>) -> std::io::Result<()> {
+    if !dir.join("ports.json").exists() {
+        return Ok(());
+    }
+    let _lock = LedgerLock::take(dir)?;
+    let mut ledger = read_ledger(dir);
+    let before = ledger.clone();
+    ledger.retain(|path, l| {
+        if !keep.contains(Path::new(path)) {
+            l.sessions.remove(session);
+        }
+        !l.sessions.is_empty()
+    });
+    if ledger == before {
+        return Ok(());
+    }
+    write_ledger(dir, &ledger)
+}
+
 /// The worktree is gone, whoever was in it.
 fn forget_in(dir: &Path, worktree: &Path) -> std::io::Result<()> {
     if !dir.join("ports.json").exists() {
@@ -464,7 +555,8 @@ pub fn lease(cwd: &Path, opts: &WorktreeOpts, count: Option<u16>) -> Option<Port
         return None;
     }
     let worktree = managed_root(cwd)?;
-    let count = count.unwrap_or(opts.port_count);
+    // One coming back to a worktree gets the size its repository asks for.
+    let count = count.or_else(|| if read_ledger(&state_dir()).contains_key(&worktree.display().to_string()) { None } else { trusted_ports(&worktree) }).unwrap_or(opts.port_count);
     match lease_in(&state_dir(), &worktree, crate::session::name(), opts.port_base, count, &port_free) {
         Ok(p) => p,
         Err(e) => {
@@ -472,6 +564,62 @@ pub fn lease(cwd: &Path, opts: &WorktreeOpts, count: Option<u16>) -> Option<Port
             None
         }
     }
+}
+
+fn trusted_ports(worktree: &Path) -> Option<u16> {
+    RepoConfig::load(worktree).ok().flatten().filter(RepoConfig::trusted).and_then(|r| r.ports)
+}
+
+/// Said when a worktree that should have ports got none.
+pub fn no_ports(cwd: &Path, opts: &WorktreeOpts, ports: Option<Ports>) -> Option<String> {
+    (ports.is_none() && opts.ports && managed_root(cwd).is_some()).then(|| format!("no free block of {} ports from {}: started without TRIX_PORT", opts.port_count, opts.port_base))
+}
+
+/// Give back this session's blocks, but for the worktrees in `keep`.
+pub fn keep_only(keep: impl IntoIterator<Item = PathBuf>) {
+    let keep: BTreeSet<PathBuf> = keep.into_iter().filter_map(|p| managed_root(&p)).collect();
+    if let Err(e) = keep_only_in(&state_dir(), crate::session::name(), &keep) {
+        eprintln!("trix: couldn't release ports: {e}");
+    }
+}
+
+/// The agents in `json` (a `trix ls --json` reply) inside `worktree`.
+fn agents_in(reply: &str, worktree: &Path) -> Option<Vec<String>> {
+    let reply: crate::control::Reply = serde_json::from_str(reply).ok()?;
+    let list: serde_json::Value = serde_json::from_str(&reply.out).ok()?;
+    let agents = list.get("agents")?.as_array()?;
+    Some(agents.iter().filter(|a| a.get("cwd").and_then(|c| c.as_str()).is_some_and(|c| Path::new(c).starts_with(worktree))).filter_map(|a| a.get("name")?.as_str().map(String::from)).collect())
+}
+
+/// Why another session keeps this worktree from being removed, if it does.
+/// A session that can't say counts as using it: removing a folder from under
+/// an agent is worse than asking you to look.
+pub fn used_elsewhere(worktree: &Path) -> Option<String> {
+    use crate::session::ClientMsg;
+    if cfg!(test) {
+        return None;
+    }
+    let me = crate::session::name();
+    let held: BTreeSet<String> = read_ledger(&state_dir()).get(&worktree.display().to_string()).map(|l| l.sessions.clone()).unwrap_or_default();
+    let mut sessions: BTreeSet<String> = crate::session::candidates().into_iter().collect();
+    sessions.extend(held.iter().cloned());
+    for s in sessions.iter().filter(|s| *s != me) {
+        let ask = ClientMsg::Control { protocol: crate::control::CONTROL, from: None, req: crate::control::Request::List { json: true } };
+        match crate::session::ask(s, &ask) {
+            Ok(Some(text)) => match agents_in(&text, worktree) {
+                Some(names) if names.is_empty() => {}
+                Some(names) => return Some(format!("{} in session {s} still use this worktree: close them first", names.join(", "))),
+                None => return Some(format!("session {s} didn't say whether it uses this worktree: try again")),
+            },
+            Err(()) => return Some(format!("session {s} didn't say whether it uses this worktree: try again")),
+            // No server, but agents its crash left running may be in here.
+            Ok(None) if held.contains(s) && !crate::holder::discover(s).is_empty() => {
+                return Some(format!("session {s} has agents left running: open it, or `trix kill -s {s}`, first"));
+            }
+            Ok(None) => {}
+        }
+    }
+    None
 }
 
 pub fn release(cwd: &Path) {
@@ -520,9 +668,9 @@ pub fn prepare(path: &Path, repo: Option<&RepoConfig>, reused: bool, skip: bool,
                 notes.push(format!("copied {} file{}", copied.files, if copied.files == 1 { "" } else { "s" }));
             }
             if !copied.skipped.is_empty() {
-                out.warning = Some(format!("not copied: {}", copied.skipped.join("; ")));
+                out.warning = Some(skipped_note(&copied.skipped));
             }
-            out.runtime.setup = r.setup.clone().map(|script| Setup { script, root: r.root.clone() });
+            out.runtime.setup = r.setup.clone().map(|script| Setup { script, root: r.root.clone(), done: done_marker(path) });
         } else if repo.is_some() && !skip {
             out.warning = Some(format!("{FILE} isn't trusted yet, so its setup and copies didn't run: start an agent with Worktree from the new-agent form to read and trust it"));
         }
@@ -530,16 +678,27 @@ pub fn prepare(path: &Path, repo: Option<&RepoConfig>, reused: bool, skip: bool,
     if let Some(p) = out.runtime.ports {
         notes.push(format!("ports {}–{}", p.base, p.last()));
     }
+    if let Some(w) = no_ports(path, opts, out.runtime.ports) {
+        out.warning = Some(out.warning.take().map_or(w.clone(), |had| format!("{had} · {w}")));
+    }
     out.note = (!notes.is_empty()).then(|| notes.join(" · "));
     out
 }
 
+/// Where a worktree's setup says it finished: its private git folder, so it
+/// can't be committed and goes when the worktree does.
+fn done_marker(worktree: &Path) -> Option<PathBuf> {
+    let out = Command::new("git").arg("-C").arg(worktree).args(["rev-parse", "--absolute-git-dir"]).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| PathBuf::from(std::ffi::OsStr::from_bytes(out.stdout.trim_ascii_end())).join("trix-setup-done"))
+}
+
 // ───────────────────────────── the setup, in the pane ─────────────────────────────
 
-/// The pane's command that runs `script` and then becomes `program`.
+/// The pane's command that runs the setup and then becomes `program`.
 /// `installs`: what follows is `trix install`, which says when it's done.
-pub fn wrap(exe: &Path, script: &str, installs: bool, program: String, args: Vec<String>) -> (String, Vec<String>) {
-    let mut all = vec!["worktree-setup".to_string(), if installs { "quiet" } else { "tell" }.to_string(), script.to_string(), "--".to_string(), program];
+pub fn wrap(exe: &Path, setup: &Setup, installs: bool, program: String, args: Vec<String>) -> (String, Vec<String>) {
+    let marker = setup.done.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+    let mut all = vec!["worktree-setup".to_string(), if installs { "quiet" } else { "tell" }.to_string(), marker, setup.script.clone(), "--".to_string(), program];
     all.extend(args);
     (exe.display().to_string(), all)
 }
@@ -548,27 +707,17 @@ pub fn wrap(exe: &Path, script: &str, installs: bool, program: String, args: Vec
 /// returns: it becomes the agent. A setup that fails leaves the pane exited,
 /// so nothing starts on a broken worktree, and Enter tries it again.
 pub fn run_setup(args: &[String]) -> i32 {
-    let [mode, script, dashes, program, agent_args @ ..] = args else {
-        eprintln!("usage: trix worktree-setup <tell|quiet> <script> -- <command> [args…]   (internal: trix runs it in a pane)");
+    let [mode, marker, script, dashes, program, agent_args @ ..] = args else {
+        eprintln!("usage: trix worktree-setup <tell|quiet> <done-file> <script> -- <command> [args…]   (internal: trix runs it in a pane)");
         return 2;
     };
     if dashes != "--" {
         eprintln!("trix worktree-setup: expected -- before the command");
         return 2;
     }
-    println!("\x1b[1mtrix:\x1b[0m setting up this worktree ({FILE}):\n");
-    // `-e`: a script's first failure is the setup's. No stdin: a question
-    // here would wait unseen behind a pane that reads as starting.
-    match Command::new("sh").arg("-ec").arg(script).stdin(Stdio::null()).status() {
-        Ok(s) if s.success() => println!("\n\x1b[1mtrix:\x1b[0m setup finished. Starting the agent…\n"),
-        Ok(s) => {
-            eprintln!("\ntrix: the worktree's setup failed ({s}). Fix it and press Enter to run it again. To go on without it, close this pane and start an agent with the same name and Worktree: an existing worktree isn't set up again.");
-            return s.code().unwrap_or(1);
-        }
-        Err(e) => {
-            eprintln!("\ntrix: couldn't run the worktree's setup: {e}");
-            return 127;
-        }
+    let marker = (!marker.is_empty()).then(|| Path::new(marker));
+    if let Err(code) = run_script(script, marker) {
+        return code;
     }
     if mode == "tell" {
         crate::hooks::tell("trix", "Installed");
@@ -576,6 +725,34 @@ pub fn run_setup(args: &[String]) -> i32 {
     let err = Command::new(program).args(agent_args).exec();
     eprintln!("trix: couldn't start {program}: {err}");
     126
+}
+
+/// The script itself: `Err` is the exit code to leave the pane with.
+fn run_script(script: &str, marker: Option<&Path>) -> Result<(), i32> {
+    if let Some(m) = marker {
+        let _ = std::fs::remove_file(m);
+    }
+    println!("\x1b[1mtrix:\x1b[0m setting up this worktree ({FILE}):\n");
+    // `-e`: a script's first failure is the setup's. No stdin: a question
+    // here would wait unseen behind a pane that reads as starting.
+    match Command::new("sh").arg("-ec").arg(script).stdin(Stdio::null()).status() {
+        Ok(s) if s.success() => {
+            // Before the agent, and whether or not a server is there to hear.
+            if let Some(m) = marker {
+                let _ = std::fs::write(m, "");
+            }
+            println!("\n\x1b[1mtrix:\x1b[0m setup finished. Starting the agent…\n");
+            Ok(())
+        }
+        Ok(s) => {
+            eprintln!("\ntrix: the worktree's setup failed ({s}). Fix it and press Enter to run it again. To go on without it, close this pane and start an agent with the same name and Worktree: an existing worktree isn't set up again.");
+            Err(s.code().unwrap_or(1))
+        }
+        Err(e) => {
+            eprintln!("\ntrix: couldn't run the worktree's setup: {e}");
+            Err(127)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -665,7 +842,82 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dest.join(".env")).unwrap(), "A=1\n");
         assert!(dest.join("secrets/key").exists());
         assert!(!dest.join("untracked.txt").exists());
-        assert_eq!(done.skipped.len(), 2, "{done:?}");
+        assert_eq!(done.skipped.len(), 1, "a tracked file is no news: {done:?}");
+        assert!(done.skipped[0].starts_with("untracked.txt"), "{done:?}");
+    }
+
+    #[test]
+    fn tracked_files_do_not_use_up_the_cap() {
+        let root = repo("cap");
+        for i in 0..(MAX_FILES + 1) {
+            std::fs::write(root.join(format!("t{i:04}.txt")), "t").unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "many"]);
+        std::fs::write(root.join(".env.z"), "z").unwrap();
+        let dest = linked(&root, "cap-dest");
+        let done = copy_files(&root, &dest, &["*".into()]);
+        assert_eq!(done.files, 1, "{:?}", done.skipped.first());
+        assert!(dest.join(".env.z").exists());
+        assert!(done.skipped.is_empty(), "{:?}", done.skipped.first());
+    }
+
+    #[test]
+    fn the_cap_still_holds_for_what_is_copied() {
+        let root = repo("cap-real");
+        std::fs::create_dir(root.join("secrets")).unwrap();
+        for i in 0..(MAX_FILES + 2) {
+            std::fs::write(root.join(format!("secrets/{i:04}")), "s").unwrap();
+        }
+        let dest = linked(&root, "cap-real-dest");
+        let done = copy_files(&root, &dest, &["secrets/*".into()]);
+        assert_eq!((done.files, done.skipped.len()), (MAX_FILES, 2));
+        assert!(skipped_note(&done.skipped).contains("over 1000 files"));
+    }
+
+    #[test]
+    fn a_long_list_of_what_stayed_behind_is_shortened() {
+        let all: Vec<String> = (0..5).map(|i| format!("f{i}: why")).collect();
+        let note = skipped_note(&all);
+        assert!(note.contains("f2") && !note.contains("f3") && note.ends_with("and 2 more"), "{note}");
+    }
+
+    #[test]
+    fn ignored_files_are_asked_about_in_one_batch_and_a_refused_path_falls_back() {
+        let root = repo("batch");
+        let names: Vec<PathBuf> = [".env", "tracked.txt", "odd name\nwith newline.env"].iter().map(PathBuf::from).collect();
+        std::fs::write(root.join(".env"), "x").unwrap();
+        assert_eq!(ignored_among(&root, &names), HashSet::from([PathBuf::from(".env")]));
+        // git refuses the whole batch for a path through a symlink.
+        std::os::unix::fs::symlink("/tmp", root.join("through")).unwrap();
+        let mixed = [PathBuf::from(".env"), PathBuf::from("through/x")];
+        assert_eq!(ignored_among(&root, &mixed), HashSet::from([PathBuf::from(".env")]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_utf8_is_copied() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = repo("bytes");
+        let name = OsString::from_vec(b".env-\xff".to_vec());
+        std::fs::write(root.join(&name), "b").unwrap();
+        let dest = linked(&root, "bytes-dest");
+        let done = copy_files(&root, &dest, &[".env*".into()]);
+        assert_eq!(done.files, 1, "{done:?}");
+        assert_eq!(std::fs::read(dest.join(&name)).unwrap(), b"b");
+    }
+
+    #[test]
+    fn a_tracked_example_file_raises_no_warning() {
+        let root = repo("example");
+        std::fs::write(root.join(".gitignore"), ".env\n").unwrap();
+        std::fs::write(root.join(".env.example"), "A=\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "example"]);
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let dest = linked(&root, "example-dest");
+        let done = copy_files(&root, &dest, &[".env".into(), ".env.*".into()]);
+        assert_eq!((done.files, done.skipped.len()), (1, 0), "{done:?}");
     }
 
     #[test]
@@ -798,6 +1050,70 @@ mod tests {
     }
 
     #[test]
+    fn a_session_keeps_only_the_worktrees_it_can_come_back_to() {
+        let dir = temp("keep-only");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let free = |_: u16| true;
+        lease_in(&dir, &a, "one", 20000, 10, &free).unwrap();
+        lease_in(&dir, &b, "one", 20000, 10, &free).unwrap();
+        lease_in(&dir, &b, "two", 20000, 10, &free).unwrap();
+        keep_only_in(&dir, "one", &BTreeSet::new()).unwrap();
+        let ledger = read_ledger(&dir);
+        assert!(!ledger.contains_key(&a.display().to_string()), "nobody else had it");
+        assert_eq!(ledger[&b.display().to_string()].sessions, BTreeSet::from(["two".to_string()]), "another session's stays");
+    }
+
+    #[test]
+    fn another_sessions_agents_are_found_in_a_worktree() {
+        let out = r#"{"agents":[{"name":"rb","cwd":"/r/.trix/worktrees/w/src"},{"name":"x","cwd":"/r/.trix/worktrees/w2"}]}"#;
+        let reply = serde_json::to_string(&crate::control::Reply::ok(out)).unwrap();
+        assert_eq!(agents_in(&reply, Path::new("/r/.trix/worktrees/w")), Some(vec!["rb".to_string()]));
+        assert_eq!(agents_in(&reply, Path::new("/r/.trix/worktrees/none")), Some(vec![]));
+        assert_eq!(agents_in("", Path::new("/r")), None, "no answer isn't \"nobody\"");
+    }
+
+    #[test]
+    fn running_out_of_ports_is_said() {
+        let opts = WorktreeOpts::default();
+        assert!(no_ports(Path::new("/r/.trix/worktrees/w"), &opts, None).unwrap().contains("without TRIX_PORT"));
+        assert_eq!(no_ports(Path::new("/r/.trix/worktrees/w"), &opts, Some(Ports { base: 20000, count: 10 })), None);
+        assert_eq!(no_ports(Path::new("/r/src"), &opts, None), None, "not a worktree of trix's");
+        assert_eq!(no_ports(Path::new("/r/.trix/worktrees/w"), &WorktreeOpts { ports: false, ..opts }, None), None, "turned off");
+    }
+
+    #[test]
+    fn coming_back_to_a_released_worktree_gets_the_repos_size() {
+        let root = repo("size");
+        std::fs::write(root.join(FILE), "[worktree]\nports = 5\n").unwrap();
+        let cfg = RepoConfig::load(&root).unwrap().unwrap();
+        cfg.trust().unwrap();
+        let tree = root.join(".trix/worktrees/w");
+        git(&root, &["worktree", "add", "-q", "--detach", &tree.display().to_string()]);
+        let p = lease(&tree, &WorktreeOpts::default(), None).unwrap();
+        assert_eq!(p.count, 5);
+        release(&tree);
+        assert_eq!(lease(&tree, &WorktreeOpts::default(), None).unwrap().count, 5);
+        release(&tree);
+    }
+
+    #[test]
+    fn a_setup_says_it_finished_where_a_new_server_can_read_it() {
+        let root = repo("marker");
+        let tree = linked(&root, "marker-tree");
+        let m = done_marker(&tree).unwrap();
+        assert!(m.starts_with(root.join(".git")), "{}", m.display());
+        let s = Setup { script: "true".into(), root: root.clone(), done: Some(m.clone()) };
+        assert!(!s.finished());
+        // Not through `run_setup`: on success that becomes the agent.
+        assert_eq!(run_script("true", Some(&m)), Ok(()));
+        assert!(s.finished());
+        assert_eq!(run_script("exit 3", Some(&m)), Err(3));
+        assert!(!s.finished(), "a retry that fails takes it back");
+    }
+
+    #[test]
     fn a_removed_worktree_gives_its_ports_back() {
         let dir = temp("gone");
         let (a, b) = (dir.join("a"), dir.join("b"));
@@ -816,7 +1132,7 @@ mod tests {
     fn a_setup_that_fails_never_reaches_the_agent() {
         let dir = temp("setup");
         let marker = dir.join("agent-ran");
-        let args = |script: &str| ["tell".to_string(), script.to_string(), "--".to_string(), "touch".to_string(), marker.display().to_string()];
+        let args = |script: &str| ["tell".to_string(), String::new(), script.to_string(), "--".to_string(), "touch".to_string(), marker.display().to_string()];
         assert_eq!(run_setup(&args("exit 7")), 7);
         assert_eq!(run_setup(&args("false; echo not reached")), 1, "the first failure is the setup's");
         assert!(!marker.exists());
@@ -825,9 +1141,10 @@ mod tests {
 
     #[test]
     fn the_wrapped_command_keeps_every_argument() {
-        let (exe, args) = wrap(Path::new("/bin/trix"), "npm ci", false, "claude".into(), vec!["--flag".into(), "--".into()]);
+        let setup = Setup { script: "npm ci".into(), root: "/r".into(), done: Some("/g/done".into()) };
+        let (exe, args) = wrap(Path::new("/bin/trix"), &setup, false, "claude".into(), vec!["--flag".into(), "--".into()]);
         assert_eq!(exe, "/bin/trix");
-        assert_eq!(args, ["worktree-setup", "tell", "npm ci", "--", "claude", "--flag", "--"]);
-        assert_eq!(wrap(Path::new("t"), "x", true, "p".into(), vec![]).1[1], "quiet");
+        assert_eq!(args, ["worktree-setup", "tell", "/g/done", "npm ci", "--", "claude", "--flag", "--"]);
+        assert_eq!(wrap(Path::new("t"), &setup, true, "p".into(), vec![]).1[1], "quiet");
     }
 }

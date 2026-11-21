@@ -895,6 +895,22 @@ pub fn query(session: &str, msg: &ClientMsg) -> Option<String> {
     }
 }
 
+/// `query`, telling a session that's gone from one that won't say.
+/// `Ok(None)`: no server there, or it left without answering. `Err`: it's
+/// there and didn't answer in time.
+pub fn ask(session: &str, msg: &ClientMsg) -> Result<Option<String>, ()> {
+    let Some(mut s) = connect_to(session) else { return Ok(None) };
+    if send_msg(&mut s, msg).is_err() {
+        return Ok(None);
+    }
+    let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+    match read_frame(&mut s) {
+        Ok((TEXT, p)) => Ok(Some(String::from_utf8_lossy(&p).into_owned())),
+        Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => Ok(None),
+        _ => Err(()),
+    }
+}
+
 /// The biggest terminal a client may claim. A client that says 65535 by 65535
 /// would make the server allocate billions of cells.
 const MAX_COLS: u16 = 1000;
