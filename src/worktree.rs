@@ -548,6 +548,16 @@ fn forget_in(dir: &Path, worktree: &Path) -> std::io::Result<()> {
     write_ledger(dir, &ledger)
 }
 
+/// Who a lease is held for: this session. Tests share one ledger and run at
+/// once, so each thread counts as a session, or one settling its restore
+/// would give back the ports of all the others.
+fn lease_holder() -> String {
+    if cfg!(test) {
+        return format!("test-{:?}", std::thread::current().id());
+    }
+    crate::session::name().to_string()
+}
+
 /// `cwd`'s worktree's ports, reserved now if it has none. `None`: it isn't a
 /// worktree of trix's, ports are off, or there's no block left.
 pub fn lease(cwd: &Path, opts: &WorktreeOpts, count: Option<u16>) -> Option<Ports> {
@@ -557,7 +567,7 @@ pub fn lease(cwd: &Path, opts: &WorktreeOpts, count: Option<u16>) -> Option<Port
     let worktree = managed_root(cwd)?;
     // One coming back to a worktree gets the size its repository asks for.
     let count = count.or_else(|| if read_ledger(&state_dir()).contains_key(&worktree.display().to_string()) { None } else { trusted_ports(&worktree) }).unwrap_or(opts.port_count);
-    match lease_in(&state_dir(), &worktree, crate::session::name(), opts.port_base, count, &port_free) {
+    match lease_in(&state_dir(), &worktree, &lease_holder(), opts.port_base, count, &port_free) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("trix: couldn't reserve ports for {}: {e}", worktree.display());
@@ -578,7 +588,7 @@ pub fn no_ports(cwd: &Path, opts: &WorktreeOpts, ports: Option<Ports>) -> Option
 /// Give back this session's blocks, but for the worktrees in `keep`.
 pub fn keep_only(keep: impl IntoIterator<Item = PathBuf>) {
     let keep: BTreeSet<PathBuf> = keep.into_iter().filter_map(|p| managed_root(&p)).collect();
-    if let Err(e) = keep_only_in(&state_dir(), crate::session::name(), &keep) {
+    if let Err(e) = keep_only_in(&state_dir(), &lease_holder(), &keep) {
         eprintln!("trix: couldn't release ports: {e}");
     }
 }
@@ -624,7 +634,7 @@ pub fn used_elsewhere(worktree: &Path) -> Option<String> {
 
 pub fn release(cwd: &Path) {
     if let Some(worktree) = managed_root(cwd)
-        && let Err(e) = release_in(&state_dir(), &worktree, crate::session::name())
+        && let Err(e) = release_in(&state_dir(), &worktree, &lease_holder())
     {
         eprintln!("trix: couldn't release the ports of {}: {e}", worktree.display());
     }
