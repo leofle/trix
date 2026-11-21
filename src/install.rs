@@ -407,9 +407,11 @@ mod tests {
         let out = dir.join("out");
         let script = dir.join("amp");
         std::fs::write(&script, format!("#!/bin/sh\ncat > '{0}'\nprintf ' [%s]' \"$@\" >> '{0}'\n", out.display())).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut cmd = Command::new(&script);
-        cmd.args(["--fast", "-x y"]);
+        // Through sh, not exec'd: a child another test is spawning may hold
+        // the descriptor it was written with until its own exec, and a file
+        // open for writing can't be exec'd (ETXTBSY).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(&script).args(["--fast", "-x y"]);
         feed(&mut cmd, "amp", "- fix it\nplease");
         assert!(cmd.status().unwrap().success());
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "- fix it\nplease [--fast] [-x y]");

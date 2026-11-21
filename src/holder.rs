@@ -1643,9 +1643,11 @@ pub(crate) mod tests {
             }
             seen.contains("started")
         }));
-        write_frame(&mut first.stream, INPUT, b"one\n").unwrap();
+        // Frames are handled in order, so the answer to the input, sent last,
+        // says the two before it are done.
         write_frame(&mut first.stream, META, b"{\"name\":\"renamed\"}").unwrap();
         write_frame(&mut first.stream, RESIZE, &resize_payload(100, 30)).unwrap();
+        write_frame(&mut first.stream, INPUT, b"one\n").unwrap();
         assert!(read_until(&mut first.stream, |k, p| k == OUTPUT && String::from_utf8_lossy(p).contains("got one")));
 
         // The server goes, the way a crash goes: no goodbye.
@@ -1663,7 +1665,8 @@ pub(crate) mod tests {
         // A third takes over from the second, which is let go.
         let third = attach(&path).unwrap();
         let (said, hung_up) = drain(&mut second.stream);
-        assert_eq!(said, vec![BYE], "the old server is told why");
+        // The end of the program's last answer may still be on its way.
+        assert!(matches!(said.as_slice(), [BYE] | [OUTPUT, BYE]), "the old server is told why, last: {said:?}");
         assert!(hung_up, "and hung up on");
 
         let tx = writer(third.stream.try_clone().unwrap(), Arc::default());
