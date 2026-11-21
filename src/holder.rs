@@ -1513,8 +1513,13 @@ pub(crate) mod tests {
         let pidfile = dir.join("pid");
         // A "holder" that never says it's up.
         let exe = dir.join("slow-holder");
-        std::fs::write(&exe, format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pidfile.display())).unwrap();
-        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // Written by a child of its own: a descriptor open for writing here
+        // could be inherited by a child a parallel test is forking, and
+        // exec'ing the script would then fail with ETXTBSY. It has to be
+        // exec'd directly, since launching runs `exe holder`.
+        let script = format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pidfile.display());
+        let wrote = Command::new("/bin/sh").args(["-c", "printf '%s' \"$1\" > \"$0\" && chmod 755 \"$0\""]).arg(&exe).arg(&script).status().unwrap();
+        assert!(wrote.success());
         let started = Instant::now();
         let res = launch_within(&exe, &spec("/bin/true", &[]), Duration::from_millis(500));
         assert!(matches!(res, Err(LaunchError::Holder(_))), "the server runs the program some other way");
