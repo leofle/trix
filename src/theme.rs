@@ -188,11 +188,12 @@ fn omarchy_paths() -> [PathBuf; 2] {
 }
 
 /// The themes that come with trix, built in so an installed binary has them
-/// too: Omarchy's, from its folders in `themes/`, with their name and
-/// `colors.toml`.
-pub const SHIPPED: [(&str, &str, &str); 23] = [
+/// too: Omarchy's and Cyber Aura, from their folders in `themes/`, with their
+/// name and `colors.toml`.
+pub const SHIPPED: [(&str, &str, &str); 24] = [
     ("catppuccin", "Catppuccin", include_str!("../themes/catppuccin/colors.toml")),
     ("catppuccin-latte", "Catppuccin Latte", include_str!("../themes/catppuccin-latte/colors.toml")),
+    ("cyber-aura", "Cyber Aura", include_str!("../themes/cyber-aura/colors.toml")),
     ("ethereal", "Ethereal", include_str!("../themes/ethereal/colors.toml")),
     ("everforest", "Everforest", include_str!("../themes/everforest/colors.toml")),
     ("flexoki-light", "Flexoki Light", include_str!("../themes/flexoki-light/colors.toml")),
@@ -538,7 +539,9 @@ mod tests {
             }
             let t = from_toml(text);
             assert!(contrast(t.fg, t.bg) >= 4.5, "{dir}: text must read on its background");
-            assert_eq!(text.lines().next(), Some(format!("# {name}, from Omarchy 4.5 (https://github.com/omacom/omarchy, MIT license).").as_str()));
+            // Cyber Aura is the one theme that isn't Omarchy's.
+            let credit = if dir == "cyber-aura" { format!("# {name}") } else { format!("# {name}, from Omarchy 4.5 (https://github.com/omacom/omarchy, MIT license).") };
+            assert_eq!(text.lines().next(), Some(credit.as_str()));
         }
         assert!(SHIPPED.windows(2).all(|w| w[0].0 < w[1].0), "in order, once each");
         // Every folder is built in, so the settings offer what install-theme.sh does.

@@ -1,0 +1,29 @@
+# Cyber Aura
+
+mode = "dark"
+
+accent = "#FF007F"
+selection = "#FF007F"
+muted = "#44445A"
+
+background = "#09090E"
+dark_background = "#09090E"
+lighter_background = "#151521"
+
+foreground = "#E0E6F0"
+dark_foreground = "#44445A"
+bright_foreground = "#FFFFFF"
+
+red = "#FF007F"
+green = "#00FF9F"
+yellow = "#FFE700"
+blue = "#00E5FF"
+magenta = "#BD00FF"
+cyan = "#00FFFF"
+
+bright_red = "#FF3399"
+bright_green = "#33FFB2"
+bright_yellow = "#FFF033"
+bright_blue = "#33EAFF"
+bright_magenta = "#CA33FF"
+bright_cyan = "#33FFFF"
