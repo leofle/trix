@@ -682,7 +682,7 @@ impl Action {
             Action::Search => &["alt+f"],
             Action::Broadcast => &["alt+b"],
             Action::Review => &["alt+v"],
-            Action::Clone => &["alt+t"],
+            Action::Clone => &["alt+l"],
             Action::Rename => &["alt+r"],
             Action::Close => &["alt+w"],
             Action::Menu => &["alt+o"],
@@ -1014,13 +1014,15 @@ mod tests {
 
     #[test]
     fn your_keys_take_them_from_defaults() {
-        let c = parse("[keys]\nnew = \"alt+t\"\n", Path::new("/")).unwrap();
-        assert_eq!(c.keys.lookup(&key(KeyCode::Char('t'), ALT)), Some((Action::New, 0)), "yours, not clone's default");
+        let c = parse("[keys]\nnew = \"alt+l\"\n", Path::new("/")).unwrap();
+        assert_eq!(c.keys.lookup(&key(KeyCode::Char('l'), ALT)), Some((Action::New, 0)), "yours, not clone's default");
         assert_eq!(c.keys.label(Action::Clone), None, "clone goes without a key");
         let c = parse("[keys]\nnew = \"alt+a\"\n", Path::new("/")).unwrap();
         assert_eq!(c.keys.lookup(&key(KeyCode::Char('a'), ALT)), Some((Action::New, 0)));
         assert_eq!(c.keys.label(Action::Attention), None);
-        assert_eq!(Keys::default().lookup(&key(KeyCode::Char('t'), ALT)), Some((Action::Clone, 0)));
+        assert_eq!(Keys::default().lookup(&key(KeyCode::Char('l'), ALT)), Some((Action::Clone, 0)));
+        // Claude Code's alt+t (thinking) goes through to the pane.
+        assert_eq!(Keys::default().lookup(&key(KeyCode::Char('t'), ALT)), None);
     }
 
     #[test]

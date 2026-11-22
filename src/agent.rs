@@ -368,6 +368,13 @@ pub struct Agent {
     /// permission prompt comes as a notification with no tool in it, so
     /// this says what the approval is for.
     pending_tool: Option<String>,
+    /// A clone's: the conversation it was forked from. Its `session` is
+    /// that one until the agent reports its own, and isn't its to save
+    /// meanwhile: resumed, it would go on in the original's conversation.
+    pub forked_from: Option<String>,
+    /// A clone's: what its log has of the conversation it was forked from,
+    /// which the original spent (`usage::less` takes it off).
+    pub inherited: crate::usage::Spend,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -474,6 +481,11 @@ pub struct Meta {
     pub activity: String,
     #[serde(default)]
     pub unseen: bool,
+    /// A clone's `forked_from` and `inherited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<(crate::usage::Bucket, crate::usage::Tokens)>,
 }
 
 /// One thread per agent that sends each write when it's due, in the order
@@ -954,6 +966,8 @@ impl Agent {
         a.asked = meta.asked;
         a.managed_by = meta.managed_by.clone();
         a.transcript = meta.transcript.clone();
+        a.forked_from = meta.forked_from.clone();
+        a.inherited = meta.inherited.iter().cloned().collect();
         if a.state != State::Exited {
             a.restore_state(meta, quiet);
         }
@@ -1034,6 +1048,8 @@ impl Agent {
             state: self.state.label().into(),
             activity: self.activity.clone(),
             unseen: self.unseen,
+            forked_from: self.forked_from.clone(),
+            inherited: crate::usage::to_list(&self.inherited),
         }
     }
 
@@ -1108,6 +1124,8 @@ impl Agent {
             installing: None,
             amp_welcome_at: None,
             pending_tool: None,
+            forked_from: None,
+            inherited: Default::default(),
         }
     }
 

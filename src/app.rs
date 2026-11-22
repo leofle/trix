@@ -528,9 +528,6 @@ pub struct App {
     usage_targets: crate::usage::Targets,
     /// What agents closed since this server started had spent.
     closed_spend: crate::usage::Spend,
-    /// What a clone's log has of its original's conversation, by the
-    /// clone's id: spent once already, by the original.
-    inherited: HashMap<u32, crate::usage::Spend>,
     /// How near the workspace's budget it was last told to be.
     budget_level: u8,
     /// The live price list, and the fetcher's settings (the config's).
@@ -646,7 +643,6 @@ impl App {
             git_targets,
             usage_targets,
             closed_spend: Default::default(),
-            inherited: HashMap::new(),
             budget_level: 0,
             price_feed: Default::default(),
             price_settings,
@@ -830,6 +826,9 @@ impl App {
                 // Claude names its conversation at start, but writes it only
                 // with the first message: until then `--resume` finds nothing.
                 let written = a.transcript.as_ref().is_none_or(|p| p.exists());
+                // A clone's conversation is its own once the agent says so.
+                let own = a.forked_from.is_none() || a.session != a.forked_from;
+                let session = if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) && written && own { a.session.clone() } else { None };
                 Some(SavedAgent {
                     kind: a.kind.label().into(),
                     name: a.name.clone(),
@@ -838,7 +837,9 @@ impl App {
                     command: spec.command.clone(),
                     // An id trix made up for Grok names no conversation until
                     // a turn; one it resumed does from the start.
-                    session: if a.kind.resumes() && (!a.session_named_by_trix || a.turn_seen) && written { a.session.clone() } else { None },
+                    // Back in its own conversation, it still started with the original's.
+                    inherited: if session.is_some() { crate::usage::to_list(&a.inherited) } else { Vec::new() },
+                    session,
                     pinned: a.pinned,
                 })
             })
@@ -891,6 +892,7 @@ impl App {
                 continue;
             }
             let pinned = s.pinned;
+            let inherited: crate::usage::Spend = s.inherited.into_iter().collect();
             let resume = s.session.clone().filter(|_| kind.resumes());
             let name = unique_with(&self.agents, &names, &s.name);
             names.push(name.clone());
@@ -918,10 +920,10 @@ impl App {
             } else {
                 jobs.push((clone_spec(&spec), spec));
             }
-            notes.push((i, pinned, parked, resumes));
+            notes.push((i, pinned, parked, resumes, inherited));
         }
         let started = self.start_all(jobs);
-        for ((i, pinned, parked, resumes), res) in notes.into_iter().zip(started) {
+        for ((i, pinned, parked, resumes, inherited), res) in notes.into_iter().zip(started) {
             match res {
                 Ok(id) => {
                     restored += 1;
@@ -932,6 +934,9 @@ impl App {
                         self.parked.insert(id);
                     }
                     let Some(at) = self.agents.iter().position(|a| a.id == id) else { continue };
+                    if resumes {
+                        self.agents[at].inherited = inherited;
+                    }
                     // Saved in list order, so the pinned ones come back on top.
                     if pinned && self.agents.iter().filter(|a| a.pinned).count() < PIN_LIMIT {
                         self.agents[at].pinned = true;
@@ -1923,8 +1928,16 @@ impl App {
                 };
                 notes.push(format!("clone of {of} · new worktree on {branch}"));
                 match copy_changes(&top, &path) {
-                    Ok(0) => {}
-                    Ok(n) => notes.push(format!("{n} uncommitted file{}", if n == 1 { "" } else { "s" })),
+                    Ok((n, skipped)) => {
+                        if n > 0 {
+                            notes.push(format!("{n} uncommitted file{}", if n == 1 { "" } else { "s" }));
+                        }
+                        if !skipped.is_empty() {
+                            let shown: Vec<&str> = skipped.iter().take(3).map(|s| s.trim_end_matches('/')).collect();
+                            let more = if skipped.len() > 3 { format!(" and {} more", skipped.len() - 3) } else { String::new() };
+                            warnings.push(format!("{name} didn't get {}{more}: not files it could copy", shown.join(", ")));
+                        }
+                    }
                     Err(e) => warnings.push(format!("{name} didn't get all of {of}'s uncommitted changes: {e}")),
                 }
                 let ready = crate::worktree::prepare(&path, repo.as_ref(), false, false, &self.config.worktree);
@@ -1975,11 +1988,15 @@ impl App {
         run.branch_note = Some(notes.join(" · "));
         keep.branch_note = run.branch_note.clone();
         let name = keep.name.clone();
+        let forked_from = run.resume.clone().filter(|_| run.fork);
         match self.spawn_as(run, keep) {
             Ok(new_id) => {
-                if let Some(base) = base {
-                    self.inherited.insert(new_id, base);
+                if let Some(a) = self.agents.iter_mut().find(|a| a.id == new_id) {
+                    a.forked_from = forked_from;
+                    a.inherited = base.unwrap_or_default();
                 }
+                // Its holder keeps both, for a server after this one.
+                self.sync_holders();
                 self.sync_git_targets();
                 self.toast(format!("cloned {of} as {name}"), ToastKind::Good);
                 for w in warnings {
@@ -1991,7 +2008,6 @@ impl App {
     }
 
     pub fn close(&mut self, id: u32) {
-        self.inherited.remove(&id);
         if let Some(i) = self.index_of(id) {
             let a = self.agents.remove(i);
             a.shutdown();
@@ -2258,10 +2274,8 @@ impl App {
             }
             AppEvent::Spend(id, spend) => {
                 if let Some(i) = self.index_of(id) {
-                    self.agents[i].spend = match self.inherited.get(&id) {
-                        Some(base) => crate::usage::less(&spend, base),
-                        None => spend,
-                    };
+                    let a = &mut self.agents[i];
+                    a.spend = if a.inherited.is_empty() { spend } else { crate::usage::less(&spend, &a.inherited) };
                     let _ = self.check_budgets();
                     self.dirty = true;
                 }
@@ -4037,8 +4051,9 @@ fn make_worktree_at(dir: &Path, name: &str, base: Option<&str>) -> anyhow::Resul
 /// Put the uncommitted changes of the checkout at `from` in `to`, a new
 /// worktree of the same repo at the same commit: what's staged staged, the
 /// rest as it is, and the files git doesn't track yet (not ignored ones).
-/// How many files came.
-fn copy_changes(from: &Path, to: &Path) -> Result<usize, String> {
+/// How many files came, and the untracked ones that couldn't (a repo inside
+/// it, which git lists as a folder; a file gone meanwhile).
+fn copy_changes(from: &Path, to: &Path) -> Result<(usize, Vec<String>), String> {
     use std::io::Write;
     let run = |dir: &Path, args: &[&str], input: Option<&[u8]>| -> Result<Vec<u8>, String> {
         let mut child = Command::new("git")
@@ -4072,20 +4087,23 @@ fn copy_changes(from: &Path, to: &Path) -> Result<usize, String> {
     let names = |out: Vec<u8>| -> Vec<String> { out.split(|&b| b == 0).filter(|n| !n.is_empty()).map(|n| String::from_utf8_lossy(n).into_owned()).collect() };
     let changed = names(run(from, &["diff", "--name-only", "-z", "--no-renames", "HEAD"], None)?);
     let untracked = names(run(from, &["ls-files", "-z", "--others", "--exclude-standard"], None)?);
-    for rel in &untracked {
+    let copy = |rel: &str| -> std::io::Result<()> {
         let (src, dst) = (from.join(rel), to.join(rel));
-        if let Some(dir) = dst.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{rel}: {e}"))?;
+        let meta = std::fs::symlink_metadata(&src)?;
+        if meta.is_dir() {
+            return Err(std::io::Error::other("a folder"));
         }
-        let meta = std::fs::symlink_metadata(&src).map_err(|e| format!("{rel}: {e}"))?;
-        let copied = if meta.file_type().is_symlink() {
-            std::fs::read_link(&src).and_then(|target| std::os::unix::fs::symlink(target, &dst))
+        if let Some(dir) = dst.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if meta.file_type().is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)
         } else {
             std::fs::copy(&src, &dst).map(|_| ())
-        };
-        copied.map_err(|e| format!("{rel}: {e}"))?;
-    }
-    Ok(changed.len() + untracked.len())
+        }
+    };
+    let skipped: Vec<String> = untracked.iter().filter(|rel| copy(rel).is_err()).cloned().collect();
+    Ok((changed.len() + untracked.len() - skipped.len(), skipped))
 }
 
 /// A folder's branch, and its diff against HEAD (files, insertions, deletions).
@@ -4254,7 +4272,7 @@ mod tests {
         }
 
         let mut app = test_app();
-        let saved = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: "/tmp".into(), command: None, session: None, pinned: false };
+        let saved = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: "/tmp".into(), command: None, session: None, pinned: false, inherited: Vec::new() };
         app.pending_restore = Some(Saved::new(1, vec![saved("counter"), saved("other")]));
         // And one whose holder can't be reached now: its id stays taken.
         assert_eq!(app.reattach_from(vec![(7, path.clone()), (12, dir.join("unreachable.sock"))]), 1);
@@ -5357,6 +5375,10 @@ mod tests {
         std::fs::create_dir_all(wt.join("new")).unwrap();
         std::fs::write(wt.join("new/c.txt"), "untracked\n").unwrap();
         std::fs::write(wt.join(".env"), "SECRET=1\n").unwrap();
+        // A repo inside it, which git lists as a folder: the files after it still come.
+        std::fs::create_dir_all(wt.join("inner")).unwrap();
+        git_out(&wt.join("inner"), &["init", "-q"]);
+        std::fs::write(wt.join("z.txt"), "last\n").unwrap();
         let before = git_out(&wt, &["status", "--porcelain"]);
 
         app.clone_agent(app.agents[0].id);
@@ -5375,6 +5397,8 @@ mod tests {
         assert_eq!(git_out(&cw, &["show", ":b.txt"]), "staged", "what was staged is staged");
         assert_eq!(read("new/c.txt").as_deref(), Some("untracked\n"));
         assert_eq!(read(".env"), None, "ignored files stay behind");
+        assert_eq!(read("z.txt").as_deref(), Some("last\n"), "past the repo it couldn't copy");
+        assert!(!cw.join("inner").exists());
         assert_eq!(git_out(&wt, &["status", "--porcelain"]), before, "the original is left as it was");
 
         // A worktree left from before isn't taken for the clone's.
@@ -5387,13 +5411,40 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_is_saved_on_its_own_conversation_only() {
+        let mut app = test_app();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.id = 7;
+        a.session = Some("original".into());
+        a.forked_from = Some("original".into());
+        a.inherited = [(crate::usage::Bucket { model: "m".into(), fast: false, prompt: 0 }, crate::usage::Tokens { output: 5, ..Default::default() })].into();
+        app.specs.insert(7, Spawn { kind: Kind::Claude, name: "c-2".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() });
+        app.agents.push(a);
+        let saved = &app.open_agents()[0];
+        assert_eq!((saved.session.as_deref(), saved.inherited.len()), (None, 0), "the original's: resumed, the clone would go on in it");
+        // Its holder keeps it for a server after this one.
+        let meta = app.agents[0].meta(0, false, None, false);
+        assert_eq!((meta.forked_from.as_deref(), meta.inherited.len()), (Some("original"), 1));
+        // Once the agent reports its own, that's saved, with what it started with.
+        app.agents[0].session = Some("forked".into());
+        let saved = &app.open_agents()[0];
+        assert_eq!(saved.session.as_deref(), Some("forked"));
+        assert_eq!(saved.inherited, crate::usage::to_list(&app.agents[0].inherited));
+        // And its spend leaves it out.
+        let full: crate::usage::Spend = [(crate::usage::Bucket { model: "m".into(), fast: false, prompt: 0 }, crate::usage::Tokens { output: 8, ..Default::default() })].into();
+        app.handle(AppEvent::Spend(7, full));
+        assert_eq!(crate::usage::total(&app.agents[0].spend).output, 3);
+        app.agents[0].shutdown();
+    }
+
+    #[test]
     fn a_clone_outside_git_shares_the_folder() {
         let dir = std::env::temp_dir().join(format!("trix-app-clone-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut app = test_app();
         app.spawn(Spawn { kind: Kind::Custom, name: "s".into(), cwd: dir.clone(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() }).unwrap();
-        // alt+t clones the focused agent.
-        hit(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+        // alt+l clones the focused agent.
+        hit(&mut app, KeyCode::Char('l'), KeyModifiers::ALT);
         assert_eq!(app.agents.len(), 2, "{:?}", app.toast.as_ref().map(|t| &t.text));
         assert_eq!((app.agents[1].name.as_str(), &app.specs[&app.agents[1].id].cwd), ("s-2", &dir));
         assert!(app.agents[1].activity.contains("same folder"), "{}", app.agents[1].activity);
@@ -5602,7 +5653,7 @@ mod tests {
         let opts = crate::config::WorktreeOpts::default();
         assert!(crate::worktree::lease(&tree, &opts, None).is_some());
         let mut app = test_app();
-        app.pending_restore = Some(Saved::new(0, vec![SavedAgent { kind: "shell".into(), name: "w".into(), cwd: tree.clone(), command: None, session: None, pinned: false }]));
+        app.pending_restore = Some(Saved::new(0, vec![SavedAgent { kind: "shell".into(), name: "w".into(), cwd: tree.clone(), command: None, session: None, pinned: false, inherited: Vec::new() }]));
         app.modal = Some(Modal::Restore(0));
         app.dialog_hidden.set(false);
         trust_key(&mut app, KeyCode::Char('n'));
@@ -6319,7 +6370,7 @@ mod tests {
     #[test]
     fn restored_agents_with_the_same_name_get_their_own() {
         let mut app = test_app();
-        let shell = |name: &str, pinned| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned };
+        let shell = |name: &str, pinned| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned, inherited: Vec::new() };
         app.pending_restore = Some(crate::state::Saved::new(2, vec![shell("web", true), shell("web", false), shell("api", false)]));
         app.config.workspace.restore = crate::config::Restore::Always;
         app.on_attach(PathBuf::from("/"));
@@ -6335,7 +6386,7 @@ mod tests {
     #[test]
     fn the_grid_comes_back_with_the_workspace() {
         let mut app = test_app();
-        let shell = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned: false };
+        let shell = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned: false, inherited: Vec::new() };
         let mut saved = crate::state::Saved::new(1, vec![shell("c"), shell("a"), shell("b")]);
         saved.grid = true;
         app.pending_restore = Some(saved);

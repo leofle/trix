@@ -78,7 +78,7 @@ pub type Targets = Arc<Mutex<Vec<Target>>>;
 /// One kind of model call, as it's priced: which model, in fast mode or
 /// not, and how long its prompt was (`cost::tier`: some models charge more
 /// past a size).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Bucket {
     pub model: String,
     pub fast: bool,
@@ -86,7 +86,7 @@ pub struct Bucket {
 }
 
 /// Tokens used, by how they're charged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tokens {
     /// Input that wasn't read from the prompt cache or written to it.
     pub input: u64,
@@ -126,6 +126,11 @@ impl Tokens {
 
 /// An agent's tokens so far, per kind of call.
 pub type Spend = BTreeMap<Bucket, Tokens>;
+
+/// A `Spend` as a list, which JSON can hold: its keys aren't strings.
+pub fn to_list(s: &Spend) -> Vec<(Bucket, Tokens)> {
+    s.iter().map(|(b, t)| (b.clone(), *t)).collect()
+}
 
 /// Every kind of call's tokens added up.
 pub fn total(s: &Spend) -> Tokens {
