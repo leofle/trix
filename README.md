@@ -95,7 +95,7 @@ trix kill --all           # stop every running session
 
 ### Search
 
-`alt+f` opens a search over every agent's scrollback, including exited ones. The last 10,000 lines of each are kept.
+`alt+f` opens a search over every agent's scrollback, including exited ones. The last 10,000 lines of each are kept (`[ui] scrollback`, see [Config](#config)).
 
 - Results update as you type, one row per matching line, newest first. They're grouped by agent, in sidebar order. Each row shows how far back the line is (`↑340`, `↑2.1k`, `on screen`). An agent shows at most 200 lines; a `+` after the count means some were left out.
 - Smart case: a lowercase query ignores case, and any capital makes the match exact.
@@ -249,6 +249,7 @@ panes = false                     # keep the panes in the terminal's colors (on 
 
 [ui]
 nerd_font = true                  # draw icons from a Nerd Font (off by default: plain Unicode)
+scrollback = 5000                 # lines each pane keeps to scroll back through and search (10000 by default, 0 to 100000)
 
 [workspace]
 restore = "always"                # a fresh trix and the saved workspace: "ask" (default), "always", "never"
@@ -279,6 +280,7 @@ port_count = 10                   # ports per block, unless the repo's .trix.tom
 - **New agents** take `agent` and `worktree` as where `alt+n`'s form starts; you can still change both in it. `"last"` is the kind you started last from the form, remembered in `prefs.json`, or claude before you've started one. `kinds` is the form's kind row, in your order: claude, codex, shell and custom by default. Every other kind, including any trix adds later, waits under *more ▸*, and its letter picks it all the same. A name that isn't a kind, or one named twice, is a mistake.
 - **`[theme] panes = false`** keeps a theme of trix's own to its bars, sidebar and cards (see [Themes](#themes)).
 - **`[ui] nerd_font = true`** draws the pane pin from a Nerd Font (``) instead of plain Unicode (`⚲`). Turn it on only if your terminal's font is a Nerd Font: trix can't see the font, and without one the icon shows as an empty box.
+- **`[ui] scrollback`** is how many lines each pane keeps above its screen: what you scroll back through, what search (`alt+f`) looks in, and what `trix read` reads. It is most of what a pane costs in memory, about 24 bytes a character cell. 10,000 lines of a 170-column pane is some 40 MB once it fills up, so a dozen long-running agents can take half a gigabyte between them. Fewer lines use less. A change reaches the panes open now: fewer drops their oldest lines at once.
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - **`[cost]`** sets the budgets and prices in [Cost and tokens](#cost-and-tokens). A price under `[cost.prices]` applies to the model of that name, or to models whose name starts with it (`"gpt-6"` covers `gpt-6-luna`), ahead of the live list and trix's own. `live_prices` and `prices_url` are for the [live list](#cost-and-tokens).
 - **`[worktree]`** sets the ports of [runnable worktrees](#runnable-worktrees). The default base sits below the ports Linux and macOS hand out on their own. What a repository's worktrees run and copy lives in its `.trix.toml`, not here.
