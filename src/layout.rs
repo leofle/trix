@@ -16,6 +16,7 @@ use crate::app::{self, App, ToastKind};
 use crate::control::{self, Reply, Request};
 use crate::session::{self, ClientMsg};
 use crate::state::SavedAgent;
+use crate::usage::{Bucket, Spend, Tokens};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LayoutAgent {
@@ -30,6 +31,36 @@ pub struct LayoutAgent {
     /// The conversation `--resume` picks up (Claude and Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// For a clone: what its conversation had cost before it was cloned, so a
+    /// `--resume` counts only what it spent itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<Inherited>,
+}
+
+/// One kind of model call's tokens, flat, so TOML can hold it
+/// (`usage::Bucket` and `usage::Tokens` in one).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Inherited {
+    pub model: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
+    pub prompt: u32,
+    pub input: u64,
+    pub cache_write_5m: u64,
+    pub cache_write_1h: u64,
+    pub cache_read: u64,
+    pub output: u64,
+}
+
+impl Inherited {
+    fn from_pair((b, t): &(Bucket, Tokens)) -> Self {
+        Inherited { model: b.model.clone(), fast: b.fast, prompt: b.prompt, input: t.input, cache_write_5m: t.cache_write_5m, cache_write_1h: t.cache_write_1h, cache_read: t.cache_read, output: t.output }
+    }
+    fn pair(&self) -> (Bucket, Tokens) {
+        let b = Bucket { model: self.model.clone(), fast: self.fast, prompt: self.prompt };
+        (b, Tokens { input: self.input, cache_write_5m: self.cache_write_5m, cache_write_1h: self.cache_write_1h, cache_read: self.cache_read, output: self.output })
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -40,7 +71,7 @@ struct LayoutFile {
 
 impl From<&SavedAgent> for LayoutAgent {
     fn from(s: &SavedAgent) -> Self {
-        LayoutAgent { kind: s.kind.clone(), name: s.name.clone(), cwd: app::tilde(&s.cwd), args: s.command.clone(), session: s.session.clone() }
+        LayoutAgent { kind: s.kind.clone(), name: s.name.clone(), cwd: app::tilde(&s.cwd), args: s.command.clone(), session: s.session.clone(), inherited: s.inherited.iter().map(Inherited::from_pair).collect() }
     }
 }
 
@@ -65,7 +96,8 @@ pub fn to_toml(name: &str, agents: &[LayoutAgent]) -> String {
         "# trix layout '{name}' · `trix layout open {name}` opens these tabs again\n\
          # kind: claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell or custom · args: extra arguments (for custom, the command)\n\
          # cwd: the folder; a relative one starts from your home folder\n\
-         # session: the conversation `--resume` picks up; delete the line to always start fresh\n\n{body}"
+         # session: the conversation `--resume` picks up; delete the line to always start fresh\n\
+         # inherited: for a clone, what its conversation had cost before it was cloned (counted once, in the original)\n\n{body}"
     )
 }
 
@@ -302,6 +334,9 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
                     opened += 1;
                     if let Some(x) = app.agents.iter_mut().find(|x| x.id == id) {
                         x.managed_by = by.clone();
+                        if resumed {
+                            x.inherited = a.inherited.iter().map(Inherited::pair).collect::<Spend>();
+                        }
                     }
                     ("opened", format!("{}{}", a.cwd, if resumed { " · resuming its conversation" } else { "" }))
                 }
@@ -356,7 +391,7 @@ mod tests {
         d
     }
     fn entry(kind: &str, name: &str, cwd: &str) -> LayoutAgent {
-        LayoutAgent { kind: kind.into(), name: name.into(), cwd: cwd.into(), args: None, session: None }
+        LayoutAgent { kind: kind.into(), name: name.into(), cwd: cwd.into(), args: None, session: None, inherited: Vec::new() }
     }
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
@@ -391,6 +426,23 @@ mod tests {
         assert!(text.contains("[[agent]]\nkind = \"claude\"\nname = \"api\"\ncwd = \"~/code/api\"\nsession = \"4f1c-abc\""), "{text}");
         assert!(!text.contains("args = \"\"") && !text.contains("session = \"\""), "absent fields stay out:\n{text}");
         assert_eq!(from_toml(&text), Ok(agents));
+    }
+
+    #[test]
+    fn a_clone_keeps_what_its_conversation_cost_before() {
+        let b = Bucket { model: "claude-opus-5-5".into(), fast: false, prompt: 0 };
+        let t = Tokens { input: 3, cache_read: 1000, output: 42, ..Default::default() };
+        let saved = SavedAgent { kind: "claude".into(), name: "api-2".into(), cwd: "/tmp".into(), command: None, session: Some("own".into()), pinned: false, inherited: vec![(b.clone(), t)] };
+        let a = LayoutAgent::from(&saved);
+        let text = to_toml("work", std::slice::from_ref(&a));
+        assert!(text.contains("[[agent.inherited]]\nmodel = \"claude-opus-5-5\"\nprompt = 0\ninput = 3\n"), "{text}");
+        assert!(!text.contains("fast ="), "only when it's on:\n{text}");
+        let back = from_toml(&text).unwrap();
+        assert_eq!(back, [a]);
+        assert_eq!(back[0].inherited.iter().map(Inherited::pair).collect::<Spend>(), [(b, t)].into());
+        let by_hand = from_toml("[[agent]]\nkind = \"claude\"\nname = \"x\"\ncwd = \"/tmp\"\n[[agent.inherited]]\nmodel = \"m\"\noutput = 5\n").unwrap();
+        assert_eq!(by_hand[0].inherited[0].pair().1, Tokens { output: 5, ..Default::default() }, "what's left out is 0");
+        assert!(!to_toml("w", &[entry("shell", "s", "/tmp")]).contains("inherited]]"), "only a clone has one");
     }
 
     #[test]
