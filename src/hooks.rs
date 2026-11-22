@@ -381,19 +381,27 @@ impl Integrations {
 
 fn write_workspace_instructions() -> anyhow::Result<PathBuf> {
     let dir = runtime_dir().join(format!("workspace-instructions-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("AGENTS.md"), crate::agent::WORKSPACE_INSTRUCTIONS)?;
+    refresh_workspace_instructions(&dir)?;
+    Ok(dir)
+}
+
+/// The workspace instructions (`instructions::workspace`, yours too) as the
+/// files OpenCode and Copilot read in `dir`. Written again as each of them
+/// starts, so an edit of yours since reaches it.
+pub fn refresh_workspace_instructions(dir: &Path) -> std::io::Result<()> {
+    let text = crate::instructions::workspace();
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("AGENTS.md"), &text)?;
     // Copilot reads `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` for
     // `.github/instructions/*.instructions.md`, not for a root `AGENTS.md`.
     let nested = dir.join(".github").join("instructions");
     std::fs::create_dir_all(&nested)?;
-    std::fs::write(nested.join("trix-workspace.instructions.md"), copilot_instructions())?;
-    Ok(dir)
+    std::fs::write(nested.join("trix-workspace.instructions.md"), copilot_instructions(&text))
 }
 
 /// The workspace instructions as a Copilot instructions file, applied to every file.
-fn copilot_instructions() -> String {
-    format!("---\napplyTo: \"**\"\n---\n{}\n", crate::agent::WORKSPACE_INSTRUCTIONS)
+fn copilot_instructions(text: &str) -> String {
+    format!("---\napplyTo: \"**\"\n---\n{text}\n")
 }
 
 /// Merge a session instruction path without discarding user configuration.
@@ -428,7 +436,7 @@ fn workspace_hook_context(source: &str, payload: &Value, pane: Option<&str>) -> 
     }
     Some(serde_json::json!({"hookSpecificOutput": {
         "hookEventName": "SessionStart",
-        "additionalContext": crate::agent::WORKSPACE_INSTRUCTIONS
+        "additionalContext": crate::instructions::workspace()
     }}))
 }
 
@@ -1321,7 +1329,7 @@ fn condense_gemini(agent: u32, v: &Value) -> HookMsg {
 fn antigravity_answer(v: &Value, pane: bool) -> Value {
     match v.get("hookEventName").and_then(Value::as_str) {
         Some("PreToolUse") => serde_json::json!({"decision": "allow"}),
-        Some("SessionStart") if pane => serde_json::json!({"injectSteps": [{"systemMessage": {"systemMessage": crate::agent::WORKSPACE_INSTRUCTIONS}}]}),
+        Some("SessionStart") if pane => serde_json::json!({"injectSteps": [{"systemMessage": {"systemMessage": crate::instructions::workspace()}}]}),
         _ => serde_json::json!({}),
     }
 }
@@ -1394,7 +1402,7 @@ fn unhex(s: &str) -> Option<String> {
 /// doesn't show. Nothing otherwise.
 fn amp_answer(v: &Value) -> Option<Value> {
     let first = text(v, "event").as_deref() == Some("agent.start") && v.get("first").and_then(Value::as_bool) == Some(true);
-    first.then(|| serde_json::json!({"message": {"content": crate::agent::WORKSPACE_INSTRUCTIONS}}))
+    first.then(|| serde_json::json!({"message": {"content": crate::instructions::workspace()}}))
 }
 
 /// An event from trix's Amp plugin (see `AMP_PLUGIN`): Amp's own event

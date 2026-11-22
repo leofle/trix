@@ -756,6 +756,14 @@ impl Agent {
         {
             env.insert("TRIX_CODEX_NOTIFY".into(), chain);
         }
+        // They read the instructions from files: what you wrote since the
+        // server made them reaches this one too.
+        if matches!(spec.kind, Kind::OpenCode | Kind::Copilot)
+            && let Some(dir) = &integrations.workspace_instructions
+            && let Err(e) = hooks::refresh_workspace_instructions(dir)
+        {
+            eprintln!("trix: could not write the workspace instructions in {}: {e}", dir.display());
+        }
         if spec.kind == Kind::OpenCode {
             let theirs = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
             if let Some(c) = integrations.opencode_plugin_for_version().and_then(|p| hooks::opencode_config(p, theirs.as_deref())) {
@@ -2458,7 +2466,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             }
             let mut theirs = extra.map(split_args).unwrap_or_default();
             // Claude accepts one append prompt; combine ours with the user's.
-            let mut instructions = WORKSPACE_INSTRUCTIONS.to_string();
+            let mut instructions = crate::instructions::workspace();
             let mut i = 0;
             while i < theirs.len() {
                 if theirs[i] == "--append-system-prompt" && i + 1 < theirs.len() {
@@ -2502,7 +2510,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             // go after ours, as Claude's append prompt does. A `-c
             // developer_instructions=` in their args still replaces both.
             let theirs = extra.map(split_args).unwrap_or_default();
-            let mut instructions = WORKSPACE_INSTRUCTIONS.to_string();
+            let mut instructions = crate::instructions::workspace();
             if let Some(own) = integrations.codex_home.as_deref().and_then(|h| codex_user_instructions(h, &theirs)) {
                 instructions.push_str("\n\n");
                 instructions.push_str(&own);

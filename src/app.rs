@@ -961,7 +961,13 @@ impl App {
         if !skipped.is_empty() {
             msg.push_str(&format!(" · skipped {} (folder gone)", skipped.join(", ")));
         }
-        self.toast(msg, if skipped.is_empty() { ToastKind::Good } else { ToastKind::Info });
+        // One toast at a time: `start_all`'s word on your instructions goes here.
+        let unused = if restored > 0 { crate::instructions::user().err() } else { None };
+        let kind = if unused.is_some() { ToastKind::Bad } else if skipped.is_empty() { ToastKind::Good } else { ToastKind::Info };
+        if let Some(e) = unused {
+            msg.push_str(&format!(" · {e}"));
+        }
+        self.toast(msg, kind);
         self.release_unheld_ports();
     }
 
@@ -1584,6 +1590,10 @@ impl App {
         if ids.iter().any(Result::is_ok) {
             self.sync_git_targets();
             self.sync_holders();
+            // They started without yours: say why, rather than leave you guessing.
+            if let Err(e) = crate::instructions::user() {
+                self.toast(e, ToastKind::Bad);
+            }
         }
         ids
     }
