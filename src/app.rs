@@ -579,6 +579,10 @@ impl App {
             Ok(c) => (c, None),
             Err(e) => (crate::config::Config::default(), Some(e)),
         };
+        // Tests share one process: none may change every other's terminals.
+        if !cfg!(test) {
+            crate::agent::set_scrollback(config.ui.scrollback);
+        }
         // A test's settings go to a folder of its own.
         let (config_path, theme_path) = if cfg!(test) {
             let dir = test_dir();
@@ -720,7 +724,11 @@ impl App {
                 }
             }
             Ok(c) => {
+                let scrollback = (c.ui.scrollback != self.config.ui.scrollback).then_some(c.ui.scrollback);
                 self.config = c;
+                if let Some(lines) = scrollback {
+                    self.set_scrollback(lines);
+                }
                 self.sync_agent_themes();
                 *self.price_settings.lock().unwrap() = crate::prices::Settings { enabled: self.config.cost.live_prices, url: self.config.cost.prices_url.clone() };
                 // A budget the new settings put spend past says so, with the reload.
@@ -732,6 +740,17 @@ impl App {
             Err(e) => self.toast(format!("config: {e} — kept the previous settings"), ToastKind::Bad),
         }
         self.dirty = true;
+    }
+
+    /// Every pane keeps `lines` of scrollback from now on, those open now
+    /// and those to come (`[ui] scrollback`).
+    fn set_scrollback(&mut self, lines: usize) {
+        if !cfg!(test) {
+            crate::agent::set_scrollback(lines);
+        }
+        for a in &self.agents {
+            a.set_scrollback(lines);
+        }
     }
 
     /// The key for an action, as the help shows it. Unbound: "—".
@@ -6053,6 +6072,20 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    #[test]
+    fn a_new_scrollback_reaches_the_panes_open_now() {
+        let mut app = test_app();
+        app.agents.push(crate::agent::test_agent(Kind::Shell));
+        let history = |app: &App| app.agents[0].term.lock().grid().history_size();
+        let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        p.advance(&mut *app.agents[0].term.lock(), "x\r\n".repeat(300).as_bytes());
+        assert!(history(&app) > 200);
+        app.apply_config(crate::config::parse("[ui]\nscrollback = 50\n", Path::new("/")));
+        assert_eq!((app.config.ui.scrollback, history(&app)), (50, 50));
+        assert!(app.toast.as_ref().is_some_and(|t| t.text == "config reloaded"));
+        app.agents[0].shutdown();
     }
 
     #[test]

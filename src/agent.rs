@@ -11,7 +11,7 @@ use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
@@ -1725,6 +1725,19 @@ impl Agent {
 
     /// A new terminal title. Grok's says when it's busy and when it waits
     /// on an approval.
+    /// Keep `lines` of scrollback from now on. Fewer drops the oldest at
+    /// once, and the memory they took.
+    pub fn set_scrollback(&self, lines: usize) {
+        let mut t = self.term.lock();
+        if t.mode().contains(TermMode::ALT_SCREEN) {
+            // The scrollback is the other screen's, which only a whole new
+            // config reaches. That also sends the title again: the same one.
+            t.set_options(Config { scrolling_history: lines, ..Config::default() });
+        } else {
+            t.grid_mut().update_history(lines);
+        }
+    }
+
     pub fn on_title(&mut self, t: String) {
         if matches!(self.kind, Kind::Grok | Kind::Gemini) && t.contains(GROK_ATTENTION) {
             self.title_attention = Some(Instant::now());
@@ -1890,8 +1903,22 @@ struct Parts {
     size: (u16, u16),
 }
 
+/// Lines of scrollback each agent's terminal keeps, unless `[ui] scrollback`
+/// says otherwise. A full one costs about 24 bytes a cell: 10,000 lines of a
+/// 170-column pane is some 40 MB.
+pub const SCROLLBACK: usize = 10_000;
+
+/// What terminals made from now on keep (`set_scrollback`).
+static SCROLLBACK_LINES: AtomicUsize = AtomicUsize::new(SCROLLBACK);
+
+/// Terminals made from now on keep `lines` of scrollback; `Agent::set_scrollback`
+/// changes one already made.
+pub fn set_scrollback(lines: usize) {
+    SCROLLBACK_LINES.store(lines, Ordering::Relaxed);
+}
+
 fn new_term(size: (u16, u16), listener: Listener) -> Arc<FairMutex<Term<Listener>>> {
-    let config = Config { scrolling_history: 10_000, ..Config::default() };
+    let config = Config { scrolling_history: SCROLLBACK_LINES.load(Ordering::Relaxed), ..Config::default() };
     let tsize = TermSize { cols: size.0 as usize, lines: size.1 as usize };
     Arc::new(FairMutex::new(Term::new(config, &tsize, listener)))
 }
@@ -3164,6 +3191,30 @@ mod tests {
     fn show(a: &Agent, text: &str) {
         let mut p: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
         p.advance(&mut *a.term.lock(), text.replace('\n', "\r\n").as_bytes());
+    }
+
+    #[test]
+    fn the_scrollback_shrinks_and_grows_while_it_runs() {
+        let a = test_agent(Kind::Shell);
+        let history = |a: &Agent| a.term.lock().grid().history_size();
+        let lines: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        show(&a, &lines);
+        assert!(history(&a) > 400, "all of it kept: {}", history(&a));
+        a.set_scrollback(100);
+        assert_eq!(history(&a), 100, "the oldest go at once");
+        let kept = crate::search::tail(&*a.term.lock(), 1000);
+        assert!(!kept.iter().any(|l| l.trim_end() == "line 300") && kept.iter().any(|l| l.trim_end() == "line 499"), "the newest stay");
+        show(&a, &lines);
+        assert_eq!(history(&a), 100, "and no more come back");
+        a.set_scrollback(1000);
+        show(&a, &lines);
+        assert_eq!(history(&a), 600, "more, from then on");
+        // On the other screen, the scrollback is the first screen's.
+        show(&a, "\x1b[?1049h");
+        a.set_scrollback(10);
+        show(&a, "\x1b[?1049l");
+        assert_eq!(history(&a), 10, "and it shrinks all the same");
+        a.shutdown();
     }
 
     #[test]

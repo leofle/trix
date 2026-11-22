@@ -68,13 +68,25 @@ impl Default for CostOpts {
     }
 }
 
-/// How trix draws its own icons.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// How trix draws its own icons, and what its panes keep.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ui {
     /// The terminal's font is a Nerd Font, so its icons can be drawn (the
     /// pane pin). Off, plain Unicode that every font has.
     pub nerd_font: bool,
+    /// Lines of scrollback each pane keeps. Memory goes with it: a full
+    /// pane is about 24 bytes a cell.
+    pub scrollback: usize,
 }
+
+impl Default for Ui {
+    fn default() -> Ui {
+        Ui { nerd_font: false, scrollback: crate::agent::SCROLLBACK }
+    }
+}
+
+/// The most `[ui] scrollback` takes (as Alacritty's own limit).
+pub const MAX_SCROLLBACK: usize = 100_000;
 
 /// alt+n's form, as it opens.
 #[derive(Debug, Clone, PartialEq)]
@@ -334,6 +346,7 @@ struct FilePrice {
 #[serde(deny_unknown_fields)]
 struct FileUi {
     nerd_font: Option<bool>,
+    scrollback: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -463,7 +476,12 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         None => Restore::Ask,
         Some(s) => Restore::ALL.into_iter().find(|r| r.name() == s).ok_or_else(|| format!("workspace.restore: '{s}' is not ask, always or never"))?,
     };
-    let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false) };
+    let scrollback = match f.ui.scrollback {
+        None => crate::agent::SCROLLBACK,
+        Some(n) if (0..=MAX_SCROLLBACK as i64).contains(&n) => n as usize,
+        Some(n) => return Err(format!("ui.scrollback: {n} is not a number of lines from 0 to {MAX_SCROLLBACK}")),
+    };
+    let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false), scrollback };
     let cost = cost_opts(f.cost)?;
     let worktree = worktree_opts(f.worktree)?;
     Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree })
@@ -1019,6 +1037,12 @@ mod tests {
         assert!(!c.ui.nerd_font, "plain Unicode by default");
         assert!(read("[ui]\nnerd_font = true\n").unwrap().ui.nerd_font);
         assert!(read("[ui]\nnerd_fonts = true\n").is_err(), "a misspelling is a mistake");
+        assert_eq!(c.ui.scrollback, 10_000, "10,000 lines by default");
+        assert_eq!(read("[ui]\nscrollback = 2000\n").unwrap().ui.scrollback, 2000);
+        assert_eq!(read("[ui]\nscrollback = 0\n").unwrap().ui.scrollback, 0, "none at all is fine");
+        assert!(read("[ui]\nscrollback = -1\n").unwrap_err().contains("ui.scrollback: -1 is not"));
+        assert!(read("[ui]\nscrollback = 100001\n").is_err(), "past Alacritty's limit");
+        assert!(read("[ui]\nscrollback = \"lots\"\n").is_err());
         assert_eq!(read("[new]\nagent = \"last\"\n").unwrap().new.agent, None, "the one started last");
         assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
         assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));
