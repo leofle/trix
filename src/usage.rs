@@ -375,6 +375,39 @@ fn find_codex(root: &Path, thread: &str) -> Option<PathBuf> {
     None
 }
 
+/// An agent's conversation log, where trix would follow it.
+pub fn log_of(kind: Kind, transcript: Option<PathBuf>, session: Option<String>) -> Option<PathBuf> {
+    locate(&Target { id: 0, kind, transcript, session })
+}
+
+/// Everything a log has spent, read once from start to end.
+pub fn spent_in(path: &Path) -> Spend {
+    let mut log = Log::new(path.to_path_buf());
+    log.advance();
+    log.spend
+}
+
+/// `spend` without `base`, kind of call by kind of call: what a clone spent
+/// itself, its log starting with its original's conversation.
+pub fn less(spend: &Spend, base: &Spend) -> Spend {
+    let mut out = spend.clone();
+    for (b, t) in base {
+        if let Some(have) = out.get_mut(b) {
+            have.sub(t);
+        }
+    }
+    out.retain(|_, t| t.total() > 0);
+    out
+}
+
+/// Claude resumes only conversations logged under the folder it starts in:
+/// `<claude>/projects/<cwd, each character but a letter or digit a dash>/`.
+/// Where `cwd` would look for `session`.
+pub fn claude_log_under(cwd: &Path, session: &str) -> PathBuf {
+    let dir: String = cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    claude_dir().join("projects").join(dir).join(format!("{session}.jsonl"))
+}
+
 fn locate(t: &Target) -> Option<PathBuf> {
     // The agent said where its log is (Claude writes it only with the first
     // message): there's nothing to find anywhere else meanwhile.
@@ -657,6 +690,30 @@ mod tests {
         assert_eq!(log.spend.get(&b("gpt-5-codex")), Some(&Tokens { input: 400, cache_read: 600, output: 50, ..Default::default() }), "a count repeated isn't more");
         assert_eq!(log.spend.get(&b("gpt-5.2")), Some(&Tokens { input: 600, cache_read: 1400, output: 30, ..Default::default() }), "what was added since");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_clone_counts_only_what_it_spent_itself() {
+        let b = |m: &str| Bucket { model: m.into(), fast: false, prompt: 0 };
+        let t = |input: u64, output: u64| Tokens { input, output, ..Default::default() };
+        let base: Spend = [(b("opus"), t(100, 10))].into();
+        let spend: Spend = [(b("opus"), t(150, 25)), (b("haiku"), t(5, 1))].into();
+        assert_eq!(less(&spend, &base), [(b("opus"), t(50, 15)), (b("haiku"), t(5, 1))].into());
+        assert_eq!(less(&base, &base), Spend::new(), "nothing of its own yet");
+        // The original's whole log, read once, is the base.
+        let root = tmp();
+        let log = root.join("s.jsonl");
+        std::fs::write(&log, line(&claude_turn(1_000, "m")) + &line(&claude_turn(2_000, "m"))).unwrap();
+        let both = total(&spent_in(&log)).total();
+        std::fs::write(&log, line(&claude_turn(1_000, "m"))).unwrap();
+        assert!(both > total(&spent_in(&log)).total() && total(&spent_in(&log)).total() > 0, "every turn in it");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_resumes_from_its_folders_logs() {
+        let p = claude_log_under(Path::new("/Users/me/Projects/trix/.trix/worktrees/a b"), "s1");
+        assert!(p.ends_with("projects/-Users-me-Projects-trix--trix-worktrees-a-b/s1.jsonl"), "{}", p.display());
     }
 
     #[test]

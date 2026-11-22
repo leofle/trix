@@ -329,6 +329,8 @@ pub enum MenuItem {
     Rename,
     /// Its diff, to review, commit and merge.
     Review,
+    /// Another like it, in a worktree of its own (`App::clone_agent`).
+    Clone,
     Restart,
     CopyPath,
     Close,
@@ -341,6 +343,7 @@ impl MenuItem {
         match self {
             MenuItem::Rename => "Rename",
             MenuItem::Review => "Review diff",
+            MenuItem::Clone => "Clone",
             MenuItem::Restart => "Restart",
             MenuItem::CopyPath => "Copy folder path",
             MenuItem::Close => "Close",
@@ -353,6 +356,7 @@ impl MenuItem {
         match self {
             MenuItem::Rename => 'r',
             MenuItem::Review => 'v',
+            MenuItem::Clone => 'l',
             MenuItem::Restart => 's',
             MenuItem::CopyPath => 'f',
             MenuItem::Close => 'c',
@@ -365,6 +369,7 @@ impl MenuItem {
         match self {
             MenuItem::Rename => Some(Action::Rename),
             MenuItem::Review => Some(Action::Review),
+            MenuItem::Clone => Some(Action::Clone),
             MenuItem::Close => Some(Action::Close),
             MenuItem::Select => Some(Action::Select),
             MenuItem::Restart | MenuItem::CopyPath => None,
@@ -523,6 +528,9 @@ pub struct App {
     usage_targets: crate::usage::Targets,
     /// What agents closed since this server started had spent.
     closed_spend: crate::usage::Spend,
+    /// What a clone's log has of its original's conversation, by the
+    /// clone's id: spent once already, by the original.
+    inherited: HashMap<u32, crate::usage::Spend>,
     /// How near the workspace's budget it was last told to be.
     budget_level: u8,
     /// The live price list, and the fetcher's settings (the config's).
@@ -638,6 +646,7 @@ impl App {
             git_targets,
             usage_targets,
             closed_spend: Default::default(),
+            inherited: HashMap::new(),
             budget_level: 0,
             price_feed: Default::default(),
             price_settings,
@@ -893,6 +902,7 @@ impl App {
                 prompt: None,
                 branch_note: Some(if resume.is_some() { "resuming conversation" } else { "restored" }.into()),
                 resume,
+                fork: false,
                 runtime: Default::default(),
             };
             let parked = kind == Kind::Custom;
@@ -1125,7 +1135,7 @@ impl App {
             items.extend([MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
             return items;
         }
-        let mut items = vec![MenuItem::Rename, MenuItem::Review];
+        let mut items = vec![MenuItem::Rename, MenuItem::Review, MenuItem::Clone];
         if a.state == State::Exited {
             items.push(MenuItem::Restart);
         }
@@ -1150,7 +1160,7 @@ impl App {
             MenuItem::CopyPath => format!("Copy {} folder path{}", n, if n == 1 { "" } else { "s" }),
             MenuItem::Close => format!("Close {}", agents(n)),
             MenuItem::Select => "Unselect all".into(),
-            MenuItem::Rename | MenuItem::Review => item.label().into(),
+            MenuItem::Rename | MenuItem::Review | MenuItem::Clone => item.label().into(),
         }
     }
 
@@ -1187,7 +1197,7 @@ impl App {
         let Some(i) = self.index_of(id) else { return };
         if self.menu_is_bulk(id) {
             match item {
-                MenuItem::Rename | MenuItem::Review => {}
+                MenuItem::Rename | MenuItem::Review | MenuItem::Clone => {}
                 MenuItem::Restart => self.restart_selected(),
                 MenuItem::CopyPath => {
                     let paths: Vec<String> = self.selected_agents().map(|a| a.live_cwd().display().to_string()).collect();
@@ -1202,6 +1212,7 @@ impl App {
         match item {
             MenuItem::Rename => self.start_rename(id),
             MenuItem::Review => self.open_review(id),
+            MenuItem::Clone => self.clone_agent(id),
             MenuItem::Restart => self.restart(i),
             MenuItem::CopyPath => {
                 // Where it is now: a shell may have moved since it started.
@@ -1644,7 +1655,7 @@ impl App {
             let setup = meta.pending_setup().cloned();
             let prompt = setup.as_ref().and(meta.first_prompt.clone());
             let runtime = crate::worktree::Runtime { ports: None, setup };
-            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt, branch_note: None, resume: None, runtime };
+            let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt, branch_note: None, resume: None, fork: false, runtime };
             if meta.parked && agent.state == State::Exited {
                 self.parked.insert(id);
             }
@@ -1787,6 +1798,7 @@ impl App {
             prompt: Some(f.prompt.text.clone()).filter(|s| !s.trim().is_empty()),
             branch_note: note,
             resume: None,
+            fork: false,
             runtime,
         };
         self.modal = None;
@@ -1830,6 +1842,7 @@ impl App {
             spec.runtime.setup = None;
         }
         spec.resume = None;
+        spec.fork = false;
         // Reattached after a crash, it has no record of them.
         if spec.runtime.ports.is_none() {
             spec.runtime.ports = crate::worktree::lease(&spec.cwd, &self.config.worktree, None);
@@ -1865,7 +1878,120 @@ impl App {
         }
     }
 
+    /// Another agent like this one: the same kind, flags and repo, in a new
+    /// worktree that starts where its own folder is, uncommitted changes and
+    /// all, and on a copy of its conversation where the agent can fork one
+    /// (`Kind::forks`). A folder outside git is shared instead. The
+    /// original isn't touched.
+    pub fn clone_agent(&mut self, id: u32) {
+        let Some(i) = self.index_of(id) else { return };
+        let Some(spec) = self.specs.get(&id).map(clone_spec) else { return };
+        let a = &self.agents[i];
+        let (kind, of, session, transcript) = (a.kind, a.name.clone(), a.session.clone(), a.transcript.clone());
+        let from = spec.cwd.clone();
+        let mut keep = Spawn { prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default(), ..spec };
+        let mut notes = Vec::new();
+        let mut warnings = Vec::new();
+        match (checkout_of(&from), git(&from, &["rev-parse", "--show-toplevel"])) {
+            (Some((root, _)), Some(top)) => {
+                let top = PathBuf::from(top);
+                let Some(head) = git(&from, &["rev-parse", "--verify", "--quiet", "HEAD"]) else {
+                    self.toast(format!("can't clone {of}: its branch has no commits yet"), ToastKind::Bad);
+                    return;
+                };
+                // A name no agent has, whose worktree and branch aren't
+                // left from before: the clone's must be new.
+                let mut also = Vec::new();
+                let name = loop {
+                    let n = unique_with(&self.agents, &also, &of);
+                    let branch = format!("refs/heads/trix/{}", worktree_name(&slug(&n)));
+                    if !worktree_path(&root, &slug(&n)).exists() && git(&root, &["rev-parse", "--verify", "--quiet", &branch]).is_none() {
+                        break n;
+                    }
+                    also.push(n);
+                };
+                let repo = crate::worktree::RepoConfig::load(&from).unwrap_or_else(|e| {
+                    warnings.push(e);
+                    None
+                });
+                let (path, branch) = match make_worktree_at(&from, &slug(&name), Some(&head)) {
+                    Ok((path, branch, _)) => (path, branch),
+                    Err(e) => {
+                        self.toast(format!("can't clone {of}: {e}"), ToastKind::Bad);
+                        return;
+                    }
+                };
+                notes.push(format!("clone of {of} · new worktree on {branch}"));
+                match copy_changes(&top, &path) {
+                    Ok(0) => {}
+                    Ok(n) => notes.push(format!("{n} uncommitted file{}", if n == 1 { "" } else { "s" })),
+                    Err(e) => warnings.push(format!("{name} didn't get all of {of}'s uncommitted changes: {e}")),
+                }
+                let ready = crate::worktree::prepare(&path, repo.as_ref(), false, false, &self.config.worktree);
+                notes.extend(ready.note);
+                warnings.extend(ready.warning);
+                keep.runtime = ready.runtime;
+                // As deep in the new worktree as the original is in its own.
+                let inside = from.strip_prefix(&top).ok().filter(|rel| !rel.as_os_str().is_empty()).map(|rel| path.join(rel)).filter(|p| p.is_dir());
+                keep.cwd = inside.unwrap_or(path);
+                keep.name = name;
+            }
+            _ => {
+                keep.name = unique_in(&self.agents, &of);
+                notes.push(format!("clone of {of} · same folder: not a git repository"));
+            }
+        }
+        let mut run = clone_spec(&keep);
+        let mut base = None;
+        match session.filter(|_| kind.forks()) {
+            Some(session) => {
+                let log = crate::usage::log_of(kind, transcript, Some(session.clone()));
+                // Claude finds a conversation to resume under the folder it
+                // starts in, and the clone's is new. What it forks is that
+                // copy, so the copy is what the clone has already spent:
+                // the original may still be writing its own.
+                let forked = match (log, kind) {
+                    (Some(log), Kind::Claude) => {
+                        let dir = std::fs::canonicalize(&keep.cwd).unwrap_or_else(|_| keep.cwd.clone());
+                        let to = crate::usage::claude_log_under(&dir, &session);
+                        let copied = to == log || to.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::copy(&log, &to).is_ok();
+                        copied.then_some(Some(to))
+                    }
+                    (None, Kind::Claude) => None,
+                    (log, _) => Some(log),
+                };
+                if let Some(log) = forked {
+                    run.resume = Some(session);
+                    run.fork = true;
+                    base = log.as_deref().map(crate::usage::spent_in);
+                    notes.push("forked conversation".into());
+                } else {
+                    warnings.push(format!("couldn't copy {of}'s conversation: {} starts a new one", keep.name));
+                }
+            }
+            None if kind.forks() => {}
+            None => notes.push(format!("{} can't fork a conversation: new one", kind.label())),
+        }
+        run.branch_note = Some(notes.join(" · "));
+        keep.branch_note = run.branch_note.clone();
+        let name = keep.name.clone();
+        match self.spawn_as(run, keep) {
+            Ok(new_id) => {
+                if let Some(base) = base {
+                    self.inherited.insert(new_id, base);
+                }
+                self.sync_git_targets();
+                self.toast(format!("cloned {of} as {name}"), ToastKind::Good);
+                for w in warnings {
+                    self.toast(w, ToastKind::Bad);
+                }
+            }
+            Err(e) => self.toast(format!("could not start the clone of {of}: {e}"), ToastKind::Bad),
+        }
+    }
+
     pub fn close(&mut self, id: u32) {
+        self.inherited.remove(&id);
         if let Some(i) = self.index_of(id) {
             let a = self.agents.remove(i);
             a.shutdown();
@@ -2132,7 +2258,10 @@ impl App {
             }
             AppEvent::Spend(id, spend) => {
                 if let Some(i) = self.index_of(id) {
-                    self.agents[i].spend = spend;
+                    self.agents[i].spend = match self.inherited.get(&id) {
+                        Some(base) => crate::usage::less(&spend, base),
+                        None => spend,
+                    };
                     let _ = self.check_budgets();
                     self.dirty = true;
                 }
@@ -2327,6 +2456,10 @@ impl App {
             Action::Review => match self.focused().map(|a| a.id) {
                 Some(id) => self.open_review(id),
                 None => self.toast("no agent to review yet", ToastKind::Info),
+            },
+            Action::Clone => match self.focused().map(|a| a.id) {
+                Some(id) => self.clone_agent(id),
+                None => self.toast("no agent to clone yet", ToastKind::Info),
             },
             Action::Close => {
                 if !self.selected.is_empty() {
@@ -3721,6 +3854,7 @@ fn clone_spec(s: &Spawn) -> Spawn {
         prompt: s.prompt.clone(),
         branch_note: s.branch_note.clone(),
         resume: s.resume.clone(),
+        fork: s.fork,
         runtime: s.runtime.clone(),
     }
 }
@@ -3863,6 +3997,12 @@ fn worktree_path(root: &Path, name: &str) -> PathBuf {
 /// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
 /// is true when an existing worktree (e.g. from an earlier session) was reused.
 pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
+    make_worktree_at(dir, name, None)
+}
+
+/// `make_worktree`, a new branch starting at `base` (a commit) rather than
+/// the main checkout's HEAD.
+fn make_worktree_at(dir: &Path, name: &str, base: Option<&str>) -> anyhow::Result<(PathBuf, String, bool)> {
     let (root, common) = checkout_of(dir).ok_or_else(|| anyhow::anyhow!("not a git repository"))?;
     let exclude = common.join("info/exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
@@ -3878,17 +4018,74 @@ pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String,
     }
     let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_some();
     let p = path.display().to_string();
-    let args: Vec<&str> = if has_branch {
+    let mut args: Vec<&str> = if has_branch {
         vec!["worktree", "add", &p, &branch]
     } else {
         vec!["worktree", "add", "-b", &branch, &p]
     };
+    if let Some(base) = base.filter(|_| !has_branch) {
+        args.push(base);
+    }
     let out = Command::new("git").arg("-C").arg(&root).args(&args).output()?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("worktree: {}", err.lines().last().unwrap_or("failed"));
     }
     Ok((path, branch, false))
+}
+
+/// Put the uncommitted changes of the checkout at `from` in `to`, a new
+/// worktree of the same repo at the same commit: what's staged staged, the
+/// rest as it is, and the files git doesn't track yet (not ignored ones).
+/// How many files came.
+fn copy_changes(from: &Path, to: &Path) -> Result<usize, String> {
+    use std::io::Write;
+    let run = |dir: &Path, args: &[&str], input: Option<&[u8]>| -> Result<Vec<u8>, String> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("git: {e}"))?;
+        if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(data).map_err(|e| format!("git {}: {e}", args[0]))?;
+        }
+        let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("git {}: {}", args[0], err.lines().last().unwrap_or("failed")));
+        }
+        Ok(out.stdout)
+    };
+    const DIFF: [&str; 4] = ["diff", "--binary", "--no-color", "--no-ext-diff"];
+    let staged = run(from, &[&DIFF[..], &["--cached"]].concat(), None)?;
+    if !staged.is_empty() {
+        run(to, &["apply", "--index", "--whitespace=nowarn"], Some(&staged))?;
+    }
+    let unstaged = run(from, &DIFF, None)?;
+    if !unstaged.is_empty() {
+        run(to, &["apply", "--whitespace=nowarn"], Some(&unstaged))?;
+    }
+    let names = |out: Vec<u8>| -> Vec<String> { out.split(|&b| b == 0).filter(|n| !n.is_empty()).map(|n| String::from_utf8_lossy(n).into_owned()).collect() };
+    let changed = names(run(from, &["diff", "--name-only", "-z", "--no-renames", "HEAD"], None)?);
+    let untracked = names(run(from, &["ls-files", "-z", "--others", "--exclude-standard"], None)?);
+    for rel in &untracked {
+        let (src, dst) = (from.join(rel), to.join(rel));
+        if let Some(dir) = dst.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{rel}: {e}"))?;
+        }
+        let meta = std::fs::symlink_metadata(&src).map_err(|e| format!("{rel}: {e}"))?;
+        let copied = if meta.file_type().is_symlink() {
+            std::fs::read_link(&src).and_then(|target| std::os::unix::fs::symlink(target, &dst))
+        } else {
+            std::fs::copy(&src, &dst).map(|_| ())
+        };
+        copied.map_err(|e| format!("{rel}: {e}"))?;
+    }
+    Ok(changed.len() + untracked.len())
 }
 
 /// A folder's branch, and its diff against HEAD (files, insertions, deletions).
@@ -4440,8 +4637,8 @@ mod tests {
         click(&mut app, MouseButton::Right, 3, 6);
         assert_eq!(menu_of(&app), Some(Menu { agent: 2, at: Some((3, 6)), sel: MenuItem::Rename }));
         assert_eq!(app.focus, 0, "a menu doesn't move the focus");
-        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Review, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
-        for _ in 0..4 {
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Review, MenuItem::Clone, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+        for _ in 0..5 {
             hit(&mut app, KeyCode::Down, KeyModifiers::NONE);
         }
         assert_eq!(menu_of(&app).map(|m| m.sel), Some(MenuItem::Close));
@@ -4521,7 +4718,7 @@ mod tests {
         app.modal = None;
         // An exited agent can be restarted, and closes without asking.
         app.agents[1].set_state(State::Exited, false);
-        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Review, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
+        assert_eq!(app.menu_items(2), [MenuItem::Rename, MenuItem::Review, MenuItem::Clone, MenuItem::Restart, MenuItem::CopyPath, MenuItem::Select, MenuItem::Close]);
         app.open_menu(2, None);
         hit(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
         assert_eq!(app.agents.len(), 1);
@@ -4789,6 +4986,7 @@ mod tests {
             prompt: None,
             branch_note: None,
             resume: None,
+            fork: false,
             runtime: Default::default(),
         };
         let a = app.spawn_quiet(spec("x")).unwrap();
@@ -4884,7 +5082,7 @@ mod tests {
         // With echo on, how the terminal's echoes interleave with cat's
         // output is up to the scheduler, and CI runners differ. `ready` says
         // echo is off: a login shell can take a while to get there.
-        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; echo ready; exec cat".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+        let spec = Spawn { kind: Kind::Custom, name: "cat".into(), cwd: std::env::temp_dir(), command: Some("stty -echo; echo ready; exec cat".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
         // What's on screen after `ready`, once it shows.
@@ -4918,7 +5116,7 @@ mod tests {
         let script = std::env::temp_dir().join(format!("trix-test-wheel-{}.sh", std::process::id()));
         std::fs::write(&script, "printf '\\033[?1049h\\033[?1000h\\033[?1006h'\nstty raw -echo\nprintf 'ready\\r\\n'\nhead -c 10 | od -An -c\nsleep 5\n").unwrap();
         let command = format!("exec /bin/sh {}", script.display());
-        let spec = Spawn { kind: Kind::Custom, name: "mouse".into(), cwd: std::env::temp_dir(), command: Some(command), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+        let spec = Spawn { kind: Kind::Custom, name: "mouse".into(), cwd: std::env::temp_dir(), command: Some(command), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
         let id = app.spawn_quiet(spec).unwrap();
         let i = app.index_of(id).unwrap();
         let screen = |app: &App| crate::search::tail(&app.agents[i].term.lock(), 10).concat().split_whitespace().collect::<String>();
@@ -5029,7 +5227,7 @@ mod tests {
         let mut app = test_app();
         let mut a = crate::agent::test_agent(Kind::Claude);
         a.id = 5;
-        app.specs.insert(5, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: Some("--model opus 5.5".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() });
+        app.specs.insert(5, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: Some("--model opus 5.5".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() });
         app.agents.push(a);
         *app.extra_args_mut(5).unwrap() = Some("--model claude-opus-5-5 --effort xhigh".into());
         assert_eq!(app.open_agents()[0].command.as_deref(), Some("--model claude-opus-5-5 --effort xhigh"));
@@ -5047,7 +5245,7 @@ mod tests {
         // Restored with --resume: the conversation exists before any new turn.
         a.session = Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c".into());
         assert!(!a.session_named_by_trix && !a.turn_seen);
-        app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() });
+        app.specs.insert(3, Spawn { kind: Kind::Grok, name: "g".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() });
         app.agents.push(a);
         assert_eq!(app.open_agents()[0].session.as_deref(), Some("0b5e2c1a-7f3d-4c2e-9a1b-2d3e4f5a6b7c"), "restored, then saved again before you type");
         // An id trix made up for a new conversation: nothing to resume until a turn.
@@ -5068,7 +5266,7 @@ mod tests {
         // SessionStart names the conversation and its log, before any message.
         a.session = Some("1edd8d96-d5b4-47b7-98a2-3b9a0daa56b2".into());
         a.transcript = Some(log.clone());
-        app.specs.insert(4, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() });
+        app.specs.insert(4, Spawn { kind: Kind::Claude, name: "c".into(), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() });
         app.agents.push(a);
         assert_eq!(app.open_agents()[0].session, None, "no message yet: --resume would find nothing");
         std::fs::write(&log, "{}\n").unwrap();
@@ -5125,6 +5323,87 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_clone_starts_where_its_original_is() {
+        let dir = std::env::temp_dir().join(format!("trix-app-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        git_out(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join(".gitignore"), ".env\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_out(&dir, &["add", "."]);
+        git_out(&dir, &["commit", "-q", "-m", "init"]);
+        let mut app = test_app();
+        app.modal = Some(worktree_form(&dir, "x"));
+        app.launch_form();
+        assert_eq!(app.agents.len(), 1, "{:?}", app.toast.as_ref().map(|t| &t.text));
+        // The original has moved on from main, and has every kind of change.
+        let wt = worktree_path(&dir, "x");
+        std::fs::write(wt.join("a.txt"), "two\n").unwrap();
+        git_out(&wt, &["commit", "-q", "-am", "second"]);
+        std::fs::write(wt.join("b.txt"), "staged\n").unwrap();
+        git_out(&wt, &["add", "b.txt"]);
+        std::fs::write(wt.join("b.txt"), "staged, then more\n").unwrap();
+        std::fs::create_dir_all(wt.join("new")).unwrap();
+        std::fs::write(wt.join("new/c.txt"), "untracked\n").unwrap();
+        std::fs::write(wt.join(".env"), "SECRET=1\n").unwrap();
+        let before = git_out(&wt, &["status", "--porcelain"]);
+
+        app.clone_agent(app.agents[0].id);
+        assert_eq!(app.agents.len(), 2, "{:?}", app.toast.as_ref().map(|t| &t.text));
+        let clone = &app.agents[1];
+        let cw = worktree_path(&dir, "x-2");
+        assert_eq!((clone.name.as_str(), &app.specs[&clone.id].cwd), ("x-2", &cw));
+        assert_eq!(clone.kind, Kind::Custom);
+        assert_eq!(app.specs[&clone.id].command.as_deref(), Some("exec sleep 60"), "the same command");
+        assert_eq!(app.focus, 1, "you're taken to it");
+        assert_eq!(git_out(&cw, &["branch", "--show-current"]), "trix/x-2");
+        assert_eq!(git_out(&cw, &["rev-parse", "HEAD"]), git_out(&wt, &["rev-parse", "HEAD"]), "at the original's commit, not main's");
+        let read = |rel: &str| std::fs::read_to_string(cw.join(rel)).ok();
+        assert_eq!(read("a.txt").as_deref(), Some("two\n"));
+        assert_eq!(read("b.txt").as_deref(), Some("staged, then more\n"));
+        assert_eq!(git_out(&cw, &["show", ":b.txt"]), "staged", "what was staged is staged");
+        assert_eq!(read("new/c.txt").as_deref(), Some("untracked\n"));
+        assert_eq!(read(".env"), None, "ignored files stay behind");
+        assert_eq!(git_out(&wt, &["status", "--porcelain"]), before, "the original is left as it was");
+
+        // A worktree left from before isn't taken for the clone's.
+        std::fs::create_dir_all(worktree_path(&dir, "x-3")).unwrap();
+        app.clone_agent(app.agents[0].id);
+        assert_eq!(app.agents.last().map(|a| a.name.as_str()), Some("x-4"));
+        assert_eq!(app.specs[&app.agents[2].id].cwd, worktree_path(&dir, "x-4"));
+        stop_all(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_clone_outside_git_shares_the_folder() {
+        let dir = std::env::temp_dir().join(format!("trix-app-clone-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = test_app();
+        app.spawn(Spawn { kind: Kind::Custom, name: "s".into(), cwd: dir.clone(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() }).unwrap();
+        // alt+t clones the focused agent.
+        hit(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+        assert_eq!(app.agents.len(), 2, "{:?}", app.toast.as_ref().map(|t| &t.text));
+        assert_eq!((app.agents[1].name.as_str(), &app.specs[&app.agents[1].id].cwd), ("s-2", &dir));
+        assert!(app.agents[1].activity.contains("same folder"), "{}", app.agents[1].activity);
+        // And the menu's Clone does the same.
+        let id = app.agents[0].id;
+        app.open_menu(id, None);
+        hit(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(app.agents.last().map(|a| a.name.as_str()), Some("s-3"));
+        stop_all(&app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5198,7 +5477,7 @@ mod tests {
         let tree = root.join(".trix/worktrees/w");
         std::fs::create_dir_all(&tree).unwrap();
         let tree = tree.canonicalize().unwrap();
-        let spec = |name: &str| Spawn { kind: Kind::Custom, name: name.into(), cwd: tree.clone(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+        let spec = |name: &str| Spawn { kind: Kind::Custom, name: name.into(), cwd: tree.clone(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
         let mut app = test_app();
         // How a layout or a restore starts one: ports, and no setup.
         let a = app.spawn_quiet(spec("a")).unwrap();
@@ -5229,7 +5508,7 @@ mod tests {
     }
 
     fn sleeper(name: &str, cwd: &Path) -> Spawn {
-        Spawn { kind: Kind::Custom, name: name.into(), cwd: cwd.to_path_buf(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, runtime: Default::default() }
+        Spawn { kind: Kind::Custom, name: name.into(), cwd: cwd.to_path_buf(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() }
     }
 
     #[test]
@@ -5351,7 +5630,7 @@ mod tests {
     fn enter_on_a_failed_setup_runs_it_again_with_the_prompt() {
         let mut app = test_app();
         let setup = crate::worktree::Setup { script: "false".into(), root: std::env::temp_dir(), done: None };
-        let spec = Spawn { kind: Kind::Custom, name: "s".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 60".into()), prompt: Some("first".into()), branch_note: None, resume: None, runtime: crate::worktree::Runtime { ports: None, setup: Some(setup.clone()) } };
+        let spec = Spawn { kind: Kind::Custom, name: "s".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 60".into()), prompt: Some("first".into()), branch_note: None, resume: None, fork: false, runtime: crate::worktree::Runtime { ports: None, setup: Some(setup.clone()) } };
         let id = app.spawn_quiet(spec).unwrap();
         assert!(app.agents[0].installing.is_some(), "held in starting");
         app.agents[0].set_state(State::Exited, false);
@@ -6016,7 +6295,7 @@ mod tests {
         let integrations = crate::hooks::Integrations::default();
         let planned: Vec<crate::agent::Planned> = (1..=6)
             .map(|id| {
-                let spec = Spawn { kind: Kind::Shell, name: format!("s{id}"), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+                let spec = Spawn { kind: Kind::Shell, name: format!("s{id}"), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
                 Agent::plan(id, spec, (80, 24), tx.clone(), Path::new("/nonexistent.sock"), &integrations, &exe, true).unwrap()
             })
             .collect();
