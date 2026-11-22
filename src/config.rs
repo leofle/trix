@@ -606,6 +606,7 @@ pub enum Action {
     Search,
     Broadcast,
     Review,
+    Clone,
     Rename,
     Close,
     Menu,
@@ -617,7 +618,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 21] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -630,6 +631,7 @@ impl Action {
         Action::Search,
         Action::Broadcast,
         Action::Review,
+        Action::Clone,
         Action::Rename,
         Action::Close,
         Action::Menu,
@@ -654,6 +656,7 @@ impl Action {
             Action::Search => "search",
             Action::Broadcast => "broadcast",
             Action::Review => "review",
+            Action::Clone => "clone",
             Action::Rename => "rename",
             Action::Close => "close",
             Action::Menu => "menu",
@@ -679,6 +682,7 @@ impl Action {
             Action::Search => &["alt+f"],
             Action::Broadcast => &["alt+b"],
             Action::Review => &["alt+v"],
+            Action::Clone => &["alt+l"],
             Action::Rename => &["alt+r"],
             Action::Close => &["alt+w"],
             Action::Menu => &["alt+o"],
@@ -722,6 +726,7 @@ impl Default for Keys {
 impl Keys {
     fn from_file(file: BTreeMap<String, Binding>) -> Result<Keys, String> {
         let mut keys = Keys::default();
+        let mut set = Vec::new();
         for (name, b) in file {
             let Some(action) = Action::ALL.iter().copied().find(|a| a.name() == name) else {
                 let names: Vec<&str> = Action::ALL.iter().map(|a| a.name()).collect();
@@ -744,6 +749,14 @@ impl Keys {
                 chords.push(c);
             }
             keys.binds.iter_mut().find(|(a, _)| *a == action).expect("every action").1 = chords;
+            set.push(action);
+        }
+        // A key you bind is yours: an action that has it only by default
+        // goes without it, so a default added later never breaks your file.
+        // Not jump's range, which can't go without one digit of it.
+        let yours: Vec<Chord> = keys.binds.iter().filter(|(a, _)| set.contains(a)).flat_map(|(_, cs)| cs.clone()).collect();
+        for (_, cs) in keys.binds.iter_mut().filter(|(a, _)| !set.contains(a)) {
+            cs.retain(|c| c.key == Key::Digits || !yours.iter().any(|y| overlaps(c, y)));
         }
         // One key, one action.
         for (i, (a, cs)) in keys.binds.iter().enumerate() {
@@ -1000,9 +1013,22 @@ mod tests {
     }
 
     #[test]
+    fn your_keys_take_them_from_defaults() {
+        let c = parse("[keys]\nnew = \"alt+l\"\n", Path::new("/")).unwrap();
+        assert_eq!(c.keys.lookup(&key(KeyCode::Char('l'), ALT)), Some((Action::New, 0)), "yours, not clone's default");
+        assert_eq!(c.keys.label(Action::Clone), None, "clone goes without a key");
+        let c = parse("[keys]\nnew = \"alt+a\"\n", Path::new("/")).unwrap();
+        assert_eq!(c.keys.lookup(&key(KeyCode::Char('a'), ALT)), Some((Action::New, 0)));
+        assert_eq!(c.keys.label(Action::Attention), None);
+        assert_eq!(Keys::default().lookup(&key(KeyCode::Char('l'), ALT)), Some((Action::Clone, 0)));
+        // Claude Code's alt+t (thinking) goes through to the pane.
+        assert_eq!(Keys::default().lookup(&key(KeyCode::Char('t'), ALT)), None);
+    }
+
+    #[test]
     fn bad_keys_say_what_is_wrong() {
         let err = |s: &str| parse(s, Path::new("/")).unwrap_err();
-        assert!(err("[keys]\nnew = \"alt+a\"").contains("alt+a is bound to both new and attention"), "{}", err("[keys]\nnew = \"alt+a\""));
+        assert!(err("[keys]\nnew = \"alt+a\"\nattention = \"alt+a\"").contains("alt+a is bound to both new and attention"));
         assert!(err("[keys]\nnew = \"n\"").contains("alone would catch"));
         assert!(err("[keys]\nnew = \"shift+n\"").contains("alone would catch"));
         assert!(err("[keys]\nfoo = \"alt+x\"").contains("keys.foo: no such action"));

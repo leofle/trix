@@ -2710,6 +2710,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         (k(Action::Broadcast), "broadcast a prompt"),
         (k(Action::Search), "search all scrollback"),
         (k(Action::Review), "review diff, then merge"),
+        (k(Action::Clone), "clone · new worktree"),
         (k(Action::Rename), "rename · double-click"),
         (k(Action::Close), "close"),
         (k(Action::Menu), "menu · or right-click"),

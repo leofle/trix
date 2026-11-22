@@ -601,7 +601,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
             }
             for label in spawn {
                 let Some(kind) = Kind::from_label(&label) else { continue };
-                let spec = Spawn { kind, name: app.unique_name(kind.label()), cwd: cwd.clone(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+                let spec = Spawn { kind, name: app.unique_name(kind.label()), cwd: cwd.clone(), command: None, prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
                 if let Err(e) = app.spawn(spec) {
                     app.toast(format!("could not start {}: {e}", kind.label()), app::ToastKind::Bad);
                 }

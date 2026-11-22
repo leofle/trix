@@ -68,6 +68,13 @@ impl Kind {
         Kind::Shell,
         Kind::Custom,
     ];
+
+    /// It can start on a copy of one of its conversations, which a clone
+    /// does: Claude and Grok with `--fork-session`, Codex with `codex fork`.
+    pub fn forks(self) -> bool {
+        matches!(self, Kind::Claude | Kind::Codex | Kind::Grok)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -232,6 +239,9 @@ pub struct Spawn {
     pub branch_note: Option<String>,
     /// Conversation to resume (Claude / Codex) instead of starting a new one.
     pub resume: Option<String>,
+    /// With `resume`: continue a copy of that conversation, leaving the
+    /// original as it was (a clone, see `Kind::forks`).
+    pub fork: bool,
     /// What its worktree adds: ports, and a setup to run first.
     pub runtime: crate::worktree::Runtime,
 }
@@ -358,6 +368,13 @@ pub struct Agent {
     /// permission prompt comes as a notification with no tool in it, so
     /// this says what the approval is for.
     pending_tool: Option<String>,
+    /// A clone's: the conversation it was forked from. Its `session` is
+    /// that one until the agent reports its own, and isn't its to save
+    /// meanwhile: resumed, it would go on in the original's conversation.
+    pub forked_from: Option<String>,
+    /// A clone's: what its log has of the conversation it was forked from,
+    /// which the original spent (`usage::less` takes it off).
+    pub inherited: crate::usage::Spend,
 }
 
 pub const SPARK_LEN: usize = 48;
@@ -464,6 +481,11 @@ pub struct Meta {
     pub activity: String,
     #[serde(default)]
     pub unseen: bool,
+    /// A clone's `forked_from` and `inherited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherited: Vec<(crate::usage::Bucket, crate::usage::Tokens)>,
 }
 
 /// One thread per agent that sends each write when it's due, in the order
@@ -944,6 +966,8 @@ impl Agent {
         a.asked = meta.asked;
         a.managed_by = meta.managed_by.clone();
         a.transcript = meta.transcript.clone();
+        a.forked_from = meta.forked_from.clone();
+        a.inherited = meta.inherited.iter().cloned().collect();
         if a.state != State::Exited {
             a.restore_state(meta, quiet);
         }
@@ -1024,6 +1048,8 @@ impl Agent {
             state: self.state.label().into(),
             activity: self.activity.clone(),
             unseen: self.unseen,
+            forked_from: self.forked_from.clone(),
+            inherited: crate::usage::to_list(&self.inherited),
         }
     }
 
@@ -1098,6 +1124,8 @@ impl Agent {
             installing: None,
             amp_welcome_at: None,
             pending_tool: None,
+            forked_from: None,
+            inherited: Default::default(),
         }
     }
 
@@ -2292,6 +2320,9 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
         Kind::Grok => {
             if let Some(id) = &spec.resume {
                 args.extend(["--resume".into(), id.clone()]);
+                if spec.fork {
+                    args.push("--fork-session".into());
+                }
             } else if let Some(id) = new_session {
                 args.extend(["--session-id".into(), id.into()]);
             }
@@ -2421,6 +2452,9 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             if let Some(id) = &spec.resume {
                 args.push("--resume".into());
                 args.push(id.clone());
+                if spec.fork {
+                    args.push("--fork-session".into());
+                }
             }
             let mut theirs = extra.map(split_args).unwrap_or_default();
             // Claude accepts one append prompt; combine ours with the user's.
@@ -2447,8 +2481,9 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             ("claude".into(), args)
         }
         Kind::Codex => {
+            // `codex fork <id>` takes what `codex resume <id>` does.
             if spec.resume.is_some() {
-                args.push("resume".into());
+                args.push(if spec.fork { "fork" } else { "resume" }.into());
             }
             args.push("-c".into());
             // A JSON string array is a valid TOML inline array, with escaping.
@@ -2527,6 +2562,7 @@ pub(crate) fn test_agent_on(kind: Kind, tx: Sender<AppEvent>) -> Agent {
         prompt: None,
         branch_note: None,
         resume: None,
+        fork: false,
         runtime: Default::default(),
     };
     let sock = std::env::temp_dir().join("trix-test.sock");
@@ -2558,7 +2594,7 @@ mod tests {
         Instant::now().checked_sub(d).expect("uptime")
     }
     fn spec(kind: Kind) -> Spawn {
-        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() }
+        Spawn { kind, name: "n".into(), cwd: "/tmp".into(), command: None, prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() }
     }
 
     #[test]
@@ -3423,6 +3459,26 @@ mod tests {
     }
 
     // ── command lines ──
+
+    #[test]
+    fn a_fork_resumes_a_copy_of_the_conversation() {
+        let fork = |kind: Kind| {
+            let mut s = spec(kind);
+            s.resume = Some("abc".into());
+            s.fork = true;
+            command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1
+        };
+        let claude = fork(Kind::Claude);
+        assert_eq!(claude[..3], ["--resume", "abc", "--fork-session"]);
+        let codex = fork(Kind::Codex);
+        assert_eq!((codex[0].as_str(), codex.last().map(String::as_str)), ("fork", Some("abc")), "codex fork <id>, as codex resume <id>");
+        assert_eq!(fork(Kind::Grok)[..3], ["--resume", "abc", "--fork-session"]);
+        // Without fork, the same conversation goes on.
+        let mut s = spec(Kind::Claude);
+        s.resume = Some("abc".into());
+        assert!(!command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1.iter().any(|a| a == "--fork-session"));
+        assert!(Kind::ALL.iter().filter(|k| k.forks()).eq([Kind::Claude, Kind::Codex, Kind::Grok].iter()));
+    }
 
     #[test]
     fn claude_command_line() {

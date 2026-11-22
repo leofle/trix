@@ -579,7 +579,7 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
         }
     }
     let by = caller_name(app, from);
-    let spec = Spawn { kind, name: name.clone(), cwd: cwd.clone(), command, prompt, branch_note: note, resume: None, runtime };
+    let spec = Spawn { kind, name: name.clone(), cwd: cwd.clone(), command, prompt, branch_note: note, resume: None, fork: false, runtime };
     match app.spawn_quiet(spec) {
         Ok(id) => {
             if let Some(a) = app.agents.iter_mut().find(|a| a.id == id) {
