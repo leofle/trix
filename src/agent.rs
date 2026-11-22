@@ -652,6 +652,26 @@ impl Agent {
         exe: &std::path::Path,
         held: bool,
     ) -> anyhow::Result<Agent> {
+        let planned = Agent::plan(id, spec, size, tx, socket, integrations, exe, held)?;
+        let launched = planned.launch(exe);
+        planned.finish(launched)
+    }
+
+    /// `spawn_in` up to starting anything: the program, its arguments and
+    /// environment worked out, and what its holder is to run. Starting a
+    /// holder waits for it to come up, and that's the slow part, so a
+    /// restore starts many at once (`Planned::launch`) before finishing them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan(
+        id: u32,
+        spec: Spawn,
+        size: (u16, u16),
+        tx: Sender<AppEvent>,
+        socket: &std::path::Path,
+        integrations: &Integrations,
+        exe: &std::path::Path,
+        held: bool,
+    ) -> anyhow::Result<Planned> {
         // A sliver of a window gives a pane with no rows or columns, and the
         // terminal grid can't be made that small: same floor as `resize`.
         let size = (size.0.max(2), size.1.max(1));
@@ -732,8 +752,7 @@ impl Agent {
             env.insert(k.into(), v.into());
         }
 
-        let mut a = None;
-        if held {
+        let hold = held.then(|| {
             let meta = Meta {
                 kind: spec.kind.label().into(),
                 name: spec.name.clone(),
@@ -745,7 +764,7 @@ impl Agent {
                 asked: first_prompt,
                 ..Meta::default()
             };
-            let hspec = crate::holder::Spec {
+            crate::holder::Spec {
                 session: crate::session::name().into(),
                 id,
                 program: program.clone(),
@@ -755,8 +774,46 @@ impl Agent {
                 cols: size.0,
                 rows: size.1,
                 meta: serde_json::to_string(&meta).unwrap_or_default(),
-            };
-            match crate::holder::launch(exe, &hspec) {
+            }
+        });
+        Ok(Planned { id, spec, size, tx, program, args, env, command_line, first_prompt, installing, fresh, hold })
+    }
+}
+
+/// An agent `Agent::plan` worked out, not started yet.
+pub struct Planned {
+    id: u32,
+    spec: Spawn,
+    size: (u16, u16),
+    tx: Sender<AppEvent>,
+    program: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    command_line: String,
+    first_prompt: bool,
+    installing: Option<String>,
+    fresh: Option<String>,
+    /// What its holder runs; none when the server keeps its PTY.
+    hold: Option<crate::holder::Spec>,
+}
+
+/// How starting a planned agent's holder went: none when it has no holder.
+pub type Launched = Option<Result<(PathBuf, u32), crate::holder::LaunchError>>;
+
+impl Planned {
+    /// Start its holder (`trix holder`, run as `exe`) and wait for it to be
+    /// up. Touches nothing of the server's, so any thread may run it.
+    pub fn launch(&self, exe: &Path) -> Launched {
+        self.hold.as_ref().map(|h| crate::holder::launch(exe, h))
+    }
+
+    /// The agent, on the holder `launched` (`launch`'s answer), or on a PTY
+    /// of the server's when it has none.
+    pub fn finish(self, launched: Launched) -> anyhow::Result<Agent> {
+        let Planned { id, spec, size, tx, program, args, env, command_line, first_prompt, installing, fresh, hold: _ } = self;
+        let mut a = None;
+        if let Some(launched) = launched {
+            match launched {
                 Ok((path, holder)) => match crate::holder::attach(&path) {
                     Ok(att) => a = Some(Agent::held(id, spec.name.clone(), spec.kind, spec.cwd.clone(), command_line.clone(), att, tx.clone())),
                     Err(e) => {
@@ -800,7 +857,9 @@ impl Agent {
         a.installing = installing;
         Ok(a)
     }
+}
 
+impl Agent {
     /// An agent on the holder just attached (`att`): its emulator rebuilt
     /// from what the holder kept, at the size that was drawn at.
     fn held(id: u32, name: String, kind: Kind, cwd: PathBuf, command_line: String, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {

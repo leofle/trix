@@ -851,6 +851,11 @@ impl App {
         let Some(saved) = self.pending_restore.take() else { return };
         let (mut restored, mut resumed, mut skipped) = (0, 0, Vec::new());
         let mut focus = None;
+        // Every agent is started at once (`start_all`): (run, keep) for each,
+        // and what to do with it once it's up.
+        let (mut jobs, mut notes) = (Vec::new(), Vec::new());
+        // Names given out so far: the agents before it aren't open yet.
+        let mut names: Vec<String> = Vec::new();
         for (i, s) in saved.agents.into_iter().enumerate() {
             let Some(kind) = Kind::from_label(&s.kind) else { continue };
             if !s.cwd.is_dir() {
@@ -859,9 +864,11 @@ impl App {
             }
             let pinned = s.pinned;
             let resume = s.session.clone().filter(|_| kind.resumes());
+            let name = unique_with(&self.agents, &names, &s.name);
+            names.push(name.clone());
             let spec = Spawn {
                 kind,
-                name: self.unique_name(&s.name),
+                name,
                 cwd: s.cwd,
                 command: s.command,
                 prompt: None,
@@ -869,34 +876,39 @@ impl App {
                 resume,
                 runtime: Default::default(),
             };
-            let res = if kind == Kind::Custom {
+            let parked = kind == Kind::Custom;
+            let resumes = spec.resume.is_some();
+            if parked {
                 let cmd = spec.command.clone().unwrap_or_default();
                 let note = shell_words::quote(&format!("  was running: {cmd}")).into_owned();
                 let shown = Spawn {
                     command: Some(format!("printf '%s\\n' '' '  restored from your last session' {note} '  press enter to start it again'")),
                     ..clone_spec(&spec)
                 };
-                self.spawn_as(shown, spec).map(|id| {
-                    self.parked.insert(id);
-                })
+                jobs.push((shown, spec));
             } else {
-                if spec.resume.is_some() {
-                    resumed += 1;
-                }
-                self.spawn(spec)
-            };
+                jobs.push((clone_spec(&spec), spec));
+            }
+            notes.push((i, pinned, parked, resumes));
+        }
+        let started = self.start_all(jobs);
+        for ((i, pinned, parked, resumes), res) in notes.into_iter().zip(started) {
             match res {
-                Ok(()) => {
+                Ok(id) => {
                     restored += 1;
+                    if resumes {
+                        resumed += 1;
+                    }
+                    if parked {
+                        self.parked.insert(id);
+                    }
+                    let Some(at) = self.agents.iter().position(|a| a.id == id) else { continue };
                     // Saved in list order, so the pinned ones come back on top.
-                    if pinned
-                        && self.agents.iter().filter(|a| a.pinned).count() < PIN_LIMIT
-                        && let Some(a) = self.agents.last_mut()
-                    {
-                        a.pinned = true;
+                    if pinned && self.agents.iter().filter(|a| a.pinned).count() < PIN_LIMIT {
+                        self.agents[at].pinned = true;
                     }
                     if i == saved.focus || focus.is_none() {
-                        focus = Some(self.agents.len() - 1);
+                        focus = Some(at);
                     }
                 }
                 Err(e) => self.toast(format!("could not restore: {e}"), ToastKind::Bad),
@@ -1500,24 +1512,45 @@ impl App {
         Ok(id)
     }
 
-    fn start(&mut self, mut run: Spawn, mut keep: Spawn) -> anyhow::Result<u32> {
-        // Every way in (a form, `trix spawn`, a layout, a restore) gets the
-        // worktree's ports, and the same ones it had.
-        if run.runtime.ports.is_none() {
-            run.runtime.ports = crate::worktree::lease(&run.cwd, &self.config.worktree, None);
-            if let Some(w) = crate::worktree::no_ports(&run.cwd, &self.config.worktree, run.runtime.ports) {
-                self.toast(format!("{}: {w}", run.name), ToastKind::Bad);
+    fn start(&mut self, run: Spawn, keep: Spawn) -> anyhow::Result<u32> {
+        self.start_all(vec![(run, keep)]).pop().expect("an answer for each agent")
+    }
+
+    /// `start` for each (run, keep), in order, with their holders all coming
+    /// up at once: each takes a few milliseconds to, more with many programs
+    /// starting beside it, and a restore of many mustn't wait for each in
+    /// turn. The agents' ids, or why each didn't start, in the same order.
+    fn start_all(&mut self, wanted: Vec<(Spawn, Spawn)>) -> Vec<anyhow::Result<u32>> {
+        let mut planned = Vec::with_capacity(wanted.len());
+        for (mut run, mut keep) in wanted {
+            // Every way in (a form, `trix spawn`, a layout, a restore) gets the
+            // worktree's ports, and the same ones it had.
+            if run.runtime.ports.is_none() {
+                run.runtime.ports = crate::worktree::lease(&run.cwd, &self.config.worktree, None);
+                if let Some(w) = crate::worktree::no_ports(&run.cwd, &self.config.worktree, run.runtime.ports) {
+                    self.toast(format!("{}: {w}", run.name), ToastKind::Bad);
+                }
             }
+            keep.runtime = run.runtime.clone();
+            let id = self.next_id;
+            self.next_id += 1;
+            let plan = Agent::plan(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe, self.holders);
+            planned.push(plan.map(|p| (id, p, keep)));
         }
-        keep.runtime = run.runtime.clone();
-        let id = self.next_id;
-        self.next_id += 1;
-        let agent = Agent::spawn_in(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe, self.holders)?;
-        self.specs.insert(id, keep);
-        self.agents.push(agent);
-        self.sync_git_targets();
-        self.sync_holders();
-        Ok(id)
+        let launched = launch_all(&self.exe, &planned.iter().map(|p| p.as_ref().ok().map(|(_, p, _)| p)).collect::<Vec<_>>());
+        let mut ids = Vec::with_capacity(planned.len());
+        for (plan, launched) in planned.into_iter().zip(launched) {
+            ids.push(plan.and_then(|(id, p, keep)| {
+                self.agents.push(p.finish(launched)?);
+                self.specs.insert(id, keep);
+                Ok(id)
+            }));
+        }
+        if ids.iter().any(Result::is_ok) {
+            self.sync_git_targets();
+            self.sync_holders();
+        }
+        ids
     }
 
     /// Put back the agents whose holders outlived the last server (a crash,
@@ -3705,10 +3738,40 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// `base`, or `base-2`, `base-3`… whichever no agent has yet.
 fn unique_in(agents: &[Agent], base: &str) -> String {
-    if !agents.iter().any(|a| a.name == base) {
+    unique_with(agents, &[], base)
+}
+
+/// `unique_in`, with `also` taken too.
+fn unique_with(agents: &[Agent], also: &[String], base: &str) -> String {
+    let taken = |n: &str| agents.iter().any(|a| a.name == n) || also.iter().any(|a| a == n);
+    if !taken(base) {
         return base.to_string();
     }
-    (2..).map(|n| format!("{base}-{n}")).find(|n| !agents.iter().any(|a| &a.name == n)).unwrap()
+    (2..).map(|n| format!("{base}-{n}")).find(|n| !taken(n)).unwrap()
+}
+
+/// `Planned::launch` for each that's there, a few at a time, each on a
+/// thread of its own. Their answers, in the same order.
+fn launch_all(exe: &Path, planned: &[Option<&crate::agent::Planned>]) -> Vec<crate::agent::Launched> {
+    // Holders mostly wait for their program to start: more than this at once
+    // only crowds the programs that are starting.
+    const AT_ONCE: usize = 8;
+    let launch = |p: &Option<&crate::agent::Planned>| p.and_then(|p| p.launch(exe));
+    if planned.len() <= 1 {
+        return planned.iter().map(launch).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let answers: Vec<Mutex<crate::agent::Launched>> = planned.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..AT_ONCE.min(planned.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(p) = planned.get(i) else { break };
+                *answers[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = launch(p);
+            });
+        }
+    });
+    answers.into_iter().map(|a| a.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)).collect()
 }
 
 /// A slug that is also a safe folder and branch name: no `.` or `..`, no
@@ -5845,6 +5908,59 @@ mod tests {
         app.on_attach(PathBuf::from("/"));
         assert!(app.modal.is_none() && app.pending_restore.is_none(), "always: brought back");
         assert!(app.toast.as_ref().is_some_and(|t| t.text.starts_with("restored")));
+    }
+
+    #[test]
+    fn holders_come_up_at_once_and_answer_in_order() {
+        let dir = std::env::temp_dir().join(format!("trix-test-launch-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A "holder" that is slower the lower its agent's id, so they come up
+        // in the reverse order. Written by a child, as in
+        // `a_holder_too_slow_to_start_is_stopped` (ETXTBSY).
+        let exe = dir.join("fake-holder");
+        let script = "#!/bin/sh\nid=$(cat | sed 's/.*\"id\":\\([0-9]*\\).*/\\1/')\nsleep 0.$(( 7 - id ))\necho '{\"Up\":{\"pid\":'$$'}}'\n";
+        let wrote = Command::new("/bin/sh").args(["-c", "printf '%s' \"$1\" > \"$0\" && chmod 755 \"$0\""]).arg(&exe).arg(script).status().unwrap();
+        assert!(wrote.success());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let integrations = crate::hooks::Integrations::default();
+        let planned: Vec<crate::agent::Planned> = (1..=6)
+            .map(|id| {
+                let spec = Spawn { kind: Kind::Shell, name: format!("s{id}"), cwd: std::env::temp_dir(), command: None, prompt: None, branch_note: None, resume: None, runtime: Default::default() };
+                Agent::plan(id, spec, (80, 24), tx.clone(), Path::new("/nonexistent.sock"), &integrations, &exe, true).unwrap()
+            })
+            .collect();
+        // One that didn't plan keeps its place, with no answer.
+        let mut slots: Vec<Option<&crate::agent::Planned>> = planned.iter().map(Some).collect();
+        slots.insert(2, None);
+        let started = Instant::now();
+        let answers = launch_all(&exe, &slots);
+        // 0.6 s for the slowest, 2.1 s one after another.
+        assert!(started.elapsed() < Duration::from_millis(1500), "at once: {:?}", started.elapsed());
+        assert!(answers[2].is_none());
+        let ids: Vec<String> = answers
+            .iter()
+            .flatten()
+            .map(|a| a.as_ref().expect("up").0.file_name().unwrap().to_string_lossy().split('.').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["1", "2", "3", "4", "5", "6"], "each answer where its agent was");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restored_agents_with_the_same_name_get_their_own() {
+        let mut app = test_app();
+        let shell = |name: &str, pinned| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned };
+        app.pending_restore = Some(crate::state::Saved::new(2, vec![shell("web", true), shell("web", false), shell("api", false)]));
+        app.config.workspace.restore = crate::config::Restore::Always;
+        app.on_attach(PathBuf::from("/"));
+        let got: Vec<(&str, bool)> = app.agents.iter().map(|a| (a.name.as_str(), a.pinned)).collect();
+        assert_eq!(got, [("web", true), ("web-2", false), ("api", false)]);
+        assert_eq!(app.focus, 2, "the saved focus");
+        assert!(app.toast.as_ref().is_some_and(|t| t.text.starts_with("restored 3 agents")));
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
