@@ -780,6 +780,39 @@ impl Agent {
     }
 }
 
+/// A holder just attached, its screen rebuilt from the output it kept.
+/// That's the slow part of putting an agent back (up to `RING_BYTES` to
+/// read), and it touches nothing of the server's, so a server reattaching
+/// many does them at once.
+pub struct Replayed {
+    id: u32,
+    pub hello: crate::holder::Hello,
+    /// How much output rebuilt the screen.
+    pub bytes: usize,
+    stream: std::os::unix::net::UnixStream,
+    path: PathBuf,
+    term: Arc<FairMutex<Term<Listener>>>,
+    parser: ansi::Processor,
+    listener: Listener,
+    size: (u16, u16),
+}
+
+impl Replayed {
+    /// Agent `id`'s screen, from what its holder (`att`) kept, at the size
+    /// it was drawn at.
+    pub fn new(id: u32, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Replayed {
+        let crate::holder::Attached { hello, replay, stream, path } = att;
+        let size = (hello.cols.max(2), hello.rows.max(1));
+        let muted = Arc::new(AtomicBool::new(true));
+        let listener = Listener { id, tx, muted: muted.clone() };
+        let term = new_term(size, listener.clone());
+        let mut parser = ansi::Processor::new();
+        parser.advance(&mut *term.lock(), &replay);
+        muted.store(false, Ordering::Relaxed);
+        Replayed { id, hello, bytes: replay.len(), stream, path, term, parser, listener, size }
+    }
+}
+
 /// An agent `Agent::plan` worked out, not started yet.
 pub struct Planned {
     id: u32,
@@ -863,14 +896,12 @@ impl Agent {
     /// An agent on the holder just attached (`att`): its emulator rebuilt
     /// from what the holder kept, at the size that was drawn at.
     fn held(id: u32, name: String, kind: Kind, cwd: PathBuf, command_line: String, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
-        let crate::holder::Attached { hello, replay, stream, path } = att;
-        let size = (hello.cols.max(2), hello.rows.max(1));
-        let muted = Arc::new(AtomicBool::new(true));
-        let listener = Listener { id, tx, muted: muted.clone() };
-        let term = new_term(size, listener.clone());
-        let mut parser = ansi::Processor::new();
-        parser.advance(&mut *term.lock(), &replay);
-        muted.store(false, Ordering::Relaxed);
+        Agent::from_replayed(Replayed::new(id, att, tx), name, kind, cwd, command_line)
+    }
+
+    /// `held`, from the screen `Replayed::new` rebuilt.
+    fn from_replayed(r: Replayed, name: String, kind: Kind, cwd: PathBuf, command_line: String) -> Agent {
+        let Replayed { id, hello, stream, path, term, parser, listener, size, .. } = r;
         let killed = Arc::new(AtomicBool::new(false));
         let writer = match stream.try_clone() {
             Ok(w) => crate::holder::writer(w, killed.clone()),
@@ -894,9 +925,15 @@ impl Agent {
 
     /// Put back an agent whose holder outlived the last server, from the
     /// notes it kept (`meta`) and the output it buffered.
+    #[cfg(test)]
     pub fn reattach(id: u32, kind: Kind, name: String, meta: &Meta, att: crate::holder::Attached, tx: Sender<AppEvent>) -> Agent {
-        let quiet = Duration::from_millis(att.hello.quiet_ms);
-        let mut a = Agent::held(id, name, kind, meta.cwd.clone(), meta.command_line.clone(), att, tx);
+        Agent::reattach_replayed(kind, name, meta, Replayed::new(id, att, tx))
+    }
+
+    /// `reattach`, from the screen `Replayed::new` rebuilt.
+    pub fn reattach_replayed(kind: Kind, name: String, meta: &Meta, r: Replayed) -> Agent {
+        let quiet = Duration::from_millis(r.hello.quiet_ms);
+        let mut a = Agent::from_replayed(r, name, kind, meta.cwd.clone(), meta.command_line.clone());
         a.meta_sent = serde_json::to_string(meta).unwrap_or_default();
         a.session = meta.session.clone();
         a.session_named_by_trix = meta.session_named_by_trix;
