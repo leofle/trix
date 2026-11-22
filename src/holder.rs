@@ -515,12 +515,16 @@ pub fn launch(exe: &Path, spec: &Spec) -> Result<(PathBuf, u32), LaunchError> {
 fn launch_within(exe: &Path, spec: &Spec, limit: Duration) -> Result<(PathBuf, u32), LaunchError> {
     let bad = |e: &dyn std::fmt::Display| LaunchError::Holder(e.to_string());
     let json = serde_json::to_vec(spec).map_err(|e| bad(&e))?;
-    let mut child = Command::new(exe)
-        .arg("holder")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| bad(&e))?;
+    // Holders start one at a time, though many may be waited on at once (a
+    // restore): where pipes are made close-on-exec in a second step (macOS),
+    // a holder started on another thread in between keeps this one's stdin
+    // open, and this one never reads to the end of its spec.
+    static SPAWNING: Mutex<()> = Mutex::new(());
+    let spawned = {
+        let _one = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+        Command::new(exe).arg("holder").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
+    };
+    let mut child = spawned.map_err(|e| bad(&e))?;
     let holder = child.id();
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
