@@ -1563,34 +1563,51 @@ impl App {
 
     /// `reattach`, to the holders at these sockets: (agent id, socket).
     fn reattach_from(&mut self, holders: Vec<(u32, PathBuf)>) -> usize {
-        let mut found = Vec::new();
+        let mut wanted = Vec::new();
         for (id, path) in holders {
             // Every id a holder has is taken, whether or not it comes back
             // now: a new agent with it would get its hooks, and hide it.
             self.next_id = self.next_id.max(id.saturating_add(1));
             // A holder this server has already (ids are unique per session).
-            if self.agents.iter().any(|a| a.id == id) {
-                continue;
+            if !self.agents.iter().any(|a| a.id == id) {
+                wanted.push((id, path));
             }
-            match crate::holder::attach(&path) {
-                // Its socket names a hash of the session; the holder, all of it.
-                Ok(att) if !att.hello.session.is_empty() && att.hello.session != crate::session::name() => {}
+        }
+        /// A holder attached: put back, or one not to take on.
+        enum Back {
+            Replayed(Box<crate::agent::Replayed>),
+            Skipped(crate::holder::Hello),
+        }
+        // Its socket names a hash of the session; the holder, all of it.
+        let theirs = |h: &crate::holder::Hello| !h.session.is_empty() && h.session != crate::session::name();
+        // Attached and their screens rebuilt all at once: each can be
+        // megabytes of output to read.
+        let tx = &self.tx;
+        let attached = in_parallel(&wanted, replay_threads(), |(id, path)| {
+            crate::holder::attach(path).map(|att| {
+                if theirs(&att.hello) || !att.hello.compatible() { Back::Skipped(att.hello) } else { Back::Replayed(Box::new(crate::agent::Replayed::new(*id, att, tx.clone()))) }
+            })
+        });
+        let mut found = Vec::new();
+        for ((id, path), res) in wanted.into_iter().zip(attached) {
+            match res {
+                Ok(Back::Skipped(hello)) if theirs(&hello) => {}
                 // From a newer trix: left running, for that one to collect.
-                Ok(att) if !att.hello.compatible() => {
+                Ok(Back::Skipped(hello)) => {
                     let msg = format!(
                         "agent {id} runs under a newer trix (holder protocol {}, this one speaks {}): left running; open it with that trix, or `trix kill` stops it",
-                        att.hello.protocol(),
+                        hello.protocol(),
                         crate::holder::PROTOCOL
                     );
                     eprintln!("trix: {msg}");
                     self.toast(&msg, ToastKind::Info);
                 }
-                Ok(att) => {
-                    if att.hello.dropped > 0 {
-                        eprintln!("trix: agent {id}: replaying {} bytes of output, {} older ones dropped", att.replay.len(), att.hello.dropped);
+                Ok(Back::Replayed(r)) => {
+                    if r.hello.dropped > 0 {
+                        eprintln!("trix: agent {id}: replaying {} bytes of output, {} older ones dropped", r.bytes, r.hello.dropped);
                     }
-                    let meta: crate::agent::Meta = serde_json::from_str(&att.hello.meta).unwrap_or_default();
-                    found.push((id, meta, att));
+                    let meta: crate::agent::Meta = serde_json::from_str(&r.hello.meta).unwrap_or_default();
+                    found.push((id, meta, r));
                 }
                 Err(e) => eprintln!("trix: could not reattach {}: {e}", path.display()),
             }
@@ -1598,12 +1615,12 @@ impl App {
         found.sort_by_key(|(id, m, _)| (m.pos, *id));
         let mut focus = None;
         let n = found.len();
-        for (id, meta, att) in found {
+        for (id, meta, r) in found {
             // Notes from a newer trix, or none: still a terminal worth having.
             let kind = Kind::from_label(&meta.kind).unwrap_or(Kind::Custom);
             let base = if meta.name.is_empty() { kind.label() } else { meta.name.as_str() };
             let name = self.unique_name(base);
-            let agent = Agent::reattach(id, kind, name, &meta, att, self.tx.clone());
+            let agent = Agent::reattach_replayed(kind, name, &meta, *r);
             // A setup that hadn't finished comes back with what it was for.
             let setup = meta.pending_setup().cloned();
             let prompt = setup.as_ref().and(meta.first_prompt.clone());
@@ -3750,28 +3767,39 @@ fn unique_with(agents: &[Agent], also: &[String], base: &str) -> String {
     (2..).map(|n| format!("{base}-{n}")).find(|n| !taken(n)).unwrap()
 }
 
-/// `Planned::launch` for each that's there, a few at a time, each on a
-/// thread of its own. Their answers, in the same order.
+/// `Planned::launch` for each that's there, a few at a time. Their
+/// answers, in the same order.
 fn launch_all(exe: &Path, planned: &[Option<&crate::agent::Planned>]) -> Vec<crate::agent::Launched> {
     // Holders mostly wait for their program to start: more than this at once
     // only crowds the programs that are starting.
     const AT_ONCE: usize = 8;
-    let launch = |p: &Option<&crate::agent::Planned>| p.and_then(|p| p.launch(exe));
-    if planned.len() <= 1 {
-        return planned.iter().map(launch).collect();
+    in_parallel(planned, AT_ONCE, |p| p.and_then(|p| p.launch(exe)))
+}
+
+/// Threads for rebuilding screens from what holders kept: that's parsing,
+/// so as many as there are cores, up to 8.
+fn replay_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
+}
+
+/// `f` for each item, on up to `at_once` threads of their own. Its
+/// answers, in the items' order. One item, or none, takes no thread.
+fn in_parallel<T: Sync, R: Send>(items: &[T], at_once: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() <= 1 || at_once <= 1 {
+        return items.iter().map(f).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let answers: Vec<Mutex<crate::agent::Launched>> = planned.iter().map(|_| Mutex::new(None)).collect();
+    let answers: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
     std::thread::scope(|s| {
-        for _ in 0..AT_ONCE.min(planned.len()) {
+        for _ in 0..at_once.min(items.len()) {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(p) = planned.get(i) else { break };
-                *answers[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = launch(p);
+                let Some(item) = items.get(i) else { break };
+                *answers[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f(item));
             });
         }
     });
-    answers.into_iter().map(|a| a.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner)).collect()
+    answers.into_iter().map(|a| a.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).expect("every item answered")).collect()
 }
 
 /// A slug that is also a safe folder and branch name: no `.` or `..`, no
@@ -5908,6 +5936,49 @@ mod tests {
         app.on_attach(PathBuf::from("/"));
         assert!(app.modal.is_none() && app.pending_restore.is_none(), "always: brought back");
         assert!(app.toast.as_ref().is_some_and(|t| t.text.starts_with("restored")));
+    }
+
+    #[test]
+    fn many_holders_come_back_at_once_each_with_its_own_screen() {
+        let dir = std::env::temp_dir().join(format!("trix-test-reattach-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Ids 1..=6, listed in reverse of where they were (pos), and each
+        // with a screen of its own to rebuild.
+        let mut holders = Vec::new();
+        let mut serving = Vec::new();
+        for id in 1..=6u32 {
+            let path = dir.join(format!("h{id}.sock"));
+            let mut spec = crate::holder::tests::spec("/bin/sh", &["-c", &format!("echo screen-of-{id}; exec cat")]);
+            spec.session = crate::session::name().into();
+            spec.id = id;
+            let meta = crate::agent::Meta { kind: "shell".into(), name: format!("s{id}"), cwd: std::env::temp_dir(), pos: (6 - id) as usize, ..Default::default() };
+            spec.meta = serde_json::to_string(&meta).unwrap();
+            let held = crate::holder::Held::start(&spec, &path).unwrap();
+            serving.push(std::thread::spawn(move || held.serve()));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !String::from_utf8_lossy(&crate::holder::attach(&path).unwrap().replay).contains("screen-of") && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            holders.push((id, path));
+        }
+
+        let mut app = test_app();
+        assert_eq!(app.reattach_from(holders), 6);
+        let names: Vec<&str> = app.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["s6", "s5", "s4", "s3", "s2", "s1"], "where they were");
+        for a in &app.agents {
+            let screen = a.screen_text();
+            assert!(screen.contains(&format!("screen-of-{}", a.id)), "{}'s own screen: {screen:?}", a.name);
+            assert_eq!(screen.matches("screen-of").count(), 1, "and only its own: {screen:?}");
+        }
+        for id in 1..=6 {
+            app.close(id);
+        }
+        for s in serving {
+            s.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
