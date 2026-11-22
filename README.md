@@ -286,6 +286,7 @@ port_count = 10                   # ports per block, unless the repo's .trix.tom
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - **`[cost]`** sets the budgets and prices in [Cost and tokens](#cost-and-tokens). A price under `[cost.prices]` applies to the model of that name, or to models whose name starts with it (`"gpt-6"` covers `gpt-6-luna`), ahead of the live list and trix's own. `live_prices` and `prices_url` are for the [live list](#cost-and-tokens).
 - **`[worktree]`** sets the ports of [runnable worktrees](#runnable-worktrees). The default base sits below the ports Linux and macOS hand out on their own. What a repository's worktrees run and copy lives in its `.trix.toml`, not here.
+- **What you tell every agent** (who does what, who reports to whom) goes in `~/.config/trix/instructions.md`, not here: see [Your instructions](#your-instructions).
 - `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
 
 ### Context gauge
@@ -443,6 +444,26 @@ Cursor do not yet receive this context.
 Existing conversations may retain their original instructions; start a new
 conversation after updating Trix. No user configuration files are modified.
 
+### Your instructions
+
+`~/.config/trix/instructions.md` is what you'd otherwise tell every agent yourself: who does what, who reports to whom, what an agent may do without asking. Every agent gets it after trix's own instructions above, the same way, marked as yours. Where it asks agents to message, report to or hand work to each other, that counts as the go-ahead trix's instructions ask for. It never lifts the rule against `--force`.
+
+```markdown
+## Roles
+- **alpha dog** reviews every PR the others open, merges the ones that are
+  ready (only with CI green), and is the only one who reports to the user.
+- Everyone else builds what they're asked, then reports to alpha dog with
+  `trix send "alpha dog" "<what you did, the PR link, what's left>"`.
+  Ask him, not the user, when you're stuck. Don't merge your own PRs.
+```
+
+- Each agent knows its own name (`trix ls --json` marks it `you: true`), so one file can give every role.
+- It's read as each agent starts, so an edit reaches the agents started after it: new ones, restores, layouts, restarts. Those already running keep what they started with.
+- It lives with your config, outside every repository, and nothing of it lands in a project.
+- Every agent carries it in its prompt on every turn, so keep it short. A file over 16 KB, or one that isn't UTF-8 text, isn't used: agents get trix's instructions alone, a toast says why as they start, and `trix config` checks it. An empty file is no file.
+- Starting agents is trix's job, not the file's: nothing reads it until an agent starts. To always have an agent there, keep it in a [layout](#layouts).
+- Rules for one project's code (its tests, its style) belong in that repository's `CLAUDE.md` or `AGENTS.md`, which agents read themselves.
+
 ## Supported agents
 
 trix starts each of these agents by name, with an argv (never through a shell), and installs nothing into your agent configs: everything it adds is passed to that one process and lives in `$XDG_RUNTIME_DIR/trix` until the server stops. An agent that isn't installed yet installs first, in its own pane ([below](#not-installed-yet)). Log in to each agent yourself the first time it runs.
@@ -590,6 +611,7 @@ src/control.rs agent control: spawn / send / read / wait / close, ls --json, gua
 src/events.rs  `trix events`: the live event stream, its subscribers and the client
 src/worktree.rs runnable worktrees: .trix.toml, its trust, copies, the ports ledger, the setup in the pane
 src/config.rs  config.toml: keys, notifications, sounds
+src/instructions.rs instructions.md: what you tell every agent, after trix's own instructions
 src/settings.rs the settings (alt+,): their rows, and config.toml edits that keep your comments
 src/state.rs   saved workspace for restore
 src/app.rs     workspace state, keys, mouse, modals, worktrees, notifications

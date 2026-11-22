@@ -9,6 +9,7 @@ mod holder;
 mod hooks;
 mod input;
 mod install;
+mod instructions;
 mod layout;
 mod modes;
 #[cfg(target_os = "macos")]
@@ -91,7 +92,9 @@ layouts (named sets of tabs, in ~/.config/trix/layouts/<name>.toml):
   trix layout rm <name>     remove one
 
   trix config               check ~/.config/trix/config.toml (keys, sounds,
-                            notifications); trix reloads it on every save
+                            notifications); trix reloads it on every save.
+                            Also ~/.config/trix/instructions.md: what you
+                            tell every agent, read as each one starts
 
   trix hook <source>        (internal) agent lifecycle reporter
   trix hook amp --plugin    print trix's plugin for Amp, to save where Amp reads
@@ -274,6 +277,15 @@ fn main() -> anyhow::Result<()> {
                 (Ok(_), Some(_)) => println!("{path}: ok"),
                 (Err(e), _) => {
                     eprintln!("trix: {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            let shown = app::tilde(&instructions::path());
+            match instructions::user() {
+                Ok(None) => println!("{shown}: none, so agents get trix's instructions only"),
+                Ok(Some(t)) => println!("{shown}: ok, {} lines every agent is given", t.lines().count()),
+                Err(e) => {
+                    eprintln!("trix: {e}");
                     std::process::exit(1);
                 }
             }
