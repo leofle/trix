@@ -1835,8 +1835,9 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
         }
         Modal::ConfirmClose(id, sel) => {
             let name = app.agents.iter().find(|a| a.id == *id).map(|a| a.name.clone()).unwrap_or_default();
+            let extra = close_line(app, false);
             // Named in the title too: on a short terminal the question goes.
-            app.dialog_hidden.set(confirm(f, area, t, &format!("Close {name}"), &format!("Stop {name} and close its pane?"), *sel, hits));
+            app.dialog_hidden.set(confirm_with(f, area, t, &format!("Close {name}"), &format!("Stop {name} and close its pane?"), extra.as_deref(), app.close_buttons(), *sel, hits));
         }
         Modal::ConfirmCloseMany(ids, sel) => {
             let picked: Vec<&Agent> = app.agents.iter().filter(|a| ids.contains(&a.id)).collect();
@@ -1849,7 +1850,8 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
                 r => format!(" {r} are still running."),
             };
             let text = format!("Stop {} and close their panes?{still}", trunc(&names, 48));
-            app.dialog_hidden.set(confirm(f, area, t, &format!("Close {n} agent{}", if n == 1 { "" } else { "s" }), &text, *sel, hits));
+            let extra = close_line(app, true);
+            app.dialog_hidden.set(confirm_with(f, area, t, &format!("Close {n} agent{}", if n == 1 { "" } else { "s" }), &text, extra.as_deref(), app.close_buttons(), *sel, hits));
         }
         Modal::ConfirmQuit(sel) => {
             let live = app.agents.iter().filter(|a| a.state != State::Exited).count();
@@ -1930,23 +1932,55 @@ fn restore_prompt(f: &mut Frame, area: Rect, t: &Theme, text: &str, sel: usize, 
     }
 }
 
+/// What the close dialog says of the worktrees its agents leave: still
+/// looking, or what was found. `many`: the many-close's one summary line.
+pub(crate) fn close_line(app: &App, many: bool) -> Option<String> {
+    let c = app.close_check.as_ref()?;
+    let Some(found) = &c.found else { return Some(if many { "checking their worktrees…" } else { "checking its worktree…" }.into()) };
+    if many {
+        return crate::offer::summary(found);
+    }
+    found.first().map(crate::offer::line)
+}
+
 /// A yes/no dialog. True when it had no room to show its buttons.
 fn confirm(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str, sel: usize, hits: &mut Vec<(Rect, DialogHit)>) -> bool {
-    let r = centered(area, (text.width() as u16 + 8).max(44), 7);
+    confirm_with(f, area, t, title, text, None, &CONFIRM_BUTTONS, sel, hits)
+}
+
+/// `confirm`, with a line more under the question and its own buttons.
+#[allow(clippy::too_many_arguments)]
+fn confirm_with(f: &mut Frame, area: Rect, t: &Theme, title: &str, text: &str, extra: Option<&str>, all: &[(&str, &str)], sel: usize, hits: &mut Vec<(Rect, DialogHit)>) -> bool {
+    let widest = text.width().max(extra.map_or(0, |e| e.width())).max(buttons_width(all));
+    let r = centered(area, (widest as u16 + 8).max(44), if extra.is_some() { 8 } else { 7 });
     f.render_widget(Clear, r);
     let block = modal_block(title, t);
     let inner = block.inner(r);
     f.render_widget(block, r);
     // Centered across the whole width; a line with no room isn't drawn.
-    // Short of room, the spacers go, then the question: the keys stay.
-    let lines = Rows::new(inner, 0, false).fit(&[0, 2, 1, 3]);
-    if let Some(row) = lines[1] {
-        f.render_widget(Paragraph::new(Span::styled(text.to_string(), Style::new().fg(t.fg))).alignment(Alignment::Center), row);
+    // Short of room, the spacers go, then the question: the keys stay. The
+    // line about the worktree goes before the question does.
+    let say = |f: &mut Frame, row: Rect, s: &str, c| f.render_widget(Paragraph::new(Span::styled(s.to_string(), Style::new().fg(c))).alignment(Alignment::Center), row);
+    let keys = if let Some(extra) = extra {
+        let lines = Rows::new(inner, 0, false).fit(&[0, 2, 2, 1, 3]);
+        if let Some(row) = lines[1] {
+            say(f, row, text, t.fg);
+        }
+        if let Some(row) = lines[2] {
+            say(f, row, extra, t.dim);
+        }
+        lines[4]
+    } else {
+        let lines = Rows::new(inner, 0, false).fit(&[0, 2, 1, 3]);
+        if let Some(row) = lines[1] {
+            say(f, row, text, t.fg);
+        }
+        lines[3]
+    };
+    if let Some(row) = keys {
+        buttons(f, row, t, all, sel, t.red, hits);
     }
-    if let Some(row) = lines[3] {
-        buttons(f, row, t, &CONFIRM_BUTTONS, sel, t.red, hits);
-    }
-    lines[3].is_none()
+    keys.is_none()
 }
 
 /// A yes/no dialog's buttons, centred on `row`: each its key and what it

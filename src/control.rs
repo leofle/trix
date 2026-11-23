@@ -57,7 +57,13 @@ pub enum Request {
     Read { target: String, lines: usize },
     Wait { targets: Vec<String>, all: bool, timeout_secs: u64 },
     Spawn { kind: String, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool },
-    Close { target: String, force: bool },
+    Close {
+        target: String,
+        force: bool,
+        /// Then remove its worktree, if that's safe (`trix close --clean`).
+        #[serde(default)]
+        clean: bool,
+    },
     /// Show (`set: None`, `clear: false`), replace or clear the extra
     /// arguments an agent starts with next time (`trix args`).
     Args { target: String, set: Option<String>, clear: bool },
@@ -122,14 +128,14 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
         "read" => &["--lines", "-n"],
         "wait" => &["--all", "--timeout", "-t"],
         "spawn" => &["--name", "--cwd", "--prompt", "--args", "--worktree"],
-        "close" => &["--force", "-f"],
+        "close" => &["--force", "-f", "--clean"],
         "events" => &["--json"],
         other => return Err(format!("unknown command '{other}'")),
     };
     if let Some((f, _)) = flags.iter().find(|(f, _)| !allowed.contains(&f.as_str())) {
         return Err(format!("{cmd}: unknown option '{f}'"));
     }
-    if let Some((f, _)) = flags.iter().find(|(f, v)| v.is_some() && ["--force", "--all", "--worktree"].contains(&f.as_str())) {
+    if let Some((f, _)) = flags.iter().find(|(f, v)| v.is_some() && ["--force", "--all", "--worktree", "--clean"].contains(&f.as_str())) {
         // `--force=false` would otherwise count as --force.
         return Err(format!("{cmd}: {f} takes no value"));
     }
@@ -186,7 +192,7 @@ pub fn parse(args: &[String], cwd: PathBuf) -> Result<Request, String> {
                 worktree: has(&["--worktree"]),
             }
         }
-        "close" => Request::Close { target: one("agent")?, force: has(&["--force", "-f"]) },
+        "close" => Request::Close { target: one("agent")?, force: has(&["--force", "-f"]), clean: has(&["--clean"]) },
         "events" => Request::Events { targets: pos.clone() },
         _ => unreachable!(),
     })
@@ -240,6 +246,8 @@ pub fn run(req: Request) -> ! {
         Request::Wait { timeout_secs, .. } => Some(*timeout_secs),
         // Making a worktree in a big repo can take a while.
         Request::Spawn { .. } => Some(50),
+        // Asks every session and git before it removes anything.
+        Request::Close { clean: true, .. } => Some(50),
         _ => None,
     };
     let reply = match session::control(&ClientMsg::Control { protocol: CONTROL, from: caller(), req }, wait) {
@@ -299,7 +307,11 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Send { target, text, force } => send(app, from, &target, &text, force),
         Request::Read { target, lines } => read(app, &target, lines),
         Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree),
-        Request::Close { target, force } => close(app, from, &target, force),
+        Request::Close { target, force, clean } => match close(app, from, &target, force, clean) {
+            Ok(Closed::Said(r)) => r,
+            Ok(Closed::Later(name, left)) => return clean_later(stream, name, left),
+            Err(r) => r,
+        },
         Request::Args { target, set, clear } => extra_args(app, from, &target, set, clear),
         Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
         Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
@@ -505,6 +517,7 @@ fn outside_the_sandbox(req: &Request) -> Option<&'static str> {
         Request::Spawn { kind, .. } if matches!(kind_of(kind), Some(Kind::Shell | Kind::Custom)) => Some("start a shell or a custom command"),
         Request::Spawn { command: Some(c), .. } if !c.trim().is_empty() => Some("start an agent with --args"),
         Request::Close { force: true, .. } => Some("close --force"),
+        Request::Close { clean: true, .. } => Some("close --clean (it removes a worktree and its branch)"),
         Request::Args { set, clear, .. } if set.is_some() || *clear => Some("change the arguments an agent starts with"),
         Request::Open { .. } => Some("open a layout (its agents can have any arguments and commands)"),
         _ => None,
@@ -597,22 +610,67 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
     }
 }
 
-fn close(app: &mut App, from: Option<u32>, target: &str, force: bool) -> Reply {
-    let i = match find(app, target) {
-        Ok(i) => i,
-        Err(e) => return Reply::fail(e),
-    };
+/// What `trix close` came to: said now, or (`--clean`) the worktrees to
+/// look at and remove off this thread first.
+enum Closed {
+    Said(Reply),
+    Later(String, Vec<(PathBuf, crate::app::Users)>),
+}
+
+fn close(app: &mut App, from: Option<u32>, target: &str, force: bool, clean: bool) -> Result<Closed, Reply> {
+    let i = find(app, target).map_err(Reply::fail)?;
     let a = &app.agents[i];
-    if let Err(e) = not_self(a, from, "close") {
-        return Reply::fail(e);
-    }
+    not_self(a, from, "close").map_err(Reply::fail)?;
     if !force && matches!(a.state, State::Working | State::Blocked | State::Starting) {
         let what = if a.state == State::Blocked { "needs you" } else { &format!("is {}", a.state.label()) };
-        return Reply::fail(format!("'{}' {what} — --force to stop it anyway", a.name));
+        return Err(Reply::fail(format!("'{}' {what} — --force to stop it anyway", a.name)));
     }
     let (id, name) = (a.id, a.name.clone());
-    app.close(id);
-    Reply::ok(format!("closed {name}\n"))
+    let left = app.close_leaving(id);
+    if clean && !left.is_empty() {
+        return Ok(Closed::Later(name, left));
+    }
+    let mut r = Reply::ok(format!("closed {name}\n"));
+    if clean {
+        r.err = format!("{name} wasn't the last agent in a worktree of trix's: nothing to clean up");
+    } else if !left.is_empty() {
+        let kept: Vec<String> = left.iter().map(|(tree, _)| tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        let it = if kept.len() == 1 { "it" } else { "them" };
+        r.err = format!("kept worktree {}: `trix close --clean` would have removed {it} if safe; `trix worktrees rm <name>` does now", kept.join(", "));
+    }
+    Ok(Closed::Said(r))
+}
+
+/// `trix close --clean`'s second half, on its own thread: each worktree
+/// the agent left is looked at, then removed if nothing keeps it, by the
+/// same checks and `cleanup::remove` as the review's X. A worktree that
+/// stays is a failure, with why.
+fn clean_later(mut stream: UnixStream, name: String, left: Vec<(PathBuf, crate::app::Users)>) {
+    let started = std::thread::Builder::new().name("trix-close-clean".into()).spawn(move || {
+        let mut r = Reply::ok(format!("closed {name}\n"));
+        let mut errs = Vec::new();
+        for (tree, users) in left {
+            let users = users();
+            let again = users.clone();
+            let done = match crate::offer::look(&tree, move || users) {
+                None => Err(format!("kept {}: it isn't a git worktree any more", crate::app::tilde(&tree))),
+                Some(f) if !f.removable() => Err(crate::offer::line(&f)),
+                Some(f) => crate::offer::remove(&f, move || again),
+            };
+            match done {
+                Ok(said) => r.out.push_str(&format!("{said}\n")),
+                Err(e) => errs.push(e),
+            }
+        }
+        if !errs.is_empty() {
+            r.code = 1;
+            r.err = errs.join("\n");
+        }
+        reply(&mut stream, &r);
+    });
+    if started.is_err() {
+        eprintln!("trix: couldn't start cleaning up after closing an agent");
+    }
 }
 
 /// Show or change the extra arguments an agent starts with. A change is
@@ -908,7 +966,7 @@ mod tests {
             assert!(open(ok), "{ok:?} stays open");
         }
         for no in [&["send", "-f", "web", "y"][..], &["spawn", "shell"], &["spawn", "sh"], &["spawn", "custom", "--args", "id"],
-                   &["spawn", "claude", "--args", "--dangerously-skip-permissions"], &["close", "--force", "web"],
+                   &["spawn", "claude", "--args", "--dangerously-skip-permissions"], &["close", "--force", "web"], &["close", "--clean", "web"],
                    &["args", "web", "--", "--yolo"], &["args", "web", "--clear"]] {
             assert!(!open(no), "{no:?} is refused");
         }
@@ -924,7 +982,7 @@ mod tests {
         assert_eq!(p(&["read", "--lines=0", "web"]), Ok(Request::Read { target: "web".into(), lines: 1 }), "at least one line");
         assert_eq!(p(&["wait", "a", "b", "--all", "-t", "0"]), Ok(Request::Wait { targets: args(&["a", "b"]), all: true, timeout_secs: 0 }));
         assert_eq!(p(&["wait", "a"]), Ok(Request::Wait { targets: args(&["a"]), all: false, timeout_secs: WAIT_SECS }));
-        assert_eq!(p(&["close", "--force", "a"]), Ok(Request::Close { target: "a".into(), force: true }));
+        assert_eq!(p(&["close", "--force", "a"]), Ok(Request::Close { target: "a".into(), force: true, clean: false }));
         assert_eq!(
             p(&["spawn", "claude", "--name", "api", "--cwd", "sub", "--worktree", "--prompt=hi there"]),
             Ok(Request::Spawn {

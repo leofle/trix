@@ -53,11 +53,25 @@ pub struct WorktreeOpts {
     pub port_base: u16,
     /// A block's size, unless the repository's `.trix.toml` says.
     pub port_count: u16,
+    /// Offer to remove a worktree as its last agent closes.
+    pub on_close: OnClose,
+}
+
+/// What closing the last agent in a worktree offers. There's no "remove":
+/// even a merged worktree holds ignored files only you know about.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum OnClose {
+    /// The close dialog offers `r` when it's safe; an exited agent's close
+    /// says the worktree was kept.
+    #[default]
+    Ask,
+    /// Neither.
+    Keep,
 }
 
 impl Default for WorktreeOpts {
     fn default() -> WorktreeOpts {
-        WorktreeOpts { ports: true, port_base: 20000, port_count: 10 }
+        WorktreeOpts { ports: true, port_base: 20000, port_count: 10, on_close: OnClose::Ask }
     }
 }
 
@@ -340,6 +354,7 @@ struct FileWorktree {
     ports: Option<bool>,
     port_base: Option<i64>,
     port_count: Option<i64>,
+    on_close: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -527,7 +542,12 @@ fn worktree_opts(f: FileWorktree) -> Result<WorktreeOpts, String> {
     if base + count - 1 > 65535 {
         return Err(format!("worktree.port_count: {count} ports from {base} go past 65535"));
     }
-    Ok(WorktreeOpts { ports: f.ports.unwrap_or(d.ports), port_base: base as u16, port_count: count as u16 })
+    let on_close = match f.on_close.as_deref().map(str::trim) {
+        None | Some("ask") => OnClose::Ask,
+        Some("keep") => OnClose::Keep,
+        Some(other) => return Err(format!("worktree.on_close: '{other}' is not ask or keep")),
+    };
+    Ok(WorktreeOpts { ports: f.ports.unwrap_or(d.ports), port_base: base as u16, port_count: count as u16, on_close })
 }
 
 fn cost_opts(f: FileCost) -> Result<CostOpts, String> {
@@ -1099,6 +1119,9 @@ mod tests {
         assert_eq!(read("[new]\nagent = \"last\"\n").unwrap().new.agent, None, "the one started last");
         assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
         assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));
+        assert_eq!(read("").unwrap().worktree.on_close, OnClose::Ask);
+        assert_eq!(read("[worktree]\non_close = \"keep\"\n").unwrap().worktree.on_close, OnClose::Keep);
+        assert!(read("[worktree]\non_close = \"remove\"\n").unwrap_err().contains("ask or keep"), "there's no remove");
         assert_eq!(read("").unwrap().session.idle_after, Some(std::time::Duration::from_secs(86400)), "a day by default");
         assert_eq!(read("[session]\nidle_after = \"8h\"\n").unwrap().session.idle_after, Some(std::time::Duration::from_secs(8 * 3600)));
         assert_eq!(read("[session]\nidle_after = \"off\"\n").unwrap().session.idle_after, None);
