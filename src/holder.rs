@@ -1710,6 +1710,8 @@ pub(crate) mod tests {
         assert!(!seen.contains("winch"), "the first server isn't a takeover");
         let mut second = attach(&path).unwrap();
         let mut told = String::new();
+        // Nothing else resizes it, so any signal is the wiggle. Only the size
+        // it ends on is sure: a program busy through the wiggle never sees 23.
         assert!(
             read_until(&mut second.stream, |k, p| {
                 if k == OUTPUT {
@@ -1719,7 +1721,6 @@ pub(crate) mod tests {
             }),
             "the size wiggled, so it redraws, and is back where it was: {told:?}"
         );
-        assert!(told.contains("winch 23 80"), "{told:?}");
         write_frame(&mut second.stream, KILL, &[]).unwrap();
         serving.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
