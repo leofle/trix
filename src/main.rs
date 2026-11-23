@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod cleanup;
 mod config;
 mod cost;
 mod control;

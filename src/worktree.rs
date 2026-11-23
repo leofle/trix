@@ -194,7 +194,7 @@ fn check_pattern(p: &str) -> Result<(), String> {
 
 // ───────────────────────────── trust ─────────────────────────────
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     // Tests never read or grant the developer's own trust, or take their ports.
     if cfg!(test) {
         return std::env::temp_dir().join(format!("trix-test-state-{}", std::process::id()));
