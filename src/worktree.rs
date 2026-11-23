@@ -764,14 +764,18 @@ pub fn pretend_saved(session: &str, saved: Option<crate::state::Saved>) {
 }
 
 /// Who uses `tree`: `here`, this session's agents in it (by where they
-/// started or are now), then every other session's agents, restore offers
+/// started or are now), and `offered`, those its restore offer would bring
+/// back into it, then every other session's agents, restore offers
 /// and saved workspaces, and agents a stopped server left running. One line
 /// each, naming them. A session that can't say counts as using it: removing
 /// a folder from under an agent is worse than asking you to look.
-pub fn users(tree: &Path, here: &[String]) -> Vec<String> {
+pub fn users(tree: &Path, here: &[String], offered: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     if !here.is_empty() {
         out.push(format!("{} also in this worktree (close {} first)", names(here), if here.len() == 1 { "it" } else { "them" }));
+    }
+    if !offered.is_empty() {
+        out.push(format!("{} in this session's restore offer", names(offered)));
     }
     let me = crate::session::name();
     out.extend(users_from(tree, me, &gather(me)));
@@ -786,22 +790,33 @@ pub const LOCK_REASON: &str = "trix: an agent's worktree; remove it with the rev
 
 /// `tree`'s lock, as `git worktree list` has it: `None` when it isn't
 /// locked, `Some("")` for a lock with no reason. `Err`: git couldn't say.
+/// The newline porcelain, not `-z`, which needs git 2.36.
 fn lock_of(tree: &Path) -> Result<Option<String>, String> {
-    let out = Command::new("git").arg("-C").arg(tree).args(["worktree", "list", "--porcelain", "-z"]).stderr(Stdio::null()).output().map_err(|e| e.to_string())?;
+    let out = Command::new("git").arg("-C").arg(tree).args(["-c", "core.quotePath=false", "worktree", "list", "--porcelain"]).stderr(Stdio::null()).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err("not a worktree git knows".into());
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(lock_in_listing(&String::from_utf8_lossy(&out.stdout), tree))
+}
+
+/// `lock_of`, from `git worktree list --porcelain`'s text. A reason with
+/// unusual characters comes C-quoted, as `"…"`; it's kept as git gave it.
+fn lock_in_listing(text: &str, tree: &Path) -> Option<String> {
     let real = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
     let mut ours = false;
-    for f in text.split('\0') {
-        if let Some(p) = f.strip_prefix("worktree ") {
-            ours = Path::new(p) == tree || Path::new(p).canonicalize().is_ok_and(|c| c == real);
-        } else if ours && (f == "locked" || f.starts_with("locked ")) {
-            return Ok(Some(f.strip_prefix("locked").unwrap_or_default().trim_start().to_string()));
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            ours = Path::new(p) == tree || Path::new(p) == real || Path::new(p).canonicalize().is_ok_and(|c| c == real);
+        } else if ours && (line == "locked" || line.starts_with("locked ")) {
+            return Some(line.strip_prefix("locked").unwrap_or_default().trim_start().to_string());
         }
     }
-    Ok(None)
+    None
+}
+
+/// A lock reason (as `lock_in_listing` gives it, maybe quoted) that's trix's.
+fn is_trixs(reason: &str) -> bool {
+    reason.strip_prefix('"').unwrap_or(reason).starts_with(LOCK_MARK)
 }
 
 fn git_lock(tree: &Path, args: &[&str]) -> Result<(), String> {
@@ -834,7 +849,7 @@ pub fn lock_in_background(cwd: &Path) {
 pub fn unlock(tree: &Path) -> Result<bool, String> {
     match lock_of(tree)? {
         None => Ok(false),
-        Some(r) if r.starts_with(LOCK_MARK) => git_lock(tree, &["unlock"]).map(|()| true),
+        Some(r) if is_trixs(&r) => git_lock(tree, &["unlock"]).map(|()| true),
         Some(r) => Err(format!("locked by someone else than trix ({}): `git worktree unlock` it first", if r.is_empty() { "no reason given" } else { &r })),
     }
 }
@@ -1335,9 +1350,9 @@ mod tests {
     #[test]
     fn this_sessions_agents_come_first() {
         SEEN.with(|s| *s.borrow_mut() = Elsewhere { answers: vec![("x".into(), listed(r#"{"agents":[{"name":"rb","cwd":"/r/.trix/worktrees/w"}],"pending_restore":[]}"#))], ..Elsewhere::default() });
-        assert_eq!(users(Path::new(W), &["a".into(), "b".into()]), ["a, b also in this worktree (close them first)", "rb in session x"]);
+        assert_eq!(users(Path::new(W), &["a".into(), "b".into()], &["api".into()]), ["a, b also in this worktree (close them first)", "api in this session's restore offer", "rb in session x"]);
         SEEN.with(|s| *s.borrow_mut() = Elsewhere::default());
-        assert!(users(Path::new(W), &[]).is_empty());
+        assert!(users(Path::new(W), &[], &[]).is_empty());
     }
 
     fn locked_reason(tree: &Path) -> Option<String> {
@@ -1357,6 +1372,19 @@ mod tests {
         assert_eq!(unlock(&tree), Ok(true));
         assert_eq!(locked_reason(&tree), None);
         assert_eq!(unlock(&tree), Ok(false));
+    }
+
+    #[test]
+    fn the_lock_is_read_from_the_porcelain_git_2_34_prints() {
+        let text = "worktree /r\nHEAD 1111\nbranch refs/heads/main\n\nworktree /r/.trix/worktrees/a\nHEAD 2222\nbranch refs/heads/trix/a\nlocked trix: an agent's worktree\n\nworktree /r/.trix/worktrees/b\nHEAD 3333\ndetached\nlocked \"tab\\there\"\n\nworktree /r/.trix/worktrees/c\nHEAD 4444\nbranch refs/heads/trix/c\nlocked\n\nworktree /r/.trix/worktrees/d\nHEAD 5555\nbranch refs/heads/trix/d\nprunable gitdir file points to non-existent location\n";
+        let at = |n: &str| lock_in_listing(text, &Path::new("/r/.trix/worktrees").join(n));
+        assert_eq!(at("a").as_deref(), Some("trix: an agent's worktree"));
+        assert_eq!(at("b").as_deref(), Some("\"tab\\there\""));
+        assert_eq!(at("c").as_deref(), Some(""), "locked, no reason");
+        assert_eq!(at("d"), None);
+        assert_eq!(lock_in_listing(text, Path::new("/r")), None, "the main checkout's lines aren't another's");
+        assert!(is_trixs("trix: x") && is_trixs("\"trix: caf\\303\\251\""));
+        assert!(!is_trixs("\"tab\\there\"") && !is_trixs("") && !is_trixs("mine, trix: no"));
     }
 
     #[test]

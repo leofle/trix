@@ -821,7 +821,8 @@ Binary files a/logo.png and b/logo.png differ
         sh(&main, &["remote", "add", "origin", &bare.display().to_string()]);
         let wt = main.join(".trix/worktrees/w");
         // Locked, as trix makes them.
-        sh(&main, &["worktree", "add", "-q", "--lock", "--reason", crate::worktree::LOCK_REASON, "-b", "trix/w", &wt.display().to_string()]);
+        sh(&main, &["worktree", "add", "-q", "-b", "trix/w", &wt.display().to_string()]);
+        sh(&main, &["worktree", "lock", "--reason", crate::worktree::LOCK_REASON, &wt.display().to_string()]);
         (Repo(root), main, wt)
     }
 

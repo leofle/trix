@@ -3584,7 +3584,9 @@ impl App {
         // Removing the folder gives its ports away: not from under anyone.
         let tree = git(&dir, &["rev-parse", "--show-toplevel"]).map_or_else(|| dir.clone(), PathBuf::from);
         let here = self.others_in(&tree, id);
-        let users = crate::worktree::users(&tree, &here);
+        // What this session's unanswered restore offer would bring back here.
+        let offered: Vec<String> = self.pending_restore.iter().flat_map(|p| &p.agents).filter(|a| a.cwd.starts_with(&tree) || a.cwd.canonicalize().is_ok_and(|c| c.starts_with(&tree))).map(|a| a.name.clone()).collect();
+        let users = crate::worktree::users(&tree, &here, &offered);
         if !users.is_empty() {
             if let Some(Modal::Review(r)) = &mut self.modal {
                 r.status = Some((format!("kept, still in use: {}", users.join("; ")), false));
@@ -4045,14 +4047,11 @@ fn make_worktree_at(dir: &Path, name: &str, base: Option<&str>) -> anyhow::Resul
     }
     let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_some();
     let p = path.display().to_string();
-    // Locked from the start: git then won't remove it, or prune it once
-    // its folder is gone, or delete its branch, until X unlocks it.
-    let mut args: Vec<&str> = vec!["worktree", "add", "--lock", "--reason", crate::worktree::LOCK_REASON];
-    if has_branch {
-        args.extend([p.as_str(), branch.as_str()]);
+    let mut args: Vec<&str> = if has_branch {
+        vec!["worktree", "add", &p, &branch]
     } else {
-        args.extend(["-b", branch.as_str(), p.as_str()]);
-    }
+        vec!["worktree", "add", "-b", &branch, &p]
+    };
     if let Some(base) = base.filter(|_| !has_branch) {
         args.push(base);
     }
@@ -4060,6 +4059,13 @@ fn make_worktree_at(dir: &Path, name: &str, base: Option<&str>) -> anyhow::Resul
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("worktree: {}", err.lines().last().unwrap_or("failed"));
+    }
+    // Locked right away: git then won't remove it, or prune it once its
+    // folder is gone, or delete its branch, until X unlocks it. Not with
+    // `add --lock --reason`, which needs git 2.33; a lock that fails never
+    // stops the worktree being made.
+    if let Err(e) = crate::worktree::ensure_locked(&path) {
+        eprintln!("trix: couldn't lock the worktree {}: {e}", path.display());
     }
     Ok((path, branch, false))
 }
@@ -5590,6 +5596,27 @@ mod tests {
         let (_, _, reused) = make_worktree(&dir, "w").unwrap();
         assert!(reused);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_is_refused_while_this_sessions_restore_offer_has_the_worktree() {
+        let (_keep, wt) = {
+            let dir = repo_with_setup("cleanup-offer");
+            let (wt, _, _) = make_worktree(&dir, "w").unwrap();
+            (dir, wt.canonicalize().unwrap())
+        };
+        let mut app = test_app();
+        let ra = app.spawn_quiet(sleeper("ra", &wt)).unwrap();
+        app.agents[0].set_state(State::Idle, false);
+        let agent = |name: &str, cwd: PathBuf| crate::state::SavedAgent { kind: "claude".into(), name: name.into(), cwd, command: None, session: None, pinned: false, inherited: Vec::new() };
+        app.pending_restore = Some(crate::state::Saved::new(0, vec![agent("api", wt.join("src")), agent("elsewhere", "/tmp".into())]));
+        app.modal = Some(Modal::Review(Box::new(crate::review::Review::open(ra, &wt).unwrap())));
+        app.clean_up_worktree();
+        let Some(Modal::Review(r)) = &app.modal else { panic!("the review stays open") };
+        let said = &r.status.as_ref().unwrap().0;
+        assert!(said.contains("api in this session's restore offer") && !said.contains("elsewhere"), "{said}");
+        assert!(wt.exists());
+        stop_all(&app);
     }
 
     #[test]
