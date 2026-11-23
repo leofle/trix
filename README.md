@@ -1,6 +1,6 @@
 # trix
 
-A workspace where coding agents live. Run Claude Code, Codex, Grok, OpenCode, Cursor, GitHub Copilot CLI, Muse Code, Gemini CLI, Antigravity CLI, Amp, shells, or any CLI agent side by side. trix tells you, at a glance and without asking, which agent is working, which one needs you, and which one finished while you were looking elsewhere.
+A terminal workspace for coding agents. Run Claude Code, Codex, Grok, OpenCode, Cursor, GitHub Copilot CLI, Muse Code, Gemini CLI, Antigravity CLI, Amp, shells or any CLI agent side by side, and see at a glance which one is working, which one needs you, and which one finished while you were looking elsewhere.
 
 ```
 ◆ trix   ▲ 1 needs you   ⠹ 2 working   ✓ 1 done                              focus · 14:02
@@ -15,51 +15,69 @@ A workspace where coding agents live. Run Claude Code, Codex, Grok, OpenCode, Cu
        claude ▁▁▁▂▅▁▁▁▁▁  trix/api │                                                              │
 ```
 
+**Get started:** [Install](#install) · [Quick start](#quick-start) · [Keys](#keys) · [macOS](#macos) · [Supported agents](#supported-agents) · [Codex](#codex)<br>
+**Features:** [Search](#search) · [Runnable worktrees](#runnable-worktrees) · [Review](#review) · [Clone](#clone) · [Agent control](#agent-control) · [Layouts](#layouts) · [Restore](#restore) · [Sessions](#sessions) · [Viewers](#viewers) · [Context gauge](#context-gauge) · [Cost and tokens](#cost-and-tokens)<br>
+**Configure:** [Settings](#settings) · [Config](#config) · [Environment variables](#environment-variables) · [Themes](#themes) · [Your instructions](#your-instructions)<br>
+**Reference:** [Security](#security) · [Troubleshooting](#troubleshooting) · [Development](#development) · [License](#license)
+
 ## Why
 
-Generic multiplexers (tmux, zellij) don't know anything about agents. herdr and Rex added agent awareness, but they still treat the agent as just another pane. In trix, the agent comes first:
+Generic multiplexers (tmux, zellij) know nothing about agents. herdr and Rex added agent awareness, but still treat the agent as just another pane. In trix, the agent comes first:
 
-- **Hooks first, guessing second.** trix starts Claude Code with `--settings <overlay>`, Codex with `-c` hook overrides, OpenCode with a plugin in `OPENCODE_CONFIG_CONTENT`, Cursor and Copilot with `--plugin-dir`, and Muse with a hooks file named by `-c`, so the agent reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. (Codex asks you to trust trix's hooks once; see [Codex](#codex). Grok, Gemini, Antigravity and Amp can't be handed hooks per process: trix reads Grok's and Gemini's terminal titles and Antigravity's and Amp's screens, and you can add trix's hook, or for Amp its plugin, to them yourself.) Agents without hooks fall back to output cadence and screen heuristics. See [Supported agents](#supported-agents).
-- **Feedback you can't miss.** Each agent shows a live state glyph, what it is doing right now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, git branch, and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip drops in over your current pane's title: who, what it's asking and how long it has waited. Click it, or press `alt+a`, to go there. It covers the title rather than taking a row, so your pane never moves. You also get a desktop notification with trix's icon (through `notify-send` on Linux, so Omarchy's mako shows it), and the terminal bell sets the urgency hint when trix is unfocused. When an agent you’re not looking at finishes, a short rising chime plays (through `pw-play` from PipeWire on Linux, `afplay` on macOS). Completions within two seconds share one chime. The terminal title tracks the count too. Which of these happen, and which sound plays (one of trix's five, or a file of yours), is up to you: see [Config](#config).
-- **Context at a glance.** Each Claude and Codex agent shows how full its context window is on its pane: `context 31% · ~691k left`, yellow from 70%, red from 85%. trix reads it from the agent's own conversation log, in the background. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
-- **What it costs.** From the same logs, trix counts each Claude and Codex agent's tokens and prices them: `$1.23 · 4.1M tok` on its pane, and the whole workspace's on the top bar. Set a budget for the workspace, or for each agent, and trix warns you as spend nears it and tells you when it goes over. `trix ls --json` has it all, per agent and in total. See [Cost and tokens](#cost-and-tokens).
+- **Hooks first, guessing second.** trix hands each agent hooks or a plugin for that one process: Claude Code a `--settings` overlay, Codex `-c` hook overrides, OpenCode a plugin in `OPENCODE_CONFIG_CONTENT`, Cursor and Copilot a `--plugin-dir`, Muse a hooks file named by `-c`. The agent then reports its own lifecycle: prompt submitted, each tool call, permission request, question, turn finished, interrupted. Your own agent configs are never touched. Grok, Gemini, Antigravity and Amp can't take hooks per process, so trix reads Grok's and Gemini's terminal titles and Antigravity's and Amp's screens, and you can add trix's hook (for Amp, its plugin) yourself. Agents without hooks fall back to output cadence and screen heuristics. See [Supported agents](#supported-agents), and [Codex](#codex) for its one-time trust step.
+- **Feedback you can't miss.** Each agent's card shows a live state glyph, what it's doing now (`Edit app.rs`, `Bash cargo test`, `approve …`), time in state, a 48-second output sparkline, its git branch and the diff it has made so far. When an agent you're *not* looking at needs you, a red strip covers your pane's title (it takes no row, so your pane never moves): who, what it's asking and how long it has waited. Click it, or press `alt+a`, to go there. A desktop notification with trix's icon comes too (`notify-send` on Linux, so Omarchy's mako shows it), and the terminal bell sets the urgency hint while trix is unfocused. When an agent you're not looking at finishes, a short rising chime plays (`pw-play` from PipeWire on Linux, `afplay` on macOS); completions within two seconds share one chime. The terminal title tracks the counts. Which of these happen, and which sound plays, is up to you: see [Config](#config).
+- **Context at a glance.** Each Claude and Codex pane shows how full its context window is (`context 31% · ~691k left`), yellow from 70% and red from 85%, read in the background from the agent's own conversation log. `trix ls --json` has it too, so a lead agent can see when a worker is running low. See [Context gauge](#context-gauge).
+- **What it costs.** From the same logs, trix counts and prices each Claude and Codex agent's tokens: `$1.23 · 4.1M tok` on its pane, the workspace's total on the top bar, all of it in `trix ls --json`. Set a budget for the workspace or for each agent, and trix warns you as spend nears it and tells you when it goes over. See [Cost and tokens](#cost-and-tokens).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
-- **Many agents, one glance.** `alt+g` tiles your agents live, up to four at a time. The focused tile is accented, blocked tiles turn red, and the rest fade back a little. A page holds up to four, two to a row, and three are two on top and one below. With more agents, the grid shows the page with the focused agent, and `alt+j`/`alt+k` move through them. The sidebar keeps full cards and scrolls, or shows one-line cards after `alt+c`.
-- **Pin what matters.** Every pane's title starts with a red pin (`⚲`). Click it and that agent moves to the top of the sidebar, with the pin on its card and *pinned* on its title. Up to two agents can be pinned, in the order you pinned them. Pinned cards stay put while the rest of the sidebar scrolls under them. Click the pin again to unpin it, and it goes right below the ones still pinned. The pin is the same red in every theme, and pins come back with a restored workspace. With a Nerd Font, `[ui] nerd_font = true` draws it as `` (see [Config](#config)).
-- **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`. It is excluded from git automatically, so parallel agents never step on each other. A repository can make those worktrees [runnable](#runnable-worktrees): a setup command, its `.env` files, and a block of ports for each.
-- **Review, then merge, without leaving trix.** `alt+v`, *Review diff* in an agent's menu, or a click on the `+12 −3` on its card opens that agent's diff. Leave notes on lines and send them all back to the agent as one prompt; then commit, push, open a PR, merge, and clean up the worktree from the same view. See [Review](#review).
-- **Clone an agent.** `alt+l`, or *Clone* in an agent's menu, starts another like it, next to it: the same kind, flags and repo, in a worktree of its own (`.trix/worktrees/<name>-2` on `trix/<name>-2`). The new worktree starts at the original's commit with its uncommitted changes copied over: what's staged stays staged, and files git doesn't track yet come too, though ignored ones (`.env`, build output) don't, unless the repo's `.trix.toml` copies them as it does for any new worktree. Claude, Codex and Grok go on from a copy of the original's conversation (`--fork-session`, `codex fork`), so the clone knows what the original knew, and the two go their own ways from there. Other agents start a new conversation, and say so. A clone's cost counts only what it spends itself, not the conversation it was copied from, and that holds across a restore. It's saved with its own conversation only once the agent has one: restored before then, it starts a new one rather than going on in the original's. The original isn't touched. Outside git, the clone shares the original's folder.
-- **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, newest first, with each hit's agent and how far back it is. Enter jumps there: it focuses that agent, scrolls to the line and selects the match.
+- **Many agents, one glance.** `alt+g` tiles your agents live, up to four at a time, and `alt+j`/`alt+k` page through the rest. Pin up to two agents to the top of the sidebar, and select several to act on all of them at once. See [Grid, pins and selection](#grid-pins-and-selection).
+- **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`, excluded from git automatically, so parallel agents never step on each other. A repository can make those worktrees [runnable](#runnable-worktrees): a setup command, its `.env` files, and a block of ports for each.
+- **Review, then merge, without leaving trix.** `alt+v` opens an agent's diff. Leave notes on lines and send them back to the agent as one prompt; then commit, push, open a PR, merge and clean up the worktree from the same view. See [Review](#review).
+- **Clone an agent.** `alt+l` starts a copy of the focused agent in a worktree of its own, with the original's uncommitted changes and, for Claude, Codex and Grok, a copy of its conversation. See [Clone](#clone).
+- **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, and Enter jumps to the match. See [Search](#search).
 - **Broadcast.** `alt+b` sends one prompt to every agent, or only to the ones that are idle or done. Shells and agents sitting on a prompt are skipped, so a broadcast can never answer a permission dialog.
-- **Act on several at once.** Alt+click an agent's card, or press `alt+x` on the focused one, to select it; do it again to unselect it. Selected cards are tinted and checked, and the sidebar's header counts them (click its `✕` to unselect them all). While any are selected, the keys act on all of them: `alt+w` closes them, asking once if any still runs; `alt+g` shows only them in the grid, which follows the selection as it changes, and `alt+j`/`alt+k` go round them there; `alt+b` sends to them first (`tab` still picks every agent or the idle ones); and `alt+o`, or a right-click on a selected agent, opens their menu: restart the exited ones, copy all their folder paths, unselect all, close them. Rename, pin and jump stay one agent's. The selection isn't saved with the workspace. On macOS, Cmd+click a card in iTerm2 and Terminal.app, where Option-click doesn't reach trix; in other terminals Option-click works if the terminal passes it on (see [macOS](#macos)). `alt+x` works anywhere.
-- **Agents outlive the terminal.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches; agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, including scrollback. `trix ls` shows who needs you without attaching. They outlive the server too: each agent's terminal is held by a small process of its own, so if the server crashes or is killed, every program keeps running, and the next `trix` reattaches them with their recent output (see [Restore](#restore)).
-- **Agents can run agents.** `trix spawn`, `send`, `read`, `wait`, `close` and `events` let a script, or an agent in another pane, work the workspace the way you do. A "lead" Claude can start workers in their own worktrees, hand them tasks, wait for them and read what they did. It never answers a permission prompt for you, and the sidebar shows which agent it is driving. See [Agent control](#agent-control).
-- **Layouts on demand.** `trix layout save work` remembers the tabs you have open, with their folders. `trix layout open work` brings them back whenever you want, with fresh conversations, or the old ones with `--resume`. See [Layouts](#layouts).
-- **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Viewers see exactly what the controlling terminal sees, and nothing they type reaches an agent.
-- **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, its own saved layout and its own attached terminal. `trix ls` shows all of them at once.
-- **Survives restarts too.** The workspace is saved continuously. If the server crashed, the agents never stopped, and the next `trix` simply reattaches them. After `trix kill`, alt+q or a reboot, the next `trix` offers to bring it back: Claude, Codex, Grok, OpenCode, Cursor, Copilot, Muse and Gemini resume the exact conversation each pane was in (`claude --resume <id>`, `codex resume <id>`, …), Antigravity and Amp too once their hooks report it, and shells reopen in the folder they were in.
+- **Agents outlive the terminal, and the server.** The workspace runs in a background server. Closing the window, losing SSH or pressing `alt+d` only detaches: agents keep working and still notify you on the desktop. Run `trix` again from any terminal to pick up where you were, scrollback included. Each agent's terminal is held by a small process of its own, so if the server crashes, every program keeps running and the next `trix` reattaches it. After `trix kill`, `alt+q` or a reboot, the next `trix` offers to bring the workspace back, each agent in the conversation it was in (`claude --resume <id>`, `codex resume <id>`, …) and each shell in its folder. See [Restore](#restore).
+- **Agents can run agents.** `trix spawn`, `send`, `read`, `wait`, `close` and `events` let a script, or an agent in another pane, work the workspace the way you do. A lead Claude can start workers in their own worktrees, hand them tasks, wait for them and read what they did. It never answers a permission prompt for you, and the sidebar shows which agent it is driving. See [Agent control](#agent-control).
+- **Layouts on demand.** `trix layout save work` remembers the tabs you have open, with their folders, and `trix layout open work` brings them back, with fresh conversations or, with `--resume`, the old ones. See [Layouts](#layouts).
+- **Watch without taking over.** `trix view` attaches read-only from any number of other terminals: a second monitor, a laptop over SSH, a teammate on the same box. Nothing a viewer types reaches an agent. See [Viewers](#viewers).
+- **Named sessions.** `trix -s work` and `trix -s home` are separate workspaces, each with its own agents, saved workspace and attached terminal. `trix ls` shows all of them. See [Sessions](#sessions).
 - **Fast.** Rust, with `alacritty_terminal` as the VT engine (the same one Zed uses) and `ratatui`. Rendering is event-driven and capped at about 120 fps, and trix does nothing when nothing changes. Idle cost is about 0.4% of one core and about 10 MB of RAM. `seq 1 2000000` streams through in under a second.
-- **Follows your theme.** trix reads Omarchy's `colors.toml` and restyles live when you switch themes. Agent terminals keep your terminal's own colors, which Omarchy themes too. Without Omarchy it falls back to Tokyo Night. Or pick a theme in the settings: any of Omarchy's 23 or Cyber Aura, which trix ships so a Mac has them too, tried on live before you keep it. A theme you pick colors the agents' panes, Claude, Grok and OpenCode as well (see [Themes](#themes)).
-- **Settings.** `alt+,`, or *settings* in the bottom bar, changes the theme, the needs-you strip, the sidebar, how new agents start, whether the last workspace comes back, notifications and sounds in place. Each change is written to your config files with your comments kept, so the files and the screen always agree (see [Settings](#settings)).
+- **Follows your theme.** trix follows Omarchy's theme live, and falls back to Tokyo Night without it. Or pick one of the 24 it ships (Omarchy's 23 and Cyber Aura, so a Mac has them too) in the settings, tried on live before you keep it. A theme you pick colors the agents' panes as well. See [Themes](#themes).
+- **Settings in place.** `alt+,` changes the theme, the needs-you strip, the sidebar, how new agents start, restoring, notifications and sounds. Each change is written to your config files with your comments kept. See [Settings](#settings).
 
 ## Use
 
-Install with [Homebrew](https://brew.sh), on macOS or Linux:
+trix runs on Linux and macOS, on x86_64 and ARM.
+
+### Requirements
+
+- **Linux or macOS.** The Linux release binaries are built on Ubuntu 22.04 against glibc, so they need glibc 2.35 or newer. There is no Windows build.
+- **A terminal that passes Alt through.** Every trix key is `alt+…`. On a Mac, set your terminal's Option key to send Alt ([how, per terminal](#macos)).
+- **The agents you want to run.** One that isn't installed yet installs in its own pane the first time you start it ([Not installed yet](#not-installed-yet)). Log in to each agent yourself the first time it runs.
+- **Optional:**
+  - `git`: worktrees, branches and diffs on agent cards, and the review.
+  - `gh`: opening and merging pull requests from the review.
+  - `curl`: the live price list, and the vendors' install scripts for missing agents.
+  - On Linux, `notify-send` (libnotify) for desktop notifications, `pw-play` (PipeWire) for sounds and `wl-copy` for copying in terminals that ignore OSC 52.
+- **To build from source:** Rust stable, 1.85 or newer (the crate uses the 2024 edition).
+
+### Install
+
+With [Homebrew](https://brew.sh), on macOS or Linux:
 
 ```sh
 brew install leofle/trix/trix
 ```
 
-On Arch Linux or Omarchy, install the latest release's pacman package (x86_64 or aarch64):
+On Arch Linux or Omarchy, the latest release's pacman package (x86_64 or aarch64):
 
 ```sh
 curl -fLO https://github.com/leofle/trix/releases/latest/download/trix-$(uname -m).pkg.tar.zst
 sudo pacman -U ./trix-$(uname -m).pkg.tar.zst
 ```
 
-Each release also carries its `PKGBUILD`, if you'd rather build the package with `makepkg`. Updates come the same way: run the two lines again.
+Each release also carries its `PKGBUILD`, if you'd rather build the package with `makepkg`.
 
-Or download the latest release for Linux or macOS (x86_64 or ARM) into `~/.local/bin`:
+The release binary for Linux or macOS (x86_64 or ARM), into `~/.local/bin`:
 
 ```sh
 os=$([ "$(uname)" = Darwin ] && echo apple-darwin || echo unknown-linux-gnu)
@@ -68,14 +86,38 @@ curl -fsSL https://github.com/leofle/trix/releases/latest/download/trix-$target.
 mkdir -p ~/.local/bin && mv trix-$target/trix ~/.local/bin/ && rm -r trix-$target
 ```
 
-Each archive on the [releases page](https://github.com/leofle/trix/releases) has a `.sha256` next to it. Or build from a clone with [Rust](https://rustup.rs) (on a Mac, see [macOS](#macos) first):
+Each archive on the [releases page](https://github.com/leofle/trix/releases) has a `.sha256` next to it. On a Mac, a copy downloaded with a browser instead of `curl` is quarantined; clear it with `xattr -d com.apple.quarantine trix`.
+
+From source, with [Rust](https://rustup.rs) (on a Mac, see [Building on a Mac](#building-on-a-mac) first):
 
 ```sh
 git clone https://github.com/leofle/trix.git && cd trix
 cargo install --path .
 ```
 
-Then:
+`trix --version` prints the version you have.
+
+### Upgrade
+
+- Homebrew: `brew upgrade trix`.
+- pacman package or release binary: run the install lines again.
+- From source: `git pull && cargo install --path .` in your clone.
+
+A running workspace keeps the old version until its server stops. `trix kill` stops it and every agent, and the next `trix` starts the new version and offers to bring the workspace back ([Restore](#restore)).
+
+### Uninstall
+
+1. Stop every session: `trix kill --all`.
+2. Remove the binary: `brew uninstall trix`, `sudo pacman -R trix`, `rm ~/.local/bin/trix`, or `cargo uninstall trix`, whichever way you installed it.
+3. If you want, remove what trix keeps:
+   - `~/.config/trix/`: `config.toml`, `colors.toml`, `instructions.md` and `layouts/` (`$XDG_CONFIG_HOME/trix` if set).
+   - `~/.local/state/trix/`: the saved workspace, `prefs.json`, the ports ledger and trusted repositories (`$XDG_STATE_HOME/trix` if set).
+   - `~/.cache/trix/`: the price list (`$XDG_CACHE_HOME/trix` if set).
+   - On macOS, `~/Library/Application Support/trix`, the small app that sends notifications.
+   - Worktrees under a repository's `.trix/worktrees/` are ordinary git worktrees: `git worktree remove <path>`, then `git branch -d trix/<name>`.
+   - Hooks or plugins you added to Grok, Gemini, Antigravity or Amp yourself ([Supported agents](#supported-agents)).
+
+### Quick start
 
 ```sh
 trix                      # open the workspace (or attach to the running one)
@@ -92,7 +134,21 @@ trix -s work              # the same, for a named session (works with every comm
 trix kill --all           # stop every running session
 ```
 
+`alt+n` starts an agent from inside trix, `alt+?` lists every key, and `trix --help` every command.
+
 `trix` starts a background server on first use (`$XDG_RUNTIME_DIR/trix/session.sock`, log in `server.log` next to it) and attaches to it. One terminal is in control at a time: attaching from a second one takes over from the first. To look without taking over, use `trix view`. The server keeps the environment of the terminal that started it, so agents launched later inherit that `PATH`.
+
+### Grid, pins and selection
+
+- **Grid.** `alt+g` tiles your agents live, up to four at a time: two to a row, and three as two on top and one below. The focused tile is accented, blocked tiles turn red, and the rest fade back a little. With more agents, the grid shows the page with the focused agent, and `alt+j`/`alt+k` move through them. The sidebar keeps full cards and scrolls, or shows one-line cards after `alt+c`.
+- **Pins.** Every pane's title starts with a red pin (`⚲`). Click it and that agent moves to the top of the sidebar, with the pin on its card and *pinned* on its title. Up to two agents can be pinned, in the order you pinned them, and pinned cards stay put while the rest of the sidebar scrolls under them. Click the pin again to unpin it, and it goes right below the ones still pinned. The pin is the same red in every theme, and pins come back with a restored workspace. With a Nerd Font, `[ui] nerd_font = true` draws it as `` (see [Config](#config)).
+- **Selection.** Alt+click an agent's card, or press `alt+x` on the focused one, to select it; do it again to unselect it. Selected cards are tinted and checked, and the sidebar's header counts them (click its `✕` to unselect them all). While any are selected, the keys act on all of them:
+  - `alt+w` closes them, asking once if any still runs.
+  - `alt+g` shows only them in the grid, which follows the selection as it changes, and `alt+j`/`alt+k` go round them there.
+  - `alt+b` sends to them first (`tab` still picks every agent or the idle ones).
+  - `alt+o`, or a right-click on a selected agent, opens their menu: restart the exited ones, copy all their folder paths, unselect all, close them.
+
+  Rename, pin and jump stay one agent's. The selection isn't saved with the workspace. On macOS, Cmd+click a card in iTerm2 and Terminal.app, where Option-click doesn't reach trix; in other terminals Option-click works if the terminal passes it on (see [macOS](#macos)). `alt+x` works anywhere.
 
 ### Search
 
@@ -134,6 +190,16 @@ ports = 10                  # how many ports each worktree gets (1 to 100)
 - `X` cleans up a worktree: it closes the agent, then `git worktree remove` and `git branch -d`. Neither is forced: a worktree with changes is refused before anything happens, as is one another agent is still in, in this session or any other, and the branch is deleted only once the main checkout's branch has it, so a branch that's pushed but not merged there is kept.
 - Each git key looks again at the branch and remotes first, so a remote added while the review is open counts without a reload. Push, PR, merge and clean up ask first. Every step runs in the background and says how it went at the foot of the review, or as a toast once it's closed. git and gh are never left waiting on a password prompt.
 
+### Clone
+
+`alt+l`, or *Clone* in an agent's menu, starts another agent like the focused one, next to it: the same kind, flags and repo, in a worktree of its own (`.trix/worktrees/<name>-2` on `trix/<name>-2`). The original isn't touched.
+
+- **Its code.** The new worktree starts at the original's commit, with its uncommitted changes copied over: what's staged stays staged, and files git doesn't track yet come too. Ignored ones (`.env`, build output) don't, unless the repo's `.trix.toml` copies them, as it does for any new worktree.
+- **Its conversation.** Claude, Codex and Grok go on from a copy of the original's conversation (`--fork-session`, `codex fork`), so the clone knows what the original knew, and the two go their own ways from there. Other agents start a new conversation, and say so.
+- **Its cost** counts only what the clone spends itself, not the conversation it was copied from. That holds across a restore and a saved [layout](#layouts).
+- **Restoring it.** A clone is saved with its own conversation only once it has one. Restored before then, it starts a new conversation rather than going on in the original's.
+- Outside git, the clone shares the original's folder.
+
 ### Agent control
 
 Eight commands drive a running workspace from any shell. They're meant for scripts and for agents managing other agents:
@@ -150,7 +216,7 @@ trix args api --model claude-opus-5-5         # change the flags api starts with
 ```
 
 - `<agent>` is an agent's name, or its number in `trix ls`. Names are safer, because numbers shift when an agent closes. `spawn` prints the new agent's name and folder. It refuses a name that's already taken, and it never steals focus from the agent you're looking at.
-- `wait` takes one or more agents and returns when one of them stops working (`--all`: when every one has). It prints one `name<TAB>state<TAB>activity` line per agent, where the state is `done`, `idle`, `needs-you` or `exited`. A prompt just sent with `send` counts as work until the agent's turn starts, so `send` followed by `wait` waits for that turn. After `-t` seconds (default 300, `0` waits forever) it exits with 124, and you can simply run it again. A shell counts as done when it's back at its prompt. Builtins and shell functions run inside the shell itself, so `wait` can't see them.
+- `wait` takes one or more agents and returns when one of them stops working (`--all`: when every one has). It prints one `name<TAB>state<TAB>activity` line per agent, where the state is `done`, `idle`, `needs-you` or `exited`. A prompt just sent with `send` counts as work until the agent's turn starts, so `send` followed by `wait` waits for that turn. After `-t` seconds (default 300, `0` waits forever) it exits with 124, and you can run it again. A shell counts as done when it's back at its prompt. Builtins and shell functions run inside the shell itself, so `wait` can't see them.
 - `events` follows the workspace live, the way `wait` would if it never returned. It starts with one `present` line per agent, then prints a line per change: `spawned`, `state` (with the state it left), `renamed`, `restarted` (a new process in the same place, with a new `id`; `prev_id` is the old one) and `closed`. Name agents to follow only those. Without `--json` it prints a line a person can read (`14:02:11  api  working → needs-you  approve Bash rm -rf dist`). With `--json`, each line is an object with `event`, `at` (Unix ms), `session`, `id`, `number`, `name`, `kind`, `state`, `prev`, `activity`, `unseen`, `cwd` and `managed_by`, the same states as `wait`. It exits 0 when the workspace stops. A reader that stops reading isn't waited for: once 1024 events are queued for it, trix drops it, and it exits 1 saying it fell behind.
 - `args` shows an agent's extra arguments, replaces them (everything after the agent, flags included; one quoted word is taken as written) or removes them with `--clear`. The change is saved with the workspace and takes effect at the agent's next start, such as a restore or a saved layout. The process running now keeps its old flags. An agent may change its own, which is the usual way to fix a typo in your launch flags without closing the pane. Shells take none.
 - Exit codes: 0 ok, 1 refused or failed (the reason goes to stderr), 2 bad usage, 124 `wait` timed out.
@@ -275,7 +341,10 @@ port_base = 20000                 # where blocks start (1024 to 65535)
 port_count = 10                   # ports per block, unless the repo's .trix.toml says (1 to 100)
 ```
 
-- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `compact`, `search`, `broadcast`, `review`, `clone`, `rename`, `close`, `menu`, `select`, `detach`, `help`, `settings` and `quit`. Naming an action replaces its keys, and the actions you leave out keep theirs. A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents. The exception is an F-key, which may stand alone. `super`/`cmd` is refused, because terminals don't pass it on. A key you bind is yours: an action that has it only by default goes without it (with `new = "alt+l"`, clone has no key), so a default trix adds later never breaks your file. Two of your own bindings on one key are an error, and so is a key in jump's range. The footer, the help (`alt+?`) and the other hints show the keys you chose.
+- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `compact`, `search`, `broadcast`, `review`, `clone`, `rename`, `close`, `menu`, `select`, `detach`, `help`, `settings` and `quit`. Naming an action replaces its keys; the actions you leave out keep theirs.
+  - A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents; only an F-key may stand alone. `super`/`cmd` is refused, because terminals don't pass it on.
+  - A key you bind is yours: an action that has it only by default goes without it (with `new = "alt+l"`, clone has no key), so a default trix adds later never breaks your file. Two of your own bindings on one key are an error, and so is a key in jump's range.
+  - The footer, the help (`alt+?`) and the other hints show the keys you chose.
 - **Notifications** cover agents you're not looking at, as before. `on` picks the events; `desktop`, `bell` and `command` pick where they go. `command` runs without a shell (as an argv, or a string split like one; `~` works in the program), from your home folder, with the event's JSON on stdin (the same object as `trix events --json`). It also gets `TRIX_NOTIFY_EVENT` (`needs-you` or `done`), `TRIX_NOTIFY_AGENT`, `TRIX_NOTIFY_TITLE`, `TRIX_NOTIFY_BODY` and `TRIX_NOTIFY_SESSION`. For example, `command = ['sh', '-c', 'curl -s -d "$TRIX_NOTIFY_TITLE" ntfy.sh/my-agents']` puts every notification on your phone through [ntfy](https://ntfy.sh).
 - **Sounds** follow their own settings, separate from `on`. trix has five of its own: `chime`, short and rising, the default for done; `bell`, one strike of a small bell; `drop`, a water droplet, barely there; `knock`, two soft knocks on a door, made for needs-you; and `marimba`, three rising notes. Their names always mean them, so to play a file of yours named `bell`, write its path: `./bell`. A sound file can be anything `pw-play` (wav, flac, ogg) or `afplay` (also mp3, m4a) plays. A relative path is looked up next to `config.toml`. Sounds within two seconds of each other share one sound, done and needs-you separately.
 - **The strip** is the theme's red by default. `color` and `text` take `#rrggbb` (or `#rgb`), or the name of one of the theme's colors (`red`, `yellow`, `green`, `cyan`, `magenta`, `orange`, `accent`, `fg`, `fg_bright`, `bg`), which follows a theme switch. Without `text`, trix picks the theme's dark or light, whichever contrasts more with the strip.
@@ -287,7 +356,85 @@ port_count = 10                   # ports per block, unless the repo's .trix.tom
 - **`[cost]`** sets the budgets and prices in [Cost and tokens](#cost-and-tokens). A price under `[cost.prices]` applies to the model of that name, or to models whose name starts with it (`"gpt-6"` covers `gpt-6-luna`), ahead of the live list and trix's own. `live_prices` and `prices_url` are for the [live list](#cost-and-tokens).
 - **`[worktree]`** sets the ports of [runnable worktrees](#runnable-worktrees). The default base sits below the ports Linux and macOS hand out on their own. What a repository's worktrees run and copy lives in its `.trix.toml`, not here.
 - **What you tell every agent** (who does what, who reports to whom) goes in `~/.config/trix/instructions.md`, not here: see [Your instructions](#your-instructions).
-- `TRIX_NO_NOTIFY=1` still turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever the file says.
+
+### Environment variables
+
+Set these before the workspace server starts; a running server keeps the environment it started with.
+
+- `TRIX_NO_NOTIFY=1` turns off desktop notifications, and `TRIX_NO_SOUND=1` every sound, whatever `config.toml` says.
+- `TRIX_THEME=path/to/colors.toml` sets the theme, ahead of `~/.config/trix/colors.toml` (see [Themes](#themes)).
+- `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the [gauge](#context-gauge).
+- `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_RUNTIME_DIR` move trix's folders as they do for other programs.
+
+Inside a pane, trix sets `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION`, plus `TRIX_PORT`, `TRIX_PORT_END` and `TRIX_PORT_COUNT` in a worktree with [ports](#runnable-worktrees). So any tool can report its state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
+
+### Themes
+
+trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme, then Tokyo Night. The start screen, with no agents open, and the settings' **Theme** row say which one is in use.
+
+trix ships all 23 of Omarchy's themes plus Cyber Aura, built into the binary and in `themes/`, from Catppuccin to White, so a machine without Omarchy has them too. Catppuccin Latte, Flexoki Light, Lupine, Rose Pine and White are light. To pick one, open the [settings](#settings) (`alt+,`) and choose **Theme**: moving through the list tries each theme on, and `enter` keeps it. With Omarchy, the list also has any theme you added to Omarchy, and the file you keep sets trix's theme apart from the desktop's; to follow Omarchy again, choose **Follow Omarchy** at the top of the list, or remove the file. While `TRIX_THEME` is set, the settings can't change the theme.
+
+From a shell, `install-theme.sh` does the same with a theme's name, run from your trix clone:
+
+```sh
+./install-theme.sh ristretto
+```
+
+It copies the theme to `~/.config/trix/colors.toml` (`$XDG_CONFIG_HOME` if set), next to `config.toml`, and every running trix restyles within a second, with no restart. Run it again with another name to switch, or with `tokyo-night` to go back to the default. Run it with no name to list the themes.
+
+It also installs an Omarchy theme folder or any `colors.toml` by path, such as `./install-theme.sh ~/Downloads/some-theme`. If the `colors.toml` it replaces isn't one of the shipped themes, because you made or edited it, it saves that file next to it as `colors.toml.<date>.bak` first. Only the colors count, not comments, so Omarchy's own copy of a theme counts as that theme. The settings do the same with a file you made: choosing another theme keeps yours as a `.bak` first. Installing by hand is the same thing: `mkdir -p ~/.config/trix && cp themes/ristretto/colors.toml ~/.config/trix/colors.toml`. Removing the file, or choosing the top of the list in the settings, goes back to Omarchy's theme or, without Omarchy, to the default.
+
+**In the panes.** A theme picked or installed this way colors the panes too, not only trix's bars, sidebar and cards:
+
+- trix draws each pane's background, plain text and 16 terminal colors from it, mapped the way Omarchy builds a terminal's palette, and answers a program that asks the terminal for its colors (OSC 10, 11 and 4) with the theme's.
+- Agents that draw their own colors are asked to use the terminal's: Claude Code's ANSI-only theme (`dark-ansi`, or `light-ansi` for a light theme like Lupine, in the settings file trix hands Claude), Grok's `terminal` theme (`GROK_THEME=terminal`) and OpenCode's `system` theme (`OPENCODE_CLI_CONFIG_CONTENT`). Your own settings for them don't change, and a `GROK_THEME` or `OPENCODE_CLI_CONFIG_CONTENT` you set yourself wins.
+- Agents take this when they start, so one that was already open keeps its colors until you restart it (`alt+o` › restart). After a theme switch, whatever comes from the 16 colors changes right away. Restart an agent if the rest still looks off, as Claude needs after a switch between a dark and a light theme. A color a program sets exactly (24-bit) stays its own.
+- Because trix paints the background, your terminal's window transparency doesn't show through it. To keep the transparency, turn off **Theme in agent panes** in the settings (`[theme] panes = false`): the theme then stays on trix's bars and sidebar, and the panes and agents keep their own colors.
+- When trix follows Omarchy's theme, it leaves the panes to your terminal, which Omarchy themes for you, and answers color questions with Omarchy's colors. With no theme at all, the panes are your terminal's.
+
+To make your own theme, edit your copy. It is Omarchy's `colors.toml` format, one `key = "#rrggbb"` per line, and any key you leave out keeps its Tokyo Night color.
+
+### Agent workspace discovery
+
+Trix supplies workspace discovery instructions to Claude through
+`--append-system-prompt` and Codex through `-c developer_instructions=…`.
+New sessions are instructed to run `trix ls --json`, identify their own pane,
+and use Trix commands for authorized coordination. Claude's custom append
+prompt is combined with these instructions. So are the `developer_instructions`
+in your Codex `config.toml` (the active profile's, else the top level's), which
+`-c` would otherwise replace. A `-c developer_instructions=…` in your own Codex
+args comes last and replaces both.
+
+OpenCode receives a runtime instruction file through its session configuration;
+Copilot receives the same file through `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`,
+appended to existing directories. Muse receives context from its own
+`SessionStart` hook (when Trix’s managed hooks are enabled), and Gemini from
+its own once you've added trix's hooks ([Gemini](#supported-agents)), as does
+Antigravity from its. Amp receives it with a thread's first prompt, from
+trix's plugin once you've added that ([Amp](#supported-agents)). Grok and
+Cursor do not yet receive this context.
+Existing conversations may retain their original instructions; start a new
+conversation after updating Trix. No user configuration files are modified.
+
+### Your instructions
+
+`~/.config/trix/instructions.md` is what you'd otherwise tell every agent yourself: who does what, who reports to whom, what an agent may do without asking. Every agent gets it after trix's own instructions above, the same way, marked as yours. Where it asks agents to message, report to or hand work to each other, that counts as the go-ahead trix's instructions ask for. It never lifts the rule against `--force`.
+
+```markdown
+## Roles
+- **alpha dog** reviews every PR the others open, merges the ones that are
+  ready (only with CI green), and is the only one who reports to the user.
+- Everyone else builds what they're asked, then reports to alpha dog with
+  `trix send "alpha dog" "<what you did, the PR link, what's left>"`.
+  Ask alpha dog, not the user, when you're stuck. Don't merge your own PRs.
+```
+
+- Each agent knows its own name (`trix ls --json` marks it `you: true`), so one file can give every role.
+- It's read as each agent starts, so an edit reaches the agents started after it: new ones, restores, layouts, restarts. Those already running keep what they started with.
+- It lives with your config, outside every repository, and nothing of it lands in a project.
+- Every agent carries it in its prompt on every turn, so keep it short. A file over 16 KB, or one that isn't UTF-8 text, isn't used: agents get trix's instructions alone, a toast says why as they start, and `trix config` checks it. An empty file is no file.
+- Starting agents is trix's job, not the file's: nothing reads it until an agent starts. To always have an agent there, keep it in a [layout](#layouts).
+- Rules for one project's code (its tests, its style) belong in that repository's `CLAUDE.md` or `AGENTS.md`, which agents read themselves.
 
 ### Context gauge
 
@@ -328,15 +475,25 @@ Without `-s` you get the default session. `-s <name>` (or `--session <name>`) pi
 
 ### Restore
 
-**After a crash, nothing needs restoring.** The server owns no terminals: each agent's PTY, and the program in it, belong to a holder process of its own (`trix holder`, in its own process session, like dtach or abduco), which also keeps the last 4 MB of that agent's output. If the server dies, from a panic or a `kill -9`, the holders and their programs carry on: a long build keeps building, a shell keeps its running command, Claude keeps its turn. The next server (the next `trix`) finds them by their sockets (`holder.<hash of the session>.<agent id>.<pid>.sock`, and each holder confirms the session and id when greeted), attaches, and rebuilds each pane from the output its holder kept: same agents, same ids, same order, focus and pins, their scrollback back, the counter still counting. Agents' hooks keep reporting across the change, since `TRIX_SOCKET` is the session's (`hooks.sock`, `hooks-<name>.sock`), not one server's. Anything that came back this way is left out of the restore offer below. The emulator's answers to what the program asked long ago aren't sent again while its output replays.
+**After a crash, nothing needs restoring.** The server owns no terminals: each agent's PTY, and the program in it, belong to a holder process of its own (`trix holder`, in its own process session, like dtach or abduco), which also keeps the last 4 MB of that agent's output. If the server dies, from a panic or a `kill -9`, the holders and their programs carry on: a long build keeps building, a shell keeps its running command, Claude keeps its turn. The next server (the next `trix`) attaches to them and rebuilds each pane from the output its holder kept: same agents, same ids, same order, focus and pins, their scrollback back, the counter still counting. Anything that came back this way is left out of the restore offer below.
 
-**Full-screen programs come back full-screen.** A holder keeps only the last 4 MB, so a program that switched to the alternate screen, hid the cursor or turned on mouse reporting long ago has had that setup scroll out of the buffer. The holder follows the terminal modes as the output passes through it (alternate screen, cursor visibility and style, application cursor keys and keypad, bracketed paste, mouse reporting and its encoding, focus events, the kitty keyboard flags, the scroll region, wraparound, origin and insert mode), as a byte-level parser that doesn't mind a sequence split across reads and doesn't take what's inside a title or other string for a command. A new server gets the modes in force where the kept output begins, as a short preamble, then the output itself; when trimming, the buffer starts at a line, never inside a sequence, and on the alternate screen at its next full clear when there's one, so the replay draws from a clean screen. Then the holder tells a full-screen program the terminal changed size (one row less for a moment, then back), so it repaints all of it at once. What a preamble doesn't carry is the cursor position and colors where the kept output begins, which a full clear or repaint sets anyway, and a program that ignores a size change shows what its kept output draws until it next repaints.
+- **Finding them.** Holders are found by their sockets (`holder.<hash of the session>.<agent id>.<pid>.sock`), and each confirms the session and id when greeted. Agents' hooks keep reporting across the change, since `TRIX_SOCKET` is the session's (`hooks.sock`, `hooks-<name>.sock`), not one server's. The emulator's answers to what the program asked long ago aren't sent again while its output replays.
+- **Socket paths.** A Unix socket path has to fit in 104 bytes on macOS and 108 on Linux, which a long runtime folder can overflow. Holders' socket names are short whatever the session's name (12 hex digits stand for it), and any socket whose full path wouldn't fit goes in `/tmp/trix-<uid>` instead, a folder only you can open (trix makes it `0700`, and won't use one that isn't yours or that others can open). trix looks for sockets in both places, so no agent is left without a holder because of where your runtime folder is or what your session is called.
+- **Full-screen programs come back full-screen.** A holder keeps only the last 4 MB, so a program that switched to the alternate screen, hid the cursor or turned on mouse reporting long ago has had that setup scroll out of the buffer. So the holder follows the terminal modes as the output passes through it: alternate screen, cursor visibility and style, application cursor keys and keypad, bracketed paste, mouse reporting and its encoding, focus events, the kitty keyboard flags, the scroll region, wraparound, origin and insert mode. It's a byte-level parser that doesn't mind a sequence split across reads, and doesn't take what's inside a title or other string for a command.
+  - A new server gets the modes in force where the kept output begins, as a short preamble, then the output itself. When trimming, the buffer starts at a line, never inside a sequence, and on the alternate screen at its next full clear when there's one, so the replay draws from a clean screen.
+  - Then the holder tells a full-screen program the terminal changed size (one row less for a moment, then back), so it repaints all of it at once.
+  - A preamble doesn't carry the cursor position and colors where the kept output begins, which a full clear or repaint sets anyway. A program that ignores a size change shows what its kept output draws until it next repaints.
+- **Stopping.** `trix kill`, `alt+q` and closing an agent stop holders and their programs, as they always stopped the agents; detaching (`alt+d`, closing the terminal) never does.
+  - A holder hears that even from a program that stopped reading its input: typing goes through a queue of its own, and what's typed past 1 MB of backlog is dropped. A holder that still hasn't stopped a few seconds later is stopped by the server, program and all, so a closed agent never comes back with the next server.
+  - A holder made to stop signals its program only while that is still its child, so a pid that went to another process since is never touched.
+  - `trix kill` with no server running stops the agents a crashed one left behind, and `trix kill --all` does that for every session, except those of a session whose server is only just starting (it holds the session's lock already, and is about to reattach them). Until then they aren't forgotten: `trix ls`, and any command that finds no server, says how many agents are still running, and that `trix` picks them up and `trix kill` stops them.
+  - A program that ended while no server was attached is kept, with its last screen and exit code, for an hour; then its holder goes.
+  - If a holder can't start, or doesn't say it's up within 10 seconds (then it's killed, so it can't start the program a second time), that agent's terminal lives in the server, and only the restore below can bring it back.
+- **A server that falls behind.** A server that stops reading for 5 seconds is let go and hung up on, so the program never stalls behind it. The server hears that, attaches again and redraws the pane from the replay, and what you typed meanwhile is sent once it's back; a program that ended meanwhile comes back with its last output and its exit code. A server taken over by another is told so, and doesn't attach again.
+- **Where reattached agents are.** One that needed you still does (and so does one whose screen shows a question that came up while no server watched), news nobody looked at is still news, and one that was working still is if it's still writing. One whose turn ended while no server heard its hook is done, *finished while trix was away*, and that is news too (not "interrupted": nobody was there to interrupt it). This goes for agents that report their turns, OpenCode aside, which can work without a word.
+- **Upgrades.** Holders greet with a protocol version, since they outlive upgrades: a trix attaches to holders of its version or older, and leaves a newer one running for the trix that started it, saying so.
 
-Sockets have to fit a Unix socket path (104 bytes on macOS, 108 on Linux), which a long runtime folder can overflow. Holders' socket names are short whatever the session's name (12 hex digits stand for it), and any socket whose full path wouldn't fit goes in `/tmp/trix-<uid>` instead, a folder only you can open (trix makes it `0700`, and won't use one that isn't yours or that others can open); trix looks for sockets in both places. So no agent is left without a holder because of where your runtime folder is or what your session is called.
-
-`trix kill`, alt+q, and closing an agent stop holders and their programs, as they always stopped the agents; detaching (`alt+d`, closing the terminal) never does. A holder hears that even from a program that stopped reading its input (typing goes through a queue of its own, and what's typed past 1 MB of backlog is dropped), and a holder that still hasn't stopped a few seconds later is stopped by the server, program and all, so a closed agent never comes back with the next server. `trix kill` with no server running stops the agents a crashed one left behind, and `trix kill --all` does that for every session; not those of a session whose server is only just starting (it holds the session's lock already, and is about to reattach them). Until then they aren't forgotten: `trix ls`, and any command that finds no server, says how many agents are still running, and that `trix` picks them up and `trix kill` stops them. A holder made to stop signals its program only while that is still its child, so a pid that went to another process since is never touched. A program that ended while no server was attached is kept, with its last screen and exit code, for an hour, then its holder goes. If a holder can't start, or doesn't say it's up within 10 seconds (then it's killed, so it can't start the program a second time), that agent's terminal lives in the server as before, and only the restore below can bring it back.
-
-A server that stops reading for 5 seconds is let go and hung up on, so the program never stalls behind it; the server hears that, attaches again and redraws the pane from the replay, and what you typed meanwhile is sent once it's back; a program that ended meanwhile comes back with its last output and its exit code. A server taken over by another is told so, and doesn't. Reattached agents are where they were: one that needed you still does (and so does one whose screen shows a question that came up while no server watched), news nobody looked at is still news, and one that was working still is if it's still writing. One whose turn ended while no server heard its hook is done, *finished while trix was away*, and that is news too (not "interrupted": nobody was there to); this goes for agents that report their turns, OpenCode aside, which can work without a word. Holders greet with a protocol version, since they outlive upgrades: a trix attaches to holders of its version or older, and leaves a newer one running for the trix that started it, saying so.
+**After `trix kill`, `alt+q` or a reboot**, the saved workspace brings the agents back.
 
 The layout (kind, name, folder, extra args, and the conversation id each agent reports, or that trix gave Grok or Copilot) is saved to `$XDG_STATE_HOME/trix/workspace.json` (default `~/.local/state/trix/`; `workspace-<name>.json` for a named session) whenever it changes. When a fresh server finds it, you're asked once:
 
@@ -349,6 +506,8 @@ To stop being asked, set **Bring back the last workspace** in the [settings](#se
 Scrollback isn't restored this way (only by reattaching), and closed or exited agents aren't saved.
 
 The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separately, in `prefs.json` in the same folder. It applies to every session and survives restarts whether or not you restore.
+
+### Keys
 
 | key | action |
 | --- | --- |
@@ -378,11 +537,11 @@ Every other key goes straight to the focused agent, including `shift+enter` for 
 
 ## macOS
 
-trix runs on Linux and macOS. macOS support is new: if something doesn't work, please [open an issue](https://github.com/leofle/trix/issues) and include `$TMPDIR/trix-$(id -u)/server.log` (`server-<name>.log` for a named session).
+trix runs on Linux and macOS. macOS support is newer: if something doesn't work, please [open an issue](https://github.com/leofle/trix/issues) and include `$TMPDIR/trix-$(id -u)/server.log` (`server-<name>.log` for a named session).
 
-### Install
+### Building on a Mac
 
-`brew install leofle/trix/trix` is the quickest way, and `brew upgrade` keeps it current. The [download above](#use) works on a Mac too. A copy downloaded with a browser instead of `curl` is quarantined by macOS; clear it with `xattr -d com.apple.quarantine trix`. To build it yourself:
+`brew install leofle/trix/trix` is the quickest way, and `brew upgrade trix` keeps it current. The [release binary](#install) works on a Mac too. To build it yourself:
 
 ```sh
 xcode-select --install          # Apple's compiler and linker (skip it if git already works)
@@ -392,7 +551,7 @@ git clone https://github.com/leofle/trix.git && cd trix
 cargo install --path .          # installs ~/.cargo/bin/trix
 ```
 
-Then set your terminal's Option key to send Alt (below), and run `trix claude` in a project folder. trix starts [Claude Code](https://claude.com/claude-code), Codex and the [other supported agents](#supported-agents). One that isn't installed yet installs in its own pane the first time you start it, with Homebrew or npm (see [Not installed yet](#not-installed-yet)). Log in to each agent yourself the first time it runs.
+Then set your terminal's Option key to send Alt (below), and run `trix claude` in a project folder.
 
 ### Differences
 
@@ -401,68 +560,6 @@ Then set your terminal's Option key to send Alt (below), and run `trix claude` i
 - **Notifications** come from trix, with its icon. macOS shows the icon of the app that sends a notification, so trix keeps a small app of its own: `trix.app` in `~/Library/Application Support/trix`, a copy of the `trix` binary with the icon, made the first time trix notifies you and again after you update trix. The first notification asks whether trix may notify you. If you missed that question or said no, turn on System Settings › Notifications › trix. Clicking a notification only dismisses it. If the app can't be made, notifications go through `osascript` as before and come from Script Editor, and the server log says why.
 - **Sounds** play through `afplay`. **Copying** goes through OSC 52, plus `pbcopy` for terminals that ignore it (Terminal.app).
 - **Files:** sockets and logs live under `$TMPDIR/trix-<uid>`, where `<uid>` is your user ID (`id -u`), because there's no `XDG_RUNTIME_DIR`. The saved workspace lives in `~/.local/state/trix`, and `trix.app`, which sends the notifications, in `~/Library/Application Support/trix`. Without Omarchy, the theme is Tokyo Night until you pick one (see [Themes](#themes)).
-
-### Themes
-
-A Mac has no Omarchy theme for trix to follow, so trix ships all 23 of Omarchy's plus Cyber Aura, built into the binary and in `themes/`, from Catppuccin to White. Tokyo Night is the default. Catppuccin Latte, Flexoki Light, Lupine, Rose Pine and White are light. To pick one, open the [settings](#settings) (`alt+,`) and choose **Theme**. Moving through the list tries each theme on, and `enter` keeps it. On Linux with Omarchy, the list also has any theme you added to Omarchy.
-
-From a shell, `install-theme.sh` does the same with a theme's name, run from your trix clone:
-
-```sh
-./install-theme.sh ristretto
-```
-
-It copies the theme to `~/.config/trix/colors.toml` (`$XDG_CONFIG_HOME` if set), next to `config.toml`, and every running trix restyles within a second, with no restart. Run it again with another name to switch, or with `tokyo-night` to go back to the default. Run it with no name to list the themes.
-
-It also installs an Omarchy theme folder or any `colors.toml` by path, such as `./install-theme.sh ~/Downloads/some-theme`. If the `colors.toml` it replaces isn't one of the shipped themes, because you made or edited it, it saves that file next to it as `colors.toml.<date>.bak` first. Only the colors count, not comments, so Omarchy's own copy of a theme counts as that theme. The settings do the same with a file you made: choosing another theme keeps yours as a `.bak` first. Installing by hand is the same thing: `mkdir -p ~/.config/trix && cp themes/ristretto/colors.toml ~/.config/trix/colors.toml`. Removing the file, or choosing the top of the list in the settings, goes back to Omarchy's theme or, without Omarchy, to the default.
-
-A theme picked or installed this way colors the panes too, not only trix's bars, sidebar and cards. trix draws each pane's background, plain text and 16 terminal colors from it, mapped the way Omarchy builds a terminal's palette. It also answers a program that asks the terminal for its colors (OSC 10, 11 and 4) with the theme's. Agents that draw their own colors are asked for their themes that use the terminal's instead: Claude Code's ANSI-only theme (`dark-ansi`, or `light-ansi` for a light theme like Lupine, in the settings file trix hands Claude), Grok's `terminal` theme (`GROK_THEME=terminal`) and OpenCode's `system` theme (`OPENCODE_CLI_CONFIG_CONTENT`). Your own settings for them don't change, and a `GROK_THEME` or `OPENCODE_CLI_CONFIG_CONTENT` you set yourself wins. Agents take this when they start, so one that was already open keeps its colors until you restart it (`alt+o` › restart). After a theme switch, whatever comes from the 16 colors changes right away. Restart an agent if the rest still looks off, as Claude needs after a switch between a dark and a light theme. A color a program sets exactly (24-bit) stays its own. Because trix paints the background, your terminal's window transparency doesn't show through it. To keep the transparency, turn off **Theme in agent panes** in the settings (`[theme] panes = false`): the theme then stays on trix's bars and sidebar, and the panes and agents keep their own colors. When trix follows Omarchy's theme it leaves the panes to your terminal, which Omarchy themes for you, and answers color questions with Omarchy's colors. With no theme at all, the panes are your terminal's as before.
-
-To make your own theme, edit your copy. It is Omarchy's `colors.toml` format, one `key = "#rrggbb"` per line, and any key you leave out keeps its Tokyo Night color.
-
-trix uses the first theme it finds: the file `TRIX_THEME` points at, then `~/.config/trix/colors.toml`, then Omarchy's current theme. The start screen, with no agents open, and the settings' **Theme** row say which one is in use. While `TRIX_THEME` is set, the settings can't change the theme. On Linux with Omarchy, the file sets trix's theme apart from the desktop's. To follow Omarchy again, choose **Follow Omarchy** at the top of the list, or remove the file. On Linux without Omarchy, it all works as on a Mac.
-
-### Agent workspace discovery
-
-Trix supplies workspace discovery instructions to Claude through
-`--append-system-prompt` and Codex through `-c developer_instructions=…`.
-New sessions are instructed to run `trix ls --json`, identify their own pane,
-and use Trix commands for authorized coordination. Claude's custom append
-prompt is combined with these instructions. So are the `developer_instructions`
-in your Codex `config.toml` (the active profile's, else the top level's), which
-`-c` would otherwise replace. A `-c developer_instructions=…` in your own Codex
-args comes last and replaces both.
-
-OpenCode receives a runtime instruction file through its session configuration;
-Copilot receives the same file through `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`,
-appended to existing directories. Muse receives context from its own
-`SessionStart` hook (when Trix’s managed hooks are enabled), and Gemini from
-its own once you've added trix's hooks ([Gemini](#supported-agents)), as does
-Antigravity from its. Amp receives it with a thread's first prompt, from
-trix's plugin once you've added that ([Amp](#supported-agents)). Grok and
-Cursor do not yet receive this context.
-Existing conversations may retain their original instructions; start a new
-conversation after updating Trix. No user configuration files are modified.
-
-### Your instructions
-
-`~/.config/trix/instructions.md` is what you'd otherwise tell every agent yourself: who does what, who reports to whom, what an agent may do without asking. Every agent gets it after trix's own instructions above, the same way, marked as yours. Where it asks agents to message, report to or hand work to each other, that counts as the go-ahead trix's instructions ask for. It never lifts the rule against `--force`.
-
-```markdown
-## Roles
-- **alpha dog** reviews every PR the others open, merges the ones that are
-  ready (only with CI green), and is the only one who reports to the user.
-- Everyone else builds what they're asked, then reports to alpha dog with
-  `trix send "alpha dog" "<what you did, the PR link, what's left>"`.
-  Ask him, not the user, when you're stuck. Don't merge your own PRs.
-```
-
-- Each agent knows its own name (`trix ls --json` marks it `you: true`), so one file can give every role.
-- It's read as each agent starts, so an edit reaches the agents started after it: new ones, restores, layouts, restarts. Those already running keep what they started with.
-- It lives with your config, outside every repository, and nothing of it lands in a project.
-- Every agent carries it in its prompt on every turn, so keep it short. A file over 16 KB, or one that isn't UTF-8 text, isn't used: agents get trix's instructions alone, a toast says why as they start, and `trix config` checks it. An empty file is no file.
-- Starting agents is trix's job, not the file's: nothing reads it until an agent starts. To always have an agent there, keep it in a [layout](#layouts).
-- Rules for one project's code (its tests, its style) belong in that repository's `CLAUDE.md` or `AGENTS.md`, which agents read themselves.
 
 ## Supported agents
 
@@ -525,17 +622,23 @@ trix starts each of these agents by name, with an argv (never through a shell), 
   } }
   ```
   With it, the hooks report the prompt, each tool (`run_shell_command cargo test`, `replace app.rs`), the turn's end and the conversation id. Gemini runs `BeforeTool` before it asks you about a tool, then `Notification` with type `ToolPermission` as it asks: trix shows `approve <the tool>`, and `ask_user` shows its question. A turn you stop with esc raises no hook: the title going back to ready says so. The hook also gives Gemini the workspace discovery instructions as its session starts, inside a trix pane only (Gemini adds them to the conversation as a `<hook_context>` turn). Otherwise it prints nothing, and it never exits 2, so it never blocks or decides anything. Tested with Gemini CLI 0.68.0 in a trix pane: folder trust, its login dialog, the hooks reporting a prompt and its turn's end, the discovery instructions reaching the model's request, and `--session-id`.
-- **Antigravity** ([Antigravity CLI](https://antigravity.google/docs/cli/reference), Google's `agy`) is where Gemini CLI's personal Google sign-in moved: since June 2026, Gemini CLI answers a personal account with "This client is no longer supported for Gemini Code Assist for individuals". It can't be handed hooks per process either: it reads them from `~/.gemini/config/hooks.json`, a project's `.agents/hooks.json` and its plugins, and has no flag or variable for more. It sets no terminal title of its own, so without hooks its state comes from output cadence and the screen: its sign-in (`Select login method:`), its project trust (`Do you trust the contents of this project?`) and its approval prompts (`Requesting permission for:`, `Yes, run command`, and the ways out of the others: `No, deny…`, `No, reject this change`). A first prompt goes in as `--prompt-interactive=<prompt>`. `agy` has no flag to name a new conversation, so restore resumes one (`--conversation <id>`) only once its hooks have reported it. For that, tool-by-tool detail and [workspace discovery](#agent-workspace-discovery), add trix's hook yourself, in `~/.gemini/config/hooks.json` (`trix` must be on the `PATH` Antigravity runs hooks with; in a project's `.agents/hooks.json` it runs only from the session after the one that trusted the folder):
-  ```json
-  { "trix": {
-      "SessionStart":  [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }],
-      "PreInvocation": [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }],
-      "PreToolUse":    [{ "matcher": "*", "hooks": [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }] }],
-      "PostToolUse":   [{ "matcher": "*", "hooks": [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }] }],
-      "Stop":          [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }]
-  } }
-  ```
-  With it, the hooks report the prompt, each tool (`run_command cargo test`, `replace_file_content app.rs`), its questions (`ask_question`), the turn's end, a turn you stopped, and the conversation id. No hook reports an approval: the prompt on screen does, and trix shows `approve <the tool>` from the `PreToolUse` before it. None reports a tool you decline or a turn you stop with esc either: the prompt gone from a still screen says `declined`, and a screen gone quiet `interrupted`. Antigravity reads a hook's stdout as its answer, and the same file serves its app and IDE, so `trix hook antigravity` always answers, and never with a decision of its own: before a tool, `allow`, which hands the call on to Antigravity's own permissions (it still asks you wherever it would have; an answer with no decision makes Antigravity deny the tool), `{}` otherwise, and inside a trix pane the workspace discovery instructions as the session starts. Tested with Antigravity CLI 1.5.9 in a trix pane: sign-in, project trust, turns with and without the hooks, a command's approval allowed and declined, a turn stopped with esc, the conversation id and `--conversation`. Its file-edit and file-access approvals and its `ask_question` dialog follow the wording in its binary. In auto mode (and with `--sandbox`) Antigravity runs commands in a sandbox that refuses trix's socket, so a `trix ls` or `trix send` it runs fails there first. trix says so (`a sandbox blocks its socket here … run this trix command again outside the sandbox`) rather than `no workspace running`, and Antigravity then runs it outside the sandbox, asking you first where its mode does.
+- **Antigravity** ([Antigravity CLI](https://antigravity.google/docs/cli/reference), Google's `agy`) is where Gemini CLI's personal Google sign-in moved: since June 2026, Gemini CLI answers a personal account with "This client is no longer supported for Gemini Code Assist for individuals". It can't be handed hooks per process either: it reads them from `~/.gemini/config/hooks.json`, a project's `.agents/hooks.json` and its plugins, and has no flag or variable for more.
+  - **Without hooks.** It sets no terminal title of its own, so its state comes from output cadence and the screen: its sign-in (`Select login method:`), its project trust (`Do you trust the contents of this project?`) and its approval prompts (`Requesting permission for:`, `Yes, run command`, and the ways out of the others: `No, deny…`, `No, reject this change`). A first prompt goes in as `--prompt-interactive=<prompt>`. `agy` has no flag to name a new conversation, so restore resumes one (`--conversation <id>`) only once its hooks have reported it.
+  - **The hook.** For that, tool-by-tool detail and [workspace discovery](#agent-workspace-discovery), add trix's hook yourself, in `~/.gemini/config/hooks.json` (`trix` must be on the `PATH` Antigravity runs hooks with; in a project's `.agents/hooks.json` it runs only from the session after the one that trusted the folder):
+    ```json
+    { "trix": {
+        "SessionStart":  [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }],
+        "PreInvocation": [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }],
+        "PreToolUse":    [{ "matcher": "*", "hooks": [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }] }],
+        "PostToolUse":   [{ "matcher": "*", "hooks": [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }] }],
+        "Stop":          [{ "type": "command", "command": "trix hook antigravity", "timeout": 5 }]
+    } }
+    ```
+    With it, the hooks report the prompt, each tool (`run_command cargo test`, `replace_file_content app.rs`), its questions (`ask_question`), the turn's end, a turn you stopped, and the conversation id.
+  - **Approvals.** No hook reports one: the prompt on screen does, and trix shows `approve <the tool>` from the `PreToolUse` before it. None reports a tool you decline or a turn you stop with esc either: the prompt gone from a still screen says `declined`, and a screen gone quiet `interrupted`.
+  - **Watching only.** Antigravity reads a hook's stdout as its answer, and the same file serves its app and IDE, so `trix hook antigravity` always answers, and never with a decision of its own: before a tool, `allow`, which hands the call on to Antigravity's own permissions (it still asks you wherever it would have; an answer with no decision makes Antigravity deny the tool), `{}` otherwise, and inside a trix pane the workspace discovery instructions as the session starts.
+  - **Its sandbox.** In auto mode (and with `--sandbox`) Antigravity runs commands in a sandbox that refuses trix's socket, so a `trix ls` or `trix send` it runs fails there first. trix says so (`a sandbox blocks its socket here … run this trix command again outside the sandbox`) rather than `no workspace running`, and Antigravity then runs it outside the sandbox, asking you first where its mode does.
+  - **Tested** with Antigravity CLI 1.5.9 in a trix pane: sign-in, project trust, turns with and without the hooks, a command's approval allowed and declined, a turn stopped with esc, the conversation id and `--conversation`. Its file-edit and file-access approvals and its `ask_question` dialog follow the wording in its binary.
 - **Amp** ([Amp](https://ampcode.com/docs/cli), Sourcegraph's `amp`) can't be handed hooks per process either: it reads plugins only from a project's `.amp/plugins/` and from `~/.config/amp/plugins/`, and has no flag, variable or setting for more. Without the plugin its state comes from output cadence and the screen, with the prompt wording any agent's share: Amp's own approval wording and its terminal title aren't documented, so trix reads neither.
   - **First prompt.** Amp takes no first prompt as an argument. Its docs: "If you pipe input to the CLI, it uses the input as the first user message in interactive mode". So trix starts it with the prompt on its stdin: a pipe that holds the prompt and then ends, with Amp's screen and keys still the pane's. No shell is involved: the pane runs `trix install amp --stdin <prompt> -- amp …`, which becomes `amp`.
   - **Conversations.** Amp names its own threads (`T-…`) and can't be told a new one's id, so restore continues one (`amp threads continue <id>`, your extra args after it) only once the plugin has reported it. A thread it continues takes no first prompt.
@@ -582,7 +685,11 @@ From then on, Codex panes show live detail like Claude's: `exec_command cargo te
 
 Until the hooks are trusted, Codex skips them and trix falls back to Codex's `notify`, which only reports finished turns. Screen heuristics cover the rest, and the first finished turn shows a one-time reminder. Codex records trust against the hook's exact definition, which includes the path to trix. If you run trix from another path, such as `target/release/trix` while developing, Codex asks you to trust its hooks again.
 
-Codex panes can drive the workspace like any other agent: `trix ls`, `trix send`, `trix spawn` and the rest. Codex's sandbox blocks every socket while its network is off, trix's own included, so trix also passes `-c sandbox_workspace_write.network_access=true`. Without it, those commands say `no workspace running`. That setting also lets the commands Codex runs reach the network, as they would in a plain shell. To keep it off, start Codex with `-c sandbox_workspace_write.network_access=false` in its command (your own args come after trix's, so they win). In read-only mode (`--sandbox read-only`, or a folder you haven't trusted), Codex can't reach trix either way. The commands Codex runs in its sandbox can't use trix to get out of it: trix refuses them anything it would do outside the sandbox, such as starting a shell or answering another agent's prompt (see the guard rails under [Agent control](#agent-control)). A command you approve to run outside the sandbox isn't held back.
+Codex panes can drive the workspace like any other agent: `trix ls`, `trix send`, `trix spawn` and the rest.
+
+- **Network access.** Codex's sandbox blocks every socket while its network is off, trix's own included, so trix also passes `-c sandbox_workspace_write.network_access=true`. Without it, those commands say `no workspace running`. That setting also lets the commands Codex runs reach the network, as they would in a plain shell. To keep it off, start Codex with `-c sandbox_workspace_write.network_access=false` in its command (your own args come after trix's, so they win).
+- **Read-only mode** (`--sandbox read-only`, or a folder you haven't trusted): Codex can't reach trix either way.
+- **No way out of the sandbox.** The commands Codex runs in its sandbox can't use trix to get out of it: trix refuses them anything it would do outside the sandbox, such as starting a shell or answering another agent's prompt (see the guard rails under [Agent control](#agent-control)). A command you approve to run outside the sandbox isn't held back.
 
 Codex shows a startup warning that `-c` overrides run it "without the shared background server". That's been true of every Codex pane in trix, because trix has always passed `-c notify=…`.
 
@@ -596,7 +703,48 @@ Codex shows a startup warning that `-c` overrides run it "without the shared bac
 | `○` | idle | at the prompt, or interrupted (Codex `Interrupt`, OpenCode abort) |
 | `•` | unseen | it finished or asked something while you were elsewhere |
 
-## Layout
+## Security
+
+trix runs agents as you, with your permissions. It doesn't sandbox them; it keeps itself from widening what they can do:
+
+- **It never answers a prompt for you.** trix's hooks and plugins only watch: none decides whether a tool runs. Cursor gets none of its permission hooks, Copilot's and Muse's hooks run as `trix hook … || true`, Gemini's never blocks, and Antigravity's answers `allow`, which hands the call on to Antigravity's own permissions. `trix send` (without `--force`), a broadcast and the review's notes are never typed into an agent that needs you, so none of them can answer its prompt ([guard rails](#agent-control)).
+- **Sandboxed agents stay sandboxed.** A command running inside an agent's sandbox (such as Codex's) can't use trix to do anything outside it: no shells, custom commands, `--force`, layouts or `trix kill`. trix asks the kernel which process is on the other end of its socket and checks its sandbox ([guard rails](#agent-control)).
+- **A repository's setup runs only once you trust it.** Nothing in a `.trix.toml` runs or is copied until you accept it in the new-agent form, which shows exactly what would run, and any change to it asks again ([Trust](#runnable-worktrees)). That guards against surprises; it isn't a sandbox.
+- **Your agent configs stay yours.** Everything trix hands an agent is passed to that one process and lives in trix's runtime folder until the server stops. trix makes that folder `0700` and refuses to start if it isn't private to you; sockets whose path would be too long go in `/tmp/trix-<uid>`, which trix makes `0700` and won't use if it isn't yours or others can open it.
+- **No shell in between.** Supported agents are started by name with an argv, never through a shell, and so is a notification `command`.
+- **What reaches the network:** trix fetches [LiteLLM's](https://github.com/BerriAI/litellm) public price list about once a day with `curl` (`[cost] live_prices = false` stops it). A missing agent is installed with mise, Homebrew, npm or its vendor's install script the first time you start it, in its pane where you can watch ([Not installed yet](#not-installed-yet)). Codex panes get `-c sandbox_workspace_write.network_access=true` so they can reach trix's socket, which also lets Codex's commands reach the network ([Codex](#codex) says how to turn it off). git and gh reach a remote only when you push, open or merge a pull request from the [review](#review).
+- **Reporting a vulnerability:** please don't put the details in a public issue. Open an issue saying you have a security report, and we'll arrange a private way to send it.
+
+## Troubleshooting
+
+Start with the server log: `$XDG_RUNTIME_DIR/trix/server.log` on Linux, `$TMPDIR/trix-$(id -u)/server.log` on macOS (`server-<name>.log` for a named session). Without `XDG_RUNTIME_DIR`, Linux uses the temp folder's `trix-<uid>` too.
+
+- **`alt` keys type characters like `˜` or `å` (macOS).** Set your terminal's Option key to send Alt: see [macOS](#macos).
+- **A config change doesn't take.** A mistake in `config.toml` keeps the previous settings, and a toast names the line. `trix config` checks `config.toml` and `instructions.md` from the command line.
+- **An agent you just installed isn't found, or a new trix isn't running after an upgrade.** The server keeps the `PATH` and binary it started with. Run `trix kill`, then `trix` from a new terminal; the workspace is offered back.
+- **Codex panes only show finished turns.** Trust trix's hooks once in Codex's `/hooks` screen ([Codex](#codex)). Codex asks again if trix runs from another path.
+- **`trix` commands inside Codex say `no workspace running`.** Codex's sandbox has its network off, or the folder is read-only to it ([Codex](#codex)).
+- **Antigravity says `a sandbox blocks its socket here`.** Its auto mode runs commands in a sandbox that refuses trix's socket; Antigravity then runs the command outside it, asking you first where its mode does.
+- **`trix: refusing to use …`.** The runtime folder isn't private to you, for example another user made it first in a shared `/tmp`. Fix its owner or permissions (`0700`), or set `XDG_RUNTIME_DIR`.
+- **No notifications.** On Linux, trix needs `notify-send` and a notification daemon. On macOS, allow trix in System Settings › Notifications › trix. Check `[notify]` in `config.toml` and that `TRIX_NO_NOTIFY` isn't set.
+- **No sound.** On Linux, trix plays through `pw-play` (PipeWire). Check `[sound]` and `mute` in `config.toml`, and `TRIX_NO_SOUND`.
+- **Copying doesn't reach the clipboard.** trix copies with OSC 52, plus `wl-copy` on Linux and `pbcopy` on macOS for terminals that ignore it.
+- **The pane pin shows as a box.** Your font isn't a Nerd Font: turn **Nerd Font icons** off in the settings.
+- **An agent's colors look wrong after a theme switch.** Restart it (`alt+o` › restart) ([Themes](#themes)).
+- **Claude's context gauge reads too full on a 1M model.** trix learns the window from the first conversation that goes past 200K; to set it outright, start trix with `TRIX_CLAUDE_CONTEXT=1000000` ([Context gauge](#context-gauge)).
+- **`trix ls` says agents are still running, with no workspace.** A server stopped and left their holders running. `trix` picks them up, and `trix kill` stops them ([Restore](#restore)).
+
+Still stuck? [Open an issue](https://github.com/leofle/trix/issues) with the log and `trix --version`.
+
+## Development
+
+```sh
+cargo build
+cargo test      # the unit tests, in well under a second
+cargo clippy --all-targets -- -D warnings
+```
+
+CI runs all three on Linux and macOS for every pull request. There's no rustfmt config: don't run `cargo fmt` over the tree, which would reformat most of it.
 
 ```
 src/main.rs    CLI, attach client, frame-paced server loop
@@ -629,13 +777,11 @@ themes/        Omarchy's 23 themes and Cyber Aura, to use without Omarchy (macOS
 install-theme.sh copies one of them, or any colors.toml, to ~/.config/trix/colors.toml
 ```
 
-`cargo test` runs the unit tests, which take well under a second. They cover agent control (argument parsing, name lookup, the send guard, when `wait` counts an agent as settled), the event stream (order, filtering, readers that fall behind or leave), the config file (keys, notifications, sounds by name or file, the new-agent form's kind row and their errors), the new-agent form (its kind row, *more*, the kind letters, and its width), scrollback search (on a real emulator fed real output), the diff review (parsing a patch, notes that follow their lines through a reload and the prompt they make, sending them past the send guard, and commit, push to a bare remote, merge, a conflicting merge left untouched and clean up, on real repositories with worktrees), the agent state machine (hooks and heuristics, on a real PTY running `sleep`), hook parsing, key and paste encoding, the session flag and wire framing, holders (their framing and output buffer, replaying to a new server, outliving a dropped one, being stopped, reattaching into a workspace, socket paths that fit for session names of any length, the redraw nudge, a server that falls behind being let go and attaching again, a stop heard past input the program won't read, holders too slow to start or that won't stop, protocol versions, and where a reattached agent is at), terminal mode tracking (sequences split anywhere, strings, resets, the kitty stack, and a replay that restores the alternate screen after its setup fell out of the buffer), the context gauge and token counts (Claude replies counted once, subagents, Codex's running totals, conversations after `/clear`), prices and budgets (model names across providers and dates, config then the live list then trix's own, prompt-size tiers, reading LiteLLM's list, a bad download keeping the last good one, when to fetch, the alerts, closed agents in the totals, the pane and top bar, `ls --json`), the saved workspace, runnable worktrees (the repo file, trust and its dialog, what's copied and what never is, the ports ledger across agents and sessions, a setup that fails and is retried), theme parsing and lookup, including the themes in `themes/` and `install-theme.sh`, and the settings: what they write to `config.toml` (comments kept, mistakes left alone), trying themes on and keeping one, going round the sounds, new agents, restoring and panes left to the terminal as set, and the bottom bar's buttons.
+The tests cover agent control and its guard rails, the event stream, the config file and the settings that write it, the new-agent form, scrollback search on a real emulator, the diff review on real repositories with worktrees, the agent state machine on a real PTY, hook parsing, key and paste encoding, the session flag and wire framing, holders and reattaching, terminal mode tracking, the context gauge, token counts, prices and budgets, the saved workspace, runnable worktrees, and themes, including `themes/` and `install-theme.sh`.
 
-Environment: `TRIX_NO_NOTIFY=1` turns off desktop notifications. `TRIX_NO_SOUND=1` mutes every sound independently. Set these before starting the workspace server; an existing server keeps its original environment. `TRIX_THEME=path/to/colors.toml` overrides the theme, ahead of `~/.config/trix/colors.toml`. `TRIX_CLAUDE_CONTEXT=<tokens>` sets Claude's context window for the gauge. Inside a pane, `TRIX`, `TRIX_SOCKET`, `TRIX_AGENT_ID`, `TRIX_AGENT_NAME` and `TRIX_SESSION` are set, plus `TRIX_PORT`, `TRIX_PORT_END` and `TRIX_PORT_COUNT` in a worktree with [ports](#runnable-worktrees), so any tool can report state with `trix hook <source>` and a hook-style JSON payload on stdin (e.g. `{"hook_event_name":"Stop"}`). Once a tool reports, trix trusts it and stops guessing from output.
+## Contributing
 
-## Next
-
-Nothing queued. Ideas and requests welcome.
+Issues and pull requests are welcome on [GitHub](https://github.com/leofle/trix). For a bug, include the server log ([Troubleshooting](#troubleshooting)) and `trix --version`.
 
 ## License
 
