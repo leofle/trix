@@ -1573,6 +1573,8 @@ impl App {
                 }
             }
             keep.runtime = run.runtime.clone();
+            // One from before trix locked its worktrees gets locked now.
+            crate::worktree::lock_in_background(&run.cwd);
             let id = self.next_id;
             self.next_id += 1;
             let plan = Agent::plan(id, run, self.pane_size, self.tx.clone(), &self.socket, &self.integrations, &self.exe, self.holders);
@@ -1863,6 +1865,7 @@ impl App {
             spec.runtime.ports = crate::worktree::lease(&spec.cwd, &self.config.worktree, None);
         }
         let no_ports = crate::worktree::no_ports(&spec.cwd, &self.config.worktree, spec.runtime.ports);
+        crate::worktree::lock_in_background(&spec.cwd);
         self.parked.remove(&old_id);
         // A fresh id, so late hook / exit events from the old process can't
         // land on the new one.
@@ -3581,10 +3584,10 @@ impl App {
         // Removing the folder gives its ports away: not from under anyone.
         let tree = git(&dir, &["rev-parse", "--show-toplevel"]).map_or_else(|| dir.clone(), PathBuf::from);
         let here = self.others_in(&tree, id);
-        let refused = if here.is_empty() { crate::worktree::used_elsewhere(&tree) } else { Some(format!("{} also in this worktree: close {} first", here.join(", "), if here.len() == 1 { "it" } else { "them" })) };
-        if let Some(why) = refused {
+        let users = crate::worktree::users(&tree, &here);
+        if !users.is_empty() {
             if let Some(Modal::Review(r)) = &mut self.modal {
-                r.status = Some((why, false));
+                r.status = Some((format!("kept, still in use: {}", users.join("; ")), false));
             }
             return;
         }
@@ -4042,11 +4045,14 @@ fn make_worktree_at(dir: &Path, name: &str, base: Option<&str>) -> anyhow::Resul
     }
     let has_branch = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_some();
     let p = path.display().to_string();
-    let mut args: Vec<&str> = if has_branch {
-        vec!["worktree", "add", &p, &branch]
+    // Locked from the start: git then won't remove it, or prune it once
+    // its folder is gone, or delete its branch, until X unlocks it.
+    let mut args: Vec<&str> = vec!["worktree", "add", "--lock", "--reason", crate::worktree::LOCK_REASON];
+    if has_branch {
+        args.extend([p.as_str(), branch.as_str()]);
     } else {
-        vec!["worktree", "add", "-b", &branch, &p]
-    };
+        args.extend(["-b", branch.as_str(), p.as_str()]);
+    }
     if let Some(base) = base.filter(|_| !has_branch) {
         args.push(base);
     }
@@ -5570,6 +5576,42 @@ mod tests {
 
     fn sleeper(name: &str, cwd: &Path) -> Spawn {
         Spawn { kind: Kind::Custom, name: name.into(), cwd: cwd.to_path_buf(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() }
+    }
+
+    #[test]
+    fn a_worktree_trix_makes_is_locked_from_the_start() {
+        let dir = repo_with_setup("locked");
+        let (path, branch, reused) = make_worktree(&dir, "w").unwrap();
+        assert_eq!((branch.as_str(), reused), ("trix/w", false));
+        let list = Command::new("git").arg("-C").arg(&dir).args(["worktree", "list", "--porcelain"]).output().unwrap();
+        let list = String::from_utf8_lossy(&list.stdout);
+        let entry = list.split("\n\n").find(|e| e.contains(&format!("worktree {}", path.canonicalize().unwrap().display()))).expect("registered");
+        assert!(entry.contains(&format!("locked {}", crate::worktree::LOCK_REASON)), "{entry}");
+        let (_, _, reused) = make_worktree(&dir, "w").unwrap();
+        assert!(reused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_is_refused_while_another_sessions_saved_workspace_has_the_worktree() {
+        let (_keep, wt) = {
+            let dir = repo_with_setup("cleanup-saved");
+            let (wt, _, _) = make_worktree(&dir, "w").unwrap();
+            (dir, wt.canonicalize().unwrap())
+        };
+        let mut app = test_app();
+        let ra = app.spawn_quiet(sleeper("ra", &wt)).unwrap();
+        app.agents[0].set_state(State::Idle, false);
+        let agent = crate::state::SavedAgent { kind: "claude".into(), name: "trix-2".into(), cwd: wt.clone(), command: None, session: None, pinned: false, inherited: Vec::new() };
+        crate::worktree::pretend_saved("sidebar", Some(crate::state::Saved::new(0, vec![agent])));
+        app.modal = Some(Modal::Review(Box::new(crate::review::Review::open(ra, &wt).unwrap())));
+        app.clean_up_worktree();
+        crate::worktree::pretend_saved("sidebar", None);
+        let Some(Modal::Review(r)) = &app.modal else { panic!("the review stays open") };
+        assert!(r.status.as_ref().unwrap().0.contains("trix-2 in session sidebar's saved workspace"), "{:?}", r.status);
+        assert_eq!(app.agents.len(), 1, "nobody was closed");
+        assert!(wt.exists());
+        stop_all(&app);
     }
 
     #[test]

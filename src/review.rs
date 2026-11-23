@@ -592,8 +592,16 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
             if !p.worktree {
                 return Err("this folder is the main checkout, not a worktree".into());
             }
+            // trix's lock comes off only now, every check passed; someone
+            // else's stays, and git then refuses.
+            let unlocked = crate::worktree::unlock(top)?;
             // No --force: git keeps a worktree with changes in it.
-            git(&p.main, &["worktree", "remove", &top.display().to_string()])?;
+            if let Err(e) = git(&p.main, &["worktree", "remove", &top.display().to_string()]) {
+                if unlocked && let Err(l) = crate::worktree::ensure_locked(top) {
+                    eprintln!("trix: couldn't lock the worktree {} again: {l}", top.display());
+                }
+                return Err(e);
+            }
             crate::worktree::forget(top);
             // `branch -d` also takes a branch merged into its upstream, so a
             // pushed branch would go though the main checkout never got it.
@@ -812,8 +820,39 @@ Binary files a/logo.png and b/logo.png differ
         sh(&root, &["init", "-q", "--bare", &bare.display().to_string()]);
         sh(&main, &["remote", "add", "origin", &bare.display().to_string()]);
         let wt = main.join(".trix/worktrees/w");
-        sh(&main, &["worktree", "add", "-q", "-b", "trix/w", &wt.display().to_string()]);
+        // Locked, as trix makes them.
+        sh(&main, &["worktree", "add", "-q", "--lock", "--reason", crate::worktree::LOCK_REASON, "-b", "trix/w", &wt.display().to_string()]);
         (Repo(root), main, wt)
+    }
+
+    fn lock_line(main: &Path) -> Option<String> {
+        sh(main, &["worktree", "list", "--porcelain"]).lines().find(|l| l.starts_with("locked")).map(String::from)
+    }
+
+    #[test]
+    fn cleanup_takes_trixs_lock_off_only_to_remove_the_worktree() {
+        let (_keep, main, wt) = repo("locked");
+        assert_eq!(lock_line(&main), Some(format!("locked {}", crate::worktree::LOCK_REASON)));
+        // git refuses, and the lock goes back on: nothing is left unguarded.
+        std::fs::write(wt.join("b.txt"), "new\n").unwrap();
+        assert!(perform(&Op::Cleanup, &wt).is_err());
+        assert!(wt.exists());
+        assert_eq!(lock_line(&main), Some(format!("locked {}", crate::worktree::LOCK_REASON)));
+        std::fs::remove_file(wt.join("b.txt")).unwrap();
+        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree and trix/w");
+        assert!(!wt.exists());
+        assert_eq!(lock_line(&main), None);
+    }
+
+    #[test]
+    fn cleanup_leaves_someone_elses_lock_and_the_worktree() {
+        let (_keep, main, wt) = repo("foreign-lock");
+        sh(&main, &["worktree", "unlock", &wt.display().to_string()]);
+        sh(&main, &["worktree", "lock", "--reason", "my backup", &wt.display().to_string()]);
+        let err = perform(&Op::Cleanup, &wt).unwrap_err();
+        assert!(err.contains("my backup") && err.contains("unlock"), "{err}");
+        assert!(wt.exists());
+        assert_eq!(lock_line(&main).as_deref(), Some("locked my backup"));
     }
 
     #[test]

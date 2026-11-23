@@ -657,6 +657,8 @@ struct JsonAgent<'a> {
     focused: bool,
     you: bool,
     cwd: String,
+    /// Where it is now: a shell that cd'd elsewhere, or an agent that did.
+    live_cwd: String,
     branch: Option<&'a str>,
     diff: Option<JsonDiff>,
     last_prompt: Option<&'a str>,
@@ -761,6 +763,15 @@ struct JsonList<'a> {
     /// Where model prices come from.
     prices: JsonPrices,
     agents: Vec<JsonAgent<'a>>,
+    /// The restore offer nobody has answered yet: what this session would
+    /// bring back, and so what it still uses.
+    pending_restore: Vec<JsonPending<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonPending<'a> {
+    name: &'a str,
+    cwd: String,
 }
 
 fn listing_json(app: &App, from: Option<u32>) -> String {
@@ -783,6 +794,7 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
             focused: i == app.focus,
             you: from == Some(a.id),
             cwd: a.cwd.display().to_string(),
+            live_cwd: a.live_cwd().display().to_string(),
             branch: a.branch.as_deref(),
             diff: a.diff.map(|(files, added, removed)| JsonDiff { files, added, removed }),
             last_prompt: a.last_prompt.as_deref(),
@@ -794,7 +806,8 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
         .collect();
     let totals = JsonSpend::new(app, &app.totals(), app.config.cost.budget);
     let prices = JsonPrices::new(app);
-    let mut s = serde_json::to_string_pretty(&JsonList { session: session::name(), viewers: app.viewers, totals, prices, agents }).unwrap_or_default();
+    let pending_restore = app.pending_restore.iter().flat_map(|p| &p.agents).map(|a| JsonPending { name: &a.name, cwd: a.cwd.display().to_string() }).collect();
+    let mut s = serde_json::to_string_pretty(&JsonList { session: session::name(), viewers: app.viewers, totals, prices, agents, pending_restore }).unwrap_or_default();
     s.push('\n');
     s
 }

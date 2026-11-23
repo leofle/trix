@@ -411,6 +411,11 @@ pub fn discover(session: &str) -> Vec<(u32, PathBuf)> {
     discover_in(&crate::hooks::socket_dirs(), Some(session))
 }
 
+/// The hash of the session a holder's socket is for (`short_hash`).
+pub fn session_hash(socket: &Path) -> Option<String> {
+    socket.file_name().and_then(|n| n.to_str()).and_then(parse_name).map(|(hash, ..)| hash.to_string())
+}
+
 /// Every session's live holders.
 pub fn discover_all() -> Vec<(u32, PathBuf)> {
     discover_in(&crate::hooks::socket_dirs(), None)
