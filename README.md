@@ -713,7 +713,7 @@ trix runs agents as you, with your permissions. It doesn't sandbox them; it keep
 - **Your agent configs stay yours.** Everything trix hands an agent is passed to that one process and lives in trix's runtime folder until the server stops. trix makes that folder `0700` and refuses to start if it isn't private to you; sockets whose path would be too long go in `/tmp/trix-<uid>`, which trix makes `0700` and won't use if it isn't yours or others can open it.
 - **No shell in between.** Supported agents are started by name with an argv, never through a shell, and so is a notification `command`.
 - **What reaches the network:** trix fetches [LiteLLM's](https://github.com/BerriAI/litellm) public price list about once a day with `curl` (`[cost] live_prices = false` stops it). A missing agent is installed with mise, Homebrew, npm or its vendor's install script the first time you start it, in its pane where you can watch ([Not installed yet](#not-installed-yet)). Codex panes get `-c sandbox_workspace_write.network_access=true` so they can reach trix's socket, which also lets Codex's commands reach the network ([Codex](#codex) says how to turn it off). git and gh reach a remote only when you push, open or merge a pull request from the [review](#review).
-- **Reporting a vulnerability:** please don't put the details in a public issue. Open an issue saying you have a security report, and we'll arrange a private way to send it.
+- **Reporting a vulnerability:** report it privately at [github.com/leofle/trix/security/advisories/new](https://github.com/leofle/trix/security/advisories/new), not in a public issue.
 
 ## Troubleshooting
 
