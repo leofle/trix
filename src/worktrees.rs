@@ -86,6 +86,8 @@ fn parse(args: &[String]) -> Result<(Cmd, Opts), String> {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Entry {
     path: PathBuf,
+    /// Its HEAD's commit.
+    head: String,
     branch: Option<String>,
     prunable: bool,
 }
@@ -96,7 +98,9 @@ fn entries(text: &str) -> Vec<Entry> {
         if let Some(p) = line.strip_prefix("worktree ") {
             out.push(Entry { path: PathBuf::from(p), ..Entry::default() });
         } else if let Some(e) = out.last_mut() {
-            if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            if let Some(h) = line.strip_prefix("HEAD ") {
+                e.head = h.to_string();
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
                 e.branch = Some(b.to_string());
             } else if line == "prunable" || line.starts_with("prunable ") {
                 e.prunable = true;
@@ -120,6 +124,7 @@ pub struct Tree {
     pub name: String,
     pub path: PathBuf,
     pub branch: Option<String>,
+    pub head: String,
     pub missing: bool,
     /// "none", "trix", or someone else's reason.
     pub lock: String,
@@ -213,7 +218,7 @@ fn state_of(t: &Tree) -> String {
         return format!("in use: {}", t.users.join("; "));
     }
     if t.missing {
-        return "folder missing".into();
+        return if t.a.orphans > 0 { format!("folder missing, {} on no branch", s(t.a.orphans as usize, "commit", "commits")) } else { "folder missing".into() };
     }
     if t.uncommitted > 0 {
         return s(t.uncommitted, "uncommitted file", "uncommitted files");
@@ -234,6 +239,10 @@ fn decide(t: &Tree, o: &Opts) -> Plan {
     let keep = |why: Option<String>| Plan::Keep { why };
     if matches!(t.lock_kind, Some(Lock::Other(_))) || !t.users.is_empty() {
         return keep(None);
+    }
+    if t.missing && t.a.orphans > 0 {
+        let n = s(t.a.orphans as usize, "commit", "commits");
+        return keep(Some(format!("its HEAD has {n} on no branch, and dropping the entry would lose them: `git branch <name> {}` keeps them", t.head)));
     }
     if t.missing {
         return if t.lock_kind == Some(Lock::Trix) || rm { Plan::DropEntry } else { keep(Some("not locked by trix, so not trix's to drop: `git worktree prune` does".into())) };
@@ -264,7 +273,16 @@ fn tree(main: &Path, e: &Entry, text: &str, seen: &crate::worktree::Seen, caps: 
     // Before git looks inside: a status could touch the index.
     let age = crate::cleanup::last_used(main, &e.path).map(|t| since(now, t));
     let a = if missing {
-        e.branch.as_deref().and_then(|b| crate::cleanup::assess_branch(main, b, caps).ok()).unwrap_or_default()
+        match e.branch.as_deref() {
+            Some(b) => crate::cleanup::assess_branch(main, b, caps).ok().unwrap_or_default(),
+            // Its HEAD, in the entry about to go, may be all that holds
+            // these commits: once it's gone, gc takes them.
+            None => {
+                let orphans = git(main, &["rev-list", "--count", &e.head, "--not", "--branches", "--remotes", "--tags"]).ok().and_then(|n| n.parse().ok());
+                // Can't tell (a HEAD git no longer has): as if there were.
+                Assessment { detached: true, orphans: orphans.unwrap_or(1), ..Assessment::default() }
+            }
+        }
     } else {
         crate::cleanup::assess_with(&e.path, caps).unwrap_or_default()
     };
@@ -272,6 +290,7 @@ fn tree(main: &Path, e: &Entry, text: &str, seen: &crate::worktree::Seen, caps: 
         name: e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
         path: e.path.clone(),
         branch: e.branch.clone(),
+        head: e.head.clone(),
         missing,
         lock: match &lock_kind {
             Lock::None => "none".into(),
@@ -780,6 +799,35 @@ mod tests {
         assert!(left.contains("worktrees/theirs"), "not trix's to drop");
         assert!(!has_branch(&root, "trix/gone"), "merged: deleted");
         assert!(has_branch(&root, "trix/lost"), "unmerged: kept");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_detached_entry_with_commits_on_no_branch_is_kept() {
+        crate::worktree::pretend_nobody();
+        let root = repo("missing-detached");
+        let wt = add(&root, "adrift");
+        sh(&wt, &["checkout", "-q", "--detach"]);
+        commit(&wt, "only-here.txt", "on no branch\n");
+        let sha = sh(&wt, &["rev-parse", "HEAD"]);
+        // And one with nothing of its own: that entry can go.
+        let empty = add(&root, "empty");
+        sh(&empty, &["checkout", "-q", "--detach"]);
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::fs::remove_dir_all(&empty).unwrap();
+        let (list, _) = run_in(&root, &[], None);
+        let line = list.lines().find(|l| l.trim_start().starts_with("adrift ")).unwrap_or_else(|| panic!("{list}"));
+        assert!(line.contains("folder missing, 1 commit on no branch · locked → kept: its HEAD has 1 commit on no branch") && line.contains(&format!("`git branch <name> {sha}` keeps them")), "{line}");
+        let (out, code) = run_in(&root, &["prune", "--yes"], None);
+        assert_eq!(code, DONE, "{out}");
+        let (out, code) = run_in(&root, &["rm", "adrift", "--yes"], None);
+        assert_eq!(code, FAILED, "{out}");
+        assert!(out.starts_with("trix: kept adrift: its HEAD has 1 commit on no branch"), "{out}");
+        let left = sh(&root, &["worktree", "list", "--porcelain"]);
+        assert!(left.contains("worktrees/adrift") && !left.contains("worktrees/empty"), "{left}");
+        // Still reachable from the entry kept: gc keeps it.
+        sh(&root, &["gc", "-q", "--prune=now"]);
+        assert_eq!(sh(&root, &["cat-file", "-t", &sha]), "commit");
         let _ = std::fs::remove_dir_all(&root);
     }
 
