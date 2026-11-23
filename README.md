@@ -2,19 +2,6 @@
 
 A terminal workspace for coding agents. Run Claude Code, Codex, Grok, OpenCode, Cursor, GitHub Copilot CLI, Muse Code, Gemini CLI, Antigravity CLI, Amp, shells or any CLI agent side by side, and see at a glance which one is working, which one needs you, and which one finished while you were looking elsewhere.
 
-```
-◆ trix   ▲ 1 needs you   ⠹ 2 working   ✓ 1 done                              focus · 14:02
-                                   ╭ ▲ api (2)  approve Bash rm -rf dist · 12s        alt+a  jump ╮
- AGENTS  4                         │                                                              │
-  1  ⠹ web                 2m14s   │   (live agent terminal)                                      │
-       Edit src/app.tsx            │                                                              │
-       claude ▂▃▅▇▅▃▂▁▂▅  main     │                                                              │
-                                   │                                                              │
-  2  ▲ api                   12s   │                                                              │
-       approve Bash rm -rf dist    │                                                              │
-       claude ▁▁▁▂▅▁▁▁▁▁  trix/api │                                                              │
-```
-
 ![trix demo: starting trix in a project and working with agents side by side](assets/trix.gif)
 
 **Get started:** [Install](#install) · [Quick start](#quick-start) · [Keys](#keys) · [macOS](#macos) · [Supported agents](#supported-agents) · [Codex](#codex)<br>
