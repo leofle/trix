@@ -204,7 +204,7 @@ pub fn assess(path: &Path) -> Result<Assessment, String> {
 
 pub fn assess_with(path: &Path, caps: Caps) -> Result<Assessment, String> {
     let top = PathBuf::from(git(path, &["rev-parse", "--show-toplevel"]).map_err(|_| "not a git repository".to_string())?);
-    let (staged, unstaged, untracked) = counts(&git(&top, &["status", "--porcelain", "--ignore-submodules=none"])?);
+    let (staged, unstaged, untracked) = counts(&git(&top, &["--no-optional-locks", "status", "--porcelain", "--ignore-submodules=none"])?);
     let current = git(&top, &["branch", "--show-current"]).ok().filter(|b| !b.is_empty());
     let detached = current.is_none();
     let orphans = if detached { git(&top, &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags"]).ok().and_then(|n| n.parse().ok()).unwrap_or(0) } else { 0 };
@@ -219,6 +219,94 @@ pub fn assess_with(path: &Path, caps: Caps) -> Result<Assessment, String> {
         branches.push(branch_state(&top, name, &bases, caps)?);
     }
     Ok(Assessment { staged, unstaged, untracked, detached, orphans, branches, bases })
+}
+
+/// How the branch `name` of the repository at `main` stands, for a
+/// worktree whose folder is gone, or a branch with none.
+pub fn assess_branch(main: &Path, name: &str, caps: Caps) -> Result<Assessment, String> {
+    let bases = bases(main);
+    let branches = if bases.iter().any(|b| b == name) { Vec::new() } else { vec![branch_state(main, name, &bases, caps)?] };
+    Ok(Assessment { branches, bases, ..Assessment::default() })
+}
+
+/// The ignored files and folders a worktree's removal takes with it (git
+/// deletes them without a word), top-level entries as git names them.
+pub fn ignored(top: &Path) -> Vec<String> {
+    let out = git(top, &["--no-optional-locks", "-c", "core.quotePath=false", "status", "--porcelain", "--ignored=matching", "--untracked-files=normal"]).unwrap_or_default();
+    out.lines().filter_map(|l| l.strip_prefix("!! ")).map(String::from).collect()
+}
+
+/// `git rev-parse --git-common-dir`, absolute.
+fn common_dir(main: &Path) -> Option<PathBuf> {
+    git(main, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).ok().map(PathBuf::from).or_else(|| {
+        // Before git 2.31's --path-format: relative to `main`.
+        git(main, &["rev-parse", "--git-common-dir"]).ok().map(|d| main.join(d))
+    })
+}
+
+/// The worktree's own folder in the repository's git dir
+/// (`.git/worktrees/<id>`), found by where its `gitdir` file points.
+pub fn admin_dir(main: &Path, top: &Path) -> Option<PathBuf> {
+    let want = top.join(".git");
+    std::fs::read_dir(common_dir(main)?.join("worktrees")).ok()?.flatten().map(|e| e.path()).find(|d| std::fs::read_to_string(d.join("gitdir")).is_ok_and(|g| Path::new(g.trim()) == want))
+}
+
+/// When the worktree was last used: the newest of its own git files (HEAD,
+/// index, logs/HEAD) and of its folder.
+pub fn last_used(main: &Path, top: &Path) -> Option<std::time::SystemTime> {
+    let mut files = vec![top.to_path_buf()];
+    if let Some(admin) = admin_dir(main, top) {
+        files.extend(["HEAD", "index", "logs/HEAD"].iter().map(|f| admin.join(f)));
+    }
+    files.iter().filter_map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).max()
+}
+
+/// Remove the worktree at `top` of the repository at `main`, then delete
+/// its branches in `a` that are merged (`delete_merged`), unless
+/// `keep_branches`. Shared by the review's X and `trix worktrees`; the
+/// caller has checked who uses it and that `a.keeps()` is nothing.
+///
+/// trix's lock comes off only now; someone else's stays, and this refuses.
+/// Never forced: git keeps a worktree with changes in it, and then the
+/// lock goes back on. A worktree whose folder is gone loses its entry only.
+/// `pushed`: the branch of `a` that's been pushed, for what's said.
+pub fn remove(main: &Path, top: &Path, a: &Assessment, keep_branches: bool, pushed: Option<&str>) -> Result<String, String> {
+    let unlocked = crate::worktree::unlock_at(main, top)?;
+    if let Err(e) = git(main, &["worktree", "remove", &top.display().to_string()]) {
+        // An older git won't remove an entry whose folder is gone: its own
+        // folder in .git is all there is, and only that one goes.
+        let pruned = !top.exists() && admin_dir(main, top).is_some_and(|d| std::fs::remove_dir_all(d).is_ok());
+        if !pruned {
+            if unlocked && let Err(l) = crate::worktree::ensure_locked_at(main, top) {
+                eprintln!("trix: couldn't lock the worktree {} again: {l}", top.display());
+            }
+            return Err(e);
+        }
+    }
+    crate::worktree::forget(top);
+    let (mut gone, mut kept) = (Vec::new(), Vec::new());
+    for b in &a.branches {
+        match &b.state {
+            _ if keep_branches => kept.push(format!("{} (as asked)", b.name)),
+            State::Merged { .. } => match delete_merged(main, b) {
+                Ok(said) => gone.push(said),
+                Err(e) => kept.push(format!("{} ({e})", b.name)),
+            },
+            State::Unmerged { .. } if a.bases.is_empty() => kept.push(format!("{} (the repository has no main or master to tell if it's merged)", b.name)),
+            State::Unmerged { ahead } => {
+                let s = if *ahead == 1 { "" } else { "s" };
+                kept.push(format!("{} ({}{ahead} commit{s} not in {})", b.name, if pushed == Some(b.name.as_str()) { "pushed, but " } else { "" }, a.bases[0]));
+            }
+        }
+    }
+    let mut said = "removed the worktree".to_string();
+    if !gone.is_empty() {
+        said.push_str(&format!(" and {}", gone.join(", ")));
+    }
+    if !kept.is_empty() {
+        said.push_str(&format!("; kept {}", kept.join(", ")));
+    }
+    Ok(said)
 }
 
 /// What a deletion is said as: how it was merged.

@@ -623,40 +623,8 @@ fn clean_up(p: &Place) -> Outcome {
     if let Some(why) = a.keeps() {
         return Err(format!("kept the worktree: {why}"));
     }
-    // trix's lock comes off only now, every check passed; someone else's
-    // stays, and git then refuses.
-    let unlocked = crate::worktree::unlock(top)?;
-    // No --force: git keeps a worktree with changes in it.
-    if let Err(e) = git(&p.main, &["worktree", "remove", &top.display().to_string()]) {
-        if unlocked && let Err(l) = crate::worktree::ensure_locked(top) {
-            eprintln!("trix: couldn't lock the worktree {} again: {l}", top.display());
-        }
-        return Err(e);
-    }
-    crate::worktree::forget(top);
-    let (mut gone, mut kept) = (Vec::new(), Vec::new());
-    for b in &a.branches {
-        match &b.state {
-            crate::cleanup::State::Merged { .. } => match crate::cleanup::delete_merged(&p.main, b) {
-                Ok(said) => gone.push(said),
-                Err(e) => kept.push(format!("{} ({e})", b.name)),
-            },
-            crate::cleanup::State::Unmerged { .. } if a.bases.is_empty() => kept.push(format!("{} (the repository has no main or master to tell if it's merged)", b.name)),
-            crate::cleanup::State::Unmerged { ahead } => {
-                let pushed = p.branch.as_deref() == Some(b.name.as_str()) && p.pushed;
-                let s = if *ahead == 1 { "" } else { "s" };
-                kept.push(format!("{} ({}{ahead} commit{s} not in {})", b.name, if pushed { "pushed, but " } else { "" }, a.bases[0]));
-            }
-        }
-    }
-    let mut said = "removed the worktree".to_string();
-    if !gone.is_empty() {
-        said.push_str(&format!(" and {}", gone.join(", ")));
-    }
-    if !kept.is_empty() {
-        said.push_str(&format!("; kept {}", kept.join(", ")));
-    }
-    Ok(said)
+    let pushed = p.branch.as_deref().filter(|_| p.pushed);
+    crate::cleanup::remove(&p.main, top, &a, false, pushed)
 }
 
 fn push(top: &Path, branch: &str) -> Outcome {

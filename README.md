@@ -103,7 +103,7 @@ A running workspace keeps the old version until its server stops. `trix kill` st
    - `~/.local/state/trix/`: the saved workspace, `prefs.json`, the ports ledger, trusted repositories and `removed.log` (`$XDG_STATE_HOME/trix` if set).
    - `~/.cache/trix/`: the price list (`$XDG_CACHE_HOME/trix` if set).
    - On macOS, `~/Library/Application Support/trix`, the small app that sends notifications.
-   - Worktrees under a repository's `.trix/worktrees/` are ordinary git worktrees, locked by trix: `git worktree unlock <path>`, `git worktree remove <path>`, then `git branch -d trix/<name>`. The tips of branches the review's `X` deleted stay under `refs/trix/removed/` until you drop them (`git for-each-ref refs/trix/removed/`, then `git update-ref -d <ref>`).
+   - Worktrees under a repository's `.trix/worktrees/` are ordinary git worktrees, locked by trix. Before uninstalling, `trix worktrees rm <name>` (or `trix worktrees prune`) removes them safely. Afterwards, by hand: `git worktree unlock <path>`, `git worktree remove <path>`, then `git branch -d trix/<name>`. The tips of deleted branches stay under `refs/trix/removed/` until `trix worktrees prune` drops them after 30 days, or you do (`git for-each-ref refs/trix/removed/`, then `git update-ref -d <ref>`).
    - Hooks or plugins you added to Grok, Gemini, Antigravity or Amp yourself ([Supported agents](#supported-agents)).
 
 ### Quick start
@@ -165,7 +165,24 @@ ports = 10                  # how many ports each worktree gets (1 to 100)
 - **Copy** takes paths inside the repository, with `*` and `?` in each part. It brings only regular files that git ignores in both the main checkout and the new worktree, because anything else could land in the agent's commit. A tracked file a pattern also matches, like a committed `.env.example`, is already in the worktree, so it's passed over without a word and doesn't count. It never follows a symlink or overwrites a file, skips `.git` and `.trix`, keeps each file's mode, and stops after copying 1000 files or 64 MB. Anything else it leaves behind is named in a toast.
 - **Ports.** Each worktree under `.trix/worktrees/` holds its own block, exported in its panes as `TRIX_PORT` (the first), `TRIX_PORT_END` and `TRIX_PORT_COUNT`, so `npm run dev -- --port $TRIX_PORT` never collides. This needs no `.trix.toml`. Blocks skip ports something is listening on, and are recorded in `$XDG_STATE_HOME/trix/ports.json`, shared by every session. Agents in the same worktree share its block. A restart, a reattach, and a quit followed by a restore keep it. Closing the last agent in the worktree, cleaning it up from the review, starting fresh instead of restoring, or quitting with nothing there to restore gives it back. If the range runs out, the agent starts without ports and a toast says so.
 
-**Locked.** Every worktree trix makes is locked with `git worktree lock`, its reason starting with `trix:`. git then refuses to remove it, even with `--force` given once, keeps it when `git worktree prune` runs after its folder was deleted, and won't delete its branch. One from an earlier trix gets locked when an agent next starts in it. To remove one, use the review's `X`, which unlocks it only once nobody uses it. A lock whose reason doesn't start with `trix:` is never touched. A lock that fails is logged in the server log and never stops the agent.
+**Locked.** Every worktree trix makes is locked with `git worktree lock`, its reason starting with `trix:`. git then refuses to remove it, even with `--force` given once, keeps it when `git worktree prune` runs after its folder was deleted, and won't delete its branch. One from an earlier trix gets locked when an agent next starts in it. To remove one, use `trix worktrees rm <name>` or the review's `X`, which unlock it only once nobody uses it. A lock whose reason doesn't start with `trix:` is never touched. A lock that fails is logged in the server log and never stops the agent.
+
+**`trix worktrees`** lists trix's worktrees in the repository you're in: each one's branch, when it was last used, what it is (in use by whom, uncommitted files, commits on no branch, merged and how, commits not in the default branch, folder missing, locked by someone else), and what `prune` would do with it. It also lists the `trix/*` branches with no worktree, and the deleted branches' tips under `refs/trix/removed/`. `--all` looks in every repository trix knows of: where sessions' agents are or would come back, the ports ledger, and the folders you've started agents in. `--json` is for scripts and agents.
+
+- `trix worktrees prune` removes what holds no work, and nothing anyone uses:
+  - worktrees that are clean and merged: the folder, then the branch;
+  - entries whose folder is gone and that carry trix's lock: the entry, then the branch if it's merged;
+  - `trix/*` branches with no worktree that are merged;
+  - tips under `refs/trix/removed/` older than 30 days.
+
+  `--folders` also removes clean worktrees whose branch isn't merged, keeping the branch. Anything used in the last day is left alone (the newest of the worktree's folder and its own git files; `--min-age 12h` changes it, `--min-age 0` turns it off).
+- `trix worktrees rm <name>` removes one worktree, the same way the review's `X` does: the folder, and the branch if it's merged (`--keep-branch` keeps it). When it won't, it says why.
+- **How they remove.**
+  - Both show the plan first and ask, with no as the default. Without a terminal they do a dry run unless given `--yes`, and so does `--json` without `--yes`.
+  - Each removal looks again right before it's done, at who uses the worktree and what it holds. Nothing is forced, and a lock that isn't trix's is never touched.
+  - Ignored files go with the folder, as with `git worktree remove`, so the plan names them.
+  - Deleted branches' tips are kept and logged as for `X`.
+  - Exit codes: 0 done (or nothing to do), 1 something was refused or failed, 2 a usage mistake, 3 nothing done (a dry run, or no).
 
 **Trust.** `.trix.toml` arrives with the repository, so it's someone else's commands until you've read them. Nothing in it is used until you accept it in the new-agent form (`alt+n`, with Worktree ticked), which shows exactly what would run: `y` trusts it and runs it, `n` or Enter starts this agent without it, `esc` goes back to the form. Any change to the file asks again. The file is read from the main checkout, so an agent's edits in its own worktree don't count. There's no command to grant trust: `trix spawn --worktree` on an untrusted repository makes the worktree without setup or copies, and says so on stderr and in a toast. Trust is recorded in `$XDG_STATE_HOME/trix/trusted-repos.json`. That's a guard against surprises and not a sandbox: an agent running as you, without a sandbox, could edit that file directly.
 

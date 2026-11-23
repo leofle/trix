@@ -760,6 +760,52 @@ fn gather(me: &str) -> Elsewhere {
     Elsewhere { answers, saved, holders }
 }
 
+/// What every session says, gathered once, for a command that's in no
+/// session of its own (`trix worktrees`): every session counts, its own too.
+pub struct Seen(Elsewhere);
+
+pub fn seen() -> Seen {
+    Seen(gather(""))
+}
+
+impl Seen {
+    /// `users` of `tree`, from what every session said.
+    pub fn users(&self, tree: &Path) -> Vec<String> {
+        users_from(tree, "", &self.0)
+    }
+
+    /// Every folder a session has an agent in, offers to restore one into,
+    /// or would bring one back into: where to look for repositories.
+    pub fn dirs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for (_, a) in &self.0.answers {
+            if let Answer::Listed(Some(l)) = a {
+                out.extend(l.agents.iter().flat_map(|(_, at)| at.iter().cloned()));
+                out.extend(l.pending.iter().flatten().map(|(_, c)| c.clone()));
+            }
+        }
+        out.extend(self.0.saved.iter().flat_map(|(_, w)| w.agents.iter().map(|a| a.cwd.clone())));
+        out
+    }
+}
+
+/// The worktrees the ports ledger has, every session's.
+pub fn ledger_dirs() -> Vec<PathBuf> {
+    read_ledger(&state_dir()).into_keys().map(PathBuf::from).collect()
+}
+
+/// For a test: what every other session says.
+#[cfg(test)]
+pub fn pretend_users(session: &str, agent: &str, cwd: &Path) {
+    let listing = Listing { agents: vec![(agent.to_string(), vec![cwd.to_path_buf()])], pending: Some(Vec::new()) };
+    SEEN.with(|s| *s.borrow_mut() = Elsewhere { answers: vec![(session.to_string(), Answer::Listed(Some(listing)))], ..Elsewhere::default() });
+}
+
+#[cfg(test)]
+pub fn pretend_nobody() {
+    SEEN.with(|s| *s.borrow_mut() = Elsewhere::default());
+}
+
 thread_local! {
     /// What a test says the other sessions are.
     static SEEN: std::cell::RefCell<Elsewhere> = std::cell::RefCell::new(Elsewhere::default());
@@ -794,13 +840,14 @@ pub fn users(tree: &Path, here: &[String], offered: &[String]) -> Vec<String> {
 
 /// What trix's locks start with: a lock without it is someone else's.
 const LOCK_MARK: &str = "trix:";
-pub const LOCK_REASON: &str = "trix: an agent's worktree; remove it with the review's X (alt+v), not by hand";
+pub const LOCK_REASON: &str = "trix: an agent's worktree; remove it with `trix worktrees rm <name>` or the review's X, not by hand";
 
-/// `tree`'s lock, as `git worktree list` has it: `None` when it isn't
+/// `tree`'s lock, as `git worktree list` has it, asked in `dir` (the tree
+/// itself, or its repository when the folder is gone): `None` when it isn't
 /// locked, `Some("")` for a lock with no reason. `Err`: git couldn't say.
 /// The newline porcelain, not `-z`, which needs git 2.36.
-fn lock_of(tree: &Path) -> Result<Option<String>, String> {
-    let out = Command::new("git").arg("-C").arg(tree).args(["-c", "core.quotePath=false", "worktree", "list", "--porcelain"]).stderr(Stdio::null()).output().map_err(|e| e.to_string())?;
+fn lock_of(dir: &Path, tree: &Path) -> Result<Option<String>, String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["-c", "core.quotePath=false", "worktree", "list", "--porcelain"]).stderr(Stdio::null()).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err("not a worktree git knows".into());
     }
@@ -827,17 +874,31 @@ fn is_trixs(reason: &str) -> bool {
     reason.strip_prefix('"').unwrap_or(reason).starts_with(LOCK_MARK)
 }
 
-fn git_lock(tree: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git").arg("-C").arg(tree).args(["worktree"]).args(args).arg(tree).stderr(Stdio::piped()).stdout(Stdio::null()).output().map_err(|e| e.to_string())?;
+fn git_lock(dir: &Path, tree: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["worktree"]).args(args).arg(tree).stderr(Stdio::piped()).stdout(Stdio::null()).output().map_err(|e| e.to_string())?;
     if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("failed").to_string()) }
+}
+
+/// Whose lock a worktree has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lock {
+    None,
+    Trix,
+    /// Someone else's, with its reason as git gave it.
+    Other(String),
 }
 
 /// Lock `tree` if it isn't: one from before trix locked its worktrees.
 /// Someone else's lock stays as it is.
 pub fn ensure_locked(tree: &Path) -> Result<(), String> {
-    match lock_of(tree)? {
+    ensure_locked_at(tree, tree)
+}
+
+/// `ensure_locked`, asked in `dir`.
+pub fn ensure_locked_at(dir: &Path, tree: &Path) -> Result<(), String> {
+    match lock_of(dir, tree)? {
         Some(_) => Ok(()),
-        None => git_lock(tree, &["lock", "--reason", LOCK_REASON]),
+        None => git_lock(dir, tree, &["lock", "--reason", LOCK_REASON]),
     }
 }
 
@@ -852,12 +913,22 @@ pub fn lock_in_background(cwd: &Path) {
     });
 }
 
+/// Whose lock `tree` has, from a `git worktree list --porcelain` text.
+pub fn lock_in(text: &str, tree: &Path) -> Lock {
+    match lock_in_listing(text, tree) {
+        None => Lock::None,
+        Some(r) if is_trixs(&r) => Lock::Trix,
+        Some(r) => Lock::Other(r),
+    }
+}
+
 /// Take trix's lock off `tree`, to remove it. `Ok(true)`: it had one.
-/// `Err`: someone else's lock, which stays.
-pub fn unlock(tree: &Path) -> Result<bool, String> {
-    match lock_of(tree)? {
+/// `Err`: someone else's lock, which stays. Asked in `dir`: the tree, or
+/// its repository when the folder is gone.
+pub fn unlock_at(dir: &Path, tree: &Path) -> Result<bool, String> {
+    match lock_of(dir, tree)? {
         None => Ok(false),
-        Some(r) if is_trixs(&r) => git_lock(tree, &["unlock"]).map(|()| true),
+        Some(r) if is_trixs(&r) => git_lock(dir, tree, &["unlock"]).map(|()| true),
         Some(r) => Err(format!("locked by someone else than trix ({}): `git worktree unlock` it first", if r.is_empty() { "no reason given" } else { &r })),
     }
 }
@@ -1364,7 +1435,7 @@ mod tests {
     }
 
     fn locked_reason(tree: &Path) -> Option<String> {
-        lock_of(tree).unwrap()
+        lock_of(tree, tree).unwrap()
     }
 
     #[test]
@@ -1377,9 +1448,9 @@ mod tests {
         ensure_locked(&tree).unwrap();
         let out = Command::new("git").arg("-C").arg(&root).args(["worktree", "remove", "--force"]).arg(&tree).output().unwrap();
         assert!(!out.status.success() && tree.exists(), "git refuses a locked worktree, forced once");
-        assert_eq!(unlock(&tree), Ok(true));
+        assert_eq!(unlock_at(&tree, &tree), Ok(true));
         assert_eq!(locked_reason(&tree), None);
-        assert_eq!(unlock(&tree), Ok(false));
+        assert_eq!(unlock_at(&tree, &tree), Ok(false));
     }
 
     #[test]
@@ -1402,7 +1473,7 @@ mod tests {
         git(&root, &["worktree", "lock", "--reason", "mine, hands off", &tree.display().to_string()]);
         ensure_locked(&tree).unwrap();
         assert_eq!(locked_reason(&tree).as_deref(), Some("mine, hands off"));
-        assert!(unlock(&tree).unwrap_err().contains("mine, hands off"));
+        assert!(unlock_at(&tree, &tree).unwrap_err().contains("mine, hands off"));
         assert_eq!(locked_reason(&tree).as_deref(), Some("mine, hands off"), "still theirs");
     }
 
