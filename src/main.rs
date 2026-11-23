@@ -27,6 +27,7 @@ mod theme;
 mod ui;
 mod usage;
 mod worktree;
+mod worktrees;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
@@ -54,6 +55,16 @@ usage:
   trix view                 watch the running workspace read-only (q leaves)
   trix ls [--json] [--all]  list agents and their state without attaching;
                             --all lists every session, even from inside a pane
+  trix worktrees [--all] [--json]
+                            trix's worktrees in this repo (--all: every repo trix
+                            knows): who uses each, what it holds, if it's merged
+  trix worktrees prune [--folders] [--min-age 1d] [--yes]
+                            remove clean, merged, unused worktrees, merged trix/*
+                            branches and month-old kept tips; --folders also
+                            unmerged folders, keeping the branch. Shows the plan
+                            and asks; a dry run without a terminal unless --yes
+  trix worktrees rm <name> [--keep-branch] [--yes]
+                            remove one, as the review's X does; says why not
   trix forget -s <name> [--yes]
                             drop a stopped session's saved workspace, so it
                             stops keeping its worktrees in use; asks first
@@ -311,6 +322,7 @@ fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some("worktrees") => std::process::exit(worktrees::run(&args[1..])),
         Some("forget") => {
             let yes = args.iter().skip(1).any(|a| a == "--yes" || a == "-y");
             if !flagged || args.iter().skip(1).any(|a| a != "--yes" && a != "-y") {
