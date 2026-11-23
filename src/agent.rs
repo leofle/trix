@@ -375,6 +375,9 @@ pub struct Agent {
     /// that one until the agent reports its own, and isn't its to save
     /// meanwhile: resumed, it would go on in the original's conversation.
     pub forked_from: Option<String>,
+    /// A clone's: the name its clones are numbered after (`<family>-N`),
+    /// the first original's. Kept through a rename.
+    pub family: Option<String>,
     /// A clone's: what its log has of the conversation it was forked from,
     /// which the original spent (`usage::less` takes it off).
     pub inherited: crate::usage::Spend,
@@ -489,6 +492,9 @@ pub struct Meta {
     pub forked_from: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inherited: Vec<(crate::usage::Bucket, crate::usage::Tokens)>,
+    /// A clone's `family`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 /// One thread per agent that sends each write when it's due, in the order
@@ -978,6 +984,7 @@ impl Agent {
         a.managed_by = meta.managed_by.clone();
         a.transcript = meta.transcript.clone();
         a.forked_from = meta.forked_from.clone();
+        a.family = meta.family.clone();
         a.inherited = meta.inherited.iter().cloned().collect();
         if a.state != State::Exited {
             a.restore_state(meta, quiet);
@@ -1061,6 +1068,7 @@ impl Agent {
             unseen: self.unseen,
             forked_from: self.forked_from.clone(),
             inherited: crate::usage::to_list(&self.inherited),
+            family: self.family.clone(),
         }
     }
 
@@ -1137,6 +1145,7 @@ impl Agent {
             amp_welcome_at: None,
             pending_tool: None,
             forked_from: None,
+            family: None,
             inherited: Default::default(),
         }
     }

@@ -764,6 +764,55 @@ fn gather(me: &str) -> Elsewhere {
 /// session of its own (`trix worktrees`): every session counts, its own too.
 pub struct Seen(Elsewhere);
 
+/// The other sessions, as this one's server sees them: gathered once, to
+/// ask about several folders. Blocking: each session is asked.
+pub struct Others(Elsewhere, String);
+
+pub fn others() -> Others {
+    let me = crate::session::name();
+    Others(gather(me), me.to_string())
+}
+
+/// An agent of another session that is in a folder: its name, and where it
+/// is ("session sidebar", or that session's restore offer or saved
+/// workspace).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Away {
+    pub agent: String,
+    pub at: String,
+}
+
+impl Others {
+    /// The agents of other sessions in `tree` or a folder under it: running
+    /// (where they started, or where they are now), offered for restore, or
+    /// in a stopped session's saved workspace. A session that didn't answer,
+    /// or a stopped server's holders, name no agent, so they aren't here.
+    pub fn agents_in(&self, tree: &Path) -> Vec<Away> {
+        let (seen, me) = (&self.0, self.1.as_str());
+        let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+        let mut out = Vec::new();
+        let mut served = BTreeSet::new();
+        let saved_in = |s: &str| -> Vec<String> { seen.saved.iter().filter(|(n, _)| n == s).flat_map(|(_, w)| w.agents.iter()).filter(|a| inside(&a.cwd, &tree)).map(|a| a.name.clone()).collect() };
+        for (s, answer) in seen.answers.iter().filter(|(s, _)| s != me) {
+            let Answer::Listed(Some(l)) = answer else { continue };
+            served.insert(s.clone());
+            let live: Vec<String> = l.agents.iter().filter(|(_, at)| at.iter().any(|p| inside(p, &tree))).map(|(n, _)| n.clone()).collect();
+            let offered: Vec<String> = match &l.pending {
+                Some(p) => p.iter().filter(|(_, c)| inside(c, &tree)).map(|(n, _)| n.clone()).collect(),
+                None => saved_in(s).into_iter().filter(|n| !live.contains(n)).collect(),
+            };
+            out.extend(live.into_iter().map(|agent| Away { agent, at: format!("session {s}") }));
+            out.extend(offered.into_iter().map(|agent| Away { agent, at: format!("session {s}'s restore offer") }));
+        }
+        let mut stopped: Vec<&String> = seen.saved.iter().map(|(s, _)| s).filter(|s| *s != me && !served.contains(*s)).collect();
+        stopped.dedup();
+        for s in stopped {
+            out.extend(saved_in(s).into_iter().map(|agent| Away { agent, at: format!("session {s}'s saved workspace") }));
+        }
+        out
+    }
+}
+
 pub fn seen() -> Seen {
     Seen(gather(""))
 }
@@ -1376,7 +1425,7 @@ mod tests {
     }
 
     fn saved(agents: &[(&str, &str)]) -> crate::state::Saved {
-        crate::state::Saved::new(0, agents.iter().map(|(n, c)| crate::state::SavedAgent { kind: "claude".into(), name: (*n).into(), cwd: c.into(), command: None, session: None, pinned: false, inherited: Vec::new() }).collect())
+        crate::state::Saved::new(0, agents.iter().map(|(n, c)| crate::state::SavedAgent { kind: "claude".into(), name: (*n).into(), cwd: c.into(), command: None, session: None, pinned: false, inherited: Vec::new(), family: None }).collect())
     }
 
     const W: &str = "/r/.trix/worktrees/w";

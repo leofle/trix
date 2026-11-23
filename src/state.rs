@@ -28,6 +28,9 @@ pub struct SavedAgent {
     /// spent by the original (`Agent::inherited`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inherited: Vec<(crate::usage::Bucket, crate::usage::Tokens)>,
+    /// A clone's: the name its clones are numbered after (`Agent::family`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -320,7 +323,7 @@ mod tests {
     }
 
     fn agent(kind: &str, name: &str, session: Option<&str>) -> SavedAgent {
-        SavedAgent { kind: kind.into(), name: name.into(), cwd: "/tmp".into(), command: None, session: session.map(Into::into), pinned: false, inherited: Vec::new() }
+        SavedAgent { kind: kind.into(), name: name.into(), cwd: "/tmp".into(), command: None, session: session.map(Into::into), pinned: false, inherited: Vec::new(), family: None }
     }
 
     #[test]
