@@ -836,6 +836,21 @@ pub fn users(tree: &Path, here: &[String], offered: &[String]) -> Vec<String> {
     out
 }
 
+/// `users`, to be asked on another thread: sessions are asked there, not
+/// here. A test's `SEEN` is taken along from this thread.
+pub fn users_later(tree: PathBuf, here: Vec<String>, offered: Vec<String>) -> impl FnOnce() -> Vec<String> + Send {
+    let pretended = cfg!(test).then(|| SEEN.with(|s| s.borrow().clone()));
+    move || match pretended {
+        Some(seen) => {
+            let was = SEEN.with(|s| s.replace(seen));
+            let out = users(&tree, &here, &offered);
+            SEEN.with(|s| *s.borrow_mut() = was);
+            out
+        }
+        None => users(&tree, &here, &offered),
+    }
+}
+
 // ───────────────────────────── git's lock ─────────────────────────────
 
 /// What trix's locks start with: a lock without it is someone else's.

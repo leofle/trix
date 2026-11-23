@@ -16,6 +16,7 @@ mod layout;
 mod modes;
 #[cfg(target_os = "macos")]
 mod notifier;
+mod offer;
 mod platform;
 mod prices;
 mod review;
@@ -86,8 +87,10 @@ agent control (for scripts, and for agents managing other agents):
                             block until one (or --all) stops working: done,
                             idle, needs-you or exited. Exits 124 after -t
                             seconds (300; 0 waits forever)
-  trix close <agent> [--force]
-                            close it; --force if it is working or needs you
+  trix close <agent> [--force] [--clean]
+                            close it; --force if it is working or needs you.
+                            --clean then removes its worktree if nothing keeps
+                            it (exits 1 with why, keeping it, otherwise)
   trix args <agent> [<args…> | --clear]
                             show or change the extra arguments it starts with
                             (e.g. --model claude-opus-5-5). Used from its next

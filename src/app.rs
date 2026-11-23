@@ -51,6 +51,13 @@ pub enum AppEvent {
     Spend(u32, crate::usage::Spend),
     /// The live price list: read from the cache, fetched, or failed to be.
     Prices(crate::prices::Feed),
+    /// The close dialog's look at the closing agents' worktrees came back:
+    /// its token, and what was found.
+    Offer(u64, Vec<crate::offer::Found>),
+    /// The worktrees an exited agent's close left, looked at.
+    Kept(Vec<crate::offer::Found>),
+    /// The close dialog's `r` took its worktrees away, or didn't.
+    Cleaned(Vec<Result<String, String>>),
     /// Attach / detach / control traffic; handled by the server loop.
     Session(SessionEvent),
 }
@@ -454,6 +461,32 @@ pub enum DialogHit {
 /// The buttons of the yes/no dialogs, left to right: the label, and the key
 /// that presses it. The first is the one Enter presses when the dialog opens.
 pub const CONFIRM_BUTTONS: [(&str, &str); 2] = [("y", "yes"), ("esc", "keep")];
+/// The close dialog's, once its worktree turned out to be safe to remove.
+pub const CLOSE_REMOVE_BUTTONS: [(&str, &str); 3] = [("y", "yes"), ("r", "and remove the worktree"), ("esc", "keep")];
+
+/// The close dialog's look at the worktrees its agents leave behind.
+pub struct CloseCheck {
+    pub token: u64,
+    /// `None`: still looking ("checking its worktree…", and no `r`).
+    pub found: Option<Vec<crate::offer::Found>>,
+}
+
+impl CloseCheck {
+    pub fn removable(&self) -> bool {
+        self.found.as_ref().is_some_and(|f| f.iter().any(crate::offer::Found::removable))
+    }
+}
+
+/// Who else uses a worktree, to be asked on another thread.
+pub type Users = Box<dyn FnOnce() -> Vec<String> + Send>;
+
+/// A worktree closing agents leave, and who else in this session is in it
+/// or would come back to it.
+struct Left {
+    tree: PathBuf,
+    here: Vec<String>,
+    offered: Vec<String>,
+}
 pub const RESTORE_BUTTONS: [(&str, &str); 3] = [("y", "restore"), ("n", "start fresh"), ("esc", "later")];
 pub const TRUST_BUTTONS: [(&str, &str); 3] = [("y", "trust and run"), ("n", "not this time"), ("esc", "back")];
 
@@ -547,6 +580,9 @@ pub struct App {
     /// Saved workspace awaiting the human's restore / start-fresh answer.
     /// Kept in every save until then, so detaching first loses nothing.
     pub pending_restore: Option<Saved>,
+    /// While a close dialog is open: what its agents' worktrees came to.
+    pub close_check: Option<CloseCheck>,
+    next_check: u64,
     /// Set by the last draw: the open dialog had no room for the line that
     /// shows what a key would do (Broadcast's message, Rename's name, the y of
     /// a confirm). Its Enter and y then do nothing rather than act unseen.
@@ -656,6 +692,8 @@ impl App {
             codex_hint: false,
             out,
             pending_restore: state::load(),
+            close_check: None,
+            next_check: 0,
             dialog_hidden: std::cell::Cell::new(false),
             last_saved: None,
             last_completion_sound: None,
@@ -1355,9 +1393,12 @@ impl App {
             return;
         }
         if self.selected_agents().all(|a| a.state == State::Exited) {
+            let left = self.left_by(&ids);
             self.close_many(&ids);
+            self.check_kept(left);
         } else {
-            self.modal = Some(Modal::ConfirmCloseMany(ids, 0));
+            self.modal = Some(Modal::ConfirmCloseMany(ids.clone(), 0));
+            self.check_close(ids);
         }
     }
 
@@ -1402,9 +1443,145 @@ impl App {
     /// Close an exited agent; ask first about one that still runs.
     fn ask_close(&mut self, id: u32) {
         match self.index_of(id).map(|i| self.agents[i].state) {
-            Some(State::Exited) => self.close(id),
-            Some(_) => self.modal = Some(Modal::ConfirmClose(id, 0)),
+            Some(State::Exited) => {
+                let left = self.left_by(&[id]);
+                self.close(id);
+                self.check_kept(left);
+            }
+            Some(_) => {
+                self.modal = Some(Modal::ConfirmClose(id, 0));
+                self.check_close(vec![id]);
+            }
             None => {}
+        }
+    }
+
+    // ───────────────────────────── a worktree left behind ─────────────────────────────
+
+    /// The worktrees of trix's that `ids` are in and that no other agent of
+    /// this session is in, by where it started or where it is now. Who'd
+    /// come back to each (the restore offer) goes along.
+    fn left_by(&self, ids: &[u32]) -> Vec<Left> {
+        let inside = |p: &Path, tree: &Path| p.starts_with(tree) || p.canonicalize().is_ok_and(|c| c.starts_with(tree));
+        let mut out: Vec<Left> = Vec::new();
+        for a in self.agents.iter().filter(|a| ids.contains(&a.id)) {
+            let start = self.specs.get(&a.id).map_or(a.cwd.clone(), |s| s.cwd.clone());
+            let Some(tree) = crate::worktree::managed_root(&start).or_else(|| crate::worktree::managed_root(&a.live_cwd())) else { continue };
+            let tree = tree.canonicalize().unwrap_or(tree);
+            if out.iter().any(|l| l.tree == tree) {
+                continue;
+            }
+            let here = self.agents.iter().filter(|o| !ids.contains(&o.id)).filter(|o| self.specs.get(&o.id).is_some_and(|s| inside(&s.cwd, &tree)) || inside(&o.live_cwd(), &tree)).map(|o| o.name.clone()).collect();
+            let offered = self.pending_restore.iter().flat_map(|p| &p.agents).filter(|s| inside(&s.cwd, &tree)).map(|s| s.name.clone()).collect();
+            out.push(Left { tree, here, offered });
+        }
+        out
+    }
+
+    /// Close `id` (`trix close`), and say which worktrees of trix's it
+    /// leaves that no other agent here is in: each with who else uses it,
+    /// to be asked on another thread.
+    pub fn close_leaving(&mut self, id: u32) -> Vec<(PathBuf, Users)> {
+        let left = self.left_by(&[id]);
+        self.close(id);
+        left.into_iter().map(|l| (l.tree.clone(), Box::new(crate::worktree::users_later(l.tree, l.here, l.offered)) as Users)).collect()
+    }
+
+    /// Look at `left` on another thread, then send `done` what was found.
+    fn look_later(&self, left: Vec<Left>, done: impl FnOnce(Vec<crate::offer::Found>) -> AppEvent + Send + 'static) {
+        let tx = self.tx.clone();
+        let jobs: Vec<_> = left.into_iter().map(|l| (l.tree.clone(), crate::worktree::users_later(l.tree, l.here, l.offered))).collect();
+        let _ = std::thread::Builder::new().name("trix-offer".into()).spawn(move || {
+            let found = jobs.into_iter().filter_map(|(tree, users)| crate::offer::look(&tree, users)).collect();
+            let _ = tx.send(done(found));
+        });
+    }
+
+    /// A close dialog opened for `ids`: look at the worktrees they'd leave,
+    /// off this thread. Until it answers, the dialog says it's checking and
+    /// has no `r`.
+    fn check_close(&mut self, ids: Vec<u32>) {
+        self.close_check = None;
+        if self.config.worktree.on_close == crate::config::OnClose::Keep {
+            return;
+        }
+        let left = self.left_by(&ids);
+        if left.is_empty() {
+            return;
+        }
+        self.next_check += 1;
+        let token = self.next_check;
+        self.close_check = Some(CloseCheck { token, found: None });
+        self.look_later(left, move |found| AppEvent::Offer(token, found));
+    }
+
+    /// An exited agent closed: say so if it left a worktree that could go.
+    fn check_kept(&mut self, left: Vec<Left>) {
+        if left.is_empty() || self.config.worktree.on_close == crate::config::OnClose::Keep {
+            return;
+        }
+        self.look_later(left, AppEvent::Kept);
+    }
+
+    fn on_offer(&mut self, token: u64, found: Vec<crate::offer::Found>) {
+        let Some(c) = self.close_check.as_mut().filter(|c| c.token == token) else { return };
+        c.found = Some(found);
+        // A button more: the one you'd moved to ("keep") stays where it was.
+        if c.removable()
+            && let Some(Modal::ConfirmClose(_, sel) | Modal::ConfirmCloseMany(_, sel)) = &mut self.modal
+            && *sel == CONFIRM_BUTTONS.len() - 1
+        {
+            *sel = CLOSE_REMOVE_BUTTONS.len() - 1;
+        }
+        self.dirty = true;
+    }
+
+    /// The close dialog's buttons as they are now.
+    pub fn close_buttons(&self) -> &'static [(&'static str, &'static str)] {
+        if self.close_check.as_ref().is_some_and(CloseCheck::removable) { &CLOSE_REMOVE_BUTTONS } else { &CONFIRM_BUTTONS }
+    }
+
+    /// The close dialog's `r`: close `ids`, then remove the worktrees found
+    /// safe, looking again first, off this thread.
+    fn close_and_clean(&mut self, ids: &[u32]) {
+        let found: Vec<crate::offer::Found> = self.close_check.take().and_then(|c| c.found).unwrap_or_default().into_iter().filter(crate::offer::Found::removable).collect();
+        let left = self.left_by(ids);
+        if ids.len() == 1 {
+            self.close(ids[0]);
+        } else {
+            self.close_many(ids);
+        }
+        let jobs: Vec<_> = found
+            .into_iter()
+            .filter_map(|f| {
+                let l = left.iter().find(|l| l.tree == f.tree)?;
+                Some((f, crate::worktree::users_later(l.tree.clone(), l.here.clone(), l.offered.clone())))
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let _ = std::thread::Builder::new().name("trix-clean".into()).spawn(move || {
+            let done = jobs.into_iter().map(|(f, users)| crate::offer::remove(&f, users)).collect();
+            let _ = tx.send(AppEvent::Cleaned(done));
+        });
+    }
+
+    fn on_kept(&mut self, found: Vec<crate::offer::Found>) {
+        for f in &found {
+            if let Some(t) = crate::offer::kept_toast(f) {
+                self.toast(t, ToastKind::Info);
+            }
+        }
+    }
+
+    fn on_cleaned(&mut self, done: Vec<Result<String, String>>) {
+        for d in done {
+            match d {
+                Ok(t) => self.toast(t, ToastKind::Good),
+                Err(e) => self.toast(e, ToastKind::Bad),
+            }
         }
     }
 
@@ -2342,6 +2519,9 @@ impl App {
                 }
             }
             AppEvent::Review(id, op, outcome) => self.review_done(id, op, outcome),
+            AppEvent::Offer(token, found) => self.on_offer(token, found),
+            AppEvent::Kept(found) => self.on_kept(found),
+            AppEvent::Cleaned(done) => self.on_cleaned(done),
         }
     }
 
@@ -3173,20 +3353,36 @@ impl App {
                 }
             }
             Modal::ConfirmQuit(sel) | Modal::ConfirmClose(_, sel) | Modal::ConfirmCloseMany(_, sel) => {
-                if let Some(to) = move_button(*sel, CONFIRM_BUTTONS.len(), k.code) {
-                    *sel = to;
+                let sel = *sel;
+                let quitting = matches!(self.modal, Some(Modal::ConfirmQuit(_)));
+                // `r` is there only once the worktree turned out safe to
+                // remove: a y typed ahead of that is a plain close.
+                let can_clean = !quitting && self.close_check.as_ref().is_some_and(CloseCheck::removable);
+                let n = if can_clean { CLOSE_REMOVE_BUTTONS.len() } else { CONFIRM_BUTTONS.len() };
+                if let Some(to) = move_button(sel, n, k.code) {
+                    if let Some(Modal::ConfirmQuit(s) | Modal::ConfirmClose(_, s) | Modal::ConfirmCloseMany(_, s)) = &mut self.modal {
+                        *s = to;
+                    }
                     return;
                 }
-                // y, or enter on yes, says yes; anything else keeps them.
-                let yes = (k.code == KeyCode::Char('y') || (k.code == KeyCode::Enter && *sel == 0)) && !self.dialog_hidden.get();
+                let shown = !self.dialog_hidden.get();
+                // y, or enter on yes, says yes; r, or enter on it, also
+                // removes the worktree; anything else keeps them.
+                let yes = (k.code == KeyCode::Char('y') || (k.code == KeyCode::Enter && sel == 0)) && shown;
+                let clean = can_clean && (k.code == KeyCode::Char('r') || (k.code == KeyCode::Enter && sel == 1)) && shown;
                 match self.modal.take() {
                     Some(Modal::ConfirmQuit(_)) if yes => {
                         self.modal = Some(Modal::ConfirmQuit(0));
                         self.quit = true;
                     }
+                    Some(Modal::ConfirmClose(id, _)) if clean => self.close_and_clean(&[id]),
+                    Some(Modal::ConfirmCloseMany(ids, _)) if clean => self.close_and_clean(&ids),
                     Some(Modal::ConfirmClose(id, _)) if yes => self.close(id),
                     Some(Modal::ConfirmCloseMany(ids, _)) if yes => self.close_many(&ids),
                     _ => {}
+                }
+                if !matches!(self.modal, Some(Modal::ConfirmClose(..) | Modal::ConfirmCloseMany(..))) {
+                    self.close_check = None;
                 }
             }
             Modal::Rename(_, _) | Modal::Broadcast(..) | Modal::New(_) if k.code == KeyCode::Enter && self.dialog_hidden.get() => {
@@ -5666,6 +5862,241 @@ mod tests {
         assert!(text.contains("! tester in session default has needed you for 27h"), "{text}");
         assert!(!text.contains("nobody and nothing"), "the session itself isn't idle");
         stop_all(&app);
+    }
+
+    /// A repo with a trix worktree `w` and an idle agent `ra` in it.
+    fn closing_in_worktree(tag: &str) -> (App, u32, PathBuf, PathBuf) {
+        let dir = repo_with_setup(tag);
+        let (wt, _, _) = make_worktree(&dir, "w").unwrap();
+        let wt = wt.canonicalize().unwrap();
+        let mut app = test_app();
+        let id = app.spawn_quiet(sleeper("ra", &wt)).unwrap();
+        app.agents[0].set_state(State::Idle, false);
+        (app, id, dir, wt)
+    }
+
+    /// What the close dialog's check would find, answered now.
+    fn answer_check(app: &mut App, trees: &[&Path]) {
+        let token = app.close_check.as_ref().expect("a check is under way").token;
+        let found = trees.iter().map(|t| crate::offer::look(t, crate::worktree::users_later(t.to_path_buf(), Vec::new(), Vec::new())).unwrap()).collect();
+        app.handle(AppEvent::Offer(token, found));
+    }
+
+    fn press_in(app: &mut App, c: KeyCode) {
+        app.modal_key(KeyEvent::new(c, KeyModifiers::NONE));
+    }
+
+    fn gone_soon(p: &Path) -> bool {
+        for _ in 0..250 {
+            if !p.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn closing_the_last_agent_in_a_clean_merged_worktree_offers_r() {
+        crate::worktree::pretend_nobody();
+        let (mut app, id, dir, wt) = closing_in_worktree("offer-merged");
+        app.ask_close(id);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(..))));
+        answer_check(&mut app, &[&wt]);
+        assert_eq!(crate::ui::close_line(&app, false).as_deref(), Some("Its worktree is clean and merged into main: r also removes it and trix/w."));
+        assert_eq!(app.close_buttons(), CLOSE_REMOVE_BUTTONS, "y stays first: the default is close");
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Char('r'));
+        assert!(app.agents.is_empty(), "closed");
+        assert!(gone_soon(&wt), "and its worktree removed");
+        for _ in 0..250 {
+            if Command::new("git").arg("-C").arg(&dir).args(["branch", "--list", "trix/w"]).output().unwrap().stdout.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(Command::new("git").arg("-C").arg(&dir).args(["branch", "--list", "trix/w"]).output().unwrap().stdout.is_empty(), "merged: its branch went too");
+    }
+
+    #[test]
+    fn an_unmerged_clean_worktree_offers_to_remove_the_folder_only() {
+        crate::worktree::pretend_nobody();
+        let (mut app, id, dir, wt) = closing_in_worktree("offer-unmerged");
+        std::fs::write(wt.join("new.txt"), "work\n").unwrap();
+        for args in [&["add", "new.txt"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "work"]] {
+            assert!(Command::new("git").arg("-C").arg(&wt).args(args).status().unwrap().success());
+        }
+        app.ask_close(id);
+        answer_check(&mut app, &[&wt]);
+        assert_eq!(crate::ui::close_line(&app, false).as_deref(), Some("Its worktree is clean; trix/w has 1 commit not in main: r also removes the folder, keeping trix/w."));
+        app.dialog_hidden.set(false);
+        // Enter on the r button, which tab gets to.
+        press_in(&mut app, KeyCode::Tab);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(_, 1))));
+        press_in(&mut app, KeyCode::Enter);
+        assert!(app.agents.is_empty());
+        assert!(gone_soon(&wt));
+        assert!(!Command::new("git").arg("-C").arg(&dir).args(["branch", "--list", "trix/w"]).output().unwrap().stdout.is_empty(), "unmerged: the branch stays");
+    }
+
+    #[test]
+    fn a_worktree_with_work_in_it_gets_no_r() {
+        crate::worktree::pretend_nobody();
+        let (mut app, id, _dir, wt) = closing_in_worktree("offer-dirty");
+        std::fs::write(wt.join("draft.txt"), "unsaved\n").unwrap();
+        app.ask_close(id);
+        answer_check(&mut app, &[&wt]);
+        let line = crate::ui::close_line(&app, false).unwrap();
+        assert!(line.starts_with("Its worktree w stays: it has uncommitted work (1 untracked)"), "{line}");
+        assert_eq!(app.close_buttons(), CONFIRM_BUTTONS);
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.agents.len(), 1, "r isn't there: it keeps, like any other key");
+        assert!(wt.exists());
+        stop_all(&app);
+    }
+
+    #[test]
+    fn until_the_check_answers_there_is_no_r_and_a_y_typed_ahead_only_closes() {
+        crate::worktree::pretend_nobody();
+        let (mut app, id, _dir, wt) = closing_in_worktree("offer-ahead");
+        app.ask_close(id);
+        assert_eq!(crate::ui::close_line(&app, false).as_deref(), Some("checking its worktree…"));
+        assert_eq!(app.close_buttons(), CONFIRM_BUTTONS);
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.agents.len(), 1, "r before the answer does nothing");
+        // Again: tab to keep, then the answer comes: keep stays selected.
+        app.ask_close(id);
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Tab);
+        answer_check(&mut app, &[&wt]);
+        assert!(matches!(app.modal, Some(Modal::ConfirmClose(_, 2))), "still on keep");
+        press_in(&mut app, KeyCode::Enter);
+        assert_eq!(app.agents.len(), 1, "kept");
+        // And y typed before the answer is a close, nothing more.
+        app.ask_close(id);
+        let token = app.close_check.as_ref().unwrap().token;
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Char('y'));
+        assert!(app.agents.is_empty());
+        let found = vec![crate::offer::look(&wt, Vec::new).unwrap()];
+        app.handle(AppEvent::Offer(token, found));
+        assert!(app.close_check.is_none(), "a late answer finds no dialog");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(wt.exists(), "never removed");
+    }
+
+    #[test]
+    fn closing_an_exited_agent_says_its_worktree_was_kept() {
+        crate::worktree::pretend_nobody();
+        let (mut app, id, _dir, wt) = closing_in_worktree("offer-exited");
+        let left = app.left_by(&[id]);
+        assert!(left.len() == 1 && left[0].tree == wt);
+        app.agents[0].set_state(State::Exited, false);
+        app.ask_close(id);
+        assert!(app.agents.is_empty() && app.modal.is_none(), "no dialog");
+        let found = crate::offer::look(&wt, Vec::new).unwrap();
+        app.handle(AppEvent::Kept(vec![found]));
+        assert_eq!(app.toast.as_ref().unwrap().text, "kept worktree w (clean, merged): alt+v X, or `trix worktrees rm w`");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn closing_many_sums_their_worktrees_up() {
+        crate::worktree::pretend_nobody();
+        let dir = repo_with_setup("offer-many");
+        let (a, _, _) = make_worktree(&dir, "a").unwrap();
+        let (b, _, _) = make_worktree(&dir, "b").unwrap();
+        let (a, b) = (a.canonicalize().unwrap(), b.canonicalize().unwrap());
+        std::fs::write(b.join("draft.txt"), "unsaved\n").unwrap();
+        let mut app = test_app();
+        let ia = app.spawn_quiet(sleeper("ra", &a)).unwrap();
+        let ib = app.spawn_quiet(sleeper("rb", &b)).unwrap();
+        for x in &mut app.agents {
+            x.set_state(State::Idle, false);
+        }
+        app.selected = vec![ia, ib];
+        app.ask_close_selected();
+        assert_eq!(crate::ui::close_line(&app, true).as_deref(), Some("checking their worktrees…"));
+        answer_check(&mut app, &[&a, &b]);
+        assert_eq!(crate::ui::close_line(&app, true).as_deref(), Some("1 of their worktrees is clean and merged: r also removes it."));
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Char('r'));
+        assert!(app.agents.is_empty());
+        assert!(gone_soon(&a), "the clean one goes");
+        assert!(b.exists(), "the one with work stays");
+    }
+
+    #[test]
+    fn on_close_keep_offers_nothing() {
+        crate::worktree::pretend_nobody();
+        let (mut app, id, _dir, wt) = closing_in_worktree("offer-keep");
+        app.config.worktree.on_close = crate::config::OnClose::Keep;
+        app.ask_close(id);
+        assert!(app.close_check.is_none() && crate::ui::close_line(&app, false).is_none());
+        assert_eq!(app.close_buttons(), CONFIRM_BUTTONS);
+        app.dialog_hidden.set(false);
+        press_in(&mut app, KeyCode::Char('y'));
+        assert!(app.agents.is_empty() && wt.exists());
+    }
+
+    /// `trix close` as a control request: its reply.
+    fn close_by_control(app: &mut App, target: &str, clean: bool, sandboxed: bool) -> crate::control::Reply {
+        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        crate::control::handle(app, theirs, None, crate::control::Request::Close { target: target.into(), force: false, clean }, sandboxed);
+        let mut mine = mine;
+        let _ = mine.set_read_timeout(Some(Duration::from_secs(10)));
+        let (_, json) = crate::session::read_frame(&mut mine).unwrap();
+        serde_json::from_slice(&json).unwrap()
+    }
+
+    #[test]
+    fn trix_close_clean_removes_a_safe_worktree() {
+        crate::worktree::pretend_nobody();
+        let (mut app, _, dir, wt) = closing_in_worktree("clean-safe");
+        let r = close_by_control(&mut app, "ra", true, false);
+        assert_eq!(r.code, 0, "{r:?}");
+        assert!(r.out.starts_with("closed ra\nw: removed the worktree"), "{}", r.out);
+        assert!(app.agents.is_empty() && !wt.exists());
+        assert!(Command::new("git").arg("-C").arg(&dir).args(["branch", "--list", "trix/w"]).output().unwrap().stdout.is_empty(), "merged: its branch went too");
+    }
+
+    #[test]
+    fn trix_close_clean_keeps_a_worktree_with_work_and_says_why() {
+        crate::worktree::pretend_nobody();
+        let (mut app, _, _dir, wt) = closing_in_worktree("clean-dirty");
+        std::fs::write(wt.join("draft.txt"), "unsaved\n").unwrap();
+        let r = close_by_control(&mut app, "ra", true, false);
+        assert_eq!(r.code, 1, "{r:?}");
+        assert_eq!(r.out, "closed ra\n", "the agent is closed all the same");
+        assert!(r.err.contains("stays: it has uncommitted work"), "{}", r.err);
+        assert!(app.agents.is_empty() && wt.exists());
+    }
+
+    #[test]
+    fn trix_close_clean_keeps_a_worktree_another_session_uses() {
+        let (mut app, _, _dir, wt) = closing_in_worktree("clean-elsewhere");
+        crate::worktree::pretend_users("other", "web", &wt);
+        let r = close_by_control(&mut app, "ra", true, false);
+        crate::worktree::pretend_nobody();
+        assert_eq!(r.code, 1, "{r:?}");
+        assert!(r.err.contains("it's also used by") && r.err.contains("web"), "{}", r.err);
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn trix_close_clean_is_refused_in_a_sandbox_and_plain_close_says_what_it_kept() {
+        crate::worktree::pretend_nobody();
+        let (mut app, _, _dir, wt) = closing_in_worktree("clean-sandbox");
+        let r = close_by_control(&mut app, "ra", true, true);
+        assert_eq!(r.code, 1);
+        assert!(r.err.contains("can't close --clean"), "{}", r.err);
+        assert_eq!(app.agents.len(), 1, "refused outright: not even closed");
+        let r = close_by_control(&mut app, "ra", false, true);
+        assert_eq!((r.code, r.out.as_str()), (0, "closed ra\n"));
+        assert!(r.err.starts_with("kept worktree w:"), "{}", r.err);
+        assert!(wt.exists());
     }
 
     #[test]
