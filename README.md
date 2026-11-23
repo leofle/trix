@@ -15,6 +15,8 @@ A terminal workspace for coding agents. Run Claude Code, Codex, Grok, OpenCode, 
        claude ▁▁▁▂▅▁▁▁▁▁  trix/api │                                                              │
 ```
 
+![trix demo: starting trix in a project and working with agents side by side](assets/trix.gif)
+
 **Get started:** [Install](#install) · [Quick start](#quick-start) · [Keys](#keys) · [macOS](#macos) · [Supported agents](#supported-agents) · [Codex](#codex)<br>
 **Features:** [Search](#search) · [Runnable worktrees](#runnable-worktrees) · [Review](#review) · [Clone](#clone) · [Agent control](#agent-control) · [Layouts](#layouts) · [Restore](#restore) · [Sessions](#sessions) · [Viewers](#viewers) · [Context gauge](#context-gauge) · [Cost and tokens](#cost-and-tokens)<br>
 **Configure:** [Settings](#settings) · [Config](#config) · [Environment variables](#environment-variables) · [Themes](#themes) · [Your instructions](#your-instructions)<br>
@@ -772,7 +774,7 @@ src/input.rs   key → xterm byte encoding
 src/theme.rs   theme loading (TRIX_THEME, ~/.config/trix/colors.toml, Omarchy) / live reload / the themes the settings offer, built in
 src/platform.rs Linux / macOS differences: process liveness and folders, foreground job, notifications, sound, clipboard
 src/notifier.rs macOS notifications with trix's icon: makes trix.app, and posts from it through UserNotifications
-assets/        trix's icon (trix.svg, and trix.png / trix.icns made from it) and its sounds (chime, bell, drop, knock, marimba)
+assets/        trix's icon (trix.svg, and trix.png / trix.icns made from it), the README demo (trix.gif) and its sounds (chime, bell, drop, knock, marimba)
 themes/        Omarchy's 23 themes and Cyber Aura, to use without Omarchy (macOS)
 install-theme.sh copies one of them, or any colors.toml, to ~/.config/trix/colors.toml
 ```
