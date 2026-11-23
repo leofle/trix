@@ -100,15 +100,49 @@ pub fn write_through(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// One file per session; the default one keeps the original name.
 pub fn path() -> PathBuf {
-    if crate::session::is_default() {
-        dir().join("workspace.json")
-    } else {
-        dir().join(format!("workspace-{}.json", crate::session::name()))
-    }
+    path_for(crate::session::name())
+}
+
+/// `session`'s saved workspace, whichever session this is.
+pub fn path_for(session: &str) -> PathBuf {
+    path_in(&dir(), session)
+}
+
+pub(crate) fn path_in(dir: &Path, session: &str) -> PathBuf {
+    if session == crate::session::DEFAULT { dir.join("workspace.json") } else { dir.join(format!("workspace-{session}.json")) }
 }
 
 pub fn load() -> Option<Saved> {
     load_from(&path())
+}
+
+/// Every session's saved workspace with agents in it, running or not,
+/// default first: what each would bring back.
+pub fn saved_workspaces() -> Vec<(String, Saved)> {
+    saved_workspaces_in(&dir())
+}
+
+pub(crate) fn saved_workspaces_in(dir: &Path) -> Vec<(String, Saved)> {
+    saved_sessions_in(dir).into_iter().filter_map(|s| Some((s.clone(), load_from(&path_in(dir, &s))?))).collect()
+}
+
+fn saved_sessions_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let stem = file.strip_suffix(".json")?;
+            if stem == "workspace" {
+                return Some(crate::session::DEFAULT.to_string());
+            }
+            let n = stem.strip_prefix("workspace-")?;
+            crate::session::check_name(n).is_ok().then(|| n.to_string())
+        })
+        .collect();
+    names.sort_by(|a, b| (a != crate::session::DEFAULT, a).cmp(&(b != crate::session::DEFAULT, b)));
+    names
 }
 
 fn load_from(path: &Path) -> Option<Saved> {

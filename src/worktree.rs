@@ -593,45 +593,6 @@ pub fn keep_only(keep: impl IntoIterator<Item = PathBuf>) {
     }
 }
 
-/// The agents in `json` (a `trix ls --json` reply) inside `worktree`.
-fn agents_in(reply: &str, worktree: &Path) -> Option<Vec<String>> {
-    let reply: crate::control::Reply = serde_json::from_str(reply).ok()?;
-    let list: serde_json::Value = serde_json::from_str(&reply.out).ok()?;
-    let agents = list.get("agents")?.as_array()?;
-    Some(agents.iter().filter(|a| a.get("cwd").and_then(|c| c.as_str()).is_some_and(|c| Path::new(c).starts_with(worktree))).filter_map(|a| a.get("name")?.as_str().map(String::from)).collect())
-}
-
-/// Why another session keeps this worktree from being removed, if it does.
-/// A session that can't say counts as using it: removing a folder from under
-/// an agent is worse than asking you to look.
-pub fn used_elsewhere(worktree: &Path) -> Option<String> {
-    use crate::session::ClientMsg;
-    if cfg!(test) {
-        return None;
-    }
-    let me = crate::session::name();
-    let held: BTreeSet<String> = read_ledger(&state_dir()).get(&worktree.display().to_string()).map(|l| l.sessions.clone()).unwrap_or_default();
-    let mut sessions: BTreeSet<String> = crate::session::candidates().into_iter().collect();
-    sessions.extend(held.iter().cloned());
-    for s in sessions.iter().filter(|s| *s != me) {
-        let ask = ClientMsg::Control { protocol: crate::control::CONTROL, from: None, req: crate::control::Request::List { json: true } };
-        match crate::session::ask(s, &ask) {
-            Ok(Some(text)) => match agents_in(&text, worktree) {
-                Some(names) if names.is_empty() => {}
-                Some(names) => return Some(format!("{} in session {s} still use this worktree: close them first", names.join(", "))),
-                None => return Some(format!("session {s} didn't say whether it uses this worktree: try again")),
-            },
-            Err(()) => return Some(format!("session {s} didn't say whether it uses this worktree: try again")),
-            // No server, but agents its crash left running may be in here.
-            Ok(None) if held.contains(s) && !crate::holder::discover(s).is_empty() => {
-                return Some(format!("session {s} has agents left running: open it, or `trix kill -s {s}`, first"));
-            }
-            Ok(None) => {}
-        }
-    }
-    None
-}
-
 pub fn release(cwd: &Path) {
     if let Some(worktree) = managed_root(cwd)
         && let Err(e) = release_in(&state_dir(), &worktree, &lease_holder())
@@ -649,6 +610,247 @@ pub fn leased(worktree: &Path) -> Option<Ports> {
 pub fn forget(worktree: &Path) {
     if let Err(e) = forget_in(&state_dir(), worktree) {
         eprintln!("trix: couldn't release the ports of {}: {e}", worktree.display());
+    }
+}
+
+// ───────────────────────────── who uses a worktree ─────────────────────────────
+
+/// What another session's server said of itself (`trix ls --json`): its
+/// agents by where they started and where they are now, and its unanswered
+/// restore offer. `pending`: `None` from a server older than the field.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Listing {
+    agents: Vec<(String, Vec<PathBuf>)>,
+    pending: Option<Vec<(String, PathBuf)>>,
+}
+
+/// A `trix ls --json` reply, read. `None`: not one.
+fn parse_listing(reply: &str) -> Option<Listing> {
+    let reply: crate::control::Reply = serde_json::from_str(reply).ok()?;
+    let list: serde_json::Value = serde_json::from_str(&reply.out).ok()?;
+    let path = |v: &serde_json::Value, key: &str| v.get(key).and_then(|c| c.as_str()).map(PathBuf::from);
+    let agents = list.get("agents")?.as_array()?.iter().filter_map(|a| Some((a.get("name")?.as_str()?.to_string(), ["cwd", "live_cwd"].iter().filter_map(|k| path(a, k)).collect()))).collect();
+    let pending = list.get("pending_restore").and_then(|p| p.as_array()).map(|p| p.iter().filter_map(|a| Some((a.get("name")?.as_str()?.to_string(), path(a, "cwd")?))).collect());
+    Some(Listing { agents, pending })
+}
+
+/// What a session that isn't this one came to, when asked.
+#[derive(Clone, Debug)]
+enum Answer {
+    /// Its server answered with this (`parse_listing`), or with something
+    /// that isn't a listing (`None`).
+    Listed(Option<Listing>),
+    /// It's there and didn't answer in time.
+    Silent,
+    /// No server.
+    Gone,
+}
+
+/// Everything `users` looks at besides this session, gathered.
+#[derive(Clone, Debug, Default)]
+struct Elsewhere {
+    answers: Vec<(String, Answer)>,
+    /// Saved workspaces (`workspace*.json`), by session.
+    saved: Vec<(String, crate::state::Saved)>,
+    /// Live holders by the hash of their session's name (`holder`), with
+    /// the session's name when it's known.
+    holders: Vec<(String, Option<String>, usize)>,
+}
+
+fn inside(p: &Path, tree: &Path) -> bool {
+    p.starts_with(tree) || p.canonicalize().is_ok_and(|c| c.starts_with(tree))
+}
+
+fn names(list: &[String]) -> String {
+    list.join(", ")
+}
+
+/// Who uses `tree`, besides this session (`me`), from what was gathered: one
+/// line each, naming them. Saved workspaces count for the sessions with no
+/// server, and for a server too old to list its restore offer.
+fn users_from(tree: &Path, me: &str, seen: &Elsewhere) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut served = BTreeSet::new();
+    let saved_in = |s: &str| -> Vec<String> { seen.saved.iter().filter(|(n, _)| n == s).flat_map(|(_, w)| w.agents.iter()).filter(|a| inside(&a.cwd, tree)).map(|a| a.name.clone()).collect() };
+    for (s, answer) in seen.answers.iter().filter(|(s, _)| s != me) {
+        match answer {
+            Answer::Listed(Some(l)) => {
+                served.insert(s.clone());
+                let live: Vec<String> = l.agents.iter().filter(|(_, at)| at.iter().any(|p| inside(p, tree))).map(|(n, _)| n.clone()).collect();
+                if !live.is_empty() {
+                    out.push(format!("{} in session {s}", names(&live)));
+                }
+                let offered: Vec<String> = match &l.pending {
+                    Some(p) => p.iter().filter(|(_, c)| inside(c, tree)).map(|(n, _)| n.clone()).collect(),
+                    // An older server: what it would restore is in its file.
+                    None => saved_in(s).into_iter().filter(|n| !live.contains(n)).collect(),
+                };
+                if !offered.is_empty() {
+                    out.push(format!("{} in session {s}'s restore offer", names(&offered)));
+                }
+            }
+            Answer::Listed(None) | Answer::Silent => {
+                served.insert(s.clone());
+                out.push(format!("session {s}, which didn't say whether it uses this worktree (try again)"));
+            }
+            Answer::Gone => {}
+        }
+    }
+    let mut stopped: Vec<&String> = seen.saved.iter().map(|(s, _)| s).filter(|s| *s != me && !served.contains(*s)).collect();
+    stopped.dedup();
+    for s in stopped {
+        let here = saved_in(s);
+        if !here.is_empty() {
+            out.push(format!("{} in session {s}'s saved workspace (`trix -s {s}` brings {} back)", names(&here), if here.len() == 1 { "it" } else { "them" }));
+        }
+    }
+    // A holder has no server to ask where it is: it may be in here.
+    let mine = crate::hooks::short_hash(me);
+    for (hash, name, n) in &seen.holders {
+        if *hash == mine || name.as_ref().is_some_and(|s| served.contains(s)) {
+            continue;
+        }
+        let (are, them) = if *n == 1 { ("agent", "it") } else { ("agents", "them") };
+        out.push(match name {
+            Some(s) => format!("{n} {are} left running by session {s}'s stopped server (`trix -s {s}` picks {them} up, `trix kill -s {s}` stops {them})"),
+            None => format!("{n} {are} left running by a stopped trix server (`trix kill` stops {them})"),
+        });
+    }
+    out
+}
+
+/// Ask every other session, read every saved workspace, find every live
+/// holder. Tests see only what they put in `SEEN`, never the developer's
+/// own sessions.
+fn gather(me: &str) -> Elsewhere {
+    use crate::session::ClientMsg;
+    if cfg!(test) {
+        return SEEN.with(|s| s.borrow().clone());
+    }
+    let saved = crate::state::saved_workspaces();
+    let mut known: BTreeSet<String> = crate::session::candidates().into_iter().collect();
+    known.extend(saved.iter().map(|(s, _)| s.clone()));
+    known.extend(read_ledger(&state_dir()).into_values().flat_map(|l| l.sessions));
+    let answers = crate::session::candidates()
+        .into_iter()
+        .filter(|s| s != me)
+        .map(|s| {
+            let ask = ClientMsg::Control { protocol: crate::control::CONTROL, from: None, req: crate::control::Request::List { json: true } };
+            let answer = match crate::session::ask(&s, &ask) {
+                Ok(Some(text)) => Answer::Listed(parse_listing(&text)),
+                Ok(None) => Answer::Gone,
+                Err(()) => Answer::Silent,
+            };
+            (s, answer)
+        })
+        .collect();
+    let mut by_hash: BTreeMap<String, usize> = BTreeMap::new();
+    for hash in crate::holder::discover_all().iter().filter_map(|(_, p)| crate::holder::session_hash(p)) {
+        *by_hash.entry(hash).or_default() += 1;
+    }
+    let holders = by_hash.into_iter().map(|(h, n)| (h.clone(), known.iter().find(|s| crate::hooks::short_hash(s) == h).cloned(), n)).collect();
+    Elsewhere { answers, saved, holders }
+}
+
+thread_local! {
+    /// What a test says the other sessions are.
+    static SEEN: std::cell::RefCell<Elsewhere> = std::cell::RefCell::new(Elsewhere::default());
+}
+
+/// For a test: another session, stopped, whose saved workspace has `saved`.
+#[cfg(test)]
+pub fn pretend_saved(session: &str, saved: Option<crate::state::Saved>) {
+    SEEN.with(|s| *s.borrow_mut() = Elsewhere { saved: saved.map(|w| (session.to_string(), w)).into_iter().collect(), ..Elsewhere::default() });
+}
+
+/// Who uses `tree`: `here`, this session's agents in it (by where they
+/// started or are now), and `offered`, those its restore offer would bring
+/// back into it, then every other session's agents, restore offers
+/// and saved workspaces, and agents a stopped server left running. One line
+/// each, naming them. A session that can't say counts as using it: removing
+/// a folder from under an agent is worse than asking you to look.
+pub fn users(tree: &Path, here: &[String], offered: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !here.is_empty() {
+        out.push(format!("{} also in this worktree (close {} first)", names(here), if here.len() == 1 { "it" } else { "them" }));
+    }
+    if !offered.is_empty() {
+        out.push(format!("{} in this session's restore offer", names(offered)));
+    }
+    let me = crate::session::name();
+    out.extend(users_from(tree, me, &gather(me)));
+    out
+}
+
+// ───────────────────────────── git's lock ─────────────────────────────
+
+/// What trix's locks start with: a lock without it is someone else's.
+const LOCK_MARK: &str = "trix:";
+pub const LOCK_REASON: &str = "trix: an agent's worktree; remove it with the review's X (alt+v), not by hand";
+
+/// `tree`'s lock, as `git worktree list` has it: `None` when it isn't
+/// locked, `Some("")` for a lock with no reason. `Err`: git couldn't say.
+/// The newline porcelain, not `-z`, which needs git 2.36.
+fn lock_of(tree: &Path) -> Result<Option<String>, String> {
+    let out = Command::new("git").arg("-C").arg(tree).args(["-c", "core.quotePath=false", "worktree", "list", "--porcelain"]).stderr(Stdio::null()).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("not a worktree git knows".into());
+    }
+    Ok(lock_in_listing(&String::from_utf8_lossy(&out.stdout), tree))
+}
+
+/// `lock_of`, from `git worktree list --porcelain`'s text. A reason with
+/// unusual characters comes C-quoted, as `"…"`; it's kept as git gave it.
+fn lock_in_listing(text: &str, tree: &Path) -> Option<String> {
+    let real = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+    let mut ours = false;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            ours = Path::new(p) == tree || Path::new(p) == real || Path::new(p).canonicalize().is_ok_and(|c| c == real);
+        } else if ours && (line == "locked" || line.starts_with("locked ")) {
+            return Some(line.strip_prefix("locked").unwrap_or_default().trim_start().to_string());
+        }
+    }
+    None
+}
+
+/// A lock reason (as `lock_in_listing` gives it, maybe quoted) that's trix's.
+fn is_trixs(reason: &str) -> bool {
+    reason.strip_prefix('"').unwrap_or(reason).starts_with(LOCK_MARK)
+}
+
+fn git_lock(tree: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git").arg("-C").arg(tree).args(["worktree"]).args(args).arg(tree).stderr(Stdio::piped()).stdout(Stdio::null()).output().map_err(|e| e.to_string())?;
+    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("failed").to_string()) }
+}
+
+/// Lock `tree` if it isn't: one from before trix locked its worktrees.
+/// Someone else's lock stays as it is.
+pub fn ensure_locked(tree: &Path) -> Result<(), String> {
+    match lock_of(tree)? {
+        Some(_) => Ok(()),
+        None => git_lock(tree, &["lock", "--reason", LOCK_REASON]),
+    }
+}
+
+/// `ensure_locked` on the worktree trix made that `cwd` is in, off this
+/// thread; a failure is logged and never stops the agent.
+pub fn lock_in_background(cwd: &Path) {
+    let Some(tree) = managed_root(cwd) else { return };
+    let _ = std::thread::Builder::new().name("trix-lock".into()).spawn(move || {
+        if let Err(e) = ensure_locked(&tree) {
+            eprintln!("trix: couldn't lock the worktree {}: {e}", tree.display());
+        }
+    });
+}
+
+/// Take trix's lock off `tree`, to remove it. `Ok(true)`: it had one.
+/// `Err`: someone else's lock, which stays.
+pub fn unlock(tree: &Path) -> Result<bool, String> {
+    match lock_of(tree)? {
+        None => Ok(false),
+        Some(r) if is_trixs(&r) => git_lock(tree, &["unlock"]).map(|()| true),
+        Some(r) => Err(format!("locked by someone else than trix ({}): `git worktree unlock` it first", if r.is_empty() { "no reason given" } else { &r })),
     }
 }
 
@@ -1075,13 +1277,125 @@ mod tests {
         assert_eq!(ledger[&b.display().to_string()].sessions, BTreeSet::from(["two".to_string()]), "another session's stays");
     }
 
+    fn listed(json: &str) -> Answer {
+        Answer::Listed(parse_listing(&serde_json::to_string(&crate::control::Reply::ok(json)).unwrap()))
+    }
+
+    fn saved(agents: &[(&str, &str)]) -> crate::state::Saved {
+        crate::state::Saved::new(0, agents.iter().map(|(n, c)| crate::state::SavedAgent { kind: "claude".into(), name: (*n).into(), cwd: c.into(), command: None, session: None, pinned: false, inherited: Vec::new() }).collect())
+    }
+
+    const W: &str = "/r/.trix/worktrees/w";
+
     #[test]
     fn another_sessions_agents_are_found_in_a_worktree() {
-        let out = r#"{"agents":[{"name":"rb","cwd":"/r/.trix/worktrees/w/src"},{"name":"x","cwd":"/r/.trix/worktrees/w2"}]}"#;
-        let reply = serde_json::to_string(&crate::control::Reply::ok(out)).unwrap();
-        assert_eq!(agents_in(&reply, Path::new("/r/.trix/worktrees/w")), Some(vec!["rb".to_string()]));
-        assert_eq!(agents_in(&reply, Path::new("/r/.trix/worktrees/none")), Some(vec![]));
-        assert_eq!(agents_in("", Path::new("/r")), None, "no answer isn't \"nobody\"");
+        let seen = Elsewhere { answers: vec![("x".into(), listed(r#"{"agents":[{"name":"rb","cwd":"/r/.trix/worktrees/w/src"},{"name":"o","cwd":"/r/.trix/worktrees/w2"}],"pending_restore":[]}"#))], ..Elsewhere::default() };
+        assert_eq!(users_from(Path::new(W), "me", &seen), ["rb in session x"]);
+        assert!(users_from(Path::new("/r/.trix/worktrees/none"), "me", &seen).is_empty());
+        assert_eq!(parse_listing(""), None, "no answer isn't \"nobody\"");
+    }
+
+    #[test]
+    fn a_shell_that_cd_d_into_the_worktree_uses_it() {
+        let seen = Elsewhere { answers: vec![("x".into(), listed(r#"{"agents":[{"name":"sh","cwd":"/home","live_cwd":"/r/.trix/worktrees/w/src"}],"pending_restore":[]}"#))], ..Elsewhere::default() };
+        assert_eq!(users_from(Path::new(W), "me", &seen), ["sh in session x"]);
+    }
+
+    #[test]
+    fn an_unanswered_restore_offer_uses_the_worktree() {
+        let seen = Elsewhere { answers: vec![("x".into(), listed(r#"{"agents":[],"pending_restore":[{"name":"api","cwd":"/r/.trix/worktrees/w"}]}"#))], saved: vec![("x".into(), saved(&[("api", W)]))], ..Elsewhere::default() };
+        assert_eq!(users_from(Path::new(W), "me", &seen), ["api in session x's restore offer"], "said once, not again for its file");
+        // An older server doesn't list its offer: its file says what it is.
+        let old = Elsewhere { answers: vec![("x".into(), listed(r#"{"agents":[{"name":"web","cwd":"/r/.trix/worktrees/w"}]}"#))], saved: vec![("x".into(), saved(&[("web", W), ("api", W)]))], ..Elsewhere::default() };
+        assert_eq!(users_from(Path::new(W), "me", &old), ["web in session x", "api in session x's restore offer"]);
+    }
+
+    #[test]
+    fn a_stopped_sessions_saved_workspace_uses_the_worktree() {
+        let dir = temp("saved");
+        let w = dir.join(".trix/worktrees/trix-2");
+        std::fs::write(dir.join("workspace-sidebar.json"), serde_json::to_vec(&saved(&[("trix-2", &w.join("src").display().to_string()), ("other", "/elsewhere")])).unwrap()).unwrap();
+        std::fs::write(dir.join("workspace.json"), serde_json::to_vec(&saved(&[("mine", &w.display().to_string())])).unwrap()).unwrap();
+        std::fs::write(dir.join("workspace-bad name.json"), "{}").unwrap();
+        let found = crate::state::saved_workspaces_in(&dir);
+        assert_eq!(found.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["default", "sidebar"]);
+        let seen = Elsewhere { answers: vec![("sidebar".into(), Answer::Gone)], saved: found, ..Elsewhere::default() };
+        assert_eq!(users_from(&w, "default", &seen), ["trix-2 in session sidebar's saved workspace (`trix -s sidebar` brings it back)"], "this session's own file isn't another user");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_that_does_not_answer_uses_every_worktree() {
+        let seen = Elsewhere { answers: vec![("x".into(), Answer::Silent), ("y".into(), listed("not json"))], ..Elsewhere::default() };
+        let said = users_from(Path::new(W), "me", &seen);
+        assert_eq!(said.len(), 2);
+        assert!(said.iter().all(|s| s.contains("didn't say")), "{said:?}");
+    }
+
+    #[test]
+    fn agents_a_stopped_server_left_running_use_it_with_ports_off() {
+        let h = crate::hooks::short_hash;
+        let seen = Elsewhere {
+            answers: vec![("up".into(), listed(r#"{"agents":[],"pending_restore":[]}"#)), ("crashed".into(), Answer::Gone)],
+            holders: vec![(h("crashed"), Some("crashed".into()), 2), (h("up"), Some("up".into()), 1), (h("me"), Some("me".into()), 3), ("0123456789ab".into(), None, 1)],
+            ..Elsewhere::default()
+        };
+        assert!(read_ledger(&temp("no-ledger")).is_empty(), "nothing in the ports ledger");
+        let said = users_from(Path::new(W), "me", &seen);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].starts_with("2 agents left running by session crashed's stopped server"), "{said:?}");
+        assert!(said[1].starts_with("1 agent left running by a stopped trix server"), "{said:?}");
+    }
+
+    #[test]
+    fn this_sessions_agents_come_first() {
+        SEEN.with(|s| *s.borrow_mut() = Elsewhere { answers: vec![("x".into(), listed(r#"{"agents":[{"name":"rb","cwd":"/r/.trix/worktrees/w"}],"pending_restore":[]}"#))], ..Elsewhere::default() });
+        assert_eq!(users(Path::new(W), &["a".into(), "b".into()], &["api".into()]), ["a, b also in this worktree (close them first)", "api in this session's restore offer", "rb in session x"]);
+        SEEN.with(|s| *s.borrow_mut() = Elsewhere::default());
+        assert!(users(Path::new(W), &[], &[]).is_empty());
+    }
+
+    fn locked_reason(tree: &Path) -> Option<String> {
+        lock_of(tree).unwrap()
+    }
+
+    #[test]
+    fn an_unlocked_worktree_gets_trixs_lock_and_gives_it_back() {
+        let root = repo("lock");
+        let tree = linked(&root, "lock-tree");
+        assert_eq!(locked_reason(&tree), None, "as an older trix left it");
+        ensure_locked(&tree).unwrap();
+        assert_eq!(locked_reason(&tree).as_deref(), Some(LOCK_REASON));
+        ensure_locked(&tree).unwrap();
+        let out = Command::new("git").arg("-C").arg(&root).args(["worktree", "remove", "--force"]).arg(&tree).output().unwrap();
+        assert!(!out.status.success() && tree.exists(), "git refuses a locked worktree, forced once");
+        assert_eq!(unlock(&tree), Ok(true));
+        assert_eq!(locked_reason(&tree), None);
+        assert_eq!(unlock(&tree), Ok(false));
+    }
+
+    #[test]
+    fn the_lock_is_read_from_the_porcelain_git_2_34_prints() {
+        let text = "worktree /r\nHEAD 1111\nbranch refs/heads/main\n\nworktree /r/.trix/worktrees/a\nHEAD 2222\nbranch refs/heads/trix/a\nlocked trix: an agent's worktree\n\nworktree /r/.trix/worktrees/b\nHEAD 3333\ndetached\nlocked \"tab\\there\"\n\nworktree /r/.trix/worktrees/c\nHEAD 4444\nbranch refs/heads/trix/c\nlocked\n\nworktree /r/.trix/worktrees/d\nHEAD 5555\nbranch refs/heads/trix/d\nprunable gitdir file points to non-existent location\n";
+        let at = |n: &str| lock_in_listing(text, &Path::new("/r/.trix/worktrees").join(n));
+        assert_eq!(at("a").as_deref(), Some("trix: an agent's worktree"));
+        assert_eq!(at("b").as_deref(), Some("\"tab\\there\""));
+        assert_eq!(at("c").as_deref(), Some(""), "locked, no reason");
+        assert_eq!(at("d"), None);
+        assert_eq!(lock_in_listing(text, Path::new("/r")), None, "the main checkout's lines aren't another's");
+        assert!(is_trixs("trix: x") && is_trixs("\"trix: caf\\303\\251\""));
+        assert!(!is_trixs("\"tab\\there\"") && !is_trixs("") && !is_trixs("mine, trix: no"));
+    }
+
+    #[test]
+    fn someone_elses_lock_is_left_alone() {
+        let root = repo("foreign");
+        let tree = linked(&root, "foreign-tree");
+        git(&root, &["worktree", "lock", "--reason", "mine, hands off", &tree.display().to_string()]);
+        ensure_locked(&tree).unwrap();
+        assert_eq!(locked_reason(&tree).as_deref(), Some("mine, hands off"));
+        assert!(unlock(&tree).unwrap_err().contains("mine, hands off"));
+        assert_eq!(locked_reason(&tree).as_deref(), Some("mine, hands off"), "still theirs");
     }
 
     #[test]
