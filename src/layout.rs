@@ -432,7 +432,7 @@ mod tests {
     fn a_clone_keeps_what_its_conversation_cost_before() {
         let b = Bucket { model: "claude-opus-5-5".into(), fast: false, prompt: 0 };
         let t = Tokens { input: 3, cache_read: 1000, output: 42, ..Default::default() };
-        let saved = SavedAgent { kind: "claude".into(), name: "api-2".into(), cwd: "/tmp".into(), command: None, session: Some("own".into()), pinned: false, inherited: vec![(b.clone(), t)] };
+        let saved = SavedAgent { kind: "claude".into(), name: "api-2".into(), cwd: "/tmp".into(), command: None, session: Some("own".into()), pinned: false, inherited: vec![(b.clone(), t)], family: None };
         let a = LayoutAgent::from(&saved);
         let text = to_toml("work", std::slice::from_ref(&a));
         assert!(text.contains("[[agent.inherited]]\nmodel = \"claude-opus-5-5\"\nprompt = 0\ninput = 3\n"), "{text}");
@@ -527,7 +527,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         let tmp = std::env::temp_dir();
-        let saved = |name: &str| SavedAgent { kind: "claude".into(), name: name.into(), cwd: tmp.clone(), command: None, session: Some(format!("s-{name}")), pinned: false, inherited: Vec::new() };
+        let saved = |name: &str| SavedAgent { kind: "claude".into(), name: name.into(), cwd: tmp.clone(), command: None, session: Some(format!("s-{name}")), pinned: false, inherited: Vec::new(), family: None };
         app.pending_restore = Some(crate::state::Saved::new(2, vec![saved("web"), saved("api"), saved("docs")]));
         app.modal = Some(app::Modal::Restore(0));
         let mut job = entry("custom", "web", &tmp.display().to_string());

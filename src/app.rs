@@ -884,6 +884,7 @@ impl App {
                     inherited: if session.is_some() { crate::usage::to_list(&a.inherited) } else { Vec::new() },
                     session,
                     pinned: a.pinned,
+                    family: a.family.clone(),
                 })
             })
             .collect()
@@ -935,6 +936,7 @@ impl App {
                 continue;
             }
             let pinned = s.pinned;
+            let family = s.family.clone();
             let inherited: crate::usage::Spend = s.inherited.into_iter().collect();
             let resume = s.session.clone().filter(|_| kind.resumes());
             let name = unique_with(&self.agents, &names, &s.name);
@@ -963,10 +965,10 @@ impl App {
             } else {
                 jobs.push((clone_spec(&spec), spec));
             }
-            notes.push((i, pinned, parked, resumes, inherited));
+            notes.push((i, pinned, parked, resumes, inherited, family));
         }
         let started = self.start_all(jobs);
-        for ((i, pinned, parked, resumes, inherited), res) in notes.into_iter().zip(started) {
+        for ((i, pinned, parked, resumes, inherited, family), res) in notes.into_iter().zip(started) {
             match res {
                 Ok(id) => {
                     restored += 1;
@@ -977,6 +979,7 @@ impl App {
                         self.parked.insert(id);
                     }
                     let Some(at) = self.agents.iter().position(|a| a.id == id) else { continue };
+                    self.agents[at].family = family;
                     if resumes {
                         self.agents[at].inherited = inherited;
                     }
@@ -2012,6 +2015,11 @@ impl App {
                         f.field = 2;
                         return;
                     }
+                    if let Some(why) = reused.then(|| taken_elsewhere(&path, &branch, "pick another name")).flatten() {
+                        f.error = Some(why);
+                        f.field = 2;
+                        return;
+                    }
                     let ready = crate::worktree::prepare(&path, repo.as_ref(), reused, f.skip_setup, &self.config.worktree);
                     cwd = path;
                     let made = format!("{} worktree on {branch}", if reused { "reusing" } else { "new" });
@@ -2124,6 +2132,9 @@ impl App {
         let Some(spec) = self.specs.get(&id).map(clone_spec) else { return };
         let a = &self.agents[i];
         let (kind, of, session, transcript) = (a.kind, a.name.clone(), a.session.clone(), a.transcript.clone());
+        // A clone of a clone is numbered after the first original.
+        let family = a.family.clone().unwrap_or_else(|| of.clone());
+        let mut skipped = Vec::new();
         let from = spec.cwd.clone();
         let mut keep = Spawn { prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default(), ..spec };
         let mut notes = Vec::new();
@@ -2135,17 +2146,22 @@ impl App {
                     self.toast(format!("can't clone {of}: its branch has no commits yet"), ToastKind::Bad);
                     return;
                 };
-                // A name no agent has, whose worktree and branch aren't
-                // left from before: the clone's must be new.
-                let mut also = Vec::new();
-                let name = loop {
-                    let n = unique_with(&self.agents, &also, &of);
-                    let branch = format!("refs/heads/trix/{}", worktree_name(&slug(&n)));
-                    if !worktree_path(&root, &slug(&n)).exists() && git(&root, &["rev-parse", "--verify", "--quiet", &branch]).is_none() {
-                        break n;
+                // `<family>-N`: a name no agent has, whose worktree and branch
+                // aren't left from before, that no other session is in. The
+                // clone's must be new.
+                let mut others = None;
+                let name = clone_name(&family, &mut skipped, |n| {
+                    if self.agents.iter().any(|a| a.name == n) {
+                        return Some(Skip::Agent);
                     }
-                    also.push(n);
-                };
+                    let path = worktree_path(&root, &slug(n));
+                    let branch = format!("refs/heads/trix/{}", worktree_name(&slug(n)));
+                    if path.exists() || git(&root, &["rev-parse", "--verify", "--quiet", &branch]).is_some() {
+                        return Some(Skip::Leftover);
+                    }
+                    let others = others.get_or_insert_with(crate::worktree::others);
+                    (!others.agents_in(&path).is_empty()).then_some(Skip::Elsewhere)
+                });
                 let repo = crate::worktree::RepoConfig::load(&from).unwrap_or_else(|e| {
                     warnings.push(e);
                     None
@@ -2181,7 +2197,7 @@ impl App {
                 keep.name = name;
             }
             _ => {
-                keep.name = unique_in(&self.agents, &of);
+                keep.name = clone_name(&family, &mut skipped, |n| self.agents.iter().any(|a| a.name == n).then_some(Skip::Agent));
                 notes.push(format!("clone of {of} · same folder: not a git repository"));
             }
         }
@@ -2225,11 +2241,13 @@ impl App {
                 if let Some(a) = self.agents.iter_mut().find(|a| a.id == new_id) {
                     a.forked_from = forked_from;
                     a.inherited = base.unwrap_or_default();
+                    a.family = Some(family.clone());
                 }
-                // Its holder keeps both, for a server after this one.
+                // Its holder keeps them, for a server after this one.
                 self.sync_holders();
                 self.sync_git_targets();
-                self.toast(format!("cloned {of} as {name}"), ToastKind::Good);
+                let why = skipped_note(&family, &skipped).map(|w| format!(" ({w})")).unwrap_or_default();
+                self.toast(format!("cloned {of} as {name}{why}"), ToastKind::Good);
                 for w in warnings {
                     self.toast(w, ToastKind::Bad);
                 }
@@ -4179,6 +4197,59 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// `base`, or `base-2`, `base-3`… whichever no agent has yet.
+/// Why a clone's number was passed over.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Skip {
+    /// An agent here has the name.
+    Agent,
+    /// Its worktree folder or `trix/` branch is still there.
+    Leftover,
+    /// Another session has an agent in its worktree folder.
+    Elsewhere,
+}
+
+/// A clone's name: `<family>-N`, the first N from 2 that `taken` has no
+/// objection to. What it passed over, and why, goes in `skipped`.
+fn clone_name(family: &str, skipped: &mut Vec<(u32, Skip)>, mut taken: impl FnMut(&str) -> Option<Skip>) -> String {
+    for n in 2u32.. {
+        let name = format!("{family}-{n}");
+        match taken(&name) {
+            Some(why) => skipped.push((n, why)),
+            None => return name,
+        }
+    }
+    unreachable!()
+}
+
+/// What the clone's toast says of the numbers it passed over: "trix-2…4
+/// are leftover worktrees: `trix worktrees`". `None`: none were.
+fn skipped_note(family: &str, skipped: &[(u32, Skip)]) -> Option<String> {
+    let mut parts = Vec::new();
+    for (why, one, many) in [
+        (Skip::Leftover, "is a leftover worktree: `trix worktrees`", "are leftover worktrees: `trix worktrees`"),
+        (Skip::Agent, "is an agent here", "are agents here"),
+        (Skip::Elsewhere, "is in use in another session", "are in use in another session"),
+    ] {
+        let ns: Vec<u32> = skipped.iter().filter(|(_, w)| *w == why).map(|(n, _)| *n).collect();
+        if ns.is_empty() {
+            continue;
+        }
+        // Runs of numbers: trix-2…4, trix-7.
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for &n in &ns {
+            match runs.last_mut() {
+                Some((_, to)) if *to + 1 == n => *to = n,
+                _ => runs.push((n, n)),
+            }
+        }
+        let names: Vec<String> = runs.iter().map(|&(a, b)| if a == b { format!("{family}-{a}") } else { format!("{family}-{a}…{b}") }).collect();
+        parts.push((ns[0], format!("{} {}", names.join(", "), if ns.len() == 1 { one } else { many })));
+    }
+    // In the order the numbers came.
+    parts.sort_by_key(|(first, _)| *first);
+    (!parts.is_empty()).then(|| parts.into_iter().map(|(_, p)| p).collect::<Vec<_>>().join("; "))
+}
+
 fn unique_in(agents: &[Agent], base: &str) -> String {
     unique_with(agents, &[], base)
 }
@@ -4268,6 +4339,17 @@ fn worktree_path(root: &Path, name: &str) -> PathBuf {
 
 /// Create `<repo>/.trix/worktrees/<name>` on branch `trix/<name>`. The flag
 /// is true when an existing worktree (e.g. from an earlier session) was reused.
+/// Why the worktree at `path` (on `branch`) can't be reused for a new
+/// agent: an agent of another session is in it, or in a folder under it.
+/// `pick` ends the message: what to do instead. Blocking: every other
+/// session is asked. This session's agents are the caller's to check.
+pub fn taken_elsewhere(path: &Path, branch: &str, pick: &str) -> Option<String> {
+    let away = crate::worktree::others().agents_in(path);
+    let first = away.first()?;
+    let more = if away.len() > 1 { format!(" (and {} more)", away.len() - 1) } else { String::new() };
+    Some(format!("{branch} is {}'s worktree in {}{more}: {pick}", first.agent, first.at))
+}
+
 pub fn make_worktree(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, String, bool)> {
     make_worktree_at(dir, name, None)
 }
@@ -4524,6 +4606,7 @@ mod tests {
             pos: 0,
             focused: true,
             pinned: true,
+            family: Some("count".into()),
             ..Default::default()
         };
         spec.meta = serde_json::to_string(&meta).unwrap();
@@ -4537,12 +4620,13 @@ mod tests {
         }
 
         let mut app = test_app();
-        let saved = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: "/tmp".into(), command: None, session: None, pinned: false, inherited: Vec::new() };
+        let saved = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: "/tmp".into(), command: None, session: None, pinned: false, inherited: Vec::new(), family: None };
         app.pending_restore = Some(Saved::new(1, vec![saved("counter"), saved("other")]));
         // And one whose holder can't be reached now: its id stays taken.
         assert_eq!(app.reattach_from(vec![(7, path.clone()), (12, dir.join("unreachable.sock"))]), 1);
         let a = &app.agents[0];
         assert_eq!((a.id, a.name.as_str(), a.kind, a.pid, a.pinned, a.state), (7, "counter", Kind::Shell, pid, true, State::Idle));
+        assert_eq!(a.family.as_deref(), Some("count"), "a clone's family comes back from its holder");
         assert!(a.screen_text().contains("before"), "the screen comes back from the replay: {:?}", a.screen_text());
         assert_eq!(app.next_id, 13, "new agents can't take their ids (their hooks report them)");
         let offer: Vec<&str> = app.pending_restore.as_ref().unwrap().agents.iter().map(|s| s.name.as_str()).collect();
@@ -5675,6 +5759,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A repo, and an agent `name` in a worktree of it made by the form.
+    fn repo_with_agent(tag: &str, name: &str) -> (App, PathBuf) {
+        let dir = repo_with_setup(tag);
+        // No setup to trust: the form starts it right away.
+        std::fs::remove_file(dir.join(".trix.toml")).unwrap();
+        let mut app = test_app();
+        app.modal = Some(worktree_form(&dir, name));
+        app.launch_form();
+        assert_eq!(app.agents.len(), 1, "{:?}", app.toast.as_ref().map(|t| &t.text));
+        (app, dir)
+    }
+
+    fn last_name(app: &App) -> &str {
+        app.agents.last().map_or("", |a| a.name.as_str())
+    }
+
+    #[test]
+    fn a_clone_of_a_clone_is_numbered_after_the_first_original() {
+        crate::worktree::pretend_nobody();
+        let (mut app, dir) = repo_with_agent("clone-family", "trix");
+        app.clone_agent(app.agents[0].id);
+        assert_eq!(last_name(&app), "trix-2");
+        assert_eq!(app.toast.as_ref().unwrap().text, "cloned trix as trix-2");
+        assert_eq!(app.agents[1].family.as_deref(), Some("trix"));
+        app.clone_agent(app.agents[1].id);
+        assert_eq!(last_name(&app), "trix-3", "not trix-2-2");
+        assert_eq!(app.agents[2].family.as_deref(), Some("trix"));
+        assert_eq!(app.specs[&app.agents[2].id].cwd, worktree_path(&dir, "trix-3"));
+        // A renamed clone keeps its family: its clones are still trix-N.
+        let id = app.agents[2].id;
+        app.start_rename(id);
+        app.modal = Some(Modal::Rename(id, TextInput::new("web")));
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!((app.agents[2].name.as_str(), app.agents[2].family.as_deref()), ("web", Some("trix")));
+        // trix-3's worktree is still there, under the old name: skipped.
+        app.clone_agent(id);
+        assert_eq!(last_name(&app), "trix-4");
+        assert_eq!(app.toast.as_ref().unwrap().text, "cloned web as trix-4 (trix-2 is an agent here; trix-3 is a leftover worktree: `trix worktrees`)");
+        stop_all(&app);
+    }
+
+    #[test]
+    fn a_name_that_ends_in_digits_is_never_cut() {
+        crate::worktree::pretend_nobody();
+        let (mut app, _dir) = repo_with_agent("clone-digits", "issue-1234");
+        app.clone_agent(app.agents[0].id);
+        assert_eq!(last_name(&app), "issue-1234-2");
+        stop_all(&app);
+    }
+
+    #[test]
+    fn the_clone_says_which_numbers_it_passed_over_and_why() {
+        crate::worktree::pretend_nobody();
+        let (mut app, dir) = repo_with_agent("clone-skipped", "x");
+        for n in 2..=4 {
+            std::fs::create_dir_all(worktree_path(&dir, &format!("x-{n}"))).unwrap();
+        }
+        // x-6's branch is there with no folder: a leftover too.
+        git_out(&dir, &["branch", "trix/x-6"]);
+        // And an agent here is named x-5, in no worktree of its own.
+        app.spawn_quiet(sleeper("x-5", &dir)).unwrap();
+        // Another session is in x-7's folder, though it's gone.
+        crate::worktree::pretend_users("sidebar", "foo", &worktree_path(&dir, "x-7"));
+        app.clone_agent(app.agents[0].id);
+        crate::worktree::pretend_nobody();
+        assert_eq!(last_name(&app), "x-8");
+        assert_eq!(app.toast.as_ref().unwrap().text, "cloned x as x-8 (x-2…4, x-6 are leftover worktrees: `trix worktrees`; x-5 is an agent here; x-7 is in use in another session)");
+        stop_all(&app);
+    }
+
+    #[test]
+    fn a_clones_family_is_saved_and_restored() {
+        let mut app = test_app();
+        let tmp = std::env::temp_dir();
+        let shell = SavedAgent { kind: "shell".into(), name: "trix-3".into(), cwd: tmp.clone(), command: None, session: None, pinned: false, inherited: Vec::new(), family: Some("trix".into()) };
+        let json = serde_json::to_string(&shell).unwrap();
+        assert!(json.contains("\"family\":\"trix\""));
+        let old: SavedAgent = serde_json::from_str(r#"{"kind":"shell","name":"a","cwd":"/tmp"}"#).unwrap();
+        assert_eq!(old.family, None, "a file from before still loads");
+        assert!(!serde_json::to_string(&old).unwrap().contains("family"), "and an original writes none");
+        app.pending_restore = Some(Saved::new(0, vec![shell]));
+        app.restore_saved();
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents[0].family.as_deref(), Some("trix"));
+        assert_eq!(app.open_agents()[0].family.as_deref(), Some("trix"), "saved again");
+        let meta: crate::agent::Meta = serde_json::from_str(&serde_json::to_string(&app.agents[0].meta(0, false, None, false)).unwrap()).unwrap();
+        assert_eq!(meta.family.as_deref(), Some("trix"), "its holder keeps it");
+        let old: crate::agent::Meta = serde_json::from_str(r#"{"kind":"shell","name":"a","cwd":"/tmp","pos":0,"focused":false}"#).unwrap_or_default();
+        assert_eq!(old.family, None);
+        stop_all(&app);
+    }
+
+    #[test]
+    fn a_worktree_another_session_is_in_is_not_reused() {
+        let (mut app, dir) = repo_with_agent("reuse-elsewhere", "foo");
+        let wt = worktree_path(&dir, "foo");
+        let sub = wt.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // This session's agent, in a folder under it: reusing stays allowed.
+        app.agents[0].cwd = sub.clone();
+        if let Some(s) = app.specs.get_mut(&app.agents[0].id) {
+            s.cwd = sub.clone();
+        }
+        crate::worktree::pretend_nobody();
+        app.modal = Some(worktree_form(&dir, "foo"));
+        // Named foo already: rename the first so the name is free.
+        app.agents[0].name = "first".into();
+        app.launch_form();
+        assert!(app.modal.is_none(), "this session's agent in a subfolder doesn't stop a reuse");
+        assert_eq!(last_name(&app), "foo");
+        // Closed again: only another session is left in it.
+        app.close(app.agents.last().unwrap().id);
+        let n = app.agents.len();
+        // Another session's agent, in a folder under it: refused, by name.
+        crate::worktree::pretend_users("sidebar", "foo", &sub);
+        app.modal = Some(worktree_form(&dir, "foo"));
+        app.launch_form();
+        let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
+        assert_eq!(f.error.as_deref(), Some("trix/foo is foo's worktree in session sidebar: pick another name"));
+        assert_eq!(app.agents.len(), n);
+        // And `trix spawn --worktree` the same.
+        app.modal = None;
+        let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let req = crate::control::Request::Spawn { kind: "custom".into(), name: Some("foo".into()), cwd: dir.clone(), command: Some("exec sleep 60".into()), prompt: None, worktree: true };
+        crate::control::handle(&mut app, theirs, None, req, false);
+        let mut mine = mine;
+        let (_, json) = crate::session::read_frame(&mut mine).unwrap();
+        let r: crate::control::Reply = serde_json::from_slice(&json).unwrap();
+        crate::worktree::pretend_nobody();
+        assert_eq!((r.code, r.err.as_str()), (1, "trix/foo is foo's worktree in session sidebar: pick another --name"));
+        assert_eq!(app.agents.len(), n);
+        stop_all(&app);
+    }
+
     #[test]
     fn a_clone_is_saved_on_its_own_conversation_only() {
         let mut app = test_app();
@@ -6123,7 +6341,7 @@ mod tests {
         let mut app = test_app();
         let ra = app.spawn_quiet(sleeper("ra", &wt)).unwrap();
         app.agents[0].set_state(State::Idle, false);
-        let agent = |name: &str, cwd: PathBuf| crate::state::SavedAgent { kind: "claude".into(), name: name.into(), cwd, command: None, session: None, pinned: false, inherited: Vec::new() };
+        let agent = |name: &str, cwd: PathBuf| crate::state::SavedAgent { kind: "claude".into(), name: name.into(), cwd, command: None, session: None, pinned: false, inherited: Vec::new(), family: None };
         app.pending_restore = Some(crate::state::Saved::new(0, vec![agent("api", wt.join("src")), agent("elsewhere", "/tmp".into())]));
         app.modal = Some(Modal::Review(Box::new(crate::review::Review::open(ra, &wt).unwrap())));
         app.clean_up_worktree();
@@ -6144,7 +6362,7 @@ mod tests {
         let mut app = test_app();
         let ra = app.spawn_quiet(sleeper("ra", &wt)).unwrap();
         app.agents[0].set_state(State::Idle, false);
-        let agent = crate::state::SavedAgent { kind: "claude".into(), name: "trix-2".into(), cwd: wt.clone(), command: None, session: None, pinned: false, inherited: Vec::new() };
+        let agent = crate::state::SavedAgent { kind: "claude".into(), name: "trix-2".into(), cwd: wt.clone(), command: None, session: None, pinned: false, inherited: Vec::new(), family: None };
         crate::worktree::pretend_saved("sidebar", Some(crate::state::Saved::new(0, vec![agent])));
         app.modal = Some(Modal::Review(Box::new(crate::review::Review::open(ra, &wt).unwrap())));
         app.clean_up_worktree();
@@ -6247,7 +6465,7 @@ mod tests {
         let opts = crate::config::WorktreeOpts::default();
         assert!(crate::worktree::lease(&tree, &opts, None).is_some());
         let mut app = test_app();
-        app.pending_restore = Some(Saved::new(0, vec![SavedAgent { kind: "shell".into(), name: "w".into(), cwd: tree.clone(), command: None, session: None, pinned: false, inherited: Vec::new() }]));
+        app.pending_restore = Some(Saved::new(0, vec![SavedAgent { kind: "shell".into(), name: "w".into(), cwd: tree.clone(), command: None, session: None, pinned: false, inherited: Vec::new(), family: None }]));
         app.modal = Some(Modal::Restore(0));
         app.dialog_hidden.set(false);
         trust_key(&mut app, KeyCode::Char('n'));
@@ -6964,7 +7182,7 @@ mod tests {
     #[test]
     fn restored_agents_with_the_same_name_get_their_own() {
         let mut app = test_app();
-        let shell = |name: &str, pinned| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned, inherited: Vec::new() };
+        let shell = |name: &str, pinned| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned, inherited: Vec::new(), family: None };
         app.pending_restore = Some(crate::state::Saved::new(2, vec![shell("web", true), shell("web", false), shell("api", false)]));
         app.config.workspace.restore = crate::config::Restore::Always;
         app.on_attach(PathBuf::from("/"));
@@ -6980,7 +7198,7 @@ mod tests {
     #[test]
     fn the_grid_comes_back_with_the_workspace() {
         let mut app = test_app();
-        let shell = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned: false, inherited: Vec::new() };
+        let shell = |name: &str| SavedAgent { kind: "shell".into(), name: name.into(), cwd: std::env::temp_dir(), command: None, session: None, pinned: false, inherited: Vec::new(), family: None };
         let mut saved = crate::state::Saved::new(1, vec![shell("c"), shell("a"), shell("b")]);
         saved.grid = true;
         app.pending_restore = Some(saved);

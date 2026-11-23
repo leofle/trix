@@ -580,6 +580,9 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
                 if let Some(other) = app.agents.iter().find(|a| a.cwd == path) {
                     return Reply::fail(format!("{branch} is already {}'s worktree — pick another --name", other.name));
                 }
+                if let Some(why) = reused.then(|| app::taken_elsewhere(&path, &branch, "pick another --name")).flatten() {
+                    return Reply::fail(why);
+                }
                 // Trust is only ever given in the new-agent form: a script
                 // or an agent gets the worktree, and is told what didn't run.
                 let ready = crate::worktree::prepare(&path, repo.as_ref(), reused, false, &app.config.worktree);

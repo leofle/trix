@@ -238,7 +238,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let here = dir.display().to_string();
-        let saved = |agents: &[(&str, &str)]| crate::state::Saved::new(0, agents.iter().map(|(n, c)| crate::state::SavedAgent { kind: "claude".into(), name: (*n).into(), cwd: c.into(), command: None, session: None, pinned: false, inherited: Vec::new() }).collect());
+        let saved = |agents: &[(&str, &str)]| crate::state::Saved::new(0, agents.iter().map(|(n, c)| crate::state::SavedAgent { kind: "claude".into(), name: (*n).into(), cwd: c.into(), command: None, session: None, pinned: false, inherited: Vec::new(), family: None }).collect());
         std::fs::write(dir.join("workspace-sidebar.json"), serde_json::to_vec(&saved(&[("a", "/no/such/a"), ("b", "/no/such/b")])).unwrap()).unwrap();
         std::fs::write(dir.join("workspace-home.json"), serde_json::to_vec(&saved(&[("c", &here), ("d", "/no/such/d")])).unwrap()).unwrap();
         std::fs::write(dir.join("workspace.json"), serde_json::to_vec(&saved(&[("e", &here)])).unwrap()).unwrap();
