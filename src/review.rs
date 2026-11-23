@@ -210,6 +210,8 @@ pub struct Place {
     /// `branch` has been pushed there (as far as the last fetch or push
     /// knows; nothing here asks the network).
     pub pushed: bool,
+    /// With HEAD detached: commits it has that no branch, remote or tag does.
+    pub orphans: u32,
 }
 
 pub fn place(dir: &Path) -> Result<Place, String> {
@@ -230,7 +232,8 @@ pub fn place(dir: &Path) -> Result<Place, String> {
         (Some(r), Some(b)) => git(&top, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{r}/{b}")]).is_ok(),
         _ => false,
     };
-    Ok(Place { top, main, branch, base, worktree, ahead, remote, pushed })
+    let orphans = if branch.is_none() { git(&top, &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags"]).ok().and_then(|n| n.parse().ok()).unwrap_or(0) } else { 0 };
+    Ok(Place { top, main, branch, base, worktree, ahead, remote, pushed, orphans })
 }
 
 /// `origin` if there is one, else the first remote.
@@ -500,7 +503,17 @@ impl Review {
     /// Why a step can't be taken here, before asking about it.
     pub fn refusal(&self, op: &Op) -> Option<String> {
         let p = &self.place;
-        let Some(branch) = &p.branch else { return Some("HEAD is detached: check out a branch first".into()) };
+        // A detached worktree goes if nothing would be lost with it.
+        if *op == Op::Cleanup && p.branch.is_none() && p.worktree && p.orphans == 0 {
+            return (!self.files.is_empty()).then(|| "there are uncommitted changes: commit them first, or they'd be lost".into());
+        }
+        let Some(branch) = &p.branch else {
+            if *op == Op::Cleanup && p.orphans > 0 {
+                let s = if p.orphans == 1 { "" } else { "s" };
+                return Some(format!("HEAD has {} commit{s} on no branch: make a branch first (`git branch <name>`), or they'd be lost", p.orphans));
+            }
+            return Some("HEAD is detached: check out a branch first".into());
+        };
         match op {
             Op::Commit(_) => self.files.is_empty().then(|| "nothing to commit".into()),
             Op::Push | Op::Pr if p.remote.is_none() => Some("no remote to push to: add one with git remote add".into()),
@@ -529,6 +542,9 @@ pub type Outcome = Result<String, String>;
 pub fn perform(op: &Op, dir: &Path) -> Outcome {
     let p = place(dir)?;
     let top = &p.top;
+    if *op == Op::Cleanup {
+        return clean_up(&p);
+    }
     let branch = p.branch.clone().ok_or("HEAD is detached")?;
     match op {
         Op::Commit(msg) => {
@@ -588,35 +604,59 @@ pub fn perform(op: &Op, dir: &Path) -> Outcome {
             }
             Ok(format!("merged {branch} into {base}"))
         }
-        Op::Cleanup => {
-            if !p.worktree {
-                return Err("this folder is the main checkout, not a worktree".into());
-            }
-            // trix's lock comes off only now, every check passed; someone
-            // else's stays, and git then refuses.
-            let unlocked = crate::worktree::unlock(top)?;
-            // No --force: git keeps a worktree with changes in it.
-            if let Err(e) = git(&p.main, &["worktree", "remove", &top.display().to_string()]) {
-                if unlocked && let Err(l) = crate::worktree::ensure_locked(top) {
-                    eprintln!("trix: couldn't lock the worktree {} again: {l}", top.display());
-                }
-                return Err(e);
-            }
-            crate::worktree::forget(top);
-            // `branch -d` also takes a branch merged into its upstream, so a
-            // pushed branch would go though the main checkout never got it.
-            // Only the main checkout's branch decides.
-            let kept = |why: String| Ok(format!("removed the worktree; kept {branch}, {why}"));
-            let Some(base) = &p.base else { return kept("as the main checkout has no branch to tell if it's merged".into()) };
-            if git(&p.main, &["merge-base", "--is-ancestor", &branch, base]).is_err() {
-                return kept(if p.pushed { format!("pushed but not merged into {base}") } else { format!("which isn't merged into {base} yet") });
-            }
-            match git(&p.main, &["branch", "-d", &branch]) {
-                Ok(_) => Ok(format!("removed the worktree and {branch}")),
-                Err(e) => kept(format!("as git wouldn't delete it: {e}")),
+        Op::Cleanup => unreachable!("cleaned up above"),
+    }
+}
+
+/// Remove the worktree, then each of its branches whose content is in the
+/// default branch (`cleanup::assess`): the one checked out, and the
+/// `trix/<name>` it was made on. Never forced; uncommitted work and
+/// commits on no branch keep the worktree. A deleted branch's tip is kept
+/// under `refs/trix/removed/…` and in `removed.log`, and the result says
+/// how to bring it back. Remote branches are never touched.
+fn clean_up(p: &Place) -> Outcome {
+    let top = &p.top;
+    if !p.worktree {
+        return Err("this folder is the main checkout, not a worktree".into());
+    }
+    let a = crate::cleanup::assess(top)?;
+    if let Some(why) = a.keeps() {
+        return Err(format!("kept the worktree: {why}"));
+    }
+    // trix's lock comes off only now, every check passed; someone else's
+    // stays, and git then refuses.
+    let unlocked = crate::worktree::unlock(top)?;
+    // No --force: git keeps a worktree with changes in it.
+    if let Err(e) = git(&p.main, &["worktree", "remove", &top.display().to_string()]) {
+        if unlocked && let Err(l) = crate::worktree::ensure_locked(top) {
+            eprintln!("trix: couldn't lock the worktree {} again: {l}", top.display());
+        }
+        return Err(e);
+    }
+    crate::worktree::forget(top);
+    let (mut gone, mut kept) = (Vec::new(), Vec::new());
+    for b in &a.branches {
+        match &b.state {
+            crate::cleanup::State::Merged { .. } => match crate::cleanup::delete_merged(&p.main, b) {
+                Ok(said) => gone.push(said),
+                Err(e) => kept.push(format!("{} ({e})", b.name)),
+            },
+            crate::cleanup::State::Unmerged { .. } if a.bases.is_empty() => kept.push(format!("{} (the repository has no main or master to tell if it's merged)", b.name)),
+            crate::cleanup::State::Unmerged { ahead } => {
+                let pushed = p.branch.as_deref() == Some(b.name.as_str()) && p.pushed;
+                let s = if *ahead == 1 { "" } else { "s" };
+                kept.push(format!("{} ({}{ahead} commit{s} not in {})", b.name, if pushed { "pushed, but " } else { "" }, a.bases[0]));
             }
         }
     }
+    let mut said = "removed the worktree".to_string();
+    if !gone.is_empty() {
+        said.push_str(&format!(" and {}", gone.join(", ")));
+    }
+    if !kept.is_empty() {
+        said.push_str(&format!("; kept {}", kept.join(", ")));
+    }
+    Ok(said)
 }
 
 fn push(top: &Path, branch: &str) -> Outcome {
@@ -688,7 +728,7 @@ Binary files a/logo.png and b/logo.png differ
 
     fn review(patch: &str) -> Review {
         let (files, lines) = parse(patch);
-        let place = Place { top: "/r".into(), main: "/r".into(), branch: Some("trix/x".into()), base: None, worktree: false, ahead: None, remote: None, pushed: false };
+        let place = Place { top: "/r".into(), main: "/r".into(), branch: Some("trix/x".into()), base: None, worktree: false, ahead: None, remote: None, pushed: false, orphans: 0 };
         Review {
             agent: 1,
             dir: "/r".into(),
@@ -840,9 +880,64 @@ Binary files a/logo.png and b/logo.png differ
         assert!(wt.exists());
         assert_eq!(lock_line(&main), Some(format!("locked {}", crate::worktree::LOCK_REASON)));
         std::fs::remove_file(wt.join("b.txt")).unwrap();
-        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree and trix/w");
+        assert!(perform(&Op::Cleanup, &wt).unwrap().starts_with("removed the worktree and trix/w (merged into main; `git branch trix/w "));
         assert!(!wt.exists());
         assert_eq!(lock_line(&main), None);
+    }
+
+    #[test]
+    fn cleanup_deletes_a_squash_merged_branch_and_says_how_to_bring_it_back() {
+        let (_keep, main, wt) = repo("squashed");
+        std::fs::write(wt.join("a.txt"), "one\nTWO\n").unwrap();
+        perform(&Op::Commit("Shout two".into()), &wt).unwrap();
+        std::fs::write(wt.join("b.txt"), "new\n").unwrap();
+        perform(&Op::Commit("Add b".into()), &wt).unwrap();
+        let tip = sh(&wt, &["rev-parse", "HEAD"]);
+        sh(&main, &["merge", "-q", "--squash", "trix/w"]);
+        sh(&main, &["commit", "-q", "-m", "Shout two and add b (#1)"]);
+        // main moves on in the same line, so only the patch-id still knows.
+        std::fs::write(main.join("a.txt"), "one\nzwei\n").unwrap();
+        sh(&main, &["commit", "-q", "-am", "later"]);
+        let said = perform(&Op::Cleanup, &wt).unwrap();
+        assert!(said.starts_with("removed the worktree and trix/w (squash-merged into main as "), "{said}");
+        assert!(said.contains(&format!("`git branch trix/w {}` brings it back", &tip[..12])), "{said}");
+        assert!(!wt.exists());
+        assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_err());
+        assert!(sh(&main, &["for-each-ref", "--format=%(objectname)", "refs/trix/removed/trix/w/"]).contains(&tip));
+    }
+
+    #[test]
+    fn cleanup_also_deletes_the_branch_the_worktree_was_made_on_once_merged() {
+        let (_keep, main, wt) = repo("made-on");
+        std::fs::write(wt.join("b.txt"), "new\n").unwrap();
+        perform(&Op::Commit("Add b".into()), &wt).unwrap();
+        sh(&main, &["merge", "-q", "--squash", "trix/w"]);
+        sh(&main, &["commit", "-q", "-m", "Add b (#1)"]);
+        sh(&wt, &["switch", "-q", "-c", "feature"]);
+        std::fs::write(wt.join("c.txt"), "unmerged\n").unwrap();
+        perform(&Op::Commit("Add c".into()), &wt).unwrap();
+        let said = perform(&Op::Cleanup, &wt).unwrap();
+        assert!(said.contains(" and trix/w (") && said.ends_with("; kept feature (2 commits not in main)"), "{said}");
+        assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/feature"]).is_ok());
+    }
+
+    #[test]
+    fn a_detached_worktree_goes_only_without_commits_on_no_branch() {
+        let (_keep, main, wt) = repo("detached");
+        sh(&wt, &["checkout", "-q", "--detach"]);
+        std::fs::write(wt.join("a.txt"), "orphan\n").unwrap();
+        sh(&wt, &["commit", "-q", "-am", "orphan"]);
+        let r = Review::open(7, &wt).unwrap();
+        assert!(r.refusal(&Op::Cleanup).unwrap().contains("1 commit on no branch"), "refused before anything is closed");
+        assert!(perform(&Op::Cleanup, &wt).unwrap_err().contains("1 commit on no branch"), "and again where it's done");
+        assert!(wt.exists());
+        sh(&wt, &["checkout", "-q", "--detach", "trix/w"]);
+        let r = Review::open(7, &wt).unwrap();
+        assert_eq!(r.refusal(&Op::Cleanup), None);
+        assert!(r.refusal(&Op::Push).unwrap().contains("detached"));
+        assert!(perform(&Op::Cleanup, &wt).unwrap().starts_with("removed the worktree and trix/w (merged into main"));
+        assert!(!wt.exists());
+        let _ = main;
     }
 
     #[test]
@@ -887,7 +982,7 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(perform(&Op::Merge, &wt).unwrap(), "merged trix/w into main");
         assert_eq!(std::fs::read_to_string(main.join("b.txt")).unwrap(), "new\n");
 
-        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree and trix/w");
+        assert!(perform(&Op::Cleanup, &wt).unwrap().starts_with("removed the worktree and trix/w (merged into main; `git branch trix/w "));
         assert!(!wt.exists());
         assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_err());
     }
@@ -899,7 +994,7 @@ Binary files a/logo.png and b/logo.png differ
         std::fs::write(main.join(".env"), "A=1\n").unwrap();
         assert_eq!(crate::worktree::copy_files(&main, &wt, &[".env".into()]).files, 1);
         assert!(wt.join(".env").exists());
-        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree and trix/w");
+        assert!(perform(&Op::Cleanup, &wt).unwrap().starts_with("removed the worktree and trix/w (merged into main; `git branch trix/w "));
         assert!(!wt.exists());
     }
 
@@ -918,7 +1013,7 @@ Binary files a/logo.png and b/logo.png differ
         assert_eq!(sh(&main, &["rev-parse", "HEAD"]), head);
         assert_eq!(sh(&main, &["status", "--porcelain", "--untracked-files=no"]), "");
         // Cleaning up keeps the branch git won't delete safely.
-        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w, which isn't merged into main yet");
+        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w (1 commit not in main)");
         assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_ok());
     }
 
@@ -970,7 +1065,7 @@ Binary files a/logo.png and b/logo.png differ
         perform(&Op::Commit("c".into()), &wt).unwrap();
         perform(&Op::Push, &wt).unwrap();
         // Merged into its upstream, so `branch -d` alone would take it.
-        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w, pushed but not merged into main");
+        assert_eq!(perform(&Op::Cleanup, &wt).unwrap(), "removed the worktree; kept trix/w (pushed, but 1 commit not in main)");
         assert!(!wt.exists());
         assert!(git(&main, &["rev-parse", "--verify", "--quiet", "refs/heads/trix/w"]).is_ok());
     }
