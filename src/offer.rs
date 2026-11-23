@@ -98,15 +98,36 @@ pub fn summary(found: &[Found]) -> Option<String> {
     }
 }
 
+/// Who's told that a closed agent's worktree was kept.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Told {
+    /// The toast an exited agent's close leaves.
+    Toast,
+    /// A plain `trix close`, on stderr.
+    Cli,
+}
+
+/// That `f`'s worktree was kept, and what it is: what removes it when it
+/// could go (and that an unmerged branch stays), or why it stays.
+pub fn kept(f: &Found, told: Told) -> String {
+    let name = f.name();
+    let how = match told {
+        Told::Toast => format!("alt+v X, or `trix worktrees rm {name}`"),
+        Told::Cli => format!("`trix close --clean` next time, or `trix worktrees rm {name}` now"),
+    };
+    match &f.verdict {
+        Verdict::Merged { .. } => format!("kept worktree {name} (clean, merged): {how}"),
+        Verdict::Unmerged { branch, ahead, base } => {
+            let s = if *ahead == 1 { "" } else { "s" };
+            format!("kept worktree {name} (clean; {branch} has {ahead} commit{s} not in {base}): {how} removes the folder and keeps {branch}")
+        }
+        Verdict::Stays(why) => format!("kept worktree {name}: {why}"),
+    }
+}
+
 /// The toast an exited agent's close leaves when its worktree could go.
 pub fn kept_toast(f: &Found) -> Option<String> {
-    let how = match &f.verdict {
-        Verdict::Merged { .. } => "clean, merged".to_string(),
-        Verdict::Unmerged { ahead, base, .. } => format!("clean, {ahead} commit{} not in {base}", if *ahead == 1 { "" } else { "s" }),
-        Verdict::Stays(_) => return None,
-    };
-    let name = f.name();
-    Some(format!("kept worktree {name} ({how}): alt+v X, or `trix worktrees rm {name}`"))
+    f.removable().then(|| kept(f, Told::Toast))
 }
 
 /// Remove `f`'s worktree, looking again first: who uses it (`users`), what

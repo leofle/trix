@@ -309,7 +309,7 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree),
         Request::Close { target, force, clean } => match close(app, from, &target, force, clean) {
             Ok(Closed::Said(r)) => r,
-            Ok(Closed::Later(name, left)) => return clean_later(stream, name, left),
+            Ok(Closed::Later(name, left)) => return after_close(stream, name, left, clean),
             Err(r) => r,
         },
         Request::Args { target, set, clear } => extra_args(app, from, &target, set, clear),
@@ -630,34 +630,37 @@ fn close(app: &mut App, from: Option<u32>, target: &str, force: bool, clean: boo
     }
     let (id, name) = (a.id, a.name.clone());
     let left = app.close_leaving(id);
-    if clean && !left.is_empty() {
+    if !left.is_empty() {
         return Ok(Closed::Later(name, left));
     }
     let mut r = Reply::ok(format!("closed {name}\n"));
     if clean {
         r.err = format!("{name} wasn't the last agent in a worktree of trix's: nothing to clean up");
-    } else if !left.is_empty() {
-        let kept: Vec<String> = left.iter().map(|(tree, _)| tree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
-        let it = if kept.len() == 1 { "it" } else { "them" };
-        r.err = format!("kept worktree {}: `trix close --clean` would have removed {it} if safe; `trix worktrees rm <name>` does now", kept.join(", "));
     }
     Ok(Closed::Said(r))
 }
 
-/// `trix close --clean`'s second half, on its own thread: each worktree
-/// the agent left is looked at, then removed if nothing keeps it, by the
-/// same checks and `cleanup::remove` as the review's X. A worktree that
-/// stays is a failure, with why.
-fn clean_later(mut stream: UnixStream, name: String, left: Vec<(PathBuf, crate::app::Users)>) {
-    let started = std::thread::Builder::new().name("trix-close-clean".into()).spawn(move || {
+/// `trix close`'s second half, on its own thread, for the worktrees the
+/// agent left: each is looked at (who uses it, what it holds). A plain
+/// close says on stderr that each was kept, and what would remove it or why
+/// it stays. `--clean` removes each that nothing keeps, by the same checks
+/// and `cleanup::remove` as the review's X; one that stays is a failure,
+/// with why.
+fn after_close(mut stream: UnixStream, name: String, left: Vec<(PathBuf, crate::app::Users)>, clean: bool) {
+    let started = std::thread::Builder::new().name("trix-close-after".into()).spawn(move || {
         let mut r = Reply::ok(format!("closed {name}\n"));
         let mut errs = Vec::new();
         for (tree, users) in left {
             let users = users();
             let again = users.clone();
-            let done = match crate::offer::look(&tree, move || users) {
+            let found = crate::offer::look(&tree, move || users);
+            if !clean {
+                errs.extend(found.map(|f| crate::offer::kept(&f, crate::offer::Told::Cli)));
+                continue;
+            }
+            let done = match found {
                 None => Err(format!("kept {}: it isn't a git worktree any more", crate::app::tilde(&tree))),
-                Some(f) if !f.removable() => Err(crate::offer::line(&f)),
+                Some(f) if !f.removable() => Err(crate::offer::kept(&f, crate::offer::Told::Cli)),
                 Some(f) => crate::offer::remove(&f, move || again),
             };
             match done {
@@ -665,10 +668,10 @@ fn clean_later(mut stream: UnixStream, name: String, left: Vec<(PathBuf, crate::
                 Err(e) => errs.push(e),
             }
         }
-        if !errs.is_empty() {
+        if clean && !errs.is_empty() {
             r.code = 1;
-            r.err = errs.join("\n");
         }
+        r.err = errs.join("\n");
         reply(&mut stream, &r);
     });
     if started.is_err() {

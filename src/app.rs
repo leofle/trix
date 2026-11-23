@@ -6288,7 +6288,7 @@ mod tests {
         let r = close_by_control(&mut app, "ra", true, false);
         assert_eq!(r.code, 1, "{r:?}");
         assert_eq!(r.out, "closed ra\n", "the agent is closed all the same");
-        assert!(r.err.contains("stays: it has uncommitted work"), "{}", r.err);
+        assert!(r.err.starts_with("kept worktree w: it has uncommitted work"), "{}", r.err);
         assert!(app.agents.is_empty() && wt.exists());
     }
 
@@ -6313,8 +6313,58 @@ mod tests {
         assert_eq!(app.agents.len(), 1, "refused outright: not even closed");
         let r = close_by_control(&mut app, "ra", false, true);
         assert_eq!((r.code, r.out.as_str()), (0, "closed ra\n"));
-        assert!(r.err.starts_with("kept worktree w:"), "{}", r.err);
+        assert_eq!(r.err, "kept worktree w (clean, merged): `trix close --clean` next time, or `trix worktrees rm w` now");
         assert!(wt.exists());
+    }
+
+    #[test]
+    fn plain_close_says_an_unmerged_worktree_keeps_its_branch() {
+        crate::worktree::pretend_nobody();
+        let (mut app, _, _dir, wt) = closing_in_worktree("kept-unmerged");
+        std::fs::write(wt.join("new.txt"), "work\n").unwrap();
+        for args in [&["add", "new.txt"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "work"]] {
+            assert!(Command::new("git").arg("-C").arg(&wt).args(args).status().unwrap().success());
+        }
+        let r = close_by_control(&mut app, "ra", false, false);
+        assert_eq!((r.code, r.out.as_str()), (0, "closed ra\n"));
+        assert_eq!(r.err, "kept worktree w (clean; trix/w has 1 commit not in main): `trix close --clean` next time, or `trix worktrees rm w` now removes the folder and keeps trix/w");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn plain_close_says_why_a_worktree_with_work_stays_and_offers_no_removal() {
+        crate::worktree::pretend_nobody();
+        let (mut app, _, _dir, wt) = closing_in_worktree("kept-dirty");
+        std::fs::write(wt.join("draft.txt"), "unsaved\n").unwrap();
+        let r = close_by_control(&mut app, "ra", false, false);
+        assert_eq!((r.code, r.out.as_str()), (0, "closed ra\n"));
+        assert!(r.err.starts_with("kept worktree w: it has uncommitted work (1 untracked)"), "{}", r.err);
+        assert!(!r.err.contains("--clean") && !r.err.contains("worktrees rm"), "nothing would remove it: {}", r.err);
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn plain_close_says_who_else_keeps_a_worktree() {
+        let (mut app, _, _dir, wt) = closing_in_worktree("kept-in-use");
+        crate::worktree::pretend_users("sidebar", "web", &wt);
+        let r = close_by_control(&mut app, "ra", false, false);
+        crate::worktree::pretend_nobody();
+        assert_eq!(r.code, 0);
+        assert_eq!(r.err, "kept worktree w: it's also used by web in session sidebar");
+        assert!(wt.exists());
+    }
+
+    #[test]
+    fn the_toast_and_the_cli_say_kept_the_same_way() {
+        crate::worktree::pretend_nobody();
+        let (app, _, _dir, wt) = closing_in_worktree("kept-shared");
+        let f = crate::offer::look(&wt, Vec::new).unwrap();
+        assert_eq!(crate::offer::kept_toast(&f).as_deref(), Some("kept worktree w (clean, merged): alt+v X, or `trix worktrees rm w`"));
+        assert_eq!(crate::offer::kept(&f, crate::offer::Told::Cli), "kept worktree w (clean, merged): `trix close --clean` next time, or `trix worktrees rm w` now");
+        std::fs::write(wt.join("draft.txt"), "unsaved\n").unwrap();
+        let f = crate::offer::look(&wt, Vec::new).unwrap();
+        assert_eq!(crate::offer::kept_toast(&f), None, "no toast for one that stays");
+        stop_all(&app);
     }
 
     #[test]
