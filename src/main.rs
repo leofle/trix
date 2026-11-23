@@ -7,6 +7,7 @@ mod events;
 mod folders;
 mod holder;
 mod hooks;
+mod idle;
 mod input;
 mod install;
 mod instructions;
@@ -50,7 +51,11 @@ usage:
   trix claude codex shell   open, and start these agents in the current folder
   trix attach               attach to the running workspace, never start one
   trix view                 watch the running workspace read-only (q leaves)
-  trix ls [--json]          list agents and their state without attaching
+  trix ls [--json] [--all]  list agents and their state without attaching;
+                            --all lists every session, even from inside a pane
+  trix forget -s <name> [--yes]
+                            drop a stopped session's saved workspace, so it
+                            stops keeping its worktrees in use; asks first
   trix kill                 stop the workspace and every agent in it
   trix kill --all           stop every running session
 
@@ -115,7 +120,8 @@ Agents live in a background server: closing the terminal or pressing alt+d
 detaches, and they keep working. alt+q quits and stops them. One terminal
 is in control at a time; `trix view` lets any number of others watch. Each named
 session is its own workspace, with its own agents and saved layout. Without
--s, `trix ls` shows every running session.
+-s, `trix ls` shows every running session, how long each has been left
+alone, and the stopped ones that still have a saved workspace.
 
 keys inside trix (the defaults): alt+n new agent · alt+a who needs you · alt+g grid · alt+d detach · alt+? all keys
 ";
@@ -158,6 +164,12 @@ fn take_session(args: &mut Vec<String>) -> Result<Option<String>, String> {
     Ok(found)
 }
 
+/// The sessions `trix ls` lists: inside a pane or with `-s`, that one
+/// (`explicit`), unless `--all`; otherwise every one running.
+fn ls_sessions(explicit: bool, all: bool, name: &str, candidates: Vec<String>) -> Vec<String> {
+    if explicit && !all { vec![name.to_string()] } else { candidates }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // The copy of trix that posts macOS notifications, and nothing else.
@@ -191,7 +203,8 @@ fn main() -> anyhow::Result<()> {
     };
     // Inside a pane, `trix ls` and friends mean the session the pane is in.
     let from_env = std::env::var("TRIX_SESSION").ok().filter(|n| session::check_name(n).is_ok());
-    let explicit = flag.is_some() || from_env.is_some();
+    let flagged = flag.is_some();
+    let explicit = flagged || from_env.is_some();
     session::set_name(flag.or(from_env).unwrap_or_else(|| session::DEFAULT.into()));
     let missing = || format!("trix: {}", session::missing());
 
@@ -206,7 +219,19 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--json") => {
-            control::run(control::Request::List { json: true });
+            if !args.iter().skip(1).any(|a| a == "--all" || a == "-a") {
+                control::run(control::Request::List { json: true });
+            }
+            // Every running session's listing, as one array.
+            let ask = ClientMsg::Control { protocol: control::CONTROL, from: None, req: control::Request::List { json: true } };
+            let lists: Vec<serde_json::Value> = session::candidates()
+                .iter()
+                .filter_map(|n| session::ask(n, &ask).ok().flatten())
+                .filter_map(|text| serde_json::from_str::<control::Reply>(&text).ok())
+                .filter_map(|r| serde_json::from_str(&r.out).ok())
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&lists).unwrap_or_default());
+            return Ok(());
         }
         Some("layout") => {
             let cmd = match layout::parse(&args[1..]) {
@@ -237,17 +262,30 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some("ls" | "list") => {
-            let names = if explicit { vec![session::name().to_string()] } else { session::candidates() };
+            let all = args.iter().skip(1).any(|a| a == "--all" || a == "-a");
+            let names = ls_sessions(explicit, all, session::name(), session::candidates());
             let mut texts = Vec::new();
+            let mut running = Vec::new();
             // Sessions with no server, but with agents one that died left
             // running: said, or nobody would know they are.
             let mut left = Vec::new();
             for n in &names {
                 match session::query(n, &ClientMsg::List) {
-                    Some(text) => texts.push(text),
+                    Some(text) => {
+                        texts.push(text);
+                        running.push(n.clone());
+                    }
                     None => left.extend(session::left_running(n).map(|note| (n, note))),
                 }
             }
+            // Stopped sessions whose saved workspace still holds worktrees:
+            // when every session is listed.
+            let footer = if !explicit || all {
+                let age = |s: &str| std::fs::metadata(state::path_for(s)).and_then(|m| m.modified()).ok().and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+                idle::footer(&idle::stopped(&state::saved_workspaces(), &running, &age))
+            } else {
+                None
+            };
             if texts.is_empty() {
                 // Says so of this session itself.
                 left.retain(|(n, _)| *n != session::name());
@@ -261,10 +299,53 @@ fn main() -> anyhow::Result<()> {
             }
             if texts.is_empty() {
                 eprintln!("{}", missing());
+                if let Some(f) = footer {
+                    print!("{f}");
+                }
                 std::process::exit(1);
             }
             print!("{}", texts.join("\n"));
+            if let Some(f) = footer {
+                print!("\n{f}");
+            }
             return Ok(());
+        }
+        Some("forget") => {
+            let yes = args.iter().skip(1).any(|a| a == "--yes" || a == "-y");
+            if !flagged || args.iter().skip(1).any(|a| a != "--yes" && a != "-y") {
+                eprintln!("trix: forget takes a session: `trix forget -s <name> [--yes]`\n\n{HELP}");
+                std::process::exit(2);
+            }
+            let name = session::name();
+            // Held until it's done: no server starts and reads the file meanwhile.
+            let (_locks, served) = session::claim(Some(name));
+            let holders = holder::discover(name).len();
+            let mut ask = |what: &str| -> bool {
+                eprint!("{what}");
+                if yes {
+                    return true;
+                }
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    eprintln!("trix: no terminal to ask: run it again with --yes to forget it");
+                    return false;
+                }
+                eprint!("Forget it? Its agents won't be offered back; their folders and branches stay. [y/N] ");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                matches!(line.trim(), "y" | "Y" | "yes")
+            };
+            match state::forget(name, !served.is_empty(), holders, &mut ask) {
+                Ok(done) => {
+                    worktree::release_session(name);
+                    eprintln!("trix: {done}");
+                    return Ok(());
+                }
+                Err(why) => {
+                    eprintln!("trix: {why}");
+                    std::process::exit(1);
+                }
+            }
         }
         Some("config") => {
             if args.len() > 1 {
@@ -658,6 +739,14 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 #[cfg(test)]
 mod tests {
     use super::take_session;
+
+    #[test]
+    fn ls_all_lists_every_session_even_from_a_pane() {
+        let all = || vec!["default".to_string(), "sidebar".to_string()];
+        assert_eq!(super::ls_sessions(true, false, "default", all()), ["default"], "a pane sees its own");
+        assert_eq!(super::ls_sessions(true, true, "default", all()), ["default", "sidebar"], "--all sees every one");
+        assert_eq!(super::ls_sessions(false, false, "default", all()), ["default", "sidebar"]);
+    }
 
     fn run(args: &[&str]) -> (Result<Option<String>, String>, Vec<String>) {
         let mut v: Vec<String> = args.iter().map(|s| s.to_string()).collect();

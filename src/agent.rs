@@ -294,6 +294,9 @@ pub struct Agent {
 
     pub state: State,
     pub state_since: Instant,
+    /// `state_since` in wall-clock time, which goes on while the machine
+    /// sleeps: "has needed you for 27h" across a night.
+    pub state_at: std::time::SystemTime,
     pub created: Instant,
     /// Unseen completion / question — cleared when the human looks at it.
     pub unseen: bool,
@@ -1097,6 +1100,7 @@ impl Agent {
             size: p.size,
             state: State::Starting,
             state_since: now,
+            state_at: std::time::SystemTime::now(),
             created: now,
             unseen: false,
             hooked: false,
@@ -1220,6 +1224,7 @@ impl Agent {
         let prev = self.state;
         self.state = s;
         self.state_since = Instant::now();
+        self.state_at = std::time::SystemTime::now();
         self.away = false;
         // Bounded: without subscribers, nothing drains it but the server loop.
         if self.changes.len() >= 64 {
