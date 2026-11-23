@@ -19,7 +19,7 @@ Generic multiplexers (tmux, zellij) know nothing about agents. herdr and Rex add
 - **What it costs.** From the same logs, trix counts and prices each Claude and Codex agent's tokens: `$1.23 · 4.1M tok` on its pane, the workspace's total on the top bar, all of it in `trix ls --json`. Set a budget for the workspace or for each agent, and trix warns you as spend nears it and tells you when it goes over. See [Cost and tokens](#cost-and-tokens).
 - **One key to the next thing that matters.** `alt+a` goes to the agent that has been blocked longest, then to unseen finished work.
 - **Many agents, one glance.** `alt+g` tiles your agents live, up to four at a time, and `alt+j`/`alt+k` page through the rest. Pin up to two agents to the top of the sidebar, and select several to act on all of them at once. See [Grid, pins and selection](#grid-pins-and-selection).
-- **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`, excluded from git automatically, so parallel agents never step on each other. A repository can make those worktrees [runnable](#runnable-worktrees): a setup command, its `.env` files, and a block of ports for each.
+- **Isolation built in.** "Worktree" in the new-agent dialog creates `.trix/worktrees/<name>` on branch `trix/<name>`, excluded from git automatically, so parallel agents never step on each other. A repository can make those worktrees [runnable](#runnable-worktrees): a setup command, its `.env` files, and a block of ports for each. Closing an agent keeps its worktree and branch; `alt+v` then `X` instead closes it and removes both ([Review](#review)).
 - **Review, then merge, without leaving trix.** `alt+v` opens an agent's diff. Leave notes on lines and send them back to the agent as one prompt; then commit, push, open a PR, merge and clean up the worktree from the same view. See [Review](#review).
 - **Clone an agent.** `alt+l` starts a copy of the focused agent in a worktree of its own, with the original's uncommitted changes and, for Claude, Codex and Grok, a copy of its conversation. See [Clone](#clone).
 - **Search every agent at once.** `alt+f` searches every agent's scrollback as you type, and Enter jumps to the match. See [Search](#search).
@@ -187,6 +187,7 @@ ports = 10                  # how many ports each worktree gets (1 to 100)
 - **Its conversation.** Claude, Codex and Grok go on from a copy of the original's conversation (`--fork-session`, `codex fork`), so the clone knows what the original knew, and the two go their own ways from there. Other agents start a new conversation, and say so.
 - **Its cost** counts only what the clone spends itself, not the conversation it was copied from. That holds across a restore and a saved [layout](#layouts).
 - **Restoring it.** A clone is saved with its own conversation only once it has one. Restored before then, it starts a new conversation rather than going on in the original's.
+- **Cleaning it up.** Closing the clone keeps its worktree and branch. `alt+v` then `X` on the clone closes it and removes both, the branch once it's merged ([Review](#review)).
 - Outside git, the clone shares the original's folder.
 
 ### Agent control
