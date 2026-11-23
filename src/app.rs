@@ -522,6 +522,9 @@ pub struct App {
     pub detach: bool,
     pub dirty: bool,
     pub started: Instant,
+    /// When someone was last here and something last happened, in
+    /// wall-clock time: `trix ls`'s "detached 27h · idle 27h".
+    pub clock: crate::idle::Clock,
     pub start_dir: PathBuf,
     drag: Option<Drag>,
     git_targets: Arc<Mutex<GitTargets>>,
@@ -638,6 +641,7 @@ impl App {
             times_shown: String::new(),
             save_failed: None,
             started: Instant::now(),
+            clock: crate::idle::Clock::new(std::time::SystemTime::now()),
             start_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             drag: None,
             git_targets,
@@ -765,6 +769,7 @@ impl App {
 
     /// A terminal attached: it starts from a blank screen and its own folder.
     pub fn on_attach(&mut self, cwd: PathBuf) {
+        self.clock.attached(std::time::SystemTime::now());
         if cwd.is_dir() {
             self.start_dir = cwd;
         }
@@ -998,6 +1003,7 @@ impl App {
 
     /// Nobody is looking any more: every state change becomes a notification.
     pub fn on_detach(&mut self) {
+        self.clock.detached(std::time::SystemTime::now());
         self.term_focused = false;
         self.drag = None;
         self.modal = None;
@@ -1005,6 +1011,29 @@ impl App {
 
     /// Plain-text status for `trix ls`.
     pub fn listing(&self) -> String {
+        self.listing_at(std::time::SystemTime::now())
+    }
+
+    /// How long nobody (no controller attached) and nothing has used this
+    /// session, and how long since the controller left: `None` for either
+    /// while someone is attached.
+    /// A terminal is in control of this session.
+    pub fn controlled(&self) -> bool {
+        self.out.controlled()
+    }
+
+    pub fn left_alone(&self, now: std::time::SystemTime) -> (Option<Duration>, Option<Duration>) {
+        let attached = self.controlled();
+        (self.clock.idle(now, attached), self.clock.detached_for(now, attached))
+    }
+
+    /// The hint lines for a session left alone past `[session] idle_after`.
+    fn idle_hints(&self, now: std::time::SystemTime) -> Vec<String> {
+        let blocked: Vec<(String, Duration)> = self.agents.iter().filter(|a| a.state == State::Blocked).map(|a| (a.name.clone(), now.duration_since(a.state_at).unwrap_or_default())).collect();
+        crate::idle::hint(crate::session::name(), self.left_alone(now).0, &blocked, self.config.session.idle_after)
+    }
+
+    fn listing_at(&self, now: std::time::SystemTime) -> String {
         let count = |s: State| self.agents.iter().filter(|a| a.state == s).count();
         let session = if crate::session::is_default() { String::new() } else { format!("{} · ", crate::session::name()) };
         let mut out = format!(
@@ -1018,6 +1047,14 @@ impl App {
         );
         if self.viewers > 0 {
             out.insert_str(out.len() - 1, &format!(" · {} watching", self.viewers));
+        }
+        let (idle, detached) = self.left_alone(now);
+        if let Some(d) = detached {
+            out.insert_str(out.len() - 1, &format!(" · detached {}", crate::idle::coarse(d)));
+        }
+        // Said once it's worth saying: a minute, not every pause.
+        if let Some(i) = idle.filter(|i| i.as_secs() >= 60) {
+            out.insert_str(out.len() - 1, &format!(" · idle {}", crate::idle::coarse(i)));
         }
         let spent = self.totals();
         if crate::usage::total(&spent).total() > 0 {
@@ -1039,6 +1076,10 @@ impl App {
                 crate::hooks::one_line(&a.activity, 50),
                 crate::hooks::printable(&tilde(&a.cwd)),
             ));
+        }
+        for h in self.idle_hints(now) {
+            out.push_str(&h);
+            out.push('\n');
         }
         out
     }
@@ -2321,6 +2362,10 @@ impl App {
     }
 
     pub fn slow_tick(&mut self) {
+        // An agent at work is something going on, however long it takes.
+        if self.agents.iter().any(|a| a.state == State::Working) {
+            self.clock.active(std::time::SystemTime::now());
+        }
         let trying = matches!(&self.modal, Some(Modal::Settings(Settings { picker: Some(_), .. })));
         if let Some((t, source)) = self.theme_watch.poll() {
             if trying {
@@ -2613,6 +2658,7 @@ impl App {
             input::encode_key(&k, *t.mode())
         };
         a.user_input(bytes);
+        self.clock.active(std::time::SystemTime::now());
     }
 
     fn on_paste(&mut self, s: String) {
@@ -2644,6 +2690,7 @@ impl App {
         if let Some(a) = self.agents.get_mut(self.focus) {
             let bytes = input::encode_paste(&s, *a.term.lock().mode());
             a.user_input(bytes);
+            self.clock.active(std::time::SystemTime::now());
         }
     }
 
@@ -5582,6 +5629,43 @@ mod tests {
 
     fn sleeper(name: &str, cwd: &Path) -> Spawn {
         Spawn { kind: Kind::Custom, name: name.into(), cwd: cwd.to_path_buf(), command: Some("exec sleep 60".into()), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() }
+    }
+
+    #[test]
+    fn ls_says_how_long_the_session_has_been_left_alone() {
+        use std::time::SystemTime;
+        let mut app = test_app();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let h = |n: u64| Duration::from_secs(n * 3600);
+        app.clock = crate::idle::Clock::new(t0);
+        app.clock.attached(t0);
+        app.clock.detached(t0 + h(1));
+        let head = |app: &App, now| app.listing_at(now).lines().next().unwrap().to_string();
+        assert!(!head(&app, t0 + h(1)).contains("idle"), "{}", head(&app, t0 + h(1)));
+        assert!(head(&app, t0 + h(28)).ends_with(" · detached 27h · idle 27h"), "{}", head(&app, t0 + h(28)));
+        assert!(!app.listing_at(t0 + h(20)).contains("nobody and nothing"), "under a day");
+        let text = app.listing_at(t0 + h(28));
+        assert!(text.contains("has had nobody and nothing going on for 27h"), "{text}");
+        app.clock.active(t0 + h(27));
+        assert!(head(&app, t0 + h(28)).ends_with(" · detached 27h · idle 1h"), "an agent worked since");
+        app.config.session.idle_after = None;
+        app.clock.active_at = t0;
+        assert!(!app.listing_at(t0 + h(100)).contains("nobody and nothing"), "off");
+    }
+
+    #[test]
+    fn an_agent_that_needs_you_past_idle_after_is_flagged() {
+        let mut app = test_app();
+        let id = app.spawn_quiet(sleeper("tester", Path::new("/tmp"))).unwrap();
+        let i = app.index_of(id).unwrap();
+        app.agents[i].set_state(State::Blocked, false);
+        let now = std::time::SystemTime::now();
+        app.agents[i].state_at = now - Duration::from_secs(27 * 3600);
+        app.clock.active(now);
+        let text = app.listing_at(now);
+        assert!(text.contains("! tester in session default has needed you for 27h"), "{text}");
+        assert!(!text.contains("nobody and nothing"), "the session itself isn't idle");
+        stop_all(&app);
     }
 
     #[test]

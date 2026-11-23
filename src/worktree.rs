@@ -593,6 +593,14 @@ pub fn keep_only(keep: impl IntoIterator<Item = PathBuf>) {
     }
 }
 
+/// A stopped session's saved workspace was forgotten: the ports it kept
+/// for coming back go back.
+pub fn release_session(session: &str) {
+    if let Err(e) = keep_only_in(&state_dir(), session, &BTreeSet::new()) {
+        eprintln!("trix: couldn't release session {session}'s ports: {e}");
+    }
+}
+
 pub fn release(cwd: &Path) {
     if let Some(worktree) = managed_root(cwd)
         && let Err(e) = release_in(&state_dir(), &worktree, &lease_holder())

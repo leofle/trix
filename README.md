@@ -331,6 +331,9 @@ cache_write = 2                   # optional: input by default (cache_write_1h t
 ports = true                      # give each trix worktree a block of ports (on by default)
 port_base = 20000                 # where blocks start (1024 to 65535)
 port_count = 10                   # ports per block, unless the repo's .trix.toml says (1 to 100)
+
+[session]
+idle_after = "8h"                 # when `trix ls` flags a session left alone: like 30m, 8h or 1d (default), or "off"
 ```
 
 - **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `compact`, `search`, `broadcast`, `review`, `clone`, `rename`, `close`, `menu`, `select`, `detach`, `help`, `settings` and `quit`. Naming an action replaces its keys; the actions you leave out keep theirs.
@@ -347,6 +350,7 @@ port_count = 10                   # ports per block, unless the repo's .trix.tom
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - **`[cost]`** sets the budgets and prices in [Cost and tokens](#cost-and-tokens). A price under `[cost.prices]` applies to the model of that name, or to models whose name starts with it (`"gpt-6"` covers `gpt-6-luna`), ahead of the live list and trix's own. `live_prices` and `prices_url` are for the [live list](#cost-and-tokens).
 - **`[worktree]`** sets the ports of [runnable worktrees](#runnable-worktrees). The default base sits below the ports Linux and macOS hand out on their own. What a repository's worktrees run and copy lives in its `.trix.toml`, not here.
+- **`[session] idle_after`** is how long a session can go with nobody attached and nothing happening before `trix ls` flags it, and how long an agent can need you before it's flagged more strongly (see [Sessions](#sessions)). A trix from before this key was added can't reload a config that has it.
 - **What you tell every agent** (who does what, who reports to whom) goes in `~/.config/trix/instructions.md`, not here: see [Your instructions](#your-instructions).
 
 ### Environment variables
@@ -463,7 +467,11 @@ The same logs the [context gauge](#context-gauge) reads have every turn's tokens
 
 Without `-s` you get the default session. `-s <name>` (or `--session <name>`) picks another one: letters, digits, `-` and `_`, up to 32 characters. Each session is its own server, with `session-<name>.sock`, `hooks-<name>.sock` and `server-<name>.log` in the runtime folder and `workspace-<name>.json` for restore, so killing or restoring one never touches another. A named session shows its name in the top bar, the terminal title and its desktop notifications.
 
-`trix ls` without `-s` lists every running session. Inside a pane, `TRIX_SESSION` holds the pane's session, so `trix ls` and `trix kill` there act on that session.
+`trix ls` without `-s` lists every running session. Inside a pane, `TRIX_SESSION` holds the pane's session, so `trix ls` and `trix kill` there act on that session; `trix ls --all` lists every session from there too (with `--json`, as an array of each session's listing).
+
+**Left alone.** Each session's line in `trix ls` says how long it has been since its controlling terminal left and how long nobody and nothing has used it: `trix · sidebar · 4 agents · … · detached 27h · idle 27h`. Something happening means an agent working, typing into it, or a `trix send` or `trix spawn`; an agent's output alone doesn't count, because programs redraw on their own. A session with a terminal attached is never idle (watching with `trix view` doesn't count). Times are wall-clock, so a night with the laptop closed counts. A session idle longer than `[session] idle_after` (a day by default) gets a line saying so, with `trix -s <name>` to look and `trix kill -s <name>` to stop it; stopping loses nothing, since [restore](#restore) brings it back. An agent that has needed you for longer than that is flagged first, with a `!`. `trix ls --json` has the same as `attached`, `detached_seconds`, `idle_seconds` and `started_seconds`.
+
+**Stopped, but saved.** A stopped session's saved workspace keeps its worktrees in use: the review's `X` won't remove them, since a restore would bring agents back into them. `trix ls` ends with the stopped sessions that still have one, each with its number of agents, how old the file is, and "all N folders gone" when none of them is left. `trix forget -s <name>` drops one: it shows the agents it would drop and asks, with no as the default. Without a terminal to ask it does nothing unless given `--yes`. It refuses while the session's server runs (stop it first: `trix kill` saves the workspace) or while agents a server that died left running are still about. Folders and branches stay; only the offer to bring the agents back goes.
 
 ### Restore
 

@@ -289,6 +289,10 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         }
         return;
     }
+    // Someone is using the session, if not from a terminal.
+    if matches!(req, Request::Send { .. } | Request::Spawn { .. }) {
+        app.clock.active(std::time::SystemTime::now());
+    }
     let r = match req {
         Request::List { json: true } => Reply::ok(listing_json(app, from)),
         Request::List { json: false } => Reply::ok(app.listing()),
@@ -758,6 +762,13 @@ struct JsonDiff {
 struct JsonList<'a> {
     session: &'a str,
     viewers: usize,
+    /// A terminal is in control: someone is there, so it's never idle.
+    attached: bool,
+    /// Since the controller left; null while one is attached, or if none ever was.
+    detached_seconds: Option<u64>,
+    /// Since anyone was there or anything happened; null while attached.
+    idle_seconds: Option<u64>,
+    started_seconds: u64,
     /// Every agent's spend added up, agents closed since the server started too.
     totals: JsonSpend,
     /// Where model prices come from.
@@ -807,7 +818,21 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
     let totals = JsonSpend::new(app, &app.totals(), app.config.cost.budget);
     let prices = JsonPrices::new(app);
     let pending_restore = app.pending_restore.iter().flat_map(|p| &p.agents).map(|a| JsonPending { name: &a.name, cwd: a.cwd.display().to_string() }).collect();
-    let mut s = serde_json::to_string_pretty(&JsonList { session: session::name(), viewers: app.viewers, totals, prices, agents, pending_restore }).unwrap_or_default();
+    let now = std::time::SystemTime::now();
+    let (idle, detached) = app.left_alone(now);
+    let list = JsonList {
+        session: session::name(),
+        viewers: app.viewers,
+        attached: app.controlled(),
+        detached_seconds: detached.map(|d| d.as_secs()),
+        idle_seconds: idle.map(|d| d.as_secs()),
+        started_seconds: app.clock.started_for(now).as_secs(),
+        totals,
+        prices,
+        agents,
+        pending_restore,
+    };
+    let mut s = serde_json::to_string_pretty(&list).unwrap_or_default();
     s.push('\n');
     s
 }
@@ -840,6 +865,9 @@ mod tests {
         assert_eq!((s["total_tokens"].as_u64(), s["cost_complete"].as_bool(), s["budget_usd"].is_null()), (Some(1_610_000), Some(true), true));
         assert_eq!(v["agents"][1]["spend"]["cost_complete"], false, "no price for its model");
         assert!(v["agents"][2]["spend"].is_null(), "nothing spent yet");
+        assert_eq!((v["attached"].as_bool(), v["detached_seconds"].is_null()), (Some(false), true), "nobody ever attached");
+        assert!(v["idle_seconds"].as_u64().is_some() && v["started_seconds"].as_u64().is_some());
+        assert_eq!(v["pending_restore"], serde_json::json!([]));
         let t = &v["totals"];
         assert_eq!((t["total_tokens"].as_u64(), t["cost_usd"].as_f64()), (Some(3_220_000), Some(6.18)));
         assert_eq!((t["cost_complete"].as_bool(), t["budget_usd"].as_f64(), t["over_budget"].as_bool()), (Some(false), Some(5.0), Some(true)));

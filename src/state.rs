@@ -122,6 +122,50 @@ pub fn saved_workspaces() -> Vec<(String, Saved)> {
     saved_workspaces_in(&dir())
 }
 
+/// Forget `session`'s saved workspace, in `dir`, after `ask` says yes to
+/// what it would drop: so it stops holding its worktrees. Refused while its
+/// server runs (`served`; it would save it again as it stops) or agents a
+/// server that died left running (`holders`) are still about. What was
+/// done, or why not.
+pub fn forget_in(dir: &Path, session: &str, served: bool, holders: usize, ask: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+    let trix = crate::idle::trix_for(session);
+    if served {
+        return Err(format!("session {session} is running: stop it first (`trix kill -s {session}`), which saves its workspace, then forget that"));
+    }
+    if holders > 0 {
+        let (are, them) = if holders == 1 { ("agent is", "it") } else { ("agents are", "them") };
+        return Err(format!("session {session} has {holders} {are} still running from a server that died: `{trix}` picks {them} up, `trix kill -s {session}` stops {them}"));
+    }
+    let path = path_in(dir, session);
+    if !path.exists() {
+        return Err(format!("session {session} has no saved workspace"));
+    }
+    let age = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+    let age = age.map(|a| format!(", saved {} ago", crate::idle::coarse(a))).unwrap_or_default();
+    let what = match load_from(&path) {
+        Some(saved) => {
+            let n = saved.agents.len();
+            let mut what = format!("session {session}'s saved workspace{age}: {n} agent{}\n", if n == 1 { "" } else { "s" });
+            let w = saved.agents.iter().map(|a| a.name.chars().count()).max().unwrap_or(0);
+            for a in &saved.agents {
+                let gone = if a.cwd.is_dir() { "" } else { " (folder gone)" };
+                what.push_str(&format!("  {:<w$}  {:<8}  {}{gone}\n", crate::hooks::printable(&a.name), crate::hooks::printable(&a.kind), crate::hooks::printable(&crate::app::tilde(&a.cwd))));
+            }
+            what
+        }
+        None => format!("session {session}'s saved workspace{age}, which this trix can't read\n"),
+    };
+    if !ask(&what) {
+        return Err(format!("kept session {session}'s saved workspace"));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("couldn't remove {}: {e}", path.display()))?;
+    Ok(format!("forgot session {session}'s saved workspace: `{trix}` now starts it empty"))
+}
+
+pub fn forget(session: &str, served: bool, holders: usize, ask: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+    forget_in(&dir(), session, served, holders, ask)
+}
+
 pub(crate) fn saved_workspaces_in(dir: &Path) -> Vec<(String, Saved)> {
     saved_sessions_in(dir).into_iter().filter_map(|s| Some((s.clone(), load_from(&path_in(dir, &s))?))).collect()
 }
@@ -247,6 +291,32 @@ mod tests {
         let d = std::env::temp_dir().join(format!("trix-test-state-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn forgetting_a_saved_workspace_is_refused_while_it_could_come_back_and_asks_first() {
+        let d = tmp();
+        let path = path_in(&d, "sidebar");
+        store_at(&path, &Saved::new(0, vec![SavedAgent { cwd: d.join("gone/trix-2"), ..agent("claude", "trix-2", None) }])).unwrap();
+        let mut never = |_: &str| -> bool { panic!("not asked") };
+        assert!(forget_in(&d, "sidebar", true, 0, &mut never).unwrap_err().contains("is running"));
+        assert!(forget_in(&d, "sidebar", false, 2, &mut never).unwrap_err().contains("2 agents are still running"));
+        assert!(forget_in(&d, "home", false, 0, &mut never).unwrap_err().contains("no saved workspace"));
+        assert!(path.exists(), "nothing was dropped");
+        let mut shown = String::new();
+        let mut no = |what: &str| {
+            shown = what.to_string();
+            false
+        };
+        assert!(forget_in(&d, "sidebar", false, 0, &mut no).unwrap_err().starts_with("kept"), "the default is no");
+        assert!(shown.starts_with("session sidebar's saved workspace, saved ") && shown.contains("1 agent\n") && shown.contains("trix-2") && shown.contains("(folder gone)"), "{shown}");
+        assert!(path.exists());
+        // --yes: asked, and yes.
+        let said = forget_in(&d, "sidebar", false, 0, &mut |_| true).unwrap();
+        assert!(said.contains("`trix -s sidebar` now starts it empty"), "{said}");
+        assert!(!path.exists());
+        assert!(saved_workspaces_in(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn agent(kind: &str, name: &str, session: Option<&str>) -> SavedAgent {

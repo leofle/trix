@@ -28,6 +28,21 @@ pub struct Config {
     pub workspace: Workspace,
     pub cost: CostOpts,
     pub worktree: WorktreeOpts,
+    pub session: SessionOpts,
+}
+
+/// When a session left alone gets a hint in `trix ls`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionOpts {
+    /// `None`: never ("off").
+    pub idle_after: Option<std::time::Duration>,
+}
+
+impl Default for SessionOpts {
+    fn default() -> SessionOpts {
+        // A day, not 8h: a session left overnight isn't forgotten.
+        SessionOpts { idle_after: Some(std::time::Duration::from_secs(86400)) }
+    }
 }
 
 /// The ports each of trix's worktrees gets (`TRIX_PORT`…).
@@ -309,6 +324,14 @@ struct File {
     cost: FileCost,
     #[serde(default)]
     worktree: FileWorktree,
+    #[serde(default)]
+    session: FileSession,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileSession {
+    idle_after: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -484,7 +507,11 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
     let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false), scrollback };
     let cost = cost_opts(f.cost)?;
     let worktree = worktree_opts(f.worktree)?;
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree })
+    let session = match f.session.idle_after.as_deref() {
+        None => SessionOpts::default(),
+        Some(s) => SessionOpts { idle_after: crate::idle::parse_after(s).map_err(|e| format!("session.idle_after: {e}"))? },
+    };
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree, session })
 }
 
 fn worktree_opts(f: FileWorktree) -> Result<WorktreeOpts, String> {
@@ -1072,6 +1099,10 @@ mod tests {
         assert_eq!(read("[new]\nagent = \"last\"\n").unwrap().new.agent, None, "the one started last");
         assert!(read("[new]\nagent = \"gpt\"\n").unwrap_err().contains("not an agent (claude, codex"));
         assert!(read("[workspace]\nrestore = \"yes\"\n").unwrap_err().contains("ask, always or never"));
+        assert_eq!(read("").unwrap().session.idle_after, Some(std::time::Duration::from_secs(86400)), "a day by default");
+        assert_eq!(read("[session]\nidle_after = \"8h\"\n").unwrap().session.idle_after, Some(std::time::Duration::from_secs(8 * 3600)));
+        assert_eq!(read("[session]\nidle_after = \"off\"\n").unwrap().session.idle_after, None);
+        assert!(read("[session]\nidle_after = \"soon\"\n").unwrap_err().contains("session.idle_after"));
         assert!(read("[theme]\nfile = \"x\"\n").is_err(), "unknown keys are mistakes, as everywhere");
     }
 
