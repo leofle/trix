@@ -206,19 +206,21 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
             Span::styled(crate::session::name(), Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
         ]));
     }
+    // Each label for one agent, then for more: "1 needs you", "2 need you".
     let pills = [
-        (State::Blocked, "needs you", 8),
-        (State::Working, "working", 3),
-        (State::Done, "done", 2),
-        (State::Idle, "idle", 0),
+        (State::Blocked, ("needs you", "need you"), 8),
+        (State::Working, ("working", "working"), 3),
+        (State::Done, ("done", "done"), 2),
+        (State::Idle, ("idle", "idle"), 0),
     ];
     let mut any = false;
-    for (s, label, rank) in pills {
+    for (s, (one, many), rank) in pills {
         let n = count(s) + if s == State::Working { count(State::Starting) } else { 0 };
         if n == 0 {
             continue;
         }
         any = true;
+        let label = if n == 1 { one } else { many };
         let (g, gs) = glyph(app, s);
         let c = state_color(t, s);
         let bold = if s == State::Blocked { Modifier::BOLD } else { Modifier::empty() };
@@ -3741,6 +3743,29 @@ mod tests {
             }
         }
         assert!(seen_needs);
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn the_top_bar_says_needs_you_for_one_and_need_you_for_more() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        for (n, want) in [(1, "1 needs you"), (2, "2 need you")] {
+            let mut a = crate::agent::test_agent(crate::agent::Kind::Shell);
+            a.name = format!("a{n}");
+            a.set_state(State::Blocked, false);
+            app.agents.push(a);
+            let w = 100;
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let top: String = (0..w).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+            assert!(top.contains(want), "{n} blocked: {top:?}");
+            assert!(!top.contains("1 need you") && !top.contains("2 needs you"), "{n} blocked: {top:?}");
+        }
         for a in &app.agents {
             a.shutdown();
         }
