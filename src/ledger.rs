@@ -256,8 +256,10 @@ pub fn record(dir: &Path, reads: &[Read]) -> std::io::Result<Vec<Ym>> {
     let mut touched = false;
     for r in reads.iter().filter(|r| !r.entries.is_empty()) {
         let key = r.path.display().to_string();
-        // A log shorter than what was counted was written anew.
-        let counted = logs.get(&key).copied().filter(|&c| c <= r.done);
+        // A log now shorter than what was counted was written anew. A read
+        // that's behind (another session following the same log) is not.
+        let len = std::fs::metadata(&r.path).map(|m| m.len()).ok();
+        let counted = logs.get(&key).copied().filter(|&c| len.is_none_or(|l| c <= l));
         let fresh = r.entries.iter().filter(|e| match counted {
             Some(c) => e.end > c,
             None => e.at >= r.since,
@@ -269,8 +271,10 @@ pub fn record(dir: &Path, reads: &[Read]) -> std::io::Result<Vec<Ym>> {
             crate::usage::merge(m.days.entry(day).or_default(), &Spend::from([(e.bucket.clone(), e.tokens)]));
             any = true;
         }
-        if any || counted.is_some() {
-            logs.insert(key, r.done);
+        // Never back: a lagging read leaves the offset where it was.
+        let to = counted.map_or(r.done, |c| c.max(r.done));
+        if (any || counted.is_some()) && logs.get(&key) != Some(&to) {
+            logs.insert(key, to);
             touched = true;
         }
     }
@@ -495,6 +499,30 @@ mod tests {
         more.push(entry(300, at + 120, "m", 7));
         record(&d, &[read("/l.jsonl", 300, 0, more)]).unwrap();
         assert_eq!(output(&load(&d, ym)), 22);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_read_behind_the_counted_byte_adds_nothing_and_leaves_it() {
+        let d = dir("lag");
+        std::fs::create_dir_all(&d).unwrap();
+        let log = d.join("shared.jsonl");
+        std::fs::write(&log, vec![b'x'; 300]).unwrap();
+        let path = log.to_str().unwrap();
+        let at = parse_time("2026-11-24T12:00:00Z").unwrap();
+        let (ym, _, _) = local(at);
+        let offset = || -> u64 { serde_json::from_slice::<BTreeMap<String, u64>>(&std::fs::read(d.join("logs.json")).unwrap()).unwrap()[path] };
+        // One session counts the log to its end.
+        let all = vec![entry(100, at, "m", 10), entry(200, at + 1, "m", 5), entry(300, at + 2, "m", 7)];
+        record(&d, &[read(path, 300, 0, all.clone())]).unwrap();
+        assert_eq!((output(&load(&d, ym)), offset()), (22, 300));
+        // Another, following the same log, has read to 250 so far.
+        record(&d, &[read(path, 250, 0, all[..2].to_vec())]).unwrap();
+        assert_eq!((output(&load(&d, ym)), offset()), (22, 300), "nothing counted again, the offset not moved back");
+        // The log written anew, shorter: it counts again, from when its agent started.
+        std::fs::write(&log, vec![b'x'; 150]).unwrap();
+        record(&d, &[read(path, 150, at + 1, vec![entry(80, at, "m", 100), entry(150, at + 5, "m", 4)])]).unwrap();
+        assert_eq!((output(&load(&d, ym)), offset()), (26, 150));
         let _ = std::fs::remove_dir_all(&d);
     }
 
