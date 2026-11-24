@@ -242,7 +242,15 @@ fn top_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
     // What every agent has spent: "$4.21 of $25 · 3.1M tok".
     let spent = app.totals();
     let tokens = crate::usage::total(&spent).total();
-    if tokens > 0 {
+    // With a monthly budget, the month is what's held to it: "$256.50 of $300 this month".
+    if let Some(b) = app.config.cost.monthly_budget {
+        let c = app.month_cost().1;
+        right.push((4, vec![
+            Span::styled(crate::cost::label(&c), Style::new().fg(budget_color(t, app.month_level()))),
+            Span::styled(format!(" of {} this month", crate::cost::usd(b)), Style::new().fg(t.dim)),
+            Span::styled("  ·  ", Style::new().fg(t.muted)),
+        ]));
+    } else if tokens > 0 {
         let c = app.cost_of(&spent);
         let color = budget_color(t, app.budget_levels().0);
         let mut spans = vec![];
@@ -312,7 +320,7 @@ fn bottom_bar(f: &mut Frame, app: &App, area: Rect, t: &Theme) -> (Vec<(Rect, Ac
     let mut spans = vec![Span::raw(" ")];
     let hints: Vec<(String, String, Option<Action>)> = if app.modal.is_some() {
         // A list or a page of help has nothing to cancel.
-        let leaves = matches!(app.modal, Some(Modal::Help | Modal::Settings(_) | Modal::Search(_) | Modal::Menu(_) | Modal::Review(_)));
+        let leaves = matches!(app.modal, Some(Modal::Help | Modal::Spend(_) | Modal::Settings(_) | Modal::Search(_) | Modal::Menu(_) | Modal::Review(_)));
         vec![("esc".into(), (if leaves { "close" } else { "cancel" }).into(), None)]
     } else {
         let n = app.selected.len();
@@ -1861,6 +1869,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect, t: &Theme, hits: &mut Vec<(Rect, 
             app.dialog_hidden.set(confirm(f, area, t, "Quit trix", &format!("{live} agent{} still running and will be stopped.{detach}", if live == 1 { " is" } else { "s are" }), *sel, hits));
         }
         Modal::Help => help(f, app, area, t),
+        &Modal::Spend(ym) => spend_panel(f, app, ym, area, t),
         Modal::Restore(sel) => {
             let summary = app.pending_restore.as_ref().map(|p| p.summary()).unwrap_or_default();
             restore_prompt(f, area, t, &summary, *sel, &app.dialog_hidden, hits);
@@ -2763,6 +2772,7 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         ("wheel".into(), "scroll · click focus"),
         ("drag".into(), "select & copy"),
         ("shift+enter".into(), "newline to agent"),
+        (k(Action::Spend), "spend · month, by model"),
         (k(Action::Settings), "settings · theme, sounds"),
         (k(Action::Detach), "detach · keeps running"),
         (k(Action::Quit), "quit · stops agents"),
@@ -2821,6 +2831,104 @@ fn help(f: &mut Frame, app: &App, area: Rect, t: &Theme) {
         }
         let row = Rect { x: inner.x + 2, y: inner.bottom() - 1, width: room as u16, height: 1 };
         f.render_widget(Paragraph::new(TLine::from(spans)).alignment(Alignment::Center), row);
+    }
+}
+
+/// alt+$: what each model cost in a month, this month's pace, and the
+/// monthly budget. This month is the record the server keeps up to date;
+/// others are read from disk.
+fn spend_panel(f: &mut Frame, app: &App, ym: crate::ledger::Ym, area: Rect, t: &Theme) {
+    let today = crate::ledger::local(crate::prices::now());
+    let current = ym == today.0;
+    let dir = crate::ledger::dir();
+    let month = if current && app.month.0 == ym { app.month.1.clone() } else { crate::ledger::load(&dir, ym) };
+    let mut models: Vec<(String, crate::usage::Tokens, crate::cost::Cost)> = month.by_model().into_iter().map(|(m, s)| (m, crate::usage::total(&s), app.cost_of(&s))).collect();
+    models.sort_by(|a, b| b.2.usd.total_cmp(&a.2.usd).then(b.1.total().cmp(&a.1.total())));
+    let total = month.total();
+    let cost = app.cost_of(&total);
+    let budget = app.config.cost.monthly_budget.filter(|_| current);
+
+    let rows_wanted = models.len().max(1) as u16 + 9 + 2 * u16::from(current || !crate::ledger::load(&dir, ym.prev()).days.is_empty()) + u16::from(budget.is_some());
+    let r = centered(area, 66, rows_wanted);
+    f.render_widget(Clear, r);
+    let block = modal_block("Spend", t);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let rows = Rows::new(inner, 2, true);
+    let w = rows.area.width as usize;
+    let mut lines: Vec<TLine> = Vec::new();
+    let right = if current { format!("day {} of {}", today.1, ym.days()) } else { String::new() };
+    let title = ym.label();
+    lines.push(TLine::from(vec![
+        Span::styled(title.clone(), Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(w.saturating_sub(title.width() + right.width()))),
+        Span::styled(right, Style::new().fg(t.dim)),
+    ]));
+    lines.push(TLine::default());
+    // model · tokens · cost · share: the name takes what the figures leave.
+    let (tw, cw, sw) = (8, 11, 7);
+    let nw = w.saturating_sub(tw + cw + sw);
+    let row = |name: &str, tok: String, usd: String, share: String, st: Style| {
+        TLine::from(Span::styled(format!("{:<nw$}{tok:>tw$}{usd:>cw$}{share:>sw$}", trunc(name, nw.saturating_sub(1))), st))
+    };
+    lines.push(row("model", "tokens".into(), "cost".into(), "share".into(), Style::new().fg(t.dim)));
+    if models.is_empty() {
+        lines.push(TLine::from(Span::styled("nothing spent yet", Style::new().fg(t.dim))));
+    }
+    for (m, tok, c) in &models {
+        let usd = if c.unpriced > 0 && c.usd == 0.0 { "no price".to_string() } else { crate::cost::label(c) };
+        let share = if cost.usd > 0.0 && c.usd > 0.0 { format!("{}%", (c.usd / cost.usd * 100.0).round() as u64) } else { String::new() };
+        lines.push(row(m, crate::usage::tokens(tok.total()), usd, share, Style::new().fg(t.fg)));
+    }
+    lines.push(TLine::from(Span::styled("─".repeat(w), Style::new().fg(t.muted))));
+    let total_tok = crate::usage::total(&total).total();
+    lines.push(row("total", crate::usage::tokens(total_tok), crate::cost::label(&cost), String::new(), Style::new().fg(t.fg_bright).add_modifier(Modifier::BOLD)));
+    lines.push(TLine::default());
+    // Today, the month before and the pace: what there is of them.
+    let mut facts: Vec<String> = Vec::new();
+    if current {
+        let day = month.days.get(&today.1).map(|s| app.cost_of(s)).unwrap_or_default();
+        facts.push(format!("today {}", crate::cost::label(&day)));
+    }
+    let before = crate::ledger::load(&dir, ym.prev());
+    if !before.days.is_empty() {
+        facts.push(format!("{} {}", if current { "last month" } else { "month before" }, crate::cost::label(&app.cost_of(&before.total()))));
+    }
+    if let Some(p) = month.pace(cost.usd, ym, today) {
+        facts.push(format!("on pace for ~{}", crate::cost::usd(p)));
+    }
+    if facts.is_empty() {
+        lines.pop();
+    } else {
+        lines.push(TLine::from(Span::styled(trunc(&facts.join(" · "), w), Style::new().fg(t.fg))));
+    }
+    if let Some(b) = budget {
+        let frac = if b > 0.0 { (cost.usd / b).min(1.0) } else { 1.0 };
+        let label = format!("budget {}", crate::cost::usd(b));
+        let pct = format!("{}%", (cost.usd / b * 100.0).round() as u64);
+        let bar = w.saturating_sub(label.width() + pct.width() + 4);
+        let full = (frac * bar as f64).round() as usize;
+        let c = match app.month_level() {
+            0 => t.green,
+            l => budget_color(t, l),
+        };
+        lines.push(TLine::from(vec![
+            Span::styled(format!("{label}  "), Style::new().fg(t.fg)),
+            Span::styled("█".repeat(full), Style::new().fg(c)),
+            Span::styled("░".repeat(bar - full), Style::new().fg(t.muted)),
+            Span::styled(format!("  {pct}"), Style::new().fg(c)),
+        ]));
+    }
+    lines.push(TLine::from(Span::styled(trunc("at list prices: on a subscription, not what you're billed", w), Style::new().fg(t.muted))));
+    let keep: Vec<u8> = lines.iter().enumerate().map(|(i, l)| if l.width() == 0 { 0 } else if i < 3 { 3 } else { 2 }).collect();
+    for (line, at) in lines.into_iter().zip(rows.fit(&keep)) {
+        if let Some(at) = at {
+            f.render_widget(Paragraph::new(line), at);
+        }
+    }
+    if let Some(at) = rows.foot() {
+        let next = if current { "" } else { " · → later" };
+        f.render_widget(Paragraph::new(TLine::from(Span::styled(format!("← earlier{next} · esc close"), Style::new().fg(t.dim)))).alignment(Alignment::Center), at);
     }
 }
 
@@ -3036,6 +3144,42 @@ mod tests {
             term.draw(|f| draw(f, &mut app)).unwrap();
             assert!(!app.dialog_hidden.get(), "case {n} at 20 rows");
         }
+    }
+
+    fn opus(input: u64) -> crate::usage::Spend {
+        crate::usage::Spend::from([(crate::usage::Bucket { model: "claude-opus-5-5".into(), fast: false, prompt: 0 }, crate::usage::Tokens { input, ..Default::default() })])
+    }
+
+    #[test]
+    fn the_spend_panel_shows_each_model_this_month() {
+        let now = crate::ledger::Ym::now();
+        let sonnet = crate::usage::Spend::from([(crate::usage::Bucket { model: "claude-sonnet-5-5".into(), fast: false, prompt: 0 }, crate::usage::Tokens { output: 1_000_000, ..Default::default() })]);
+        let open = |budget: Option<f64>| {
+            let sonnet = sonnet.clone();
+            move |app: &mut App| {
+                app.config.cost.monthly_budget = budget;
+                app.month = (now, crate::ledger::Month { days: [(1, opus(30_000_000)), (2, sonnet)].into() });
+                app.modal = Some(Modal::Spend(now));
+            }
+        };
+        let lines = dialog(open(Some(300.0)), 90, 30);
+        let text = lines.join("\n");
+        assert!(text.contains(&now.label()), "{text}");
+        let opus_row = lines.iter().position(|l| l.contains("claude-opus-5-5")).expect("opus");
+        let sonnet_row = lines.iter().position(|l| l.contains("claude-sonnet-5-5")).expect("sonnet");
+        assert!(opus_row < sonnet_row, "the costliest first: {text}");
+        assert!(lines[opus_row].contains("$120") && lines[opus_row].contains("30M"), "{}", lines[opus_row]);
+        assert!(text.contains("total") && text.contains("budget $300"), "{text}");
+        assert!(text.contains("not what you're billed"), "{text}");
+        // The top bar holds the month to its budget.
+        assert!(lines[0].contains("of $300 this month"), "{}", lines[0]);
+        // No budget: no budget line, and the top bar as it was.
+        let lines = dialog(open(None), 90, 30);
+        assert!(!lines.join("\n").contains("budget"), "{lines:#?}");
+        assert!(!lines[0].contains("this month"), "{}", lines[0]);
+        // A short window keeps the month and the models.
+        let lines = dialog(open(Some(300.0)), 60, 12);
+        assert!(lines.iter().any(|l| l.contains("claude-opus-5-5")), "{lines:#?}");
     }
 
     #[test]
