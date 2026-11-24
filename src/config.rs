@@ -82,6 +82,8 @@ pub struct CostOpts {
     pub budget: Option<f64>,
     /// USD for each agent.
     pub agent_budget: Option<f64>,
+    /// USD for a calendar month, every session's agents together (`ledger.rs`).
+    pub monthly_budget: Option<f64>,
     /// Warn this far into a budget, in percent.
     pub warn_at: u8,
     /// Per model: ahead of the live list and trix's own prices.
@@ -93,7 +95,7 @@ pub struct CostOpts {
 
 impl Default for CostOpts {
     fn default() -> CostOpts {
-        CostOpts { budget: None, agent_budget: None, warn_at: 80, prices: BTreeMap::new(), live_prices: true, prices_url: crate::prices::DEFAULT_URL.into() }
+        CostOpts { budget: None, agent_budget: None, monthly_budget: None, warn_at: 80, prices: BTreeMap::new(), live_prices: true, prices_url: crate::prices::DEFAULT_URL.into() }
     }
 }
 
@@ -362,6 +364,7 @@ struct FileWorktree {
 struct FileCost {
     budget: Option<f64>,
     agent_budget: Option<f64>,
+    monthly_budget: Option<f64>,
     warn_at: Option<i64>,
     #[serde(default)]
     prices: BTreeMap<String, FilePrice>,
@@ -582,7 +585,7 @@ fn cost_opts(f: FileCost) -> Result<CostOpts, String> {
         Some(u) if u.starts_with("https://") || u.starts_with("http://") => u.to_string(),
         Some(u) => return Err(format!("cost.prices_url: '{u}' is not an http(s) URL")),
     };
-    Ok(CostOpts { budget: money("budget", f.budget)?, agent_budget: money("agent_budget", f.agent_budget)?, warn_at, prices, live_prices: f.live_prices.unwrap_or(true), prices_url })
+    Ok(CostOpts { budget: money("budget", f.budget)?, agent_budget: money("agent_budget", f.agent_budget)?, monthly_budget: money("monthly_budget", f.monthly_budget)?, warn_at, prices, live_prices: f.live_prices.unwrap_or(true), prices_url })
 }
 
 fn paint(what: &str, s: &str) -> Result<Paint, String> {
@@ -660,12 +663,13 @@ pub enum Action {
     Select,
     Detach,
     Help,
+    Spend,
     Settings,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 22] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -685,6 +689,7 @@ impl Action {
         Action::Select,
         Action::Detach,
         Action::Help,
+        Action::Spend,
         Action::Settings,
         Action::Quit,
     ];
@@ -710,6 +715,7 @@ impl Action {
             Action::Select => "select",
             Action::Detach => "detach",
             Action::Help => "help",
+            Action::Spend => "spend",
             Action::Settings => "settings",
             Action::Quit => "quit",
         }
@@ -736,6 +742,7 @@ impl Action {
             Action::Select => &["alt+x"],
             Action::Detach => &["alt+d"],
             Action::Help => &["alt+?", "alt+/"],
+            Action::Spend => &["alt+$"],
             Action::Settings => &["alt+,"],
             Action::Quit => &["alt+q"],
         }
@@ -1010,6 +1017,8 @@ mod tests {
         assert_eq!((p.input, p.output, p.cache_read, p.cache_write, p.cache_write_1h), (2.0, 10.0, 0.1, 2.0, 2.0));
         let p = read("[cost.prices.x]\ninput = 3\noutput = 15\n").unwrap().cost.prices["x"];
         assert_eq!(p.cache_read, 0.3, "a cache read is a tenth of input unless said");
+        assert_eq!(read("[cost]\nmonthly_budget = 300\n").unwrap().cost.monthly_budget, Some(300.0));
+        assert!(read("[cost]\nmonthly_budget = -5\n").unwrap_err().contains("cost.monthly_budget"));
         assert!(read("[cost]\nbudget = 0\n").unwrap_err().contains("cost.budget"));
         assert!(read("[cost]\nagent_budget = -1\n").unwrap_err().contains("cost.agent_budget"));
         assert!(read("[cost]\nwarn_at = 120\n").unwrap_err().contains("1 to 100"));

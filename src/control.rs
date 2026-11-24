@@ -835,6 +835,8 @@ struct JsonList<'a> {
     started_seconds: u64,
     /// Every agent's spend added up, agents closed since the server started too.
     totals: JsonSpend,
+    /// This month's spend, every session's (`trix spend --json`).
+    month: crate::ledger::Summary,
     /// Where model prices come from.
     prices: JsonPrices,
     agents: Vec<JsonAgent<'a>>,
@@ -892,6 +894,7 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
         idle_seconds: idle.map(|d| d.as_secs()),
         started_seconds: app.clock.started_for(now).as_secs(),
         totals,
+        month: crate::ledger::summary(&app.month.1, app.month.0, &|s| app.cost_of(s), app.config.cost.monthly_budget),
         prices,
         agents,
         pending_restore,
@@ -932,6 +935,15 @@ mod tests {
         assert_eq!((v["attached"].as_bool(), v["detached_seconds"].is_null()), (Some(false), true), "nobody ever attached");
         assert!(v["idle_seconds"].as_u64().is_some() && v["started_seconds"].as_u64().is_some());
         assert_eq!(v["pending_restore"], serde_json::json!([]));
+        assert_eq!((v["month"]["month"].as_str(), v["month"]["models"].as_array().map(Vec::len)), (Some(crate::ledger::Ym::now().key().as_str()), Some(0)), "nothing recorded");
+        app.config.cost.monthly_budget = Some(100.0);
+        let opus = crate::usage::Spend::from([(crate::usage::Bucket { model: "claude-opus-5-5".into(), fast: false, prompt: 0 }, crate::usage::Tokens { input: 1_000_000, ..Default::default() })]);
+        app.month = (crate::ledger::Ym::now(), crate::ledger::Month { days: [(1, opus)].into() });
+        let m: serde_json::Value = serde_json::from_str(&listing_json(&app, None)).unwrap();
+        let m = &m["month"];
+        assert_eq!((m["cost_usd"].as_f64(), m["budget_usd"].as_f64(), m["over_budget"].as_bool(), m["models"][0]["model"].as_str()), (Some(4.0), Some(100.0), Some(false), Some("claude-opus-5-5")));
+        app.config.cost.monthly_budget = None;
+        app.month.1 = Default::default();
         let t = &v["totals"];
         assert_eq!((t["total_tokens"].as_u64(), t["cost_usd"].as_f64()), (Some(3_220_000), Some(6.18)));
         assert_eq!((t["cost_complete"].as_bool(), t["budget_usd"].as_f64(), t["over_budget"].as_bool()), (Some(false), Some(5.0), Some(true)));

@@ -51,6 +51,8 @@ pub enum AppEvent {
     Spend(u32, crate::usage::Spend),
     /// The live price list: read from the cache, fetched, or failed to be.
     Prices(crate::prices::Feed),
+    /// This month's record of spend (`ledger.rs`), as it changed.
+    Month(crate::ledger::Ym, crate::ledger::Month),
     /// The close dialog's look at the closing agents' worktrees came back:
     /// its token, and what was found.
     Offer(u64, Vec<crate::offer::Found>),
@@ -311,6 +313,8 @@ pub enum Modal {
     /// A fresh server found a saved workspace: bring it back?
     Restore(usize),
     Help,
+    /// alt+$: what each model cost in a month (this one, or one before).
+    Spend(crate::ledger::Ym),
     Menu(Menu),
     /// alt+, or "settings" in the bottom bar.
     Settings(Settings),
@@ -566,6 +570,10 @@ pub struct App {
     closed_spend: crate::usage::Spend,
     /// How near the workspace's budget it was last told to be.
     budget_level: u8,
+    /// This month's spend, every session's, as recorded (`ledger.rs`).
+    pub month: (crate::ledger::Ym, crate::ledger::Month),
+    /// How near the monthly budget it was last told to be.
+    month_level: u8,
     /// The live price list, and the fetcher's settings (the config's).
     pub price_feed: crate::prices::Feed,
     price_settings: Arc<Mutex<crate::prices::Settings>>,
@@ -684,6 +692,8 @@ impl App {
             usage_targets,
             closed_spend: Default::default(),
             budget_level: 0,
+            month: (crate::ledger::Ym::now(), Default::default()),
+            month_level: 0,
             price_feed: Default::default(),
             price_settings,
             last_title: String::new(),
@@ -1143,6 +1153,18 @@ impl App {
         self.price_feed.live.as_deref().filter(|_| self.config.cost.live_prices)
     }
 
+    /// This month's spend and what it cost, every session's.
+    pub fn month_cost(&self) -> (crate::usage::Spend, crate::cost::Cost) {
+        let spend = self.month.1.total();
+        let c = self.cost_of(&spend);
+        (spend, c)
+    }
+
+    /// This month's level (`cost::level`) against the monthly budget.
+    pub fn month_level(&self) -> u8 {
+        crate::cost::level(self.month_cost().1.usd, self.config.cost.monthly_budget, self.config.cost.warn_at)
+    }
+
     /// The workspace's level (`cost::level`) against its budget, and one agent's against its.
     pub fn budget_levels(&self) -> (u8, Vec<u8>) {
         let c = &self.config.cost;
@@ -1168,6 +1190,17 @@ impl App {
             });
         }
         self.budget_level = total;
+        let month = self.month_level();
+        if month > self.month_level
+            && let Some(b) = c.monthly_budget
+        {
+            let spent = crate::cost::usd(self.month_cost().1.usd);
+            alerts.push(match month {
+                2 => (format!("over the monthly budget: {spent} spent this month, the budget is {}", crate::cost::usd(b)), true),
+                _ => (format!("{spent} spent this month, {}% of the {} monthly budget", c.warn_at, crate::cost::usd(b)), false),
+            });
+        }
+        self.month_level = month;
         for (i, level) in each.into_iter().enumerate() {
             let a = &self.agents[i];
             if level > a.budget_level
@@ -2347,7 +2380,7 @@ impl App {
             .agents
             .iter()
             .filter(|a| a.state != State::Exited)
-            .map(|a| crate::usage::Target { id: a.id, kind: a.kind, transcript: a.transcript.clone(), session: a.session.clone() })
+            .map(|a| crate::usage::Target { id: a.id, kind: a.kind, transcript: a.transcript.clone(), session: a.session.clone(), since: crate::prices::now().saturating_sub(a.created.elapsed().as_secs()) })
             .collect();
         *self.usage_targets.lock().unwrap() = usage;
     }
@@ -2515,6 +2548,15 @@ impl App {
                     self.agents[i].context = ctx;
                     self.dirty = true;
                 }
+            }
+            AppEvent::Month(ym, month) => {
+                // A new month starts its budget over.
+                if ym != self.month.0 {
+                    self.month_level = 0;
+                }
+                self.month = (ym, month);
+                let _ = self.check_budgets();
+                self.dirty = true;
             }
             AppEvent::Prices(feed) => {
                 self.price_feed = feed;
@@ -2746,6 +2788,7 @@ impl App {
             }
             Action::Detach => self.detach = true,
             Action::Help => self.modal = Some(Modal::Help),
+            Action::Spend => self.modal = Some(Modal::Spend(crate::ledger::Ym::now())),
             Action::Settings => self.open_settings(),
             Action::Quit => {
                 if self.agents.iter().any(|a| a.state != State::Exited) {
@@ -3313,6 +3356,12 @@ impl App {
             // Handled above.
             Modal::Menu(_) | Modal::Settings(_) | Modal::Review(_) => {}
             Modal::Help => self.modal = None,
+            &mut Modal::Spend(ym) => match k.code {
+                KeyCode::Left | KeyCode::Char('h') => self.modal = Some(Modal::Spend(ym.prev())),
+                // Not past this month: there's nothing there yet.
+                KeyCode::Right | KeyCode::Char('l') => self.modal = Some(Modal::Spend(if ym < crate::ledger::Ym::now() { ym.next() } else { ym })),
+                _ => self.modal = None,
+            },
             Modal::Search(s) => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 let last = s.hits.len().saturating_sub(1);
@@ -4660,6 +4709,28 @@ mod tests {
 
     fn spend_of(model: &str, input: u64, output: u64) -> crate::usage::Spend {
         crate::usage::Spend::from([(crate::usage::Bucket { model: model.into(), fast: false, prompt: 0 }, crate::usage::Tokens { input, output, ..Default::default() })])
+    }
+
+    #[test]
+    fn the_monthly_budget_warns_once_then_says_when_over() {
+        let mut app = test_app();
+        app.config.cost.monthly_budget = Some(300.0);
+        let toast = |app: &App| app.toast.as_ref().map(|t| (t.text.clone(), t.kind == ToastKind::Bad));
+        let now = crate::ledger::Ym::now();
+        let month = |input: u64| crate::ledger::Month { days: [(1, spend_of("claude-opus-5-5", input, 0))].into() };
+        // Opus 5.5 at $4 per million in: $200, then $256, then $320.
+        app.handle(AppEvent::Month(now, month(50_000_000)));
+        assert_eq!(toast(&app), None);
+        app.handle(AppEvent::Month(now, month(64_000_000)));
+        assert_eq!(toast(&app), Some(("$256 spent this month, 80% of the $300 monthly budget".into(), false)));
+        app.toast = None;
+        app.handle(AppEvent::Month(now, month(65_000_000)));
+        assert_eq!(toast(&app), None, "warned once");
+        app.handle(AppEvent::Month(now, month(80_000_000)));
+        assert_eq!(toast(&app), Some(("over the monthly budget: $320 spent this month, the budget is $300".into(), true)));
+        // A new month starts over.
+        app.handle(AppEvent::Month(now.next(), month(64_000_000)));
+        assert_eq!(app.month_level, 1, "warned again in the new month");
     }
 
     #[test]

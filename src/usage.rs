@@ -71,6 +71,9 @@ pub struct Target {
     pub transcript: Option<PathBuf>,
     /// The conversation id, to look the log up otherwise.
     pub session: Option<String>,
+    /// When the agent started, in Unix seconds: its log counts towards the
+    /// month from then (`ledger.rs`).
+    pub since: u64,
 }
 
 pub type Targets = Arc<Mutex<Vec<Target>>>;
@@ -105,7 +108,7 @@ impl Tokens {
     pub fn cache_write(&self) -> u64 {
         self.cache_write_5m + self.cache_write_1h
     }
-    fn add(&mut self, o: &Tokens) {
+    pub(crate) fn add(&mut self, o: &Tokens) {
         self.input += o.input;
         self.cache_write_5m += o.cache_write_5m;
         self.cache_write_1h += o.cache_write_1h;
@@ -266,6 +269,10 @@ struct Log {
     /// Codex: the running total as of the last count, and the model in use.
     codex_total: Tokens,
     codex_model: Option<String>,
+    /// Each turn's tokens read since the ledger last took them, dated.
+    fresh: Vec<crate::ledger::Entry>,
+    /// Where the line being read ends.
+    line_end: u64,
 }
 
 impl Log {
@@ -291,10 +298,13 @@ impl Log {
             }
             self.offset += buf.len() as u64;
             let mut data = std::mem::take(&mut self.partial);
+            let mut end = self.offset - buf.len() as u64 - data.len() as u64;
             data.extend_from_slice(&buf);
             let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
             let rest = lines.pop().unwrap_or_default().to_vec();
             for line in lines {
+                end += line.len() as u64 + 1;
+                self.line_end = end;
                 self.line(line);
             }
             self.partial = rest;
@@ -314,13 +324,18 @@ impl Log {
         } else if let Some(c) = codex_line(&v) {
             self.codex = Some(c);
         }
+        let at = v.get("timestamp").and_then(Value::as_str).and_then(crate::ledger::parse_time).unwrap_or_else(crate::prices::now);
         if let Some((id, bucket, t)) = claude_spend(&v) {
+            // What this line adds: a message logged again adds only what grew.
+            let mut new = t;
             if let Some(id) = id
                 && let Some((b, old)) = self.messages.insert(id, (bucket.clone(), t))
             {
                 self.spend.entry(b).or_default().sub(&old);
+                new.sub(&old);
             }
-            self.spend.entry(bucket).or_default().add(&t);
+            self.spend.entry(bucket.clone()).or_default().add(&t);
+            self.dated(at, bucket, new);
         } else if let Some(m) = codex_model(&v) {
             self.codex_model = Some(m);
         } else if let Some(total) = codex_total(&v) {
@@ -333,9 +348,24 @@ impl Log {
             if new.total() > 0 {
                 let model = self.codex_model.clone().unwrap_or_else(|| "unknown".into());
                 let prompt = crate::cost::tier(codex_prompt(&v));
-                self.spend.entry(Bucket { model, fast: false, prompt }).or_default().add(&new);
+                let bucket = Bucket { model, fast: false, prompt };
+                self.spend.entry(bucket.clone()).or_default().add(&new);
+                self.dated(at, bucket, new);
             }
         }
+    }
+}
+
+impl Log {
+    fn dated(&mut self, at: u64, bucket: Bucket, tokens: Tokens) {
+        if tokens.total() > 0 {
+            self.fresh.push(crate::ledger::Entry { end: self.line_end, at, bucket, tokens });
+        }
+    }
+
+    /// What it read since last time, for the ledger.
+    fn take(&mut self, since: u64) -> crate::ledger::Read {
+        crate::ledger::Read { path: self.path.clone(), done: self.offset - self.partial.len() as u64, since, entries: std::mem::take(&mut self.fresh) }
     }
 }
 
@@ -382,7 +412,7 @@ fn find_codex(root: &Path, thread: &str) -> Option<PathBuf> {
 
 /// An agent's conversation log, where trix would follow it.
 pub fn log_of(kind: Kind, transcript: Option<PathBuf>, session: Option<String>) -> Option<PathBuf> {
-    locate(&Target { id: 0, kind, transcript, session })
+    locate(&Target { id: 0, kind, transcript, session, since: 0 })
 }
 
 /// Everything a log has spent, read once from start to end.
@@ -489,7 +519,14 @@ pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
         let mut sent_spend: HashMap<u32, Spend> = HashMap::new();
         // Logs looked for and not found: what was looked for, and when.
         let mut missed: HashMap<u32, (Option<String>, Instant)> = HashMap::new();
+        // The month's record: what it holds is sent when this session adds to
+        // it, and when another one has (looked at every half minute).
+        let ledger = crate::ledger::dir();
+        let _ = crate::ledger::prune(&ledger);
+        let mut month: Option<(crate::ledger::Ym, Option<std::time::SystemTime>)> = None;
+        let mut looked = Instant::now();
         loop {
+            let mut reads = Vec::new();
             let list = targets.lock().unwrap().clone();
             logs.retain(|id, _| list.iter().any(|t| t.id == *id));
             sent.retain(|id, _| list.iter().any(|t| t.id == *id));
@@ -519,6 +556,8 @@ pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
                 }
                 let w = logs.get_mut(&t.id).unwrap();
                 w.advance(t.kind);
+                reads.push(w.log.take(t.since));
+                reads.extend(w.subagents.values_mut().map(|l| l.take(t.since)));
                 let log = &w.log;
                 let ctx = match t.kind {
                     Kind::Codex => log.codex.map(|(used, window)| Context { used, window, exact: true }),
@@ -543,6 +582,18 @@ pub fn spawn_watcher(targets: Targets, tx: Sender<AppEvent>) {
                 if sent_spend.get(&t.id) != Some(&spend) {
                     sent_spend.insert(t.id, spend.clone());
                     if tx.send(AppEvent::Spend(t.id, spend)).is_err() {
+                        return;
+                    }
+                }
+            }
+            let wrote = crate::ledger::record(&ledger, &reads).map(|m| !m.is_empty()).unwrap_or(false);
+            let ym = crate::ledger::Ym::now();
+            if wrote || month.is_none_or(|(m, _)| m != ym) || looked.elapsed() >= Duration::from_secs(30) {
+                looked = Instant::now();
+                let at = crate::ledger::changed(&ledger, ym);
+                if month != Some((ym, at)) {
+                    month = Some((ym, at));
+                    if tx.send(AppEvent::Month(ym, crate::ledger::load(&ledger, ym))).is_err() {
                         return;
                     }
                 }
@@ -770,11 +821,45 @@ mod tests {
         let root = tmp();
         let log = root.join("s1.jsonl");
         // Unwritten yet, and not searched for by id meanwhile.
-        let t = Target { id: 1, kind: Kind::Claude, transcript: Some(log.clone()), session: Some("s1".into()) };
+        let t = Target { id: 1, kind: Kind::Claude, transcript: Some(log.clone()), session: Some("s1".into()), since: 0 };
         assert_eq!(locate(&t), None);
         std::fs::write(&log, "").unwrap();
         assert_eq!(locate(&t), Some(log));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn each_turn_is_dated_for_the_month_and_counted_once() {
+        let dir = tmp();
+        let path = dir.join("s.jsonl");
+        let ledger = dir.join("spend");
+        let turn = |id: &str, out: u64, at: &str| format!("{}\n", json!({"type": "assistant", "timestamp": at, "message": {"id": id, "model": "claude-opus-5-5", "usage": {"input_tokens": 10, "output_tokens": out}}}));
+        let (a, b, c) = (turn("a", 5, "2026-11-24T10:00:00Z"), turn("a", 7, "2026-11-24T10:00:01Z"), turn("c", 3, "2026-11-24T11:00:00Z"));
+        // The last line is still being written: not read yet.
+        std::fs::write(&path, format!("{a}{b}{}", &c[..20])).unwrap();
+        let mut log = Log::new(path.clone());
+        log.advance();
+        let read = log.take(0);
+        let at = crate::ledger::parse_time("2026-11-24T10:00:00Z").unwrap();
+        let ends: Vec<(u64, u64, u64)> = read.entries.iter().map(|e| (e.end, e.at, e.tokens.total())).collect();
+        // A message logged again adds only what grew: 2 more out.
+        assert_eq!(ends, vec![(a.len() as u64, at, 15), ((a.len() + b.len()) as u64, at + 1, 2)]);
+        assert_eq!(read.done, (a.len() + b.len()) as u64, "up to the last whole line");
+        let (ym, _, _) = crate::ledger::local(at);
+        let out = || crate::usage::total(&crate::ledger::load(&ledger, ym).total()).total();
+        crate::ledger::record(&ledger, &[read]).unwrap();
+        assert_eq!(out(), 17);
+        // trix restarts and reads the log from the start: nothing more.
+        let mut again = Log::new(path.clone());
+        again.advance();
+        crate::ledger::record(&ledger, &[again.take(0)]).unwrap();
+        assert_eq!(out(), 17);
+        // The new turn, whole: that and only that.
+        std::fs::write(&path, format!("{a}{b}{c}")).unwrap();
+        again.advance();
+        crate::ledger::record(&ledger, &[again.take(0)]).unwrap();
+        assert_eq!(out(), 30);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
