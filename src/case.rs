@@ -142,6 +142,35 @@ pub struct Comment {
     pub body: String,
 }
 
+/// How a PR that may solve the issue was found.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Found {
+    /// It closes the issue: the Development sidebar, "Fixes #n". Taken
+    /// without asking when it's the only one.
+    Linked,
+    /// Its title or body mentions the issue.
+    Mention,
+    /// The issue's timeline says it refers to it.
+    Timeline,
+}
+
+impl Found {
+    pub fn label(self, n: u64) -> String {
+        match self {
+            Found::Linked => "linked".into(),
+            Found::Mention => format!("mentions #{n}"),
+            Found::Timeline => "referenced from the timeline".into(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub pr: Pr,
+    pub found: Found,
+}
+
 /// Who may write what the Builder reads without you looking first.
 const TRUSTED: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
 
@@ -182,7 +211,8 @@ pub enum Ask {
     /// Setting a role up failed (a worktree, an agent, opening the PR): r
     /// tries again.
     Setup,
-    /// The issue has several open PRs: 1 to 9 picks one.
+    /// PRs that may solve the issue, not one formal link: 1 to 9 picks
+    /// one, n has a builder make one.
     Choose,
     /// The Reviewer says the PR doesn't solve the issue: f fixes it in
     /// place, b has a builder start a fresh PR.
@@ -201,7 +231,7 @@ impl Ask {
             Ask::NoReport => &[('n', "nudge it again"), ('a', "abort")],
             Ask::Merge => &[('y', "merge"), ('a', "abort")],
             Ask::MergeFailed | Ask::Setup => &[('r', "try again"), ('a', "abort")],
-            Ask::Choose => &[('a', "abort")],
+            Ask::Choose => &[('n', "none of these: a builder makes a PR"), ('a', "abort")],
             Ask::Unsolved => &[('f', "fix it in place"), ('b', "a builder starts a fresh PR"), ('a', "abort")],
             Ask::Outsider => &[('s', "go on: the agents may read it"), ('a', "abort")],
         }
@@ -224,7 +254,7 @@ pub struct Case {
     pub issue: Option<Issue>,
     /// The issue's open PRs, to choose from.
     #[serde(default)]
-    pub choices: Vec<Pr>,
+    pub choices: Vec<Candidate>,
     /// You said the Builder may start on an issue written from outside.
     #[serde(default)]
     pub trusted: bool,
@@ -379,8 +409,9 @@ impl Case {
     pub fn keys(&self, a: Ask) -> Vec<(char, String)> {
         let mut v: Vec<(char, String)> = Vec::new();
         if a == Ask::Choose {
-            for (i, p) in self.choices.iter().take(9).enumerate() {
-                v.push((char::from(b'1' + i as u8), format!("PR #{} ({})", p.number, clean(&p.head))));
+            let n = self.issue.as_ref().map_or(0, |i| i.number);
+            for (i, k) in self.choices.iter().take(9).enumerate() {
+                v.push((char::from(b'1' + i as u8), format!("PR #{} ({}, {})", k.pr.number, clean(&k.pr.head), k.found.label(n))));
             }
         }
         v.extend(a.keys().iter().map(|(k, w)| (*k, w.to_string())));
@@ -1222,8 +1253,13 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
         c.ask = None;
         c.why.clear();
         match a {
+            Ask::Choose if key == 'n' => {
+                note(c, env, "none of those PRs: a builder makes one, as you said");
+                c.choices.clear();
+                c.stage = Stage::Building;
+            }
             Ask::Choose => {
-                let pr = c.choices[key as usize - '1' as usize].clone();
+                let pr = c.choices[key as usize - '1' as usize].pr.clone();
                 note(c, env, format!("triaging PR #{}, as you chose", pr.number));
                 c.ci_expected = expects_ci(c, env, &pr.sha);
                 c.pr = Some(pr);
@@ -1283,8 +1319,10 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
 
     match c.stage {
         Stage::Choosing => {
-            let list: Vec<String> = c.choices.iter().map(|p| format!("#{}", p.number)).collect();
-            ask(c, env, Ask::Choose, format!("issue #{} has {} open PRs ({}): which one?", c.issue.as_ref().map_or(0, |i| i.number), c.choices.len(), list.join(", ")));
+            let n = c.issue.as_ref().map_or(0, |i| i.number);
+            let list: Vec<String> = c.choices.iter().map(|k| format!("#{} ({})", k.pr.number, k.found.label(n))).collect();
+            let what = if c.choices.len() == 1 { "a PR that may solve it, not linked to close it".to_string() } else { format!("{} open PRs that may solve it", c.choices.len()) };
+            ask(c, env, Ask::Choose, format!("issue #{n} has {what}: {}. Which one?", list.join(", ")));
             return true;
         }
         // Every role's prompt has the issue's text, and the builder and the
@@ -1863,8 +1901,8 @@ pub fn triage(args: &[String]) -> i32 {
 #[derive(Debug, PartialEq)]
 pub enum Target {
     Pr(Pr),
-    /// An open issue, and its open PRs from this repository.
-    Issue(Issue, Vec<Pr>),
+    /// An open issue, and the open PRs from this repository that may solve it.
+    Issue(Issue, Vec<Candidate>),
 }
 
 /// `12`, `#12`, or a URL: `…/owner/repo/pull/12`, `…/owner/repo/issues/12`.
@@ -1909,34 +1947,34 @@ pub fn resolve(repo: &Path, input: &str, gh: &mut Gh) -> Result<Target, String> 
     // The PRs that would solve it, found the same way every time: those
     // that close it (the Development sidebar, "Fixes #n"), open ones that
     // mention it, and those the issue's timeline says refer to it.
-    let mut found: Vec<u64> = Vec::new();
-    let mut add = |pn: Option<u64>, theirs: Option<&str>| {
-        if let Some(pn) = pn.filter(|p| !found.contains(p) && theirs.is_none_or(|t| t.eq_ignore_ascii_case(&here))) {
-            found.push(pn);
+    let mut found: Vec<(u64, Found)> = Vec::new();
+    let mut add = |pn: Option<u64>, theirs: Option<&str>, how: Found| {
+        if let Some(pn) = pn.filter(|p| !found.iter().any(|(f, _)| f == p) && theirs.is_none_or(|t| t.eq_ignore_ascii_case(&here))) {
+            found.push((pn, how));
         }
     };
     let links = json(gh(repo, &["issue", "view", &n.to_string(), "--json", "closedByPullRequestsReferences"])?)?;
     for l in links["closedByPullRequestsReferences"].as_array().into_iter().flatten() {
         let r = &l["repository"];
         let theirs = r.is_object().then(|| format!("{}/{}", r["owner"]["login"].as_str().unwrap_or_default(), r["name"].as_str().unwrap_or_default()));
-        add(l["number"].as_u64(), theirs.as_deref());
+        add(l["number"].as_u64(), theirs.as_deref(), Found::Linked);
     }
     let url = v["html_url"].as_str().unwrap_or_default();
     let named = json(gh(repo, &["pr", "list", "--state", "open", "--search", &n.to_string(), "--json", "number,title,body", "--limit", "100"])?)?;
     for p in named.as_array().into_iter().flatten() {
         if mentions(p["title"].as_str().unwrap_or_default(), n, url) || mentions(p["body"].as_str().unwrap_or_default(), n, url) {
-            add(p["number"].as_u64(), None);
+            add(p["number"].as_u64(), None, Found::Mention);
         }
     }
     let timeline = json(gh(repo, &["api", &format!("repos/{{owner}}/{{repo}}/issues/{n}/timeline?per_page=100")])?)?;
     for e in timeline.as_array().into_iter().flatten().filter(|e| e["event"] == "cross-referenced") {
         let src = &e["source"]["issue"];
         if src.get("pull_request").is_some() {
-            add(src["number"].as_u64(), src["repository"]["full_name"].as_str());
+            add(src["number"].as_u64(), src["repository"]["full_name"].as_str(), Found::Timeline);
         }
     }
     let (mut open, mut forks) = (Vec::new(), Vec::new());
-    for pn in found {
+    for (pn, how) in found {
         let pv = json(gh(repo, &["pr", "view", &pn.to_string(), "--json", PR_FIELDS])?)?;
         if pv["state"] != "OPEN" {
             continue;
@@ -1944,7 +1982,7 @@ pub fn resolve(repo: &Path, input: &str, gh: &mut Gh) -> Result<Target, String> 
         if pv["isCrossRepository"].as_bool() == Some(true) {
             forks.push(pn);
         } else {
-            open.push(pr_from(&pv)?);
+            open.push(Candidate { pr: pr_from(&pv)?, found: how });
         }
     }
     if open.is_empty() && !forks.is_empty() {
@@ -1989,14 +2027,20 @@ fn slug(title: &str) -> String {
     if s.is_empty() { "work".into() } else { s }
 }
 
-/// The case for what was given, not stored yet: one PR is triaged as it is
-/// (with its issue, if it came from one); several are chosen from; none is
-/// built.
+/// The case for what was given, not stored yet. A PR is triaged as it is,
+/// and so is an issue's one formal link (with the issue on the case). Any
+/// other PR that may solve it, even one, is yours to choose; with none,
+/// it's built.
 pub fn open_case(root: &Path, repo: &Path, target: Target, opts: &crate::config::TriageOpts, now: u64, gh: &mut Gh) -> Result<Case, String> {
     let (pr, issue, choices) = match target {
         Target::Pr(pr) => (Some(pr), None, Vec::new()),
-        Target::Issue(i, mut prs) if prs.len() == 1 => (prs.pop(), Some(i), Vec::new()),
-        Target::Issue(i, prs) => (None, Some(i), prs),
+        Target::Issue(i, found) => {
+            let linked: Vec<&Candidate> = found.iter().filter(|k| k.found == Found::Linked).collect();
+            match linked.as_slice() {
+                [one] => (Some(one.pr.clone()), Some(i), Vec::new()),
+                _ => (None, Some(i), found),
+            }
+        }
     };
     let id = new_id(root, pr.as_ref().map(|p| p.number), issue.as_ref().map(|i| i.number))?;
     let mut c = Case::new(&id, pr, issue, repo.to_path_buf(), opts, now);
@@ -2551,8 +2595,8 @@ mod tests {
         let mut env = Fake { now: 1_795_000_000, ci: runs(&[]), ..Fake::default() };
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::Choose));
-        assert!(c.why.contains("#14, #16"), "{}", c.why);
-        assert_eq!(c.keys(Ask::Choose).iter().map(|k| k.0).collect::<String>(), "12a");
+        assert!(c.why.contains("#14 (linked), #16 (linked)"), "{}", c.why);
+        assert_eq!(c.keys(Ask::Choose).iter().map(|k| k.0).collect::<String>(), "12na");
         env.keys = vec!['3', '2'];
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::Choose), "3 isn't a choice");
@@ -2581,7 +2625,7 @@ mod tests {
         answer(&mut a, "pr list --state open --search 12 --json number,title,body --limit 100", r#"[{"number": 17, "title": "Rate limits", "body": "Closes #12."}, {"number": 18, "title": "Docs", "body": "see #123"}]"#.into());
         a.push((view(17), pr_json(17, "limits", "prsha", false)));
         let Target::Issue(_, prs) = resolve(repo, "12", &mut github(a.clone())).unwrap() else { panic!() };
-        assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![17]);
+        assert_eq!(prs.iter().map(|k| (k.pr.number, k.found)).collect::<Vec<_>>(), vec![(17, Found::Mention)]);
         // A link, a mention and a cross-reference: three to choose from,
         // each once; another repository's reference isn't one.
         a.push((view(14), pr_json(14, "a", "prsha", false)));
@@ -2591,7 +2635,7 @@ mod tests {
         let tl = r#"[{"event": "labeled"}, {"event": "cross-referenced", "source": {"issue": {"number": 19, "pull_request": {}, "repository": {"full_name": "acme/app"}}}}, {"event": "cross-referenced", "source": {"issue": {"number": 5, "pull_request": {}, "repository": {"full_name": "else/app"}}}}, {"event": "cross-referenced", "source": {"issue": {"number": 6}}}]"#;
         answer(&mut a, "api repos/{owner}/{repo}/issues/12/timeline?per_page=100", tl.into());
         let Target::Issue(_, prs) = resolve(repo, "12", &mut github(a)).unwrap() else { panic!() };
-        assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), vec![14, 17, 19]);
+        assert_eq!(prs.iter().map(|k| (k.pr.number, k.found)).collect::<Vec<_>>(), vec![(14, Found::Linked), (17, Found::Linked), (19, Found::Timeline)]);
         assert!(mentions("Fixes https://github.com/acme/app/issues/12", 12, "https://github.com/acme/app/issues/12") && !mentions("#12345", 12, ""));
     }
 
@@ -2721,6 +2765,43 @@ mod tests {
         c.open = vec!["F1".into()];
         step(&mut c, &root, &mut env);
         assert_eq!((c.ask, c.agent.as_deref()), (None, Some("triage-14-fix")));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn only_a_formal_link_is_taken_without_asking() {
+        let (root, _) = fixture("found");
+        let repo = root.parent().unwrap().join("repo");
+        let opts = crate::config::TriageOpts::default();
+        let mention = "pr list --state open --search 12 --json number,title,body --limit 100";
+        // One PR that only mentions the issue: you're asked, with how it was found.
+        let mut a = issue_api(12, "open", "OWNER", &[]);
+        answer(&mut a, mention, r#"[{"number": 17, "title": "Rate limits", "body": "related to #12"}]"#.into());
+        a.push((view(17), pr_json(17, "limits", "prsha", false)));
+        let mut gh = github(a.clone());
+        let t = resolve(&repo, "12", &mut gh).unwrap();
+        let mut c = open_case(&root, &repo, t, &opts, 1, &mut gh).unwrap();
+        assert_eq!((c.stage, c.choices.len()), (Stage::Choosing, 1));
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::Choose));
+        assert!(c.why.contains("a PR that may solve it, not linked to close it: #17 (mentions #12)"), "{}", c.why);
+        assert_eq!(c.keys(Ask::Choose).iter().map(|k| k.0).collect::<String>(), "1na");
+        assert!(c.keys(Ask::Choose)[0].1.contains("PR #17 (limits, mentions #12)"));
+        // n: none of these, a builder makes one.
+        env.keys.push('n');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.stage, c.pr.is_none()), (None, Stage::Building, true));
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.agent.as_deref(), Some("triage-issue-12-build"));
+        // One formal link and a mention: the link, unasked.
+        a.push((view(14), pr_json(14, "fix", "prsha", false)));
+        answer(&mut a, "issue view 12 --json closedByPullRequestsReferences", serde_json::json!({"closedByPullRequestsReferences": [{"number": 14}]}).to_string());
+        let mut gh = github(a);
+        let t = resolve(&repo, "12", &mut gh).unwrap();
+        let root2 = root.parent().unwrap().join("cases2");
+        let c = open_case(&root2, &repo, t, &opts, 1, &mut gh).unwrap();
+        assert_eq!((c.stage, c.pr().number), (Stage::Reviewing, 14));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
