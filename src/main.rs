@@ -193,6 +193,20 @@ fn ls_sessions(explicit: bool, all: bool, name: &str, candidates: Vec<String>) -
     if explicit && !all { vec![name.to_string()] } else { candidates }
 }
 
+/// What `trix ls` says of a session whose server runs another trix than this
+/// one: a server keeps the version it started with, so after an upgrade the
+/// workspace still runs the old one until its server stops. `server` is the
+/// `version` from its listing; a server from before that field is older.
+fn version_note(session: &str, server: Option<&str>, mine: &str) -> Option<String> {
+    let which = if session == session::DEFAULT { "the workspace".to_string() } else { format!("session '{session}'") };
+    let runs = match server {
+        Some(v) if v == mine => return None,
+        Some(v) => format!("trix {v}"),
+        None => "an older trix".to_string(),
+    };
+    Some(format!("{which} runs {runs}, this is trix {mine}: it keeps its version until its server stops (see Upgrade in the README)"))
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // The copy of trix that posts macOS notifications, and nothing else.
@@ -330,6 +344,19 @@ fn main() -> anyhow::Result<()> {
             print!("{}", texts.join("\n"));
             if let Some(f) = footer {
                 print!("\n{f}");
+            }
+            // The plain listing doesn't carry the server's version; its JSON does.
+            let ask = ClientMsg::Control { protocol: control::CONTROL, from: None, req: control::Request::List { json: true } };
+            for n in &running {
+                let list = session::ask(n, &ask)
+                    .ok()
+                    .flatten()
+                    .and_then(|text| serde_json::from_str::<control::Reply>(&text).ok())
+                    .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.out).ok());
+                // A session that didn't answer this time says nothing either way.
+                if let Some(note) = list.and_then(|l| version_note(n, l["version"].as_str(), env!("CARGO_PKG_VERSION"))) {
+                    print!("\n{note}\n");
+                }
             }
             return Ok(());
         }
@@ -770,7 +797,18 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 
 #[cfg(test)]
 mod tests {
-    use super::take_session;
+    use super::{take_session, version_note};
+
+    #[test]
+    fn version_note_names_a_server_on_another_trix() {
+        assert_eq!(version_note("default", Some("1.6.1"), "1.6.1"), None);
+        assert_eq!(
+            version_note("default", Some("1.2.3"), "1.6.1").as_deref(),
+            Some("the workspace runs trix 1.2.3, this is trix 1.6.1: it keeps its version until its server stops (see Upgrade in the README)")
+        );
+        let note = version_note("work", None, "1.6.1").unwrap();
+        assert!(note.starts_with("session 'work' runs an older trix, this is trix 1.6.1"), "{note}");
+    }
 
     #[test]
     fn ls_all_lists_every_session_even_from_a_pane() {

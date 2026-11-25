@@ -1165,6 +1165,9 @@ struct JsonDiff {
 #[derive(Serialize)]
 struct JsonList<'a> {
     session: &'a str,
+    /// The trix this session's server runs. It keeps it until the server
+    /// stops, whatever is installed since: `trix ls` tells you when they differ.
+    version: &'static str,
     viewers: usize,
     /// A terminal is in control: someone is there, so it's never idle.
     attached: bool,
@@ -1228,6 +1231,7 @@ fn listing_json(app: &App, from: Option<u32>) -> String {
     let (idle, detached) = app.left_alone(now);
     let list = JsonList {
         session: session::name(),
+        version: env!("CARGO_PKG_VERSION"),
         viewers: app.viewers,
         attached: app.controlled(),
         detached_seconds: detached.map(|d| d.as_secs()),
@@ -1274,6 +1278,7 @@ mod tests {
         assert!(v["agents"][2]["spend"].is_null(), "nothing spent yet");
         assert_eq!((v["attached"].as_bool(), v["detached_seconds"].is_null()), (Some(false), true), "nobody ever attached");
         assert!(v["idle_seconds"].as_u64().is_some() && v["started_seconds"].as_u64().is_some());
+        assert_eq!(v["version"].as_str(), Some(env!("CARGO_PKG_VERSION")), "what trix ls compares with the installed trix");
         assert_eq!(v["pending_restore"], serde_json::json!([]));
         assert_eq!((v["month"]["month"].as_str(), v["month"]["models"].as_array().map(Vec::len)), (Some(crate::ledger::Ym::now().key().as_str()), Some(0)), "nothing recorded");
         app.config.cost.monthly_budget = Some(100.0);

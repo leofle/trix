@@ -92,7 +92,7 @@ cargo install --path .
 - pacman package or release binary: run the install lines again.
 - From source: `git pull && cargo install --path .` in your clone.
 
-A running workspace keeps the old version until its server stops. `trix kill` stops it and every agent, and the next `trix` starts the new version and offers to bring the workspace back ([Restore](#restore)).
+A running workspace keeps the old version until its server stops. `trix kill` stops it and every agent, and the next `trix` starts the new version and offers to bring the workspace back ([Restore](#restore)). Until then `trix ls` says so under the listing (`the workspace runs trix 1.2.3, this is trix 1.6.1: …`), and `trix ls --json` has each server's `version`.
 
 ### Uninstall
 
