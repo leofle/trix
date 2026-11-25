@@ -92,7 +92,11 @@ cargo install --path .
 - pacman package or release binary: run the install lines again.
 - From source: `git pull && cargo install --path .` in your clone.
 
-A running workspace keeps the old version until its server stops. `trix kill` stops it and every agent, and the next `trix` starts the new version and offers to bring the workspace back ([Restore](#restore)). Until then `trix ls` says so under the listing (`the workspace runs trix 1.2.3, this is trix 1.6.1: …`), and `trix ls --json` has each server's `version`.
+A running workspace keeps the old version until its server stops. `trix kill` stops it and every agent, and the next `trix` starts the new version and offers to bring the workspace back ([Restore](#restore)). Until then `trix ls` says so under the listing (`the workspace runs trix 1.2.3, this is trix 1.6.1: …`), and `trix ls --json` has each server's `version`. Check that nothing is at work first, so no turn is cut off: `trix ls --busy` exits 1 when no agent is working, waiting on you or starting.
+
+```sh
+trix ls --busy; [ $? -eq 1 ] && trix kill
+```
 
 ### Uninstall
 
@@ -117,6 +121,7 @@ trix attach               # attach only; fails if nothing is running
 trix view                 # watch read-only from another terminal (q leaves)
 trix ls                   # agents, states and activity, without attaching
 trix ls --json            # the same, for scripts and agents
+trix ls --busy            # only the agents still at work; exits 1 when there are none (see Agent control)
 trix kill                 # stop the workspace and every agent in it
 
 trix -s work              # the same, for a named session (works with every command)
@@ -222,6 +227,7 @@ trix send api "also cover it with a test"     # or pipe the prompt in on stdin
 trix wait api                                 # blocks until api stops working
 trix read api -n 80                           # the last 80 lines of its screen and scrollback
 trix ls --json                                # every agent: state, activity, branch, diff, last prompt…
+trix ls --busy                                # only the agents still at work: exits 0 if any, 1 if none
 trix close api                                # --clean also removes its worktree, if that's safe
 trix events --json                            # follow every change, live: one JSON object per line
 trix args api --model claude-opus-5-5         # change the flags api starts with next time
@@ -229,6 +235,7 @@ trix args api --model claude-opus-5-5         # change the flags api starts with
 
 - `<agent>` is an agent's name, or its number in `trix ls`. Names are safer, because numbers shift when an agent closes. `spawn` prints the new agent's name and folder. It refuses a name that's already taken, and it never steals focus from the agent you're looking at.
 - `wait` takes one or more agents and returns when one of them stops working (`--all`: when every one has). It prints one `name<TAB>state<TAB>activity` line per agent, where the state is `done`, `idle`, `needs-you` or `exited`. A prompt just sent with `send` counts as work until the agent's turn starts, so `send` followed by `wait` waits for that turn. After `-t` seconds (default 300, `0` waits forever) it exits with 124, and you can run it again. A shell counts as done when it's back at its prompt. Builtins and shell functions run inside the shell itself, so `wait` can't see them.
+- `ls --busy` prints one `session<TAB>name<TAB>state<TAB>activity` line per agent that is `working`, `needs-you` or `starting`, across the same sessions as `ls`. The agent asking leaves itself out, or it would always find itself busy. It exits 0 if any agent is busy, 1 if none, and 2 if a session's server didn't answer or sent a listing trix can't read (the reason goes to stderr), so only 1 means nothing is at work: `trix ls --busy >/dev/null; [ $? -eq 1 ]`, not `trix ls --busy || …`, which also goes ahead on 2.
 - `events` follows the workspace live, the way `wait` would if it never returned. It starts with one `present` line per agent, then prints a line per change: `spawned`, `state` (with the state it left), `renamed`, `restarted` (a new process in the same place, with a new `id`; `prev_id` is the old one) and `closed`. Name agents to follow only those. Without `--json` it prints a line a person can read (`14:02:11  api  working → needs-you  approve Bash rm -rf dist`). With `--json`, each line is an object with `event`, `at` (Unix ms), `session`, `id`, `number`, `name`, `kind`, `state`, `prev`, `activity`, `unseen`, `cwd` and `managed_by`, the same states as `wait`. It exits 0 when the workspace stops. A reader that stops reading isn't waited for: once 1024 events are queued for it, trix drops it, and it exits 1 saying it fell behind.
 - `args` shows an agent's extra arguments, replaces them (everything after the agent, flags included; one quoted word is taken as written) or removes them with `--clear`. The change is saved with the workspace and takes effect at the agent's next start, such as a restore or a saved layout. The process running now keeps its old flags. An agent may change its own, which is the usual way to fix a typo in your launch flags without closing the pane. Shells take none.
 - `close` keeps the agent's worktree, and when it was the last agent in one, says so on stderr, with what it is: clean and merged, `kept worktree w (clean, merged): trix close --clean next time, or trix worktrees rm w now`; clean with commits not in the default branch, the same, and that removing it keeps the branch; otherwise why it stays (`kept worktree w: it has uncommitted work …`), with nothing offered to remove it. `close --clean` closes the agent and then removes its worktree the way the review's `X` does, with the same checks: the folder, and the branch if it's merged. When something keeps the worktree (uncommitted work, commits on no branch, anyone else using it), the agent is still closed, the worktree stays, and it exits 1 with the reason.
