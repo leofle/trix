@@ -58,6 +58,10 @@ usage:
   trix view                 watch the running workspace read-only (q leaves)
   trix ls [--json] [--all]  list agents and their state without attaching;
                             --all lists every session, even from inside a pane
+  trix ls --busy [--all]    print the agents still at work (working, needs you,
+                            starting), one per line; exits 0 if any, 1 if none,
+                            2 if a session didn't answer. Check for 1 before a
+                            `trix kill`. A pane leaves itself out
   trix triage <PR|issue>    a case: a reviewer, a fixer and a gatekeeper take the PR
                             from findings to a merge you approve; an issue's PR, or
                             a builder makes one (trix case --help)
@@ -193,6 +197,49 @@ fn ls_sessions(explicit: bool, all: bool, name: &str, candidates: Vec<String>) -
     if explicit && !all { vec![name.to_string()] } else { candidates }
 }
 
+/// The agents in `lists` (each session's `trix ls --json`) still at work:
+/// working, waiting on you or starting. The pane asking (`you`) is left out,
+/// or an agent checking would always find itself busy. One line each:
+/// session, name, state, activity, tab-separated.
+fn busy_lines(lists: &[serde_json::Value]) -> Vec<String> {
+    lists
+        .iter()
+        .flat_map(|list| {
+            let session = list["session"].as_str().unwrap_or_default();
+            list["agents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|a| !a["you"].as_bool().unwrap_or(false))
+                .filter(|a| matches!(a["state"].as_str(), Some("working" | "needs-you" | "starting")))
+                .map(move |a| {
+                    // Hook text may hold tabs or newlines: one line per agent, as `trix wait` prints.
+                    let field = |k: &str| hooks::one_line(a[k].as_str().unwrap_or_default(), 80);
+                    format!("{session}\t{}\t{}\t{}", field("name"), field("state"), field("activity"))
+                })
+        })
+        .collect()
+}
+
+/// One session's part of `trix ls --busy`, from what `session::ask` got back.
+/// No server there: nobody busy in it. A server that didn't answer in time, or
+/// a listing that can't be read, is an error, never "nobody busy": that would
+/// read as safe to `trix kill` a workspace that may be at work.
+fn busy_of(session: &str, answer: Result<Option<String>, ()>) -> Result<Vec<String>, String> {
+    let text = match answer {
+        Ok(None) => return Ok(Vec::new()),
+        Ok(Some(text)) => text,
+        Err(()) => return Err(format!("session '{session}' didn't answer")),
+    };
+    let unreadable = || format!("session '{session}' sent a listing trix can't read");
+    let reply: control::Reply = serde_json::from_str(&text).map_err(|_| unreadable())?;
+    if reply.code != 0 {
+        return Err(format!("session '{session}': {}", reply.err));
+    }
+    let list: serde_json::Value = serde_json::from_str(&reply.out).map_err(|_| unreadable())?;
+    Ok(busy_lines(&[list]))
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // The copy of trix that posts macOS notifications, and nothing else.
@@ -240,6 +287,32 @@ fn main() -> anyhow::Result<()> {
         Some("-V" | "--version") => {
             println!("trix {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--busy") => {
+            let all = args.iter().skip(1).any(|a| a == "--all" || a == "-a");
+            let in_pane = std::env::var("TRIX_SESSION").ok();
+            let (mut busy, mut failed) = (Vec::new(), false);
+            for n in ls_sessions(explicit, all, session::name(), session::candidates()) {
+                // Its own session marks the asking pane `you`.
+                let from = if in_pane.as_deref() == Some(n.as_str()) {
+                    std::env::var("TRIX_AGENT_ID").ok().and_then(|id| id.parse().ok())
+                } else {
+                    None
+                };
+                let ask = ClientMsg::Control { protocol: control::CONTROL, from, req: control::Request::List { json: true } };
+                match busy_of(&n, session::ask(&n, &ask)) {
+                    Ok(lines) => busy.extend(lines),
+                    Err(e) => {
+                        eprintln!("trix: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            for line in &busy {
+                println!("{line}");
+            }
+            // 1 only when every session answered and nobody is busy.
+            std::process::exit(if failed { 2 } else if busy.is_empty() { 1 } else { 0 });
         }
         Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--json") => {
             if !args.iter().skip(1).any(|a| a == "--all" || a == "-a") {
@@ -770,7 +843,41 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 
 #[cfg(test)]
 mod tests {
-    use super::take_session;
+    use super::{busy_lines, busy_of, take_session};
+
+    #[test]
+    fn busy_of_never_reads_a_silent_or_garbled_session_as_nobody_busy() {
+        let listing = serde_json::json!({"session": "w", "agents": [
+            {"name": "api", "state": "working", "activity": "Bash\tcargo\ntest", "you": false},
+        ]});
+        let reply = |code: i32, out: String, err: &str| serde_json::json!({"code": code, "out": out, "err": err}).to_string();
+        assert_eq!(busy_of("w", Ok(Some(reply(0, listing.to_string(), "")))), Ok(vec!["w\tapi\tworking\tBash cargo test".to_string()]));
+        assert_eq!(busy_of("w", Ok(None)), Ok(vec![]), "no server: nobody busy");
+        assert_eq!(busy_of("w", Err(())), Err("session 'w' didn't answer".to_string()));
+        assert!(busy_of("w", Ok(Some("not json".into()))).is_err());
+        assert!(busy_of("w", Ok(Some(reply(0, "not json".into(), "")))).is_err());
+        assert_eq!(busy_of("w", Ok(Some(reply(1, String::new(), "refused")))), Err("session 'w': refused".to_string()));
+    }
+
+    #[test]
+    fn busy_lines_lists_agents_at_work_but_not_the_asker() {
+        let lists = vec![
+            serde_json::json!({"session": "default", "agents": [
+                {"name": "api", "state": "working", "activity": "Bash cargo test", "you": false},
+                {"name": "web", "state": "needs-you", "activity": "approve Bash rm", "you": false},
+                {"name": "docs", "state": "idle", "activity": "", "you": false},
+                {"name": "lead", "state": "working", "activity": "Bash trix ls --busy", "you": true},
+                {"name": "new", "state": "starting", "activity": "", "you": false},
+            ]}),
+            serde_json::json!({"session": "work", "agents": [
+                {"name": "old", "state": "done", "activity": "", "you": false},
+                {"name": "gone", "state": "exited", "activity": "", "you": false},
+            ]}),
+        ];
+        assert_eq!(busy_lines(&lists), vec!["default\tapi\tworking\tBash cargo test", "default\tweb\tneeds-you\tapprove Bash rm", "default\tnew\tstarting\t"]);
+        assert!(busy_lines(&lists[1..]).is_empty());
+        assert!(busy_lines(&[]).is_empty());
+    }
 
     #[test]
     fn ls_all_lists_every_session_even_from_a_pane() {
