@@ -763,6 +763,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
             let _ = session::write_frame(&mut stream, session::TEXT, app.listing().as_bytes());
         }
         SessionEvent::Control { stream, from, req, sandboxed } => control::handle(app, stream, from, req, sandboxed),
+        SessionEvent::Asked { stream, from, req, elsewhere } => control::asked(app, stream, from, req, elsewhere),
         SessionEvent::Kill(stream) => killed.push(stream),
     }
 }
