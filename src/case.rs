@@ -15,7 +15,11 @@
 //!   reasoning, checks each fix and that CI is green: pass, or changes,
 //!   which go back to the Fixer (`max_rounds`).
 //! - Then trix merges, squashed, the commit the Gatekeeper checked, once CI
-//!   is green and you say so. No agent can merge or approve.
+//!   is green and you say so. No agent can merge or approve. A PR that
+//!   conflicts with its base goes back to the Fixer, which merges the base
+//!   in (never a rebase), and a fresh Gatekeeper checks it. A case from an
+//!   issue closes the issue after the merge, when both the Reviewer and the
+//!   Gatekeeper said the PR solves it and the PR doesn't close it itself.
 //!
 //! The case runs in a pane of its own (`trix case run <id>`), which is where
 //! it asks you things: it shows as needing you, like an agent. Agents hand
@@ -206,8 +210,11 @@ pub enum Ask {
     NoReport,
     /// Everything passed: y merges.
     Merge,
-    /// The merge failed: y tries again.
+    /// The merge failed: r tries again (a PR that conflicts now goes to the
+    /// fixer instead).
     MergeFailed,
+    /// The PR conflicts with its base, with no rounds left: r for one more.
+    Conflict,
     /// Setting a role up failed (a worktree, an agent, opening the PR): r
     /// tries again.
     Setup,
@@ -226,7 +233,7 @@ impl Ask {
     pub fn keys(self) -> &'static [(char, &'static str)] {
         match self {
             Ask::NothingFound => &[('m', "go to the merge gate anyway"), ('a', "abort")],
-            Ask::RoundLimit | Ask::CiFailed => &[('r', "one more round"), ('a', "abort")],
+            Ask::RoundLimit | Ask::CiFailed | Ask::Conflict => &[('r', "one more round"), ('a', "abort")],
             Ask::Budget => &[('b', "add the budget again"), ('a', "abort")],
             Ask::NoReport => &[('n', "nudge it again"), ('a', "abort")],
             Ask::Merge => &[('y', "merge"), ('a', "abort")],
@@ -302,6 +309,18 @@ pub struct Case {
     /// yet is waiting for them, not a repo without CI.
     #[serde(default = "yes")]
     pub ci_expected: bool,
+    /// You said y, and GitHub couldn't yet say the PR merges (it was still
+    /// working it out, or the base moved as it merged): it merges as soon
+    /// as GitHub can.
+    #[serde(default)]
+    pub merge_when_ready: bool,
+    /// Merges tried again since your y, after the base moved under one.
+    #[serde(default)]
+    pub merge_tries: u32,
+    /// The reviewer's last word on the issue (the gatekeeper's is its
+    /// verdict's).
+    #[serde(default)]
+    pub review_solves: Option<Answer>,
     /// The agent working on this stage, once it's started.
     #[serde(default)]
     pub agent: Option<String>,
@@ -365,6 +384,9 @@ impl Case {
             verdict: None,
             checked: None,
             ci_expected: true,
+            merge_when_ready: false,
+            merge_tries: 0,
+            review_solves: None,
             agent: None,
             closing: Vec::new(),
             spent_closed: 0.0,
@@ -1051,18 +1073,19 @@ pub fn prompt(c: &Case, role: Role) -> String {
             submit = submit_line(c, role),
         ),
         Role::Fixer => format!(
-            "{head}\n\nYour folder is on branch trix/{id}-fix, which starts at the PR's branch as origin has it. The Reviewer found, and checked with the evidence shown:\n\n{findings}\n{solves}\n\
+            "{head}\n\nYour folder is on branch trix/{id}-fix, which starts at the PR's branch as origin has it. The Reviewer found, and checked with the evidence shown:\n\n{findings}\n{solves}{conflict}\n\
              Keep the PR's work: fix or complete it in place, no rewrite. For each finding, fix it with a test that fails without the fix, or, if it isn't a bug, say why. If a fix is too risky or too large to do safely, or is a design choice, don't guess: mark it needs_you and say why, and the user decides. Commit, then push to the PR's branch with: git push origin HEAD:{branch} (never force). Don't merge the PR.\n\n\
              Then hand in what you did. {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"commits\": [\"<sha>\"], \"tests\": \"what you ran, and how it went\", \"findings\": [{{\"id\": \"F1\", \"outcome\": \"fixed\", \"test\": \"the test's name\"}}, {{\"id\": \"F2\", \"outcome\": \"not_a_bug\", \"note\": \"why\"}}]}}. outcome is fixed, not_a_bug, wont_fix or needs_you; each finding gets one, and a note for any that isn't fixed. trix checks the commits are on origin before it takes the report.\n\n{rules}",
             id = c.id,
             findings = serde_json::to_string_pretty(&open_findings(c)).unwrap_or_default(),
             solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\nThe PR is meant to solve issue #{n}. The reviewer says: {}\n\n{block}", c.solves.as_ref().and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default())),
             branch = pr.head,
+            conflict = if conflicts(c) { format!("\n{}\n", conflict_steps(c)) } else { String::new() },
             submit = submit_line(c, role),
         ),
         Role::Gatekeeper => format!(
             "{head}\n\nYour folder is a fresh checkout of the PR's branch after the Fixer's work ({sha}). You check that work on your own: you haven't seen the Fixer's reasoning, and you don't need it.\n\n\
-             The findings, with the reviewer's evidence:\n{findings}\n\nWhat the Fixer says it did:\n{fix}\n{solves}\n\
+             The findings, with the reviewer's evidence:\n{findings}\n\nWhat the Fixer says it did:\n{fix}\n{solves}{gate_conflict}\n\
              For each finding, is it really fixed (read the code and the test, run the tests)? For one called not_a_bug or wont_fix, is that right? For one called needs_you, is it right to leave it to the user (they're told at the merge gate)? Did the fixes break anything else? Check CI with: gh pr checks {n}. Don't edit, commit or push anything.\n\n\
              {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"verdict\": \"pass\", \"findings\": [{{\"id\": \"F1\", \"ok\": true}}, {{\"id\": \"F2\", \"ok\": false, \"reason\": \"why, and what to change\"}}], \"new\": [], \"ci\": \"green\"{solves_json}}}. verdict is pass or changes; ci is green, red, pending or none; new lists anything else you found, as findings with new ids. Pass only when every finding is ok, nothing important is new, CI isn't red{pass_solves}.\n\n{rules}",
             sha = c.checked.as_deref().unwrap_or("its head"),
@@ -1070,6 +1093,11 @@ pub fn prompt(c: &Case, role: Role) -> String {
             fix = c.fix.as_ref().and_then(|f| serde_json::to_string_pretty(f).ok()).unwrap_or_default(),
             solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\nThe PR is meant to solve issue #{n}: does it, on this commit? Try the issue's problem here. Anything it still lacks is a new finding, severity important.\n\n{block}")),
             pass_solves = if issue.is_some() { ", and solves is yes" } else { "" },
+            gate_conflict = if conflicts(c) {
+                format!("\nThe PR conflicted with {base}. For that finding, check origin/{base} was merged in, not rebased (git fetch origin {base}, then git merge-base --is-ancestor origin/{base} HEAD), that each conflict kept what both sides meant, and that the tests pass. Check GitHub can merge it now: gh pr view {n} --json mergeable.\n", base = pr.base, n = pr.number)
+            } else {
+                String::new()
+            },
             n = pr.number,
             submit = submit_line(c, role),
         ),
@@ -1138,6 +1166,11 @@ fn build_prompt(c: &Case) -> String {
         block = issue_block(c),
         submit = submit_line(c, Role::Builder),
     )
+}
+
+/// This round answers the PR conflicting with its base.
+fn conflicts(c: &Case) -> bool {
+    c.open.iter().any(|id| id.starts_with("CONFLICT"))
 }
 
 fn open_findings(c: &Case) -> Vec<&Finding> {
@@ -1223,6 +1256,9 @@ fn next_round(c: &mut Case, env: &mut dyn Env, what: String, open: Vec<String>) 
     c.stage = Stage::Fixing;
     c.fix = None;
     c.nudged = false;
+    // Your y was for a commit that's being replaced.
+    c.merge_when_ready = false;
+    c.merge_tries = 0;
     note(c, env, format!("round {}: back to the fixer", c.round));
     let fixer = c.agent_name(Role::Fixer);
     // Never started (nothing was found, and CI failed): it starts from its
@@ -1343,7 +1379,12 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
                     note(c, env, format!("couldn't nudge {name}: {e}"));
                 }
             }
-            Ask::Merge | Ask::MergeFailed => merge(c, env),
+            Ask::Conflict => conflict(c, env, true),
+            Ask::Merge | Ask::MergeFailed => {
+                c.merge_tries = 0;
+                // Your r: a PR that conflicts now gets the round it needs.
+                merge(c, env, a == Ask::MergeFailed);
+            }
             Ask::Setup => c.agent = None,
         }
         return true;
@@ -1476,6 +1517,7 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 c.solves = r.solves;
             }
             let answer = c.solves.as_ref().map(|s| s.answer);
+            c.review_solves = answer;
             if let Some(a) = answer {
                 note(c, env, format!("the reviewer says the PR solves the issue: {}", snake(&a)));
             }
@@ -1660,6 +1702,15 @@ fn watch(c: &mut Case, env: &mut dyn Env, seen: &[Seen], name: &str, role: Role)
 }
 
 fn gate(c: &mut Case, env: &mut dyn Env) {
+    // First: GitHub runs no CI on a PR that conflicts, so it would wait forever.
+    match mergeable(c, env) {
+        Mergeable::Unknown => {
+            env.say("Working", &format!("{} · waiting for GitHub to say whether PR #{} merges", c.id, c.pr().number));
+            return;
+        }
+        Mergeable::Conflicting => return conflict(c, env, false),
+        Mergeable::Clean => {}
+    }
     let (state, failed) = ci(c, env);
     match state {
         Ci::Pending => env.say("Working", &format!("{} · waiting for CI on {}", c.id, c.checked.as_deref().map_or("the PR", |s| &s[..s.len().min(7)]))),
@@ -1678,6 +1729,7 @@ fn gate(c: &mut Case, env: &mut dyn Env) {
                 ask(c, env, Ask::CiFailed, format!("CI failed ({}) and the rounds are used up", failed.join(", ")));
             }
         }
+        Ci::Green | Ci::None if c.merge_when_ready => merge(c, env, false),
         Ci::Green | Ci::None => {
             let ci = if state == Ci::None { "no CI checks on this PR" } else { "CI green" };
             let left = if c.needs_you.is_empty() {
@@ -1688,12 +1740,148 @@ fn gate(c: &mut Case, env: &mut dyn Env) {
             };
             // Sent on by you when the reviewer found nothing: no gatekeeper ran.
             let who = if c.verdict.is_some() { "the gatekeeper passed it" } else { "the reviewer found nothing, and no gatekeeper ran" };
-            ask(c, env, Ask::Merge, format!("ready to merge PR #{}: {ci}, {who}{left}", c.pr().number));
+            let n = c.pr().number;
+            let q = match after_merge(c, env) {
+                None => format!("ready to merge PR #{n}: {ci}, {who}{left}"),
+                Some((m, AfterMerge::TrixCloses)) => format!("ready to merge PR #{n} and close issue #{m}: {ci}, {who}{left}"),
+                Some((m, AfterMerge::PrCloses)) => format!("ready to merge PR #{n} (the PR closes issue #{m}): {ci}, {who}{left}"),
+                Some((m, AfterMerge::StaysOpen)) => format!("ready to merge PR #{n}: {ci}, {who}{left}. Issue #{m} stays open: {}", STAYS_OPEN),
+            };
+            ask(c, env, Ask::Merge, q);
         }
     }
 }
 
-fn merge(c: &mut Case, env: &mut dyn Env) {
+/// What GitHub says of merging the PR into its base now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mergeable {
+    Clean,
+    Conflicting,
+    /// GitHub is still working it out (after a push, or the base moved),
+    /// or couldn't be asked: looked at again, like CI that's pending.
+    Unknown,
+}
+
+fn mergeable(c: &Case, env: &mut dyn Env) -> Mergeable {
+    let Ok(out) = env.gh(&c.repo, &["pr", "view", &c.pr().number.to_string(), "--json", "mergeable,mergeStateStatus"]) else { return Mergeable::Unknown };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) else { return Mergeable::Unknown };
+    match (v["mergeable"].as_str(), v["mergeStateStatus"].as_str()) {
+        (Some("CONFLICTING"), _) | (_, Some("DIRTY")) => Mergeable::Conflicting,
+        (Some("MERGEABLE"), _) => Mergeable::Clean,
+        _ => Mergeable::Unknown,
+    }
+}
+
+/// The fixer's part when the PR conflicts: its base merged in, never a rebase.
+fn conflict_steps(c: &Case) -> String {
+    let pr = c.pr();
+    format!(
+        "The PR conflicts with {base}: GitHub can't merge it. Bring {base} in by merging, never by rebasing: git fetch origin {base}, then git merge origin/{base}. Resolve each conflict keeping what both sides meant (the PR's change and what landed on {base}), run the tests, commit the merge, and push it with git push origin HEAD:{head} (a plain push, never force). The finding is fixed once that's pushed.",
+        base = pr.base,
+        head = pr.head
+    )
+}
+
+/// The PR conflicts with its base: a finding for the fixer, like red CI,
+/// and a round. `more`: you asked for one, so it's had even past the limit.
+fn conflict(c: &mut Case, env: &mut dyn Env, more: bool) {
+    let (n, base) = (c.pr().number, c.pr().base.clone());
+    let id = format!("CONFLICT{}", c.round);
+    note(c, env, format!("PR #{n} conflicts with {base}: GitHub can't merge it"));
+    if !c.findings.iter().any(|f| f.id == id) {
+        c.findings.push(Finding { id: id.clone(), file: "merge".into(), line: None, severity: Severity::Important, summary: format!("the PR conflicts with {base}: GitHub can't merge it"), failure: format!("gh pr view {n} --json mergeable says CONFLICTING"), evidence: None });
+    }
+    if more {
+        c.max_rounds = c.max_rounds.max(c.round + 1);
+    }
+    if c.round < c.max_rounds {
+        // The fixer's worktree shares this checkout's refs: the base it merges is the new one.
+        if let Err(e) = fetch(c, env, &base) {
+            note(c, env, format!("couldn't fetch origin/{base}: {}", e.lines().next().unwrap_or_default()));
+        }
+        let what = conflict_steps(c);
+        next_round(c, env, what, vec![id]);
+    } else {
+        c.open = vec![id];
+        ask(c, env, Ask::Conflict, format!("PR #{n} conflicts with {base} and the rounds are used up"));
+    }
+}
+
+/// How often a merge is tried again after the base moved under it.
+const MERGE_TRIES: u32 = 3;
+
+/// What becomes of the case's issue once its PR merges.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AfterMerge {
+    /// GitHub closes it: the PR says it closes it.
+    PrCloses,
+    /// trix closes it: the reviewer and the gatekeeper both said it's solved.
+    TrixCloses,
+    StaysOpen,
+}
+
+const STAYS_OPEN: &str = "the reviewer and the gatekeeper didn't both say the PR solves it";
+
+/// The reviewer's last word on the issue: kept since the upgrade that
+/// keeps it, read from the log for a case from before.
+fn review_said(c: &Case) -> Option<Answer> {
+    c.review_solves.or_else(|| {
+        let said = c.log.iter().rev().find_map(|(_, l)| l.strip_prefix("the reviewer says the PR solves the issue: "))?;
+        serde_json::from_value(serde_json::Value::String(said.trim().to_string())).ok()
+    })
+}
+
+/// The case's issue, and what the merge does to it. `None`: no issue.
+fn after_merge(c: &Case, env: &mut dyn Env) -> Option<(u64, AfterMerge)> {
+    let m = c.issue.as_ref()?.number;
+    let n = c.pr.as_ref()?.number;
+    let links = env.gh(&c.repo, &["issue", "view", &m.to_string(), "--json", "closedByPullRequestsReferences"]).ok().and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok());
+    let closes = links.is_some_and(|v| v["closedByPullRequestsReferences"].as_array().into_iter().flatten().any(|l| l["number"].as_u64() == Some(n)));
+    let gate = c.verdict.as_ref().and_then(|v| v.solves.as_ref()).map(|s| s.answer);
+    Some((
+        m,
+        if closes {
+            AfterMerge::PrCloses
+        } else if review_said(c) == Some(Answer::Yes) && gate == Some(Answer::Yes) {
+            AfterMerge::TrixCloses
+        } else {
+            AfterMerge::StaysOpen
+        },
+    ))
+}
+
+/// The PR merged: close its issue, if that's trix's to do. A failure is
+/// said, never the merge's.
+fn close_issue(c: &mut Case, env: &mut dyn Env, after: Option<(u64, AfterMerge)>) {
+    let n = c.pr().number;
+    match after {
+        None => {}
+        Some((m, AfterMerge::PrCloses)) => note(c, env, format!("issue #{m} closes with the PR")),
+        Some((m, AfterMerge::StaysOpen)) => note(c, env, format!("issue #{m} stays open: {STAYS_OPEN}")),
+        Some((m, AfterMerge::TrixCloses)) => {
+            let comment = format!("Solved by #{n}, merged by trix triage case {}.", c.id);
+            match env.gh(&c.repo, &["issue", "close", &m.to_string(), "--comment", &comment]) {
+                Ok(_) => note(c, env, format!("closed issue #{m}: {comment}")),
+                Err(e) => note(c, env, format!("couldn't close issue #{m} (the PR merged all the same): {}", e.lines().next().unwrap_or_default().trim())),
+            }
+        }
+    }
+}
+
+/// Your y (or r after a failed merge, `retry`): merge the checked commit,
+/// if GitHub can.
+fn merge(c: &mut Case, env: &mut dyn Env, retry: bool) {
+    c.merge_when_ready = false;
+    let n = c.pr().number;
+    match mergeable(c, env) {
+        Mergeable::Unknown => {
+            c.merge_when_ready = true;
+            note(c, env, format!("GitHub hasn't worked out yet whether PR #{n} merges: merging once it has"));
+            return;
+        }
+        Mergeable::Conflicting => return conflict(c, env, retry),
+        Mergeable::Clean => {}
+    }
     // CI again, right before: it may have changed while you looked.
     if let (Ci::Red | Ci::Pending, failed) = ci(c, env) {
         ask(c, env, Ask::MergeFailed, if failed.is_empty() { "CI is running again: not merged yet".into() } else { format!("CI failed since: {}", failed.join(", ")) });
@@ -1705,14 +1893,22 @@ fn merge(c: &mut Case, env: &mut dyn Env) {
         ask(c, env, Ask::MergeFailed, "no checked commit to pin the merge to: not merged");
         return;
     };
-    let n = c.pr().number.to_string();
-    match env.gh(&c.repo, &["pr", "merge", &n, "--squash", "--match-head-commit", &sha]) {
+    let after = after_merge(c, env);
+    match env.gh(&c.repo, &["pr", "merge", &n.to_string(), "--squash", "--match-head-commit", &sha]) {
         Ok(_) => {
             c.stage = Stage::Merged;
-            note(c, env, format!("merged PR #{} (squash)", c.pr().number));
+            note(c, env, format!("merged PR #{n} (squash)"));
+            close_issue(c, env, after);
             close_all(c, env, true);
             remove_readonly(c, env);
             env.say("Finished", &format!("{} · merged #{}", c.id, c.pr().number));
+        }
+        // The base moved as it merged: GitHub looks at the PR again, then
+        // it's tried again (or goes to the fixer, if it conflicts now).
+        Err(e) if e.contains("Base branch was modified") && c.merge_tries < MERGE_TRIES => {
+            c.merge_tries += 1;
+            c.merge_when_ready = true;
+            note(c, env, format!("{} moved as PR #{n} merged: trying again once GitHub has looked at it again ({} of {MERGE_TRIES})", c.pr().base, c.merge_tries));
         }
         Err(e) => ask(c, env, Ask::MergeFailed, format!("the merge failed: {}", e.lines().next().unwrap_or("").trim())),
     }
@@ -2322,6 +2518,16 @@ mod tests {
         keys: Vec<char>,
         said: Vec<(String, String)>,
         now: u64,
+        /// What `gh pr view --json mergeable` says, one per look (the last
+        /// one again once they're used up); none: MERGEABLE.
+        mergeable: Vec<&'static str>,
+        /// Errors the next `gh pr merge`s fail with.
+        merge_errors: Vec<String>,
+        /// The PRs the issue says close it.
+        closes: Vec<u64>,
+        /// `gh issue close`s, and an error for them.
+        issue_closed: Vec<Vec<String>>,
+        close_error: Option<String>,
     }
 
     impl Env for Fake {
@@ -2344,9 +2550,29 @@ mod tests {
         fn gh(&mut self, _repo: &Path, args: &[&str]) -> Result<String, String> {
             match args {
                 ["api", path] if path.contains("/check-runs") => Ok(self.ci.clone()),
+                ["pr", "view", _, "--json", "mergeable,mergeStateStatus"] => {
+                    let m = if self.mergeable.len() > 1 { self.mergeable.remove(0) } else { self.mergeable.first().copied().unwrap_or("MERGEABLE") };
+                    let state = match m {
+                        "CONFLICTING" => "DIRTY",
+                        "UNKNOWN" => "UNKNOWN",
+                        _ => "CLEAN",
+                    };
+                    Ok(serde_json::json!({"mergeable": m, "mergeStateStatus": state}).to_string())
+                }
                 ["pr", "merge", ..] => {
+                    if !self.merge_errors.is_empty() {
+                        return Err(self.merge_errors.remove(0));
+                    }
                     self.merged.push(args.iter().map(|s| s.to_string()).collect());
                     Ok(String::new())
+                }
+                ["issue", "view", _, "--json", "closedByPullRequestsReferences"] => {
+                    let refs: Vec<serde_json::Value> = self.closes.iter().map(|n| serde_json::json!({"number": n})).collect();
+                    Ok(serde_json::json!({"closedByPullRequestsReferences": refs}).to_string())
+                }
+                ["issue", "close", ..] => {
+                    self.issue_closed.push(args.iter().map(|s| s.to_string()).collect());
+                    self.close_error.clone().map_or(Ok(String::new()), Err)
                 }
                 ["pr", "create", ..] => {
                     self.created.push(args.iter().map(|s| s.to_string()).collect());
@@ -2634,6 +2860,190 @@ mod tests {
         c.stage = Stage::Gate;
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::CiFailed));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// A case at the gate, CI green, its gatekeeper passed it.
+    fn at_gate(c: &mut Case, env: &mut Fake) {
+        c.stage = Stage::Gate;
+        c.checked = Some("headsha".into());
+        c.findings = serde_json::from_str::<Findings>(FINDINGS).unwrap().findings;
+        let solves = if c.issue.is_some() { r#", "solves": {"answer": "yes", "evidence": "curl: 429 after 60"}"# } else { "" };
+        c.verdict = Some(serde_json::from_str(&format!(r#"{{"verdict": "pass", "findings": [{{"id": "F1", "ok": true}}], "ci": "green"{solves}}}"#)).unwrap());
+        env.ci = runs(&[("test", "completed", Some("success"))]);
+        env.seen.push(Seen { name: c.agent_name(Role::Fixer), state: "done".into(), cost: 0.0 });
+    }
+
+    #[test]
+    fn a_conflict_at_the_gate_goes_to_the_fixer_then_the_gatekeeper_then_the_gate() {
+        let (root, mut c) = fixture("conflict");
+        let mut env = Fake { now: 1_795_000_000, mergeable: vec!["CONFLICTING"], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        // A finding like red CI's, and a round: the fixer merges main in.
+        assert_eq!((c.stage, c.round, c.open.clone(), c.ask), (Stage::Fixing, 2, vec!["CONFLICT1".to_string()], None));
+        assert!(c.findings.iter().any(|f| f.id == "CONFLICT1" && f.severity == Severity::Important && f.summary.contains("conflicts with main")));
+        assert!(env.gits.iter().any(|g| g == "fetch --quiet origin +refs/heads/main:refs/remotes/origin/main"), "the new main is fetched for the fixer: {:?}", env.gits);
+        let told = &env.sent.last().unwrap().1;
+        assert!(told.contains("git merge origin/main") && told.contains("never by rebasing") && told.contains("git push origin HEAD:rate-limits (a plain push, never force)"), "{told}");
+        env.pushed.push("abc1234".into());
+        let fix = r#"{"commits": ["abc1234"], "tests": "all pass", "findings": [{"id": "CONFLICT1", "outcome": "fixed"}]}"#;
+        assert_eq!(submit(&root, &mut c, Role::Fixer, fix).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Verifying);
+        // A fresh gatekeeper, in a fresh checkout of the new head.
+        step(&mut c, &root, &mut env);
+        let (gk, p) = env.prompts.last().unwrap();
+        assert_eq!(gk, "triage-12-gate-2");
+        assert!(p.contains("git merge-base --is-ancestor origin/main HEAD") && p.contains("not rebased"), "{p}");
+        env.mergeable = vec!["MERGEABLE"];
+        let pass = r#"{"verdict": "pass", "findings": [{"id": "CONFLICT1", "ok": true}], "ci": "green"}"#;
+        assert_eq!(submit(&root, &mut c, Role::Gatekeeper, pass).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Gate);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::Merge));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_conflict_with_the_rounds_used_up_asks() {
+        let (root, mut c) = fixture("conflict-limit");
+        let mut env = Fake { now: 1_795_000_000, mergeable: vec!["CONFLICTING"], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.round = c.max_rounds;
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.stage), (Some(Ask::Conflict), Stage::Gate));
+        assert!(c.why.contains("PR #12 conflicts with main and the rounds are used up"), "{}", c.why);
+        assert!(env.sent.is_empty());
+        // r: one more round, to the fixer.
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.round, c.max_rounds, c.open.clone()), (Stage::Fixing, 3, 3, vec!["CONFLICT2".to_string()]));
+        assert!(env.sent.last().unwrap().1.contains("git merge origin/main"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn unknown_mergeability_is_waited_for() {
+        let (root, mut c) = fixture("unknown");
+        let mut env = Fake { now: 1_795_000_000, mergeable: vec!["UNKNOWN", "UNKNOWN", "MERGEABLE"], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        for _ in 0..2 {
+            step(&mut c, &root, &mut env);
+            assert_eq!((c.ask, c.stage), (None, Stage::Gate));
+            assert!(env.said.last().unwrap().1.contains("waiting for GitHub to say whether PR #12 merges"), "{:?}", env.said);
+        }
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::Merge));
+        // Your y, while GitHub works it out again: it merges once it knows.
+        env.mergeable = vec!["UNKNOWN", "MERGEABLE"];
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert!(env.merged.is_empty() && c.merge_when_ready && c.ask.is_none());
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, env.merged.len()), (Stage::Merged, 1));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_base_that_moved_as_it_merged_is_tried_again() {
+        let (root, mut c) = fixture("base-moved");
+        let moved = "GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)".to_string();
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![moved.clone()], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.merge_tries, c.merge_when_ready, env.merged.len()), (None, 1, true, 0));
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, env.merged.len()), (Stage::Merged, 1));
+        // Not forever: past MERGE_TRIES it asks.
+        let (root, mut c) = fixture("base-moved-again");
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![moved; MERGE_TRIES as usize + 1], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        for _ in 0..=MERGE_TRIES {
+            step(&mut c, &root, &mut env);
+        }
+        assert_eq!((c.ask, env.merged.len()), (Some(Ask::MergeFailed), 0));
+        assert!(c.why.contains("Base branch was modified"), "{}", c.why);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_failed_merge_tried_again_goes_to_the_fixer_if_it_conflicts_now() {
+        let (root, mut c) = fixture("merge-failed");
+        let mut env = Fake { now: 1_795_000_000, mergeable: vec!["CONFLICTING"], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        // A case stuck from before: rounds used up, its merge failed.
+        c.round = c.max_rounds;
+        c.ask = Some(Ask::MergeFailed);
+        c.why = "the merge failed: Pull Request is not mergeable".into();
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.round, c.open.clone(), c.ask), (Stage::Fixing, 3, vec!["CONFLICT2".to_string()], None));
+        assert!(env.merged.is_empty());
+        assert!(env.sent.last().unwrap().1.contains("git merge origin/main"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn an_issue_case_closes_its_issue_once_merged() {
+        let (root, mut c) = issue_fixture("close-issue");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.review_solves = Some(Answer::Yes);
+        step(&mut c, &root, &mut env);
+        assert!(c.why.starts_with("ready to merge PR #12 and close issue #7: CI green"), "{}", c.why);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Merged);
+        let comment = format!("Solved by #12, merged by trix triage case {}.", c.id);
+        assert_eq!(env.issue_closed, vec![vec!["issue".to_string(), "close".into(), "7".into(), "--comment".into(), comment.clone()]]);
+        assert!(c.log.iter().any(|(_, l)| *l == format!("closed issue #7: {comment}")), "{:?}", c.log);
+        // A close that fails is said, and the merge stands.
+        let (root, mut c) = issue_fixture("close-issue-fails");
+        let mut env = Fake { now: 1_795_000_000, close_error: Some("HTTP 403: no".into()), ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        // From before the reviewer's word was kept: its log line says it.
+        c.log.push((1, "the reviewer says the PR solves the issue: yes".into()));
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.ask, env.issue_closed.len()), (Stage::Merged, None, 1));
+        assert!(c.log.iter().any(|(_, l)| l.starts_with("couldn't close issue #7 (the PR merged all the same): HTTP 403")), "{:?}", c.log);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn an_issue_its_pr_closes_is_left_to_github() {
+        let (root, mut c) = issue_fixture("pr-closes");
+        let mut env = Fake { now: 1_795_000_000, closes: vec![12], ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.review_solves = Some(Answer::Yes);
+        step(&mut c, &root, &mut env);
+        assert!(c.why.starts_with("ready to merge PR #12 (the PR closes issue #7): CI green"), "{}", c.why);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, env.issue_closed.len()), (Stage::Merged, 0));
+        assert!(c.log.iter().any(|(_, l)| l == "issue #7 closes with the PR"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn an_issue_not_said_solved_by_both_stays_open() {
+        let (root, mut c) = issue_fixture("stays-open");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.review_solves = Some(Answer::Partly);
+        step(&mut c, &root, &mut env);
+        assert!(c.why.contains("Issue #7 stays open: the reviewer and the gatekeeper didn't both say the PR solves it"), "{}", c.why);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, env.issue_closed.len()), (Stage::Merged, 0));
+        assert!(c.log.iter().any(|(_, l)| l.starts_with("issue #7 stays open")));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
