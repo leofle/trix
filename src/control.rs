@@ -104,6 +104,34 @@ pub struct Elsewhere {
     pub held: Option<String>,
 }
 
+/// Who's asking, when it isn't you.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Asker {
+    /// An agent, by name (with its session, when it's another's).
+    Agent(String),
+    /// A pane no server shows (`held_pane`): what runs in it, agent or
+    /// shell, nobody can say. How to say which one.
+    Held(String),
+}
+
+impl Asker {
+    /// Its name, to hold against a role's agent's, or say it isn't.
+    pub fn name(&self) -> &str {
+        match self {
+            Asker::Agent(n) | Asker::Held(n) => n,
+        }
+    }
+
+    /// Who it is, to start a sentence with: "an agent (web)", or "a pane
+    /// left running by …".
+    pub fn said(&self) -> String {
+        match self {
+            Asker::Agent(n) => format!("an agent ({n})"),
+            Asker::Held(how) => how.clone(),
+        }
+    }
+}
+
 /// How long one session gets to say whose a process is. Asked of every
 /// session at once, so this is about the whole wait.
 const WHOSE_WAIT: Duration = Duration::from_millis(1000);
@@ -340,11 +368,11 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         // session's panes, it may be in another session's agent's.
         let peer = crate::platform::peer_pid(&stream);
         let asker = match who_asks(app, peer, from) {
-            Pane::Agent(name) => Some(name),
+            Pane::Agent(name) => Some(Asker::Agent(name)),
             Pane::Outside if needs_everyone(app, &req) && let Some(pid) = peer => return ask_elsewhere(app, stream, from, req, pid),
             Pane::Shell | Pane::Outside => None,
         };
-        let r = as_asker(app, from, asker.as_deref(), req);
+        let r = as_asker(app, from, asker.as_ref(), req);
         return reply(&mut stream, &r);
     }
     let r = match req {
@@ -367,9 +395,9 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
 }
 
 /// A send or a case request, from `asker` (`None`: you).
-fn as_asker(app: &mut App, from: Option<u32>, asker: Option<&str>, req: Request) -> Reply {
+fn as_asker(app: &mut App, from: Option<u32>, asker: Option<&Asker>, req: Request) -> Reply {
     match req {
-        Request::Send { target, text, force } => send(app, from, asker, &target, &text, force),
+        Request::Send { target, text, force } => send(app, from, asker.map(Asker::name), &target, &text, force),
         Request::Case { id, op } => case_request(app, asker, &id, op),
         _ => unreachable!(),
     }
@@ -509,12 +537,12 @@ fn from_answers(answers: impl IntoIterator<Item = (String, Option<Pane>)>) -> El
 /// you. A session that didn't answer might have been an agent's: only the
 /// user approves, aborts, answers or types into a case's pane, so those
 /// are refused. A report still has its role's check, which you pass.
-fn asker_elsewhere(elsewhere: &Elsewhere, req: &Request) -> Result<Option<String>, String> {
+fn asker_elsewhere(elsewhere: &Elsewhere, req: &Request) -> Result<Option<Asker>, String> {
     if let Some((name, s)) = &elsewhere.agent {
-        return Ok(Some(format!("{name}, session {s}")));
+        return Ok(Some(Asker::Agent(format!("{name}, session {s}"))));
     }
     if let Some(held) = &elsewhere.held {
-        return Ok(Some(held.clone()));
+        return Ok(Some(Asker::Held(held.clone())));
     }
     let what = match req {
         Request::Case { op: crate::case::Op::Submit { .. }, .. } => return Ok(None),
@@ -533,7 +561,7 @@ fn asker_elsewhere(elsewhere: &Elsewhere, req: &Request) -> Result<Option<String
 /// `req`, once `ask_elsewhere` heard back.
 pub fn asked(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Request, elsewhere: Elsewhere) {
     let r = match asker_elsewhere(&elsewhere, &req) {
-        Ok(asker) => as_asker(app, from, asker.as_deref(), req),
+        Ok(asker) => as_asker(app, from, asker.as_ref(), req),
         Err(e) => Reply::fail(e),
     };
     reply(&mut stream, &r);
@@ -577,7 +605,7 @@ pub(crate) fn is_case_pane(app: &App, a: &crate::agent::Agent) -> bool {
 
 /// `trix case …` in the server. An approve or abort is typed into the
 /// case's pane, where the runner takes its answers.
-fn case_request(app: &mut App, agent: Option<&str>, id: &str, op: crate::case::Op) -> Reply {
+fn case_request(app: &mut App, agent: Option<&Asker>, id: &str, op: crate::case::Op) -> Reply {
     match crate::case::handle(&crate::case::root(), agent, id, op) {
         Err(e) => Reply::fail(e),
         Ok((out, None)) => Reply::ok(out),
@@ -1343,7 +1371,7 @@ mod tests {
         // An agent known only to another session is that session's agent, named so.
         let agent = from_answers([("triage-170".to_string(), Some(Pane::Outside)), ("default".to_string(), Some(Pane::Agent("alpha dog".into())))]);
         for req in [&approve, &answer, &submit] {
-            assert_eq!(asker_elsewhere(&agent, req), Ok(Some("alpha dog, session default".into())));
+            assert_eq!(asker_elsewhere(&agent, req), Ok(Some(Asker::Agent("alpha dog, session default".into()))));
         }
         // A shell pane in another session is you.
         let shell = from_answers([("default".to_string(), Some(Pane::Shell))]);
@@ -1376,8 +1404,11 @@ mod tests {
         // Refused for everything, a report too: no role's agent is in one.
         let held = Elsewhere { held: Some("a pane left running by session work's stopped server".into()), ..Elsewhere::default() };
         for op in [crate::case::Op::Approve, crate::case::Op::Answer { key: 'm' }, crate::case::Op::Submit { role: crate::case::Role::Fixer, report: "{}".into() }] {
-            assert_eq!(asker_elsewhere(&held, &Request::Case { id: "triage-8".into(), op }), Ok(Some("a pane left running by session work's stopped server".into())));
+            assert_eq!(asker_elsewhere(&held, &Request::Case { id: "triage-8".into(), op }), Ok(Some(Asker::Held("a pane left running by session work's stopped server".into()))));
         }
+        // Said as what it is: it may be a shell's pane, not an agent's.
+        assert_eq!(Asker::Held("a pane left running by session work's stopped server".into()).said(), "a pane left running by session work's stopped server");
+        assert_eq!(Asker::Agent("web".into()).said(), "an agent (web)");
     }
 
     #[test]

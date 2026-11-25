@@ -885,10 +885,11 @@ pub enum Op {
 /// a terminal outside trix, is you). A report is taken only from its role's
 /// agent, and no agent approves or aborts. `Ok` holds what to reply, and
 /// for approve and abort the key to type into the case's pane.
-pub fn handle(root: &Path, agent: Option<&str>, id: &str, op: Op) -> Result<(String, Option<char>), String> {
+pub fn handle(root: &Path, agent: Option<&crate::control::Asker>, id: &str, op: Op) -> Result<(String, Option<char>), String> {
     if let (Op::Approve | Op::Abort | Op::Answer { .. }, Some(who)) = (&op, agent) {
-        return Err(format!("an agent ({who}) can't approve, abort or answer a case: the user does, in the case's pane, or with trix case approve / answer from a terminal"));
+        return Err(format!("{} can't approve, abort or answer a case: the user does, in the case's pane, or with trix case approve / answer from a terminal", who.said()));
     }
+    let agent = agent.map(crate::control::Asker::name);
     let c = load(root, id)?;
     match op {
         Op::Submit { role, report } => {
@@ -2405,7 +2406,8 @@ mod tests {
 
     fn submit_as(root: &Path, c: &mut Case, agent: Option<&str>, role: Role, json: &str) -> crate::control::Reply {
         store(root, c).unwrap();
-        match handle(root, agent, &c.id, Op::Submit { role, report: json.into() }) {
+        let agent = agent.map(|n| crate::control::Asker::Agent(n.into()));
+        match handle(root, agent.as_ref(), &c.id, Op::Submit { role, report: json.into() }) {
             Ok((out, _)) => crate::control::Reply::ok(out),
             Err(e) => crate::control::Reply { code: 1, out: String::new(), err: e },
         }
@@ -2489,17 +2491,20 @@ mod tests {
         assert_eq!(env.said.last().unwrap().0, "Question");
         // An agent can't approve, you can: the server types y into the pane.
         store(&root, &c).unwrap();
-        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Approve).unwrap_err().contains("an agent (triage-12-fix) can't approve"));
+        assert!(handle(&root, Some(&crate::control::Asker::Agent("triage-12-fix".into())), &c.id, Op::Approve).unwrap_err().contains("an agent (triage-12-fix) can't approve"));
         // Another session's agent is named with its session (`control::asker_elsewhere`).
         for op in [Op::Approve, Op::Answer { key: 'a' }] {
-            assert!(handle(&root, Some("alpha dog, session default"), &c.id, op).unwrap_err().contains("an agent (alpha dog, session default) can't approve"));
+            assert!(handle(&root, Some(&crate::control::Asker::Agent("alpha dog, session default".into())), &c.id, op).unwrap_err().contains("an agent (alpha dog, session default) can't approve"));
         }
+        // A held pane may be a shell's: said as a pane, not an agent.
+        let held = crate::control::Asker::Held("a pane left running by session work's stopped server".into());
+        assert!(handle(&root, Some(&held), &c.id, Op::Abort).unwrap_err().starts_with("a pane left running by session work's stopped server can't approve"));
         assert_eq!(handle(&root, None, &c.id, Op::Approve).unwrap().1, Some('y'));
         // Any other answer, from a terminal: only one the question takes, never a merge.
         assert_eq!(handle(&root, None, &c.id, Op::Answer { key: 'a' }).unwrap().1, Some('a'));
         assert!(handle(&root, None, &c.id, Op::Answer { key: 'y' }).unwrap_err().contains("only ever trix case approve"));
         assert!(handle(&root, None, &c.id, Op::Answer { key: 'n' }).unwrap_err().contains("'n' isn't an answer to it (y: merge · a: abort)"));
-        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Answer { key: 'a' }).unwrap_err().contains("an agent (triage-12-fix) can't approve, abort or answer"));
+        assert!(handle(&root, Some(&crate::control::Asker::Agent("triage-12-fix".into())), &c.id, Op::Answer { key: 'a' }).unwrap_err().contains("an agent (triage-12-fix) can't approve, abort or answer"));
         env.keys.push('y');
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Merged);
