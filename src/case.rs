@@ -321,6 +321,9 @@ pub struct Case {
     pub given: u64,
     #[serde(default)]
     pub worked: bool,
+    /// Since when it has been seen stopped, without working in between.
+    #[serde(default)]
+    pub stopped_at: Option<u64>,
     #[serde(default)]
     pub ask: Option<Ask>,
     /// Why it asks, in a line.
@@ -368,6 +371,7 @@ impl Case {
             nudged: false,
             given: 0,
             worked: false,
+            stopped_at: None,
             ask: None,
             why: String::new(),
             log: Vec::new(),
@@ -995,7 +999,11 @@ fn make_worktree(c: &Case, role: Role, env: &mut dyn Env) -> Result<PathBuf, Str
             }
             env.git(&c.repo, &["worktree", "add", "--quiet", "-b", &i.branch, &p, &format!("refs/remotes/origin/{}", i.base)])?
         }
-        Role::Reviewer => env.git(&c.repo, &["worktree", "add", "--quiet", "--detach", &p, &c.pr().sha])?,
+        Role::Reviewer => {
+            // The PR may be nowhere in this checkout yet: pushed from elsewhere.
+            fetch_head(c, env)?;
+            env.git(&c.repo, &["worktree", "add", "--quiet", "--detach", &p, &c.pr().sha])?
+        }
         Role::Fixer => {
             fetch_head(c, env)?;
             env.git(&c.repo, &["worktree", "add", "--quiet", "-B", &format!("trix/{}-fix", c.id), &p, &format!("refs/remotes/origin/{}", c.pr().head)])?
@@ -1323,7 +1331,7 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
             Ask::NoReport => {
                 c.nudged = false;
                 let Some(name) = c.agent.clone() else { return true };
-                if seen.iter().any(|a| a.name == name && a.state == "exited") {
+                if seen.iter().all(|a| a.name != name || a.state == "exited") {
                     // Started again, from its prompt, at the next look.
                     let _ = env.close(&name, false);
                     c.agent = None;
@@ -1429,7 +1437,11 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 return;
             }
             // Its own findings again, with evidence, before the fixer sees any.
-            note(c, env, format!("the reviewer found {} ({important} important): it checks them now", plural(c.findings.len(), "finding")));
+            if c.findings.is_empty() {
+                note(c, env, "the reviewer found no bugs: it checks its word on the issue now");
+            } else {
+                note(c, env, format!("the reviewer found {} ({important} important): it checks them now", plural(c.findings.len(), "finding")));
+            }
             c.verifying = true;
             c.nudged = false;
             // Stored first: the server checks its answer against this.
@@ -1598,7 +1610,13 @@ fn nudge(c: &mut Case, env: &mut dyn Env, name: &str) -> Result<(), String> {
 fn gave_work(c: &mut Case, env: &mut dyn Env) {
     c.given = env.now();
     c.worked = false;
+    c.stopped_at = None;
 }
+
+/// How long an agent must stay stopped before it counts: one that ends a
+/// turn with a message waiting (the verify step, typed in while it was
+/// still handing in its first report) is stopped only for a moment.
+const SETTLE_SECS: u64 = 15;
 
 /// How long an agent given work may sit idle before it counts as stopped,
 /// if it's never seen working: one that never takes up its prompt.
@@ -1613,9 +1631,17 @@ fn watch(c: &mut Case, env: &mut dyn Env, seen: &[Seen], name: &str, role: Role)
     };
     if a.state == "working" {
         c.worked = true;
+        c.stopped_at = None;
     }
-    if matches!(a.state.as_str(), "done" | "idle") && !c.worked && env.now().saturating_sub(c.given) < TAKE_UP_SECS {
-        return;
+    if matches!(a.state.as_str(), "done" | "idle") {
+        let now = env.now();
+        let since = *c.stopped_at.get_or_insert(now);
+        if !c.worked && now.saturating_sub(c.given) < TAKE_UP_SECS {
+            return;
+        }
+        if now.saturating_sub(since) < SETTLE_SECS {
+            return;
+        }
     }
     match a.state.as_str() {
         "exited" => ask(c, env, Ask::NoReport, format!("the {} ({name}) exited without its report", role.name())),
@@ -2234,7 +2260,7 @@ fn show(c: &Case) -> String {
         }
     }
     if let Some(x) = &c.solves {
-        s.push_str(&format!("\nsolves the issue: {}{}\n", snake(&x.answer), x.missing.as_deref().map_or(String::new(), |m| format!(" · missing: {}", clean(m)))));
+        s.push_str(&format!("\nsolves the issue: {}{}\n", snake(&x.answer), x.missing.as_deref().filter(|m| !m.trim().is_empty()).map_or(String::new(), |m| format!(" · missing: {}", clean(m)))));
     }
     if !c.needs_you.is_empty() {
         s.push_str("\nleft for you (the fixer's needs_you):\n");
@@ -2275,6 +2301,7 @@ mod tests {
         created: Vec<Vec<String>>,
         listed: Option<String>,
         opened: Vec<Case>,
+        gits: Vec<String>,
         keys: Vec<char>,
         said: Vec<(String, String)>,
         now: u64,
@@ -2285,6 +2312,7 @@ mod tests {
             self.now
         }
         fn git(&mut self, _repo: &Path, args: &[&str]) -> Result<String, String> {
+            self.gits.push(args.join(" "));
             match args {
                 ["worktree", "add", ..] => {
                     let p = args.iter().find(|a| a.contains(".trix/worktrees")).unwrap();
@@ -2387,6 +2415,8 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!(c.agent.as_deref(), Some("triage-12-review"));
         assert!(env.prompts[0].1.contains("trix case submit triage-12 reviewer <<'EOF'") && env.prompts[0].1.contains("prsha"), "{}", env.prompts[0].1);
+        // Its checkout is of a commit fetched first: the PR may have been pushed from anywhere.
+        assert!(env.gits[0].starts_with("fetch --quiet origin +refs/heads/rate-limits:") && env.gits[2].starts_with("worktree add --quiet --detach") && env.gits[2].ends_with(" prsha"), "{:?}", env.gits);
         // Its findings, then the same agent checks them, with evidence.
         assert_eq!(submit(&root, &mut c, Role::Reviewer, FINDINGS).code, 0);
         step(&mut c, &root, &mut env);
@@ -2523,6 +2553,17 @@ mod tests {
         step(&mut c, &root, &mut env);
         set_state(&mut env, "triage-12-review", "done");
         step(&mut c, &root, &mut env);
+        // Stopped only a moment (a message waits for its next turn) isn't stopped.
+        assert!(env.sent.is_empty(), "{:?}", env.sent);
+        set_state(&mut env, "triage-12-review", "working");
+        step(&mut c, &root, &mut env);
+        set_state(&mut env, "triage-12-review", "done");
+        step(&mut c, &root, &mut env);
+        env.now += SETTLE_SECS - 1;
+        step(&mut c, &root, &mut env);
+        assert!(env.sent.is_empty(), "the moment starts again after it worked: {:?}", env.sent);
+        env.now += 1;
+        step(&mut c, &root, &mut env);
         assert!(env.sent.last().unwrap().1.contains("waiting for your report"));
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, None, "the reminder is work too: it's given time to take it up");
@@ -2539,6 +2580,10 @@ mod tests {
         step(&mut c, &root, &mut env);
         step(&mut c, &root, &mut env);
         set_state(&mut env, "triage-12-fix", "done");
+        step(&mut c, &root, &mut env);
+        env.now += SETTLE_SECS;
+        step(&mut c, &root, &mut env);
+        assert!(env.sent.last().unwrap().1.contains("waiting for your report as the fixer"));
         step(&mut c, &root, &mut env);
         env.now += TAKE_UP_SECS;
         step(&mut c, &root, &mut env);
