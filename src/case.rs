@@ -314,6 +314,13 @@ pub struct Case {
     /// The agent was reminded once to hand in its report.
     #[serde(default)]
     pub nudged: bool,
+    /// When the agent was last given work, and whether it has been seen
+    /// working since: an agent's pane reads idle for a moment before it
+    /// takes up a prompt, which isn't stopping.
+    #[serde(default)]
+    pub given: u64,
+    #[serde(default)]
+    pub worked: bool,
     #[serde(default)]
     pub ask: Option<Ask>,
     /// Why it asks, in a line.
@@ -359,6 +366,8 @@ impl Case {
             closing: Vec::new(),
             spent_closed: 0.0,
             nudged: false,
+            given: 0,
+            worked: false,
             ask: None,
             why: String::new(),
             log: Vec::new(),
@@ -1128,6 +1137,7 @@ fn ensure_agent(c: &mut Case, role: Role, seen: &[Seen], env: &mut dyn Env) -> b
             note(c, env, format!("started the {} ({}, {name}) in {}", role.name(), c.role_agent(role).agent, crate::app::tilde(&path)));
             c.agent = Some(name);
             c.nudged = false;
+            gave_work(c, env);
             true
         }
         Err(e) => {
@@ -1203,6 +1213,7 @@ fn next_round(c: &mut Case, env: &mut dyn Env, what: String, open: Vec<String>) 
         submit_line(c, Role::Fixer)
     );
     c.agent = Some(fixer.clone());
+    gave_work(c, env);
     if let Err(e) = env.send(&fixer, &text) {
         ask(c, env, Ask::NoReport, format!("couldn't tell the fixer about round {}: {e}", c.round));
     }
@@ -1371,6 +1382,7 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 let list = missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
                 let _ = std::fs::remove_file(report_file(root, c, role));
                 note(c, env, format!("the builder's commits aren't on origin/{}: {list}", r.branch));
+                gave_work(c, env);
                 let _ = env.send(&name, &format!("Your report for case {} names commits that aren't on origin/{} yet: {list}. Push them with git push origin HEAD:{} (never force), then hand in the report again.", c.id, r.branch, r.branch));
                 return;
             }
@@ -1405,6 +1417,7 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
             c.verifying = true;
             c.nudged = false;
             // Stored first: the server checks its answer against this.
+            gave_work(c, env);
             let _ = store(root, c);
             if let Err(e) = env.send(&name, &verify_text(c)) {
                 ask(c, env, Ask::NoReport, format!("couldn't ask the reviewer to check its findings: {e}"));
@@ -1457,6 +1470,7 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 let _ = std::fs::remove_file(report_file(root, c, role));
                 let head = c.pr().head.clone();
                 note(c, env, format!("the fixer's commits aren't on origin/{head}: {list}"));
+                gave_work(c, env);
                 let _ = env.send(&name, &format!("Your report for case {} names commits that aren't on origin/{head} yet: {list}. Push them with git push origin HEAD:{head} (never force), then hand in the report again.", c.id));
                 return;
             }
@@ -1560,8 +1574,19 @@ fn plural(n: usize, what: &str) -> String {
 fn nudge(c: &mut Case, env: &mut dyn Env, name: &str) -> Result<(), String> {
     let role = c.stage.role().unwrap_or(Role::Reviewer);
     c.nudged = true;
+    gave_work(c, env);
     env.send(name, &format!("trix case {} is waiting for your report as the {}. {SUBMIT_NOTE}\n{}", c.id, role.name(), submit_line(c, role)))
 }
+
+/// The agent has work: it's stopped only once it's been seen at it.
+fn gave_work(c: &mut Case, env: &mut dyn Env) {
+    c.given = env.now();
+    c.worked = false;
+}
+
+/// How long an agent given work may sit idle before it counts as stopped,
+/// if it's never seen working: one that never takes up its prompt.
+const TAKE_UP_SECS: u64 = 120;
 
 /// No report yet: an agent that stopped gets one reminder, then you're asked.
 fn watch(c: &mut Case, env: &mut dyn Env, seen: &[Seen], name: &str, role: Role) {
@@ -1570,6 +1595,12 @@ fn watch(c: &mut Case, env: &mut dyn Env, seen: &[Seen], name: &str, role: Role)
         c.agent = None;
         return;
     };
+    if a.state == "working" {
+        c.worked = true;
+    }
+    if matches!(a.state.as_str(), "done" | "idle") && !c.worked && env.now().saturating_sub(c.given) < TAKE_UP_SECS {
+        return;
+    }
     match a.state.as_str() {
         "exited" => ask(c, env, Ask::NoReport, format!("the {} ({name}) exited without its report", role.name())),
         "done" | "idle" if !c.nudged => {
@@ -2440,10 +2471,19 @@ mod tests {
         env.keys.push('b');
         step(&mut c, &root, &mut env);
         assert_eq!((c.ask, c.budget), (None, 20.0));
-        // And a stopped agent gets one reminder, then you're asked.
+        // Idle before it took up its prompt isn't stopping.
+        set_state(&mut env, "triage-12-review", "idle");
+        step(&mut c, &root, &mut env);
+        assert!(env.sent.is_empty() && c.ask.is_none(), "{:?}", env.sent);
+        // Once it's worked, a stop gets one reminder; stopped again, you're asked.
+        set_state(&mut env, "triage-12-review", "working");
+        step(&mut c, &root, &mut env);
         set_state(&mut env, "triage-12-review", "done");
         step(&mut c, &root, &mut env);
         assert!(env.sent.last().unwrap().1.contains("waiting for your report"));
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, None, "the reminder is work too: it's given time to take it up");
+        env.now += TAKE_UP_SECS;
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::NoReport));
         // The report comes after all: on it goes, unasked.
@@ -2454,8 +2494,10 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!((c.ask, c.stage), (None, Stage::Fixing));
         step(&mut c, &root, &mut env);
+        step(&mut c, &root, &mut env);
         set_state(&mut env, "triage-12-fix", "done");
         step(&mut c, &root, &mut env);
+        env.now += TAKE_UP_SECS;
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::NoReport));
         env.keys.push('a');
