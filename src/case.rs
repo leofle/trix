@@ -17,9 +17,14 @@
 //! the case before it's taken, so a report that doesn't fit goes back to the
 //! agent that wrote it, at once.
 //!
-//! Each case is a folder in `<state>/cases/<id>/`: `case.json`, the reports
-//! (`reviewer-1.json`, `fixer-1.json`, `gatekeeper-1.json`, …) and an
-//! `answer` waiting for the pane.
+//! Each case is a folder in `<state>/cases/<id>/`: `case.json` and the
+//! reports (`reviewer-1.json`, `fixer-1.json`, `gatekeeper-1.json`, …).
+//!
+//! Who's asking is the kernel's word, not the environment's: the server
+//! walks the asking process's parents to the pane it runs in. A report is
+//! taken only from its role's agent, and an agent's pane can't approve or
+//! abort; `trix case approve` has the server type the key into the case's
+//! pane, the one place the runner takes answers from.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -164,9 +169,14 @@ pub struct Case {
     pub fix: Option<FixReport>,
     #[serde(default)]
     pub verdict: Option<Verdict>,
-    /// The commit the Gatekeeper checked: what's merged.
+    /// The commit that was checked (by the Gatekeeper, or the Reviewer when
+    /// it found nothing): the only one that's merged.
     #[serde(default)]
     pub checked: Option<String>,
+    /// The PR had CI checks when the case began: then a commit with none
+    /// yet is waiting for them, not a repo without CI.
+    #[serde(default = "yes")]
+    pub ci_expected: bool,
     /// The agent working on this stage, once it's started.
     #[serde(default)]
     pub agent: Option<String>,
@@ -209,6 +219,7 @@ impl Case {
             fix: None,
             verdict: None,
             checked: None,
+            ci_expected: true,
             agent: None,
             closing: Vec::new(),
             spent_closed: 0.0,
@@ -251,6 +262,10 @@ impl Case {
 
 fn ten() -> f64 {
     10.0
+}
+
+fn yes() -> bool {
+    true
 }
 
 // ───────────────────────────── reports ─────────────────────────────
@@ -402,6 +417,9 @@ pub fn check_report(c: &Case, role: Role, text: &str) -> Result<String, String> 
         Role::Fixer => {
             let r: FixReport = serde_json::from_str(text).map_err(bad)?;
             covers("findings", &c.open, &r.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>())?;
+            if let Some(bad) = r.commits.iter().find(|sha| !(7..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit())) {
+                return Err(format!("commits: '{bad}' isn't a commit id (7 to 40 hex digits)"));
+            }
             if r.findings.iter().any(|f| f.outcome == Outcome::Fixed) && r.commits.is_empty() {
                 return Err("commits: a finding is fixed, but no commit is named: push the fix and list its commits".into());
             }
@@ -497,34 +515,28 @@ pub enum Op {
     Abort,
 }
 
-/// `trix case submit / approve / abort`, in the server: it writes what the
-/// pane reads. An agent can hand in a report, but only you approve or
-/// abort (`from`: the pane asking, if one is).
-pub fn handle(root: &Path, from: Option<u32>, id: &str, op: Op) -> crate::control::Reply {
-    use crate::control::Reply;
-    let fail = |e: String| Reply { code: 1, out: String::new(), err: e };
-    let c = match load(root, id) {
-        Ok(c) => c,
-        Err(e) => return fail(e),
-    };
+/// `trix case submit / approve / abort`, in the server. `agent`: the agent
+/// whose pane the request comes from, as the kernel says (a shell pane, or
+/// a terminal outside trix, is you). A report is taken only from its role's
+/// agent, and no agent approves or aborts. `Ok` holds what to reply, and
+/// for approve and abort the key to type into the case's pane.
+pub fn handle(root: &Path, agent: Option<&str>, id: &str, op: Op) -> Result<(String, Option<char>), String> {
+    let c = load(root, id)?;
     match op {
-        Op::Submit { role, report } => match check_report(&c, role, &report) {
-            Ok(kept) => match write_atomic(&report_path(root, id, role, c.round), kept.as_bytes()) {
-                Ok(()) => Reply::ok(format!("{} report taken for case {id}\n", role.name())),
-                Err(e) => fail(e),
-            },
-            Err(e) => fail(format!("{e}\nFix the report and submit it again.")),
-        },
-        Op::Approve | Op::Abort if from.is_some() => fail("an agent can't approve or abort a case: the user does, in the case's pane or with trix case approve from a terminal".into()),
-        Op::Approve if c.ask != Some(Ask::Merge) => fail(format!("case {id} isn't waiting to be merged: it's {}", c.status())),
-        Op::Approve | Op::Abort if c.stage.over() => fail(format!("case {id} is already {}", c.stage.label())),
-        Op::Approve | Op::Abort => {
-            let key = if op == Op::Approve { "y" } else { "a" };
-            match write_atomic(&dir_of(root, id).join("answer"), key.as_bytes()) {
-                Ok(()) => Reply::ok(format!("case {id}: {}\n", if key == "y" { "merging" } else { "aborting" })),
-                Err(e) => fail(e),
+        Op::Submit { role, report } => {
+            let want = c.agent_name(role);
+            if let Some(who) = agent.filter(|w| *w != want) {
+                return Err(format!("only {want} hands in the {}'s report for case {id}, not {who}", role.name()));
             }
+            let kept = check_report(&c, role, &report).map_err(|e| format!("{e}\nFix the report and submit it again."))?;
+            write_atomic(&report_path(root, id, role, c.round), kept.as_bytes())?;
+            Ok((format!("{} report taken for case {id}\n", role.name()), None))
         }
+        Op::Approve | Op::Abort if agent.is_some() => Err("an agent can't approve or abort a case: the user does, in the case's pane, or with trix case approve from a terminal".into()),
+        Op::Approve | Op::Abort if c.stage.over() => Err(format!("case {id} is already {}", c.stage.label())),
+        Op::Approve if c.ask != Some(Ask::Merge) => Err(format!("case {id} isn't waiting to be merged: it's {}", c.status())),
+        Op::Approve => Ok((format!("case {id}: merging\n"), Some('y'))),
+        Op::Abort => Ok((format!("case {id}: aborting\n"), Some('a'))),
     }
 }
 
@@ -549,7 +561,8 @@ pub trait Env {
     /// Close an agent; `Err` while it's still working.
     fn close(&mut self, name: &str, clean: bool) -> Result<(), String>;
     fn agents(&mut self) -> Result<Vec<Seen>, String>;
-    /// A key you pressed in the pane, or `trix case approve / abort`'s.
+    /// A key typed into the pane: yours, or `trix case approve / abort`'s,
+    /// which the server types there.
     fn answer(&mut self) -> Option<char>;
     /// The pane's state and activity: `Working`, `Question` or `Finished`.
     fn say(&mut self, event: &str, detail: &str);
@@ -697,25 +710,32 @@ fn cost_of(c: &Case, seen: &[Seen]) -> f64 {
     c.spent_closed + seen.iter().filter(|a| a.name.starts_with(&prefix)).map(|a| a.cost).sum::<f64>()
 }
 
-/// What `gh pr checks` says of CI, and which checks failed.
+/// Runs `gh` with these arguments in this folder.
+type Gh<'a> = dyn FnMut(&Path, &[&str]) -> Result<String, String> + 'a;
+
+/// The check runs on `sha`, as GitHub has them.
+pub fn check_runs(repo: &Path, sha: &str, gh: &mut Gh) -> Result<Vec<serde_json::Value>, String> {
+    let out = gh(repo, &["api", &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100")])?;
+    let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+    Ok(v["check_runs"].as_array().cloned().unwrap_or_default())
+}
+
+/// CI on the commit that was checked (not whatever the PR's head is now),
+/// and which checks failed. Right after a push GitHub may have no checks
+/// for it yet: for a PR that had them, that's waiting, not "no CI".
 fn ci(c: &Case, env: &mut dyn Env) -> (Ci, Vec<String>) {
-    match env.gh(&c.repo, &["pr", "checks", &c.pr.number.to_string(), "--json", "name,bucket"]) {
-        Ok(out) => {
-            let list: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap_or_default();
-            let bucket = |b: &str| list.iter().filter(|v| v["bucket"] == b).map(|v| v["name"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>();
-            let failed: Vec<String> = bucket("fail").into_iter().chain(bucket("cancel")).collect();
-            if !failed.is_empty() {
-                (Ci::Red, failed)
-            } else if !bucket("pending").is_empty() {
-                (Ci::Pending, Vec::new())
-            } else if list.is_empty() {
-                (Ci::None, Vec::new())
-            } else {
-                (Ci::Green, Vec::new())
-            }
-        }
-        Err(e) if e.contains("no checks reported") => (Ci::None, Vec::new()),
-        Err(_) => (Ci::Pending, Vec::new()),
+    let sha = c.checked.clone().unwrap_or_else(|| c.pr.sha.clone());
+    let Ok(runs) = check_runs(&c.repo, &sha, &mut |r, a| env.gh(r, a)) else { return (Ci::Pending, Vec::new()) };
+    let name = |v: &serde_json::Value| v["name"].as_str().unwrap_or("?").to_string();
+    let failed: Vec<String> = runs.iter().filter(|v| matches!(v["conclusion"].as_str(), Some("failure" | "cancelled" | "timed_out" | "action_required" | "startup_failure"))).map(name).collect();
+    if !failed.is_empty() {
+        (Ci::Red, failed)
+    } else if runs.iter().any(|v| v["status"] != "completed") {
+        (Ci::Pending, Vec::new())
+    } else if runs.is_empty() {
+        (if c.ci_expected { Ci::Pending } else { Ci::None }, Vec::new())
+    } else {
+        (Ci::Green, Vec::new())
     }
 }
 
@@ -795,6 +815,8 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
         match a {
             Ask::NothingFound => {
                 note(c, env, "nothing to fix: to the merge gate, as you said");
+                // What the reviewer read: nothing pushed since is merged.
+                c.checked = Some(c.pr.sha.clone());
                 c.stage = Stage::Gate;
             }
             Ask::RoundLimit | Ask::CiFailed => {
@@ -851,7 +873,8 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
         Stage::Gate => gate(c, env),
         Stage::Merged | Stage::Aborted => {}
     }
-    if c.ask.is_none() && !c.stage.over() {
+    // At the gate, it says what it waits for itself.
+    if c.ask.is_none() && !c.stage.over() && c.stage != Stage::Gate {
         env.say("Working", &format!("{} · {}", c.id, c.status()));
     }
     *c != before
@@ -969,7 +992,7 @@ fn watch(c: &mut Case, env: &mut dyn Env, seen: &[Seen], name: &str, role: Role)
 fn gate(c: &mut Case, env: &mut dyn Env) {
     let (state, failed) = ci(c, env);
     match state {
-        Ci::Pending => env.say("Working", &format!("{} · waiting for CI", c.id)),
+        Ci::Pending => env.say("Working", &format!("{} · waiting for CI on {}", c.id, c.checked.as_deref().map_or("the PR", |s| &s[..s.len().min(7)]))),
         Ci::Red => {
             // A finding like any other, so it's fixed and checked the same way.
             let id = format!("CI{}", c.round);
@@ -998,13 +1021,14 @@ fn merge(c: &mut Case, env: &mut dyn Env) {
         ask(c, env, Ask::MergeFailed, if failed.is_empty() { "CI is running again: not merged yet".into() } else { format!("CI failed since: {}", failed.join(", ")) });
         return;
     }
+    // Only the commit that was checked: GitHub refuses the merge if the
+    // branch moved since. Never a merge without it.
+    let Some(sha) = c.checked.clone() else {
+        ask(c, env, Ask::MergeFailed, "no checked commit to pin the merge to: not merged");
+        return;
+    };
     let n = c.pr.number.to_string();
-    let mut args = vec!["pr", "merge", n.as_str(), "--squash"];
-    // Only what the Gatekeeper checked: a push since is refused by GitHub.
-    if let Some(sha) = c.checked.as_deref() {
-        args.extend(["--match-head-commit", sha]);
-    }
-    match env.gh(&c.repo, &args) {
+    match env.gh(&c.repo, &["pr", "merge", &n, "--squash", "--match-head-commit", &sha]) {
         Ok(_) => {
             c.stage = Stage::Merged;
             note(c, env, format!("merged PR #{} (squash)", c.pr.number));
@@ -1071,7 +1095,6 @@ fn abort(c: &mut Case, env: &mut dyn Env, _seen: &[Seen]) {
 /// The runner in its pane: git, gh and the workspace for real.
 struct Live {
     keys: std::sync::mpsc::Receiver<char>,
-    answer: PathBuf,
     /// What the pane last said: said again only when it changes.
     said: (String, String),
 }
@@ -1133,10 +1156,6 @@ impl Env for Live {
             .collect())
     }
     fn answer(&mut self) -> Option<char> {
-        if let Ok(s) = std::fs::read_to_string(&self.answer) {
-            let _ = std::fs::remove_file(&self.answer);
-            return s.trim().chars().next();
-        }
         self.keys.try_recv().ok()
     }
     fn say(&mut self, event: &str, detail: &str) {
@@ -1171,7 +1190,7 @@ pub fn run_pane(id: &str) -> i32 {
             line.clear();
         }
     });
-    let mut env = Live { keys: rx, answer: dir_of(&root, id).join("answer"), said: Default::default() };
+    let mut env = Live { keys: rx, said: Default::default() };
     println!("trix triage · {} · PR #{} {}\n{}\nReviewer {}, fixer {}, gatekeeper {} · budget {} · up to {}\n", c.id, c.pr.number, c.pr.title, c.pr.url, c.reviewer.agent, c.fixer.agent, c.gatekeeper.agent, crate::cost::usd(c.budget), plural(c.max_rounds as usize, "round"));
     for (at, text) in &c.log {
         let (_, _, secs) = crate::ledger::local(*at);
@@ -1260,7 +1279,8 @@ fn start(pr: &str) -> Result<String, String> {
     let config = crate::config::load().unwrap_or_default();
     let root = root();
     let id = new_id(&root, pr.number)?;
-    let c = Case::new(&id, pr, repo.clone(), &config.triage, crate::prices::now());
+    let mut c = Case::new(&id, pr, repo.clone(), &config.triage, crate::prices::now());
+    c.ci_expected = check_runs(&repo, &c.pr.sha, &mut |r, a| run_cmd("gh", r, a)).map_or(true, |runs| !runs.is_empty());
     store(&root, &c)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let command = shell_words::join([exe.display().to_string(), "case".into(), "run".into(), id.clone()]);
@@ -1383,7 +1403,7 @@ mod tests {
         }
         fn gh(&mut self, _repo: &Path, args: &[&str]) -> Result<String, String> {
             match args {
-                ["pr", "checks", ..] => Ok(self.ci.clone()),
+                ["api", path] if path.contains("/check-runs") => Ok(self.ci.clone()),
                 ["pr", "merge", ..] => {
                     self.merged.push(args.iter().map(|s| s.to_string()).collect());
                     Ok(String::new())
@@ -1428,9 +1448,23 @@ mod tests {
         (root, c)
     }
 
+    /// Handed in by the role's own agent, as the server would see it.
     fn submit(root: &Path, c: &mut Case, role: Role, json: &str) -> crate::control::Reply {
+        let name = c.agent_name(role);
+        submit_as(root, c, Some(&name), role, json)
+    }
+
+    fn submit_as(root: &Path, c: &mut Case, agent: Option<&str>, role: Role, json: &str) -> crate::control::Reply {
         store(root, c).unwrap();
-        handle(root, Some(7), &c.id, Op::Submit { role, report: json.into() })
+        match handle(root, agent, &c.id, Op::Submit { role, report: json.into() }) {
+            Ok((out, _)) => crate::control::Reply::ok(out),
+            Err(e) => crate::control::Reply { code: 1, out: String::new(), err: e },
+        }
+    }
+
+    fn runs(list: &[(&str, &str, Option<&str>)]) -> String {
+        let runs: Vec<serde_json::Value> = list.iter().map(|(n, status, conclusion)| serde_json::json!({"name": n, "status": status, "conclusion": conclusion})).collect();
+        serde_json::json!({"total_count": runs.len(), "check_runs": runs}).to_string()
     }
 
     fn set_state(env: &mut Fake, name: &str, state: &str) {
@@ -1442,7 +1476,7 @@ mod tests {
     #[test]
     fn a_case_goes_from_findings_through_two_rounds_to_a_merge() {
         let (root, mut c) = fixture("flow");
-        let mut env = Fake { now: 1_795_000_000, ci: r#"[{"name": "test", "bucket": "pending"}]"#.into(), ..Fake::default() };
+        let mut env = Fake { now: 1_795_000_000, ci: runs(&[("test", "in_progress", None)]), ..Fake::default() };
         // The reviewer starts, told how to hand in its report.
         step(&mut c, &root, &mut env);
         assert_eq!(c.agent.as_deref(), Some("triage-12-review"));
@@ -1460,12 +1494,12 @@ mod tests {
         assert_eq!(env.closed, vec![("triage-12-review".to_string(), false)]);
         assert!((c.spent_closed - 1.0).abs() < 1e-9);
         // A report naming a commit that isn't pushed goes back to the fixer.
-        let fix = r#"{"commits": ["c1"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed", "test": "window_resets"}]}"#;
+        let fix = r#"{"commits": ["c1c1c1c"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed", "test": "window_resets"}]}"#;
         assert_eq!(submit(&root, &mut c, Role::Fixer, fix).code, 0);
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Fixing);
         assert!(env.sent.last().unwrap().1.contains("aren't on origin/rate-limits"), "{:?}", env.sent);
-        env.pushed.push("c1".into());
+        env.pushed.push("c1c1c1c".into());
         submit(&root, &mut c, Role::Fixer, fix);
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Verifying);
@@ -1480,8 +1514,8 @@ mod tests {
         assert_eq!((c.stage, c.round), (Stage::Fixing, 2));
         let (to, text) = env.sent.last().unwrap();
         assert!(to == "triage-12-fix" && text.contains("per process, not per client"), "{text}");
-        let fix2 = r#"{"commits": ["c2"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
-        env.pushed.push("c2".into());
+        let fix2 = r#"{"commits": ["c2c2c2c"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
+        env.pushed.push("c2c2c2c".into());
         submit(&root, &mut c, Role::Fixer, fix2);
         step(&mut c, &root, &mut env);
         step(&mut c, &root, &mut env);
@@ -1493,14 +1527,14 @@ mod tests {
         // CI still running: no question yet. Green: it asks you.
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, None);
-        env.ci = r#"[{"name": "test", "bucket": "pass"}]"#.into();
+        env.ci = runs(&[("test", "completed", Some("success"))]);
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::Merge));
         assert_eq!(env.said.last().unwrap().0, "Question");
-        // An agent can't approve, you can.
+        // An agent can't approve, you can: the server types y into the pane.
         store(&root, &c).unwrap();
-        assert_eq!(handle(&root, Some(7), &c.id, Op::Approve).code, 1);
-        assert_eq!(handle(&root, None, &c.id, Op::Approve).code, 0);
+        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Approve).unwrap_err().contains("an agent can't approve"));
+        assert_eq!(handle(&root, None, &c.id, Op::Approve).unwrap().1, Some('y'));
         env.keys.push('y');
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Merged);
@@ -1522,7 +1556,7 @@ mod tests {
         assert!(submit(&root, &mut c, Role::Reviewer, twice).err.contains("used twice"));
         c.stage = Stage::Fixing;
         c.open = vec!["F1".into(), "F2".into()];
-        let short = r#"{"commits": ["c"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
+        let short = r#"{"commits": ["abcdef1"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
         assert!(submit(&root, &mut c, Role::Fixer, short).err.contains("no answer for F2"));
         let unexplained = r#"{"commits": [], "tests": "ok", "findings": [{"id": "F1", "outcome": "not_a_bug"}, {"id": "F2", "outcome": "wont_fix", "note": "out of scope"}]}"#;
         assert!(submit(&root, &mut c, Role::Fixer, unexplained).err.contains("say why in `note`"));
@@ -1537,7 +1571,8 @@ mod tests {
     #[test]
     fn the_case_asks_you_when_nothing_is_found_and_when_the_budget_is_spent() {
         let (root, mut c) = fixture("asks");
-        let mut env = Fake { now: 1_795_000_000, ci: "[]".into(), ..Fake::default() };
+        let mut env = Fake { now: 1_795_000_000, ci: runs(&[]), ..Fake::default() };
+        c.ci_expected = false;
         step(&mut c, &root, &mut env);
         submit(&root, &mut c, Role::Reviewer, r#"{"findings": []}"#);
         step(&mut c, &root, &mut env);
@@ -1550,6 +1585,10 @@ mod tests {
         assert_eq!((c.ask, c.stage), (None, Stage::Gate));
         step(&mut c, &root, &mut env);
         assert!(c.ask == Some(Ask::Merge) && c.why.contains("no CI checks"), "{}", c.why);
+        // Merged pinned to what the reviewer read, not the branch as it is now.
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.merged.last().unwrap()[4..], ["--match-head-commit".to_string(), "prsha".to_string()]);
         // The budget: $10 by default.
         let (root, mut c) = fixture("budget");
         let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
@@ -1584,7 +1623,7 @@ mod tests {
     #[test]
     fn red_ci_at_the_gate_is_a_finding_for_the_fixer() {
         let (root, mut c) = fixture("ci");
-        let mut env = Fake { now: 1_795_000_000, ci: r#"[{"name": "clippy", "bucket": "fail"}]"#.into(), ..Fake::default() };
+        let mut env = Fake { now: 1_795_000_000, ci: runs(&[("clippy", "completed", Some("failure")), ("test", "completed", Some("success"))]), ..Fake::default() };
         c.stage = Stage::Gate;
         c.findings = serde_json::from_str::<Findings>(FINDINGS).unwrap().findings;
         env.seen.push(Seen { name: "triage-12-fix".into(), state: "done".into(), cost: 0.0 });
@@ -1596,6 +1635,50 @@ mod tests {
         c.stage = Stage::Gate;
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::CiFailed));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn only_the_roles_own_agent_hands_in_its_report() {
+        let (root, mut c) = fixture("who");
+        c.stage = Stage::Verifying;
+        c.open = vec!["F1".into()];
+        let pass = r#"{"verdict": "pass", "findings": [{"id": "F1", "ok": true}], "ci": "green"}"#;
+        // The fixer, still open, can't pass its own work.
+        let r = submit_as(&root, &mut c, Some("triage-12-fix"), Role::Gatekeeper, pass);
+        assert!(r.err.contains("only triage-12-gate-1 hands in the gatekeeper's report"), "{}", r.err);
+        assert!(!report_path(&root, &c.id, Role::Gatekeeper, 1).exists());
+        assert_eq!(submit_as(&root, &mut c, Some("triage-12-gate-1"), Role::Gatekeeper, pass).code, 0);
+        // You, from a terminal, may hand one in for it.
+        assert_eq!(submit_as(&root, &mut c, None, Role::Gatekeeper, pass).code, 0);
+        // A commit that isn't a commit id never reaches git.
+        c.stage = Stage::Fixing;
+        let opt = r#"{"commits": ["--output=/tmp/x"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
+        assert!(submit(&root, &mut c, Role::Fixer, opt).err.contains("isn't a commit id"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn checks_not_registered_yet_are_waited_for() {
+        let (root, mut c) = fixture("pending");
+        let mut env = Fake { now: 1_795_000_000, ci: runs(&[]), ..Fake::default() };
+        c.stage = Stage::Gate;
+        c.checked = Some("fixsha".into());
+        // The PR had CI: none yet on the pushed commit is waiting.
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, None);
+        assert!(env.said.last().unwrap().1.contains("waiting for CI on fixsha"), "{:?}", env.said);
+        env.ci = runs(&[("test", "queued", None)]);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, None);
+        env.ci = runs(&[("test", "completed", Some("success")), ("lint", "completed", Some("skipped"))]);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::Merge));
+        // Never merged without a checked commit to pin it to.
+        c.checked = None;
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert!(env.merged.is_empty() && c.ask == Some(Ask::MergeFailed), "{:?}", env.merged);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

@@ -317,10 +317,45 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Args { target, set, clear } => extra_args(app, from, &target, set, clear),
         Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
         Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
-        Request::Case { id, op } => crate::case::handle(&crate::case::root(), from, &id, op),
+        Request::Case { id, op } => {
+            // The kernel's word for who's asking, or the pane's own if it
+            // names one: either way an agent is never taken for you.
+            let agent = asking_agent(app, crate::platform::peer_pid(&stream)).or_else(|| caller_name(app, from).filter(|n| app.agents.iter().any(|a| a.name == *n && a.kind != Kind::Shell)));
+            case_request(app, agent.as_deref(), &id, op)
+        }
         Request::Wait { .. } | Request::Events { .. } => unreachable!(),
     };
     reply(&mut stream, &r);
+}
+
+/// The agent whose pane the process `pid` runs in: its parents, up to an
+/// agent's program or holder. A shell's pane is yours: `None`, as is a
+/// process outside trix.
+fn asking_agent(app: &App, pid: Option<u32>) -> Option<String> {
+    let mut pid = pid?;
+    for _ in 0..64 {
+        if let Some(a) = app.agents.iter().find(|a| a.pid == pid || a.holder == Some(pid)) {
+            return (a.kind != Kind::Shell).then(|| a.name.clone());
+        }
+        pid = crate::platform::parent_of(pid).filter(|&p| p > 1)?;
+    }
+    None
+}
+
+/// `trix case …` in the server. An approve or abort is typed into the
+/// case's pane, where the runner takes its answers.
+fn case_request(app: &mut App, agent: Option<&str>, id: &str, op: crate::case::Op) -> Reply {
+    match crate::case::handle(&crate::case::root(), agent, id, op) {
+        Err(e) => Reply::fail(e),
+        Ok((out, None)) => Reply::ok(out),
+        Ok((out, Some(key))) => match app.agents.iter_mut().find(|a| a.name == id && a.state != State::Exited) {
+            Some(pane) => {
+                pane.submit(vec![key as u8]);
+                Reply::ok(out)
+            }
+            None => Reply::fail(format!("case {id}'s pane isn't running: it comes back when the workspace is restored")),
+        },
+    }
 }
 
 pub(crate) fn caller_name(app: &App, from: Option<u32>) -> Option<String> {
@@ -977,6 +1012,28 @@ mod tests {
     }
     fn p(s: &[&str]) -> Result<Request, String> {
         parse(&args(s), PathBuf::from("/work"))
+    }
+
+    #[test]
+    fn the_kernel_says_which_agent_is_asking() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.name = "triage-12-fix".into();
+        a.pid = std::process::id();
+        app.agents.push(a);
+        // A process this agent started, whatever its environment says.
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        assert_eq!(asking_agent(&app, Some(child.id())).as_deref(), Some("triage-12-fix"));
+        assert_eq!(asking_agent(&app, Some(1)), None, "outside every pane");
+        // A shell's pane is yours.
+        app.agents[0].kind = Kind::Shell;
+        assert_eq!(asking_agent(&app, Some(child.id())), None);
+        let _ = child.kill();
+        let _ = child.wait();
+        for a in &app.agents {
+            a.shutdown();
+        }
     }
 
     #[test]
