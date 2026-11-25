@@ -258,6 +258,7 @@ trix case ls                   # every case and where it is
 trix case show triage-123      # its findings, what was done to each, its log (--json too)
 trix case approve triage-123   # merge it, once it's at the gate (or press y in its pane)
 trix case abort triage-123     # stop it (or press a)
+trix case answer triage-123 n  # answer any other question it asks, as in its pane (a merge is only ever approve)
 ```
 
 1. **The reviewer** (Claude) gets a detached checkout of the PR's head and reports what's wrong: each finding with its file, line, severity and how it fails. It doesn't edit anything. Then it checks its own review: for each finding it re-reads the code and confirms it with evidence (a failing test or command and its output, or the lines that show it), or retracts it. Only confirmed findings reach the fixer; retracted ones stay in `trix case show`.

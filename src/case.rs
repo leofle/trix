@@ -872,6 +872,8 @@ pub enum Op {
     Submit { role: Role, report: String },
     Approve,
     Abort,
+    /// Any other answer to what the case asks: `n`, `r`, `b`, `1`, …
+    Answer { key: char },
 }
 
 /// `trix case submit / approve / abort`, in the server. `agent`: the agent
@@ -891,8 +893,18 @@ pub fn handle(root: &Path, agent: Option<&str>, id: &str, op: Op) -> Result<(Str
             write_atomic(&report_file(root, &c, role), kept.as_bytes())?;
             Ok((format!("{} report taken for case {id}\n", role.name()), None))
         }
-        Op::Approve | Op::Abort if agent.is_some() => Err("an agent can't approve or abort a case: the user does, in the case's pane, or with trix case approve from a terminal".into()),
-        Op::Approve | Op::Abort if c.stage.over() => Err(format!("case {id} is already {}", c.stage.label())),
+        Op::Approve | Op::Abort | Op::Answer { .. } if agent.is_some() => Err("an agent can't approve, abort or answer a case: the user does, in the case's pane, or with trix case approve / answer from a terminal".into()),
+        Op::Approve | Op::Abort | Op::Answer { .. } if c.stage.over() => Err(format!("case {id} is already {}", c.stage.label())),
+        Op::Answer { key: 'y' } => Err("a merge is only ever trix case approve, or y in the case's pane".into()),
+        Op::Answer { key } => {
+            let Some(a) = c.ask else { return Err(format!("case {id} isn't asking anything: it's {}", c.status())) };
+            let keys = c.keys(a);
+            if !keys.iter().any(|(k, _)| *k == key) {
+                let list: Vec<String> = keys.iter().map(|(k, w)| format!("{k}: {w}")).collect();
+                return Err(format!("case {id} asks: {}. '{key}' isn't an answer to it ({})", c.why, list.join(" · ")));
+            }
+            Ok((format!("case {id}: answered {key}\n"), Some(key)))
+        }
         Op::Approve if c.ask != Some(Ask::Merge) => Err(format!("case {id} isn't waiting to be merged: it's {}", c.status())),
         Op::Approve => Ok((format!("case {id}: merging\n"), Some('y'))),
         Op::Abort => Ok((format!("case {id}: aborting\n"), Some('a'))),
@@ -1911,6 +1923,8 @@ usage:
   trix case show <id> [--json]      one case: its findings, what was done, its log
   trix case approve <id>            merge a case waiting at the gate (or press y in its pane)
   trix case abort <id>              stop a case (or press a in its pane)
+  trix case answer <id> <key>       answer what it asks with that key, as in its pane (n, r, b,
+                                    1, …); a merge is only ever approve
   trix case submit <id> <role> [--file F]
                                     for the agents: hand in a report, JSON on stdin (or in F,
                                     which is deleted once the report is taken)
@@ -2145,6 +2159,7 @@ pub fn run(args: &[String]) -> i32 {
         ["run", id] => run_pane(id),
         ["approve", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Approve })),
         ["abort", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Abort })),
+        ["answer", id, key] if key.chars().count() == 1 => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Answer { key: key.chars().next().unwrap_or(' ').to_ascii_lowercase() } })),
         ["submit", id, role] | ["submit", id, role, "--file", _] => {
             let Some(role) = Role::parse(role) else {
                 return say(Err(format!("'{role}' isn't a role (builder, reviewer, fixer, gatekeeper)")));
@@ -2430,6 +2445,11 @@ mod tests {
         store(&root, &c).unwrap();
         assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Approve).unwrap_err().contains("an agent can't approve"));
         assert_eq!(handle(&root, None, &c.id, Op::Approve).unwrap().1, Some('y'));
+        // Any other answer, from a terminal: only one the question takes, never a merge.
+        assert_eq!(handle(&root, None, &c.id, Op::Answer { key: 'a' }).unwrap().1, Some('a'));
+        assert!(handle(&root, None, &c.id, Op::Answer { key: 'y' }).unwrap_err().contains("only ever trix case approve"));
+        assert!(handle(&root, None, &c.id, Op::Answer { key: 'n' }).unwrap_err().contains("'n' isn't an answer to it (y: merge · a: abort)"));
+        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Answer { key: 'a' }).unwrap_err().contains("an agent can't approve, abort or answer"));
         env.keys.push('y');
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Merged);
