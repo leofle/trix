@@ -525,8 +525,12 @@ fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
         queue!(out, EnterAlternateScreen)?;
     } else {
         queue!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange)?;
+        // With the shifted character too (REPORT_ALTERNATE_KEYS): without it,
+        // a terminal speaking the kitty protocol (iTerm2, Ghostty, kitty, WezTerm)
+        // sends alt+$ as alt+shift+4, which reads as alt+4, a jump to agent 4,
+        // and a pane gets alt+4 for it too.
         if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-            queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+            queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS))?;
         }
     }
     out.flush()?;
