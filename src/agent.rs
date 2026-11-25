@@ -2360,7 +2360,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             }
             args.extend(extra.map(split_args).unwrap_or_default());
             if let Some(p) = prompt {
-                push_prompt(&mut args, p);
+                push_prompt(&mut args, p, extra);
             }
             ("grok".into(), args)
         }
@@ -2390,7 +2390,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             }
             args.extend(extra.map(split_args).unwrap_or_default());
             if let Some(p) = prompt {
-                push_prompt(&mut args, p);
+                push_prompt(&mut args, p, extra);
             }
             ("cursor-agent".into(), args)
         }
@@ -2430,7 +2430,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             if let Some(id) = &spec.resume {
                 args.extend(["resume".into(), id.clone()]);
             } else if let Some(p) = prompt {
-                push_prompt(&mut args, p);
+                push_prompt(&mut args, p, extra);
             }
             ("muse".into(), args)
         }
@@ -2508,7 +2508,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             args.extend(["--append-system-prompt".into(), instructions]);
             args.extend(theirs);
             if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
-                push_prompt(&mut args, p);
+                push_prompt(&mut args, p, extra);
             }
             ("claude".into(), args)
         }
@@ -2544,7 +2544,7 @@ fn command_for(spec: &Spawn, integrations: &Integrations, exe: &std::path::Path,
             if let Some(id) = &spec.resume {
                 args.push(id.clone());
             } else if let Some(p) = spec.prompt.as_deref().filter(|p| !p.is_empty()) {
-                push_prompt(&mut args, p);
+                push_prompt(&mut args, p, extra);
             }
             ("codex".into(), args)
         }
@@ -2565,11 +2565,13 @@ fn stdin_prompt(spec: &Spawn) -> Option<&str> {
     (spec.kind == Kind::Amp && spec.resume.is_none()).then_some(prompt)
 }
 
-/// The first prompt, last on the command line. One starting with `-` (a
-/// markdown list, "--help is broken") goes after `--`, or the CLI would take
-/// it for an option.
-fn push_prompt(args: &mut Vec<String>, prompt: &str) {
-    if prompt.starts_with('-') {
+/// The first prompt, last on the command line. It goes after `--` when it
+/// starts with `-` (a markdown list, "--help is broken"), or the CLI would
+/// take it for an option, and after your own args (`extra`), whose last
+/// option may take any number of values (Claude's `--allowedTools a b`) and
+/// would take the prompt for one more.
+fn push_prompt(args: &mut Vec<String>, prompt: &str, extra: Option<&str>) {
+    if prompt.starts_with('-') || extra.is_some_and(|e| !split_args(e).is_empty()) {
         args.push("--".into());
     }
     args.push(prompt.into());
@@ -3532,7 +3534,14 @@ mod tests {
         s.prompt = Some("fix it".into());
         let (prog, args) = command_for(&s, &Integrations { claude_settings: Some("/run/s.json".into()), ..Default::default() }, Path::new("/bin/trix"), None);
         assert_eq!(prog, "claude");
-        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--append-system-prompt", &format!("{WORKSPACE_INSTRUCTIONS}\n\nbe terse"), "--model", "opus", "fix it"]);
+        assert_eq!(args, ["--settings", "/run/s.json", "--resume", "abc", "--append-system-prompt", &format!("{WORKSPACE_INSTRUCTIONS}\n\nbe terse"), "--model", "opus", "--", "fix it"]);
+
+        // An option of yours that takes any number of values never takes the prompt for one.
+        let mut s = spec(Kind::Claude);
+        s.command = Some(r#"--allowedTools "Read,Bash(git:*)""#.into());
+        s.prompt = Some("You're the builder".into());
+        let args = command_for(&s, &Integrations::default(), Path::new("/bin/trix"), None).1;
+        assert_eq!(args[args.len() - 4..], ["--allowedTools", "Read,Bash(git:*)", "--", "You're the builder"]);
 
         let mut s = spec(Kind::Claude);
         s.command = Some("   ".into());
