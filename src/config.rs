@@ -1041,6 +1041,9 @@ mod tests {
         assert_eq!(k.lookup(&key(KeyCode::Char('o'), ALT)), Some((Action::Menu, 0)));
         // `?` comes with shift; it's the character that counts.
         assert_eq!(k.lookup(&key(KeyCode::Char('?'), ALT | KeyModifiers::SHIFT)), Some((Action::Help, 0)));
+        // As a terminal reports it with the shifted character (kitty's alternate keys).
+        assert_eq!(k.lookup(&key(KeyCode::Char('$'), ALT)), Some((Action::Spend, 0)));
+        assert_eq!(k.label(Action::Spend).as_deref(), Some("alt+$"));
         assert_eq!(k.lookup(&key(KeyCode::Char('n'), KeyModifiers::NONE)), None, "plain n is typing");
         assert_eq!(k.lookup(&key(KeyCode::Char('n'), ALT | KeyModifiers::CONTROL)), None);
         assert_eq!(k.lookup(&key(KeyCode::Char('0'), ALT)), None);
