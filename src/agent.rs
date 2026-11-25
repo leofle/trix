@@ -1473,6 +1473,16 @@ impl Agent {
                 self.activity = "interrupted".into();
                 self.set_state(State::Idle, focused)
             }
+            // A tool saying in its own words what it's doing, or that it's
+            // done (a triage case's pane: `case.rs`).
+            "Working" => {
+                self.activity = msg.detail.clone().unwrap_or_default();
+                self.set_state(State::Working, focused)
+            }
+            "Finished" => {
+                self.activity = msg.detail.clone().unwrap_or_default();
+                self.set_state(State::Done, focused)
+            }
             // A tool that already ran, from agents that report tools only
             // once they're done (Cursor). Cursor's screen says whether it's
             // working: this names what it did, and one that lands after the
@@ -2611,6 +2621,18 @@ mod tests {
     }
     fn claude(event: &str, tool: Option<&str>, detail: Option<&str>) -> HookMsg {
         hook("claude", event, tool, detail)
+    }
+
+    #[test]
+    fn a_pane_can_say_what_it_does_in_its_own_words() {
+        let mut a = test_agent(Kind::Custom);
+        a.on_hook(&hook("triage", "Working", None, Some("triage-12 · fixing")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Working, "triage-12 · fixing"));
+        a.on_hook(&hook("triage", "Question", None, Some("triage-12 · ready to merge")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Blocked, "triage-12 · ready to merge"));
+        a.on_hook(&hook("triage", "Finished", None, Some("triage-12 · merged #12")), false);
+        assert_eq!((a.state, a.activity.as_str()), (State::Done, "triage-12 · merged #12"));
+        a.shutdown();
     }
     fn ago(d: Duration) -> Instant {
         Instant::now().checked_sub(d).expect("uptime")

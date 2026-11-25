@@ -195,6 +195,13 @@ pub fn cwd_of(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// The session a process is in: its leader's pid. `None` if it isn't
+/// running.
+pub fn session_of(pid: u32) -> Option<u32> {
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    (sid > 0).then_some(sid as u32)
+}
+
 /// A process's parent. `None` if it isn't running, or there's no way to
 /// ask here.
 #[cfg(target_os = "linux")]

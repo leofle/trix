@@ -509,7 +509,7 @@ pub struct App {
     save_failed: Option<(Saved, Instant)>,
     last_search: Option<Instant>,
     pub agents: Vec<Agent>,
-    specs: HashMap<u32, Spawn>,
+    pub(crate) specs: HashMap<u32, Spawn>,
     pub focus: usize,
     pub view: View,
     pub sidebar: bool,
