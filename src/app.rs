@@ -547,6 +547,10 @@ pub struct App {
     socket: PathBuf,
     integrations: crate::hooks::Integrations,
     exe: PathBuf,
+    /// The binary this server runs, symlinks resolved, and the file that was
+    /// there when it started: an upgrade replaces or removes it, and the
+    /// server keeps running the old one (`trix ls` says so).
+    binary: (PathBuf, Option<FileId>),
     /// Agents get a holder process of their own for their PTY (`holder`),
     /// so they outlive this server. The server turns it on; tests don't.
     pub holders: bool,
@@ -671,6 +675,11 @@ impl App {
             tx,
             socket,
             integrations,
+            binary: {
+                let path = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+                let id = FileId::of(&path);
+                (path, id)
+            },
             exe,
             holders: false,
             term_focused: true,
@@ -4640,8 +4649,46 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// What tells one file at a path from another put there since: its device,
+/// inode, size and modification time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FileId(u64, u64, u64, Option<std::time::SystemTime>);
+
+impl FileId {
+    pub fn of(path: &Path) -> Option<FileId> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(FileId(m.dev(), m.ino(), m.len(), m.modified().ok()))
+    }
+}
+
+impl App {
+    /// The trix binary this server runs, and whether the file at its path has
+    /// been replaced or removed since the server started.
+    pub fn binary(&self) -> (&Path, bool) {
+        let (path, started) = &self.binary;
+        (path, FileId::of(path) != *started)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_id_tells_a_replaced_or_removed_binary() {
+        let path = std::env::temp_dir().join(format!("trix-file-id-{}", std::process::id()));
+        std::fs::write(&path, b"trix 1.8.0").unwrap();
+        let started = FileId::of(&path);
+        assert!(started.is_some());
+        assert_eq!(FileId::of(&path), started, "untouched");
+        // An upgrade writes a new file and renames it over the old: a new inode.
+        let next = path.with_extension("new");
+        std::fs::write(&next, b"trix 1.9.0").unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert_ne!(FileId::of(&path), started, "replaced");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(FileId::of(&path), None, "removed");
+    }
+
     use super::*;
 
     #[test]

@@ -197,18 +197,51 @@ fn ls_sessions(explicit: bool, all: bool, name: &str, candidates: Vec<String>) -
     if explicit && !all { vec![name.to_string()] } else { candidates }
 }
 
-/// What `trix ls` says of a session whose server runs another trix than this
-/// one: a server keeps the version it started with, so after an upgrade the
-/// workspace still runs the old one until its server stops. `server` is the
-/// `version` from its listing; a server from before that field is older.
-fn version_note(session: &str, server: Option<&str>, mine: &str) -> Option<String> {
+/// The trix a session's server runs, from its listing (`trix ls --json`):
+/// `version` and `exe` are missing from a server that predates them.
+struct ServerTrix<'a> {
+    version: Option<&'a str>,
+    exe: Option<&'a str>,
+    replaced: bool,
+}
+
+impl<'a> ServerTrix<'a> {
+    fn of(list: &'a serde_json::Value) -> ServerTrix<'a> {
+        ServerTrix { version: list["version"].as_str(), exe: list["exe"].as_str(), replaced: list["exe_replaced"].as_bool().unwrap_or(false) }
+    }
+}
+
+/// Dotted versions compared number by number (`1.10.0` after `1.9.0`); what
+/// follows a part's digits, like `-rc1`, is ignored.
+fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let parts = |v: &str| -> Vec<u64> { v.split('.').map(|p| p.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0)).collect() };
+    let (mut a, mut b) = (parts(a), parts(b));
+    let len = a.len().max(b.len());
+    a.resize(len, 0);
+    b.resize(len, 0);
+    a.cmp(&b)
+}
+
+/// What `trix ls` says when a session's server doesn't run this trix (`mine`,
+/// at `my_exe`): a server keeps the binary it started with, so after an
+/// upgrade the workspace runs the old one until its server stops. Restarting
+/// is advised only when that would move it forward: a server newer than this
+/// trix means an older install comes first on PATH.
+fn version_note(session: &str, server: &ServerTrix, mine: &str, my_exe: &str) -> Option<String> {
+    use std::cmp::Ordering;
     let which = if session == session::DEFAULT { "the workspace".to_string() } else { format!("session '{session}'") };
-    let runs = match server {
-        Some(v) if v == mine => return None,
-        Some(v) => format!("trix {v}"),
-        None => "an older trix".to_string(),
+    let restart = "it keeps it until its server stops (see Upgrade in the README)";
+    let Some(v) = server.version else {
+        return Some(format!("{which} runs a trix that doesn't say its version, from before this one ({mine}, {my_exe}): {restart}"));
     };
-    Some(format!("{which} runs {runs}, this is trix {mine}: it keeps its version until its server stops (see Upgrade in the README)"))
+    let exe = server.exe.unwrap_or("?");
+    match version_order(v, mine) {
+        Ordering::Less => Some(format!("{which} runs trix {v} ({exe}), this is trix {mine} ({my_exe}): {restart}")),
+        Ordering::Greater => Some(format!("this trix ({mine}, {my_exe}) is older than {which}'s ({v}, {exe}): an older install comes first on your PATH")),
+        Ordering::Equal if exe != my_exe => Some(format!("{which} runs trix {v} from {exe}, this is trix {mine} from {my_exe}: two installs, which may not be the same build")),
+        Ordering::Equal if server.replaced => Some(format!("{which} runs trix {v} from {exe}, and that file was replaced or removed since its server started: {restart}")),
+        Ordering::Equal => None,
+    }
 }
 
 /// The agents in `lists` (each session's `trix ls --json`) still at work:
@@ -424,6 +457,22 @@ fn main() -> anyhow::Result<()> {
             // Sessions with no server, but with agents one that died left
             // running: said, or nobody would know they are.
             let mut left = Vec::new();
+            // The plain listing doesn't carry the server's trix; its JSON does. Asked
+            // alongside, not after, so a session that hangs costs its timeout once.
+            let listings: Vec<_> = names
+                .iter()
+                .map(|n| {
+                    let n = n.clone();
+                    std::thread::spawn(move || {
+                        let ask = ClientMsg::Control { protocol: control::CONTROL, from: None, req: control::Request::List { json: true } };
+                        session::ask(&n, &ask)
+                            .ok()
+                            .flatten()
+                            .and_then(|text| serde_json::from_str::<control::Reply>(&text).ok())
+                            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.out).ok())
+                    })
+                })
+                .collect();
             for n in &names {
                 match session::query(n, &ClientMsg::List) {
                     Some(text) => {
@@ -463,17 +512,12 @@ fn main() -> anyhow::Result<()> {
             if let Some(f) = footer {
                 print!("\n{f}");
             }
-            // The plain listing doesn't carry the server's version; its JSON does.
-            let ask = ClientMsg::Control { protocol: control::CONTROL, from: None, req: control::Request::List { json: true } };
-            for n in &running {
-                let list = session::ask(n, &ask)
-                    .ok()
-                    .flatten()
-                    .and_then(|text| serde_json::from_str::<control::Reply>(&text).ok())
-                    .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.out).ok());
+            let my_exe = std::env::current_exe().and_then(std::fs::canonicalize).map(|p| p.display().to_string()).unwrap_or_default();
+            for (n, listing) in names.iter().zip(listings) {
                 // A session that didn't answer this time says nothing either way.
-                if let Some(note) = list.and_then(|l| version_note(n, l["version"].as_str(), env!("CARGO_PKG_VERSION"))) {
-                    print!("\n{note}\n");
+                let Some(list) = listing.join().ok().flatten() else { continue };
+                if let Some(note) = version_note(n, &ServerTrix::of(&list), env!("CARGO_PKG_VERSION"), &my_exe) {
+                    eprintln!("trix: {note}");
                 }
             }
             return Ok(());
@@ -915,17 +959,39 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 
 #[cfg(test)]
 mod tests {
-    use super::{busy_lines, busy_of, busy_targets, take_session, version_note};
+    use super::{ServerTrix, busy_lines, busy_of, busy_targets, take_session, version_note, version_order};
 
     #[test]
-    fn version_note_names_a_server_on_another_trix() {
-        assert_eq!(version_note("default", Some("1.6.1"), "1.6.1"), None);
-        assert_eq!(
-            version_note("default", Some("1.2.3"), "1.6.1").as_deref(),
-            Some("the workspace runs trix 1.2.3, this is trix 1.6.1: it keeps its version until its server stops (see Upgrade in the README)")
-        );
-        let note = version_note("work", None, "1.6.1").unwrap();
-        assert!(note.starts_with("session 'work' runs an older trix, this is trix 1.6.1"), "{note}");
+    fn version_note_says_which_trix_runs_and_advises_a_restart_only_forward() {
+        let server = |version, exe, replaced| ServerTrix { version, exe, replaced };
+        let brew = "/opt/homebrew/Cellar/trix/1.9.0/bin/trix";
+        let cargo = "/home/me/.cargo/bin/trix";
+        assert_eq!(version_note("default", &server(Some("1.9.0"), Some(brew), false), "1.9.0", brew), None);
+        let older = version_note("default", &server(Some("1.8.0"), Some(cargo), false), "1.9.0", brew).unwrap();
+        assert_eq!(older, format!("the workspace runs trix 1.8.0 ({cargo}), this is trix 1.9.0 ({brew}): it keeps it until its server stops (see Upgrade in the README)"));
+        // An older trix first on PATH: restarting would downgrade, so no restart advice.
+        let newer = version_note("work", &server(Some("1.9.0"), Some(brew), false), "1.8.0", cargo).unwrap();
+        assert_eq!(newer, format!("this trix (1.8.0, {cargo}) is older than session 'work''s (1.9.0, {brew}): an older install comes first on your PATH"));
+        assert!(!newer.contains("Upgrade"), "{newer}");
+        assert!(version_note("default", &server(Some("1.10.0"), Some(brew), false), "1.9.0", brew).unwrap().contains("is older than"), "1.10 is newer than 1.9");
+        // Same version, other binary: a stale build of the same number.
+        let two = version_note("default", &server(Some("1.9.0"), Some(cargo), false), "1.9.0", brew).unwrap();
+        assert!(two.contains(cargo) && two.contains(brew) && two.contains("may not be the same build"), "{two}");
+        // Same path, but the file was replaced under the running server.
+        let replaced = version_note("default", &server(Some("1.9.0"), Some(brew), true), "1.9.0", brew).unwrap();
+        assert!(replaced.contains("replaced or removed since its server started") && replaced.contains("Upgrade"), "{replaced}");
+        // From before the field: says what it knows, not that it's older by number.
+        let silent = version_note("default", &server(None, None, false), "1.9.0", brew).unwrap();
+        assert!(silent.starts_with("the workspace runs a trix that doesn't say its version, from before this one (1.9.0"), "{silent}");
+    }
+
+    #[test]
+    fn version_order_compares_numbers_not_strings() {
+        use std::cmp::Ordering::*;
+        assert_eq!(version_order("1.10.0", "1.9.0"), Greater);
+        assert_eq!(version_order("1.9", "1.9.0"), Equal);
+        assert_eq!(version_order("1.9.0-rc1", "1.9.0"), Equal);
+        assert_eq!(version_order("0.9.9", "1.0.0"), Less);
     }
 
     #[test]
