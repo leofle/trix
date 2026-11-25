@@ -1249,10 +1249,24 @@ fn ci(c: &Case, env: &mut dyn Env) -> (Ci, Vec<String>) {
     }
 }
 
-/// Another round: the Fixer gets what to change, and answers these.
-fn next_round(c: &mut Case, env: &mut dyn Env, what: String, open: Vec<String>) {
+/// Another round: the Fixer gets what to change, and answers these. One
+/// that answers the PR conflicting with its base, however it came (the
+/// gate, the gatekeeper's changes, your r), gets the steps for that, and
+/// the base as origin has it now.
+fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<String>) {
     c.round += 1;
     c.open = open;
+    if conflicts(c) {
+        let base = c.pr().base.clone();
+        // The fixer's worktree shares this checkout's refs: the base it merges is the new one.
+        if let Err(e) = fetch(c, env, &base) {
+            note(c, env, format!("couldn't fetch origin/{base}: {}", e.lines().next().unwrap_or_default()));
+        }
+        let steps = conflict_steps(c);
+        if !what.contains(&steps) {
+            what = format!("{what}\n\n{steps}");
+        }
+    }
     c.stage = Stage::Fixing;
     c.fix = None;
     c.nudged = false;
@@ -1795,10 +1809,6 @@ fn conflict(c: &mut Case, env: &mut dyn Env, more: bool) {
         c.max_rounds = c.max_rounds.max(c.round + 1);
     }
     if c.round < c.max_rounds {
-        // The fixer's worktree shares this checkout's refs: the base it merges is the new one.
-        if let Err(e) = fetch(c, env, &base) {
-            note(c, env, format!("couldn't fetch origin/{base}: {}", e.lines().next().unwrap_or_default()));
-        }
         let what = conflict_steps(c);
         next_round(c, env, what, vec![id]);
     } else {
@@ -1940,6 +1950,9 @@ fn close_all(c: &mut Case, env: &mut dyn Env, clean: bool) {
 
 /// The reviewer's and gatekeepers' checkouts: detached and only read, so
 /// nothing in them is lost. Removed without force: one that changed stays.
+/// trix locks its agents' worktrees, so its lock comes off first, and goes
+/// back on if git keeps the checkout; someone else's lock stays, and so
+/// does the checkout.
 fn remove_readonly(c: &mut Case, env: &mut dyn Env) {
     let mut paths = vec![worktree(c, Role::Reviewer)];
     let round = c.round;
@@ -1948,9 +1961,19 @@ fn remove_readonly(c: &mut Case, env: &mut dyn Env) {
         paths.push(worktree(c, Role::Gatekeeper));
     }
     c.round = round;
+    let listing = env.git(&c.repo, &["-c", "core.quotePath=false", "worktree", "list", "--porcelain"]).unwrap_or_default();
     for p in paths.into_iter().filter(|p| p.is_dir()) {
-        if let Err(e) = env.git(&c.repo, &["worktree", "remove", &p.display().to_string()]) {
-            note(c, env, format!("kept {}: {}", crate::app::tilde(&p), e.lines().next().unwrap_or_default()));
+        let path = p.display().to_string();
+        let ours = crate::worktree::lock_in(&listing, &p) == crate::worktree::Lock::Trix;
+        let removed = if ours { env.git(&c.repo, &["worktree", "unlock", &path]) } else { Ok(String::new()) }.and_then(|_| env.git(&c.repo, &["worktree", "remove", &path]));
+        match removed {
+            Ok(_) => crate::worktree::forget(&p),
+            Err(e) => {
+                if ours && let Err(l) = env.git(&c.repo, &["worktree", "lock", "--reason", crate::worktree::LOCK_REASON, &path]) {
+                    note(c, env, format!("couldn't lock {} again: {}", crate::app::tilde(&p), l.lines().next().unwrap_or_default()));
+                }
+                note(c, env, format!("kept {}: {}", crate::app::tilde(&p), e.lines().next().unwrap_or_default()));
+            }
         }
     }
 }
@@ -2528,6 +2551,10 @@ mod tests {
         /// `gh issue close`s, and an error for them.
         issue_closed: Vec<Vec<String>>,
         close_error: Option<String>,
+        /// Worktrees locked, and with what reason; those `remove` refuses
+        /// for having changes.
+        locks: Vec<(String, String)>,
+        changed: Vec<String>,
     }
 
     impl Env for Fake {
@@ -2543,6 +2570,17 @@ mod tests {
                     Ok(String::new())
                 }
                 ["rev-parse", ..] => Ok("headsha\n".into()),
+                ["-c", "core.quotePath=false", "worktree", "list", "--porcelain"] => Ok(self.locks.iter().map(|(p, why)| format!("worktree {p}\nHEAD 0123\ndetached\nlocked {why}\n\n")).collect()),
+                ["worktree", "unlock", p] => {
+                    self.locks.retain(|(l, _)| l != p);
+                    Ok(String::new())
+                }
+                ["worktree", "lock", "--reason", why, p] => {
+                    self.locks.push((p.to_string(), why.to_string()));
+                    Ok(String::new())
+                }
+                ["worktree", "remove", p] if self.locks.iter().any(|(l, _)| l == p) => Err(format!("fatal: cannot remove a locked working tree, lock reason: {}", self.locks.iter().find(|(l, _)| l == p).unwrap().1)),
+                ["worktree", "remove", p] if self.changed.iter().any(|c| c == p) => Err("fatal: '…' contains modified or untracked files, use --force to delete it".into()),
                 ["merge-base", "--is-ancestor", sha, _] => if self.pushed.iter().any(|p| p == sha) { Ok(String::new()) } else { Err("no".into()) },
                 _ => Ok(String::new()),
             }
@@ -2907,6 +2945,42 @@ mod tests {
     }
 
     #[test]
+    fn a_round_for_a_conflict_the_gatekeeper_still_sees_has_the_merge_steps() {
+        let (root, mut c) = fixture("conflict-again");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.findings.push(Finding { id: "CONFLICT1".into(), file: "merge".into(), line: None, severity: Severity::Important, summary: "the PR conflicts with main".into(), failure: "f".into(), evidence: None });
+        // The gatekeeper says main moved on again: changes, rounds used up.
+        c.stage = Stage::Verifying;
+        c.open = vec!["CONFLICT1".into()];
+        c.fix = Some(serde_json::from_str(r#"{"commits": [], "tests": "ok", "findings": [{"id": "CONFLICT1", "outcome": "fixed"}]}"#).unwrap());
+        c.round = c.max_rounds;
+        let changes = r#"{"verdict": "changes", "findings": [{"id": "CONFLICT1", "ok": false, "reason": "main moved on to aa74af0: merge origin/main again"}], "ci": "none"}"#;
+        env.seen.push(Seen { name: c.agent_name(Role::Gatekeeper), state: "working".into(), cost: 0.0 });
+        c.agent = Some(c.agent_name(Role::Gatekeeper));
+        assert_eq!(submit(&root, &mut c, Role::Gatekeeper, changes).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::RoundLimit));
+        // Your r: the gatekeeper's word, and how to merge, with main fetched first.
+        env.gits.clear();
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.round), (Stage::Fixing, 3));
+        let told = &env.sent.last().unwrap().1;
+        assert!(told.contains("main moved on to aa74af0") && told.contains("git merge origin/main") && told.contains("never by rebasing"), "{told}");
+        assert_eq!(env.gits.first().map(String::as_str), Some("fetch --quiet origin +refs/heads/main:refs/remotes/origin/main"), "{:?}", env.gits);
+        // Said once, from the conflict path too.
+        let (root2, mut c2) = fixture("conflict-once");
+        let mut env2 = Fake { now: 1_795_000_000, mergeable: vec!["CONFLICTING"], ..Fake::default() };
+        at_gate(&mut c2, &mut env2);
+        step(&mut c2, &root2, &mut env2);
+        assert_eq!(env2.sent.last().unwrap().1.matches("never by rebasing").count(), 1);
+        assert_eq!(env2.gits.iter().filter(|g| g.starts_with("fetch --quiet origin +refs/heads/main:")).count(), 1, "{:?}", env2.gits);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(root2.parent().unwrap());
+    }
+
+    #[test]
     fn a_conflict_with_the_rounds_used_up_asks() {
         let (root, mut c) = fixture("conflict-limit");
         let mut env = Fake { now: 1_795_000_000, mergeable: vec!["CONFLICTING"], ..Fake::default() };
@@ -3044,6 +3118,41 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!((c.stage, env.issue_closed.len()), (Stage::Merged, 0));
         assert!(c.log.iter().any(|(_, l)| l.starts_with("issue #7 stays open")));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_merge_removes_the_read_only_checkouts_trix_locked() {
+        let (root, mut c) = fixture("locked");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.round = 2;
+        let wt = |c: &mut Case, role, round| {
+            let r = std::mem::replace(&mut c.round, round);
+            let p = worktree(c, role);
+            c.round = r;
+            std::fs::create_dir_all(&p).unwrap();
+            p.display().to_string()
+        };
+        let (review, gate1, gate2) = (wt(&mut c, Role::Reviewer, 1), wt(&mut c, Role::Gatekeeper, 1), wt(&mut c, Role::Gatekeeper, 2));
+        let trixs = crate::worktree::LOCK_REASON.to_string();
+        // All three locked by trix, as its agents' are; one has changes,
+        // and one is someone else's too.
+        env.locks = vec![(review.clone(), trixs.clone()), (gate1.clone(), trixs.clone()), (gate2.clone(), "my backup".into())];
+        env.changed = vec![gate1.clone()];
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Merged);
+        let at = |what: &str| env.gits.iter().position(|g| g == what);
+        assert!(at(&format!("worktree unlock {review}")) < at(&format!("worktree remove {review}")) && at(&format!("worktree remove {review}")).is_some(), "{:?}", env.gits);
+        assert!(!env.locks.iter().any(|(p, _)| *p == review), "removed, its lock with it");
+        // Kept: the one with changes (its lock back on), and the one someone else locked.
+        assert!(env.locks.contains(&(gate1.clone(), trixs)), "{:?}", env.locks);
+        assert!(at(&format!("worktree unlock {gate2}")).is_none() && env.locks.contains(&(gate2.clone(), "my backup".into())));
+        let kept: Vec<&String> = c.log.iter().map(|(_, l)| l).filter(|l| l.starts_with("kept ")).collect();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().any(|l| l.contains("triage-12-gate-1") && l.contains("modified or untracked")) && kept.iter().any(|l| l.contains("triage-12-gate-2") && l.contains("my backup")), "{kept:?}");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
