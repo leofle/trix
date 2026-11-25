@@ -235,12 +235,16 @@ fn busy_lines(lists: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// One session's part of `trix ls --busy`, from what `session::ask` got back.
-/// No server there: nobody busy in it. A server that didn't answer in time, or
-/// a listing that can't be read, is an error, never "nobody busy": that would
-/// read as safe to `trix kill` a workspace that may be at work.
-fn busy_of(session: &str, answer: Result<Option<String>, ()>) -> Result<Vec<String>, String> {
+/// One session's part of `trix ls --busy`, from what `session::ask` got back,
+/// and how many of its agents run under holders. No server there and no
+/// holders: nobody busy in it. A server that didn't answer in time, a
+/// listing that can't be read, or agents a stopped server left running
+/// (their state is nobody's to say, and they may be mid-turn) is an error,
+/// never "nobody busy": that would read as safe to `trix kill` a workspace
+/// that may be at work.
+fn busy_of(session: &str, answer: Result<Option<String>, ()>, held: usize) -> Result<Vec<String>, String> {
     let text = match answer {
+        Ok(None) if held > 0 => return Err(unserved(Some(session), session, held)),
         Ok(None) => return Ok(Vec::new()),
         Ok(Some(text)) => text,
         Err(()) => return Err(format!("session '{session}' didn't answer")),
@@ -252,6 +256,39 @@ fn busy_of(session: &str, answer: Result<Option<String>, ()>) -> Result<Vec<Stri
     }
     let list: serde_json::Value = serde_json::from_str(&reply.out).map_err(|_| unreadable())?;
     Ok(busy_lines(&[list]))
+}
+
+/// What to say of `n` agents running with no server: of `session`, or of
+/// one known only by its hash.
+fn unserved(session: Option<&str>, hash: &str, n: usize) -> String {
+    let agents = if n == 1 { "1 agent".to_string() } else { format!("{n} agents") };
+    let them = if n == 1 { "it" } else { "them" };
+    match session {
+        Some(s) => format!("session '{s}' has {agents} running with no server: `trix -s {s}` picks {them} up"),
+        None => format!("a session trix can't name (hash {hash}) has {agents} running with no server: `trix kill --all` stops {them}"),
+    }
+}
+
+/// The sessions `trix ls --busy` looks at: those `ls` would (`listed`),
+/// each with how many live holders it has, then, when it looks at every
+/// session, those that are only holders now (their server died, and took
+/// its socket with it): named if `known` has a name for the hash, else
+/// `None`, said by the hash. (name or hash, name, holders).
+fn busy_targets(listed: Vec<String>, every: bool, holders: &[(String, u32)], known: &[String]) -> Vec<(String, Option<String>, usize)> {
+    let count = |hash: &str| holders.iter().filter(|(h, _)| h == hash).count();
+    let mut out: Vec<(String, Option<String>, usize)> = listed.into_iter().map(|n| (n.clone(), Some(n.clone()), count(&hooks::short_hash(&n)))).collect();
+    if every {
+        let mut seen: Vec<String> = out.iter().map(|(n, _, _)| hooks::short_hash(n)).collect();
+        for (hash, _) in holders {
+            if seen.contains(hash) {
+                continue;
+            }
+            seen.push(hash.clone());
+            let name = known.iter().find(|k| hooks::short_hash(k) == *hash).cloned();
+            out.push((name.clone().unwrap_or_else(|| hash.clone()), name, count(hash)));
+        }
+    }
+    out
 }
 
 fn main() -> anyhow::Result<()> {
@@ -306,7 +343,15 @@ fn main() -> anyhow::Result<()> {
             let all = args.iter().skip(1).any(|a| a == "--all" || a == "-a");
             let in_pane = std::env::var("TRIX_SESSION").ok();
             let (mut busy, mut failed) = (Vec::new(), false);
-            for n in ls_sessions(explicit, all, session::name(), session::candidates()) {
+            let every = !explicit || all;
+            let mut known = session::candidates();
+            known.extend(state::saved_workspaces().into_iter().map(|(s, _)| s));
+            for (n, named, held) in busy_targets(ls_sessions(explicit, all, session::name(), session::candidates()), every, &holder::live_holders(), &known) {
+                let Some(n) = named else {
+                    eprintln!("trix: {}", unserved(None, &n, held));
+                    failed = true;
+                    continue;
+                };
                 // Its own session marks the asking pane `you`.
                 let from = if in_pane.as_deref() == Some(n.as_str()) {
                     std::env::var("TRIX_AGENT_ID").ok().and_then(|id| id.parse().ok())
@@ -314,7 +359,7 @@ fn main() -> anyhow::Result<()> {
                     None
                 };
                 let ask = ClientMsg::Control { protocol: control::CONTROL, from, req: control::Request::List { json: true } };
-                match busy_of(&n, session::ask(&n, &ask)) {
+                match busy_of(&n, session::ask(&n, &ask), held) {
                     Ok(lines) => busy.extend(lines),
                     Err(e) => {
                         eprintln!("trix: {e}");
@@ -870,7 +915,7 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 
 #[cfg(test)]
 mod tests {
-    use super::{busy_lines, busy_of, take_session, version_note};
+    use super::{busy_lines, busy_of, busy_targets, take_session, version_note};
 
     #[test]
     fn version_note_names_a_server_on_another_trix() {
@@ -889,12 +934,40 @@ mod tests {
             {"name": "api", "state": "working", "activity": "Bash\tcargo\ntest", "you": false},
         ]});
         let reply = |code: i32, out: String, err: &str| serde_json::json!({"code": code, "out": out, "err": err}).to_string();
-        assert_eq!(busy_of("w", Ok(Some(reply(0, listing.to_string(), "")))), Ok(vec!["w\tapi\tworking\tBash cargo test".to_string()]));
-        assert_eq!(busy_of("w", Ok(None)), Ok(vec![]), "no server: nobody busy");
-        assert_eq!(busy_of("w", Err(())), Err("session 'w' didn't answer".to_string()));
-        assert!(busy_of("w", Ok(Some("not json".into()))).is_err());
-        assert!(busy_of("w", Ok(Some(reply(0, "not json".into(), "")))).is_err());
-        assert_eq!(busy_of("w", Ok(Some(reply(1, String::new(), "refused")))), Err("session 'w': refused".to_string()));
+        assert_eq!(busy_of("w", Ok(Some(reply(0, listing.to_string(), ""))), 0), Ok(vec!["w\tapi\tworking\tBash cargo test".to_string()]));
+        assert_eq!(busy_of("w", Ok(None), 0), Ok(vec![]), "no server: nobody busy");
+        assert_eq!(busy_of("w", Err(()), 0), Err("session 'w' didn't answer".to_string()));
+        assert!(busy_of("w", Ok(Some("not json".into())), 0).is_err());
+        assert!(busy_of("w", Ok(Some(reply(0, "not json".into(), ""))), 0).is_err());
+        assert_eq!(busy_of("w", Ok(Some(reply(1, String::new(), "refused"))), 0), Err("session 'w': refused".to_string()));
+    }
+
+    #[test]
+    fn agents_a_stopped_server_left_running_are_never_nobody_busy() {
+        // No server, but its holders still run its agents: maybe mid-turn.
+        assert_eq!(busy_of("w", Ok(None), 2), Err("session 'w' has 2 agents running with no server: `trix -s w` picks them up".to_string()));
+        assert_eq!(busy_of("w", Ok(None), 1), Err("session 'w' has 1 agent running with no server: `trix -s w` picks it up".to_string()));
+        // No server and nothing held: nobody busy, as before.
+        assert_eq!(busy_of("w", Ok(None), 0), Ok(vec![]));
+        // A server that answers speaks for its holders.
+        let listing = serde_json::json!({"session": "w", "agents": []}).to_string();
+        let reply = serde_json::json!({"code": 0, "out": listing, "err": ""}).to_string();
+        assert_eq!(busy_of("w", Ok(Some(reply)), 3), Ok(vec![]));
+    }
+
+    #[test]
+    fn busy_looks_at_sessions_that_are_only_holders_now() {
+        let h = |s: &str| crate::hooks::short_hash(s);
+        let holders = vec![(h("default"), 10), (h("work"), 11), (h("work"), 12), ("0123456789ab".to_string(), 13)];
+        let known = vec!["default".to_string(), "work".to_string()];
+        // Every session: default's socket, then work (named by its saved
+        // workspace) and one trix can't name, both only holders.
+        let all = busy_targets(vec!["default".into()], true, &holders, &known);
+        assert_eq!(all, vec![("default".to_string(), Some("default".to_string()), 1), ("work".to_string(), Some("work".to_string()), 2), ("0123456789ab".to_string(), None, 1)]);
+        // One session asked for: only it, with its holders.
+        assert_eq!(busy_targets(vec!["work".into()], false, &holders, &known), vec![("work".to_string(), Some("work".to_string()), 2)]);
+        assert_eq!(busy_targets(vec!["default".into()], true, &[], &known), vec![("default".to_string(), Some("default".to_string()), 0)]);
+        assert!(super::unserved(None, "0123456789ab", 1).contains("can't name (hash 0123456789ab) has 1 agent running with no server"));
     }
 
     #[test]
