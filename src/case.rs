@@ -20,6 +20,10 @@
 //!   in (never a rebase), and a fresh Gatekeeper checks it. A case from an
 //!   issue closes the issue after the merge, when both the Reviewer and the
 //!   Gatekeeper said the PR solves it and the PR doesn't close it itself.
+//!   A merge the base branch's rules refuse (it needs another reviewer's
+//!   approval) waits for one, said plainly: r tries again, w turns on
+//!   GitHub's auto-merge and m merges as an admin, each offered only where
+//!   GitHub allows it, and the case finishes once GitHub merges the PR.
 //!
 //! The case runs in a pane of its own (`trix case run <id>`), which is where
 //! it asks you things: it shows as needing you, like an agent. Agents hand
@@ -228,6 +232,11 @@ pub enum Ask {
     /// Someone outside the project wrote some of the issue, which every
     /// role's prompt holds: s lets the agents start on it.
     Outsider,
+    /// The base branch's rules refused the merge (it needs another
+    /// reviewer's approval, …): parked until someone approves. r tries the
+    /// merge again; w turns on GitHub's auto-merge and m merges as an admin,
+    /// each only when GitHub allows it (see `Blocked`).
+    Approval,
 }
 
 impl Ask {
@@ -242,8 +251,43 @@ impl Ask {
             Ask::Choose => &[('n', "none of these: a builder makes a PR"), ('a', "abort")],
             Ask::Unsolved => &[('f', "fix it in place"), ('b', "a builder starts a fresh PR"), ('a', "abort")],
             Ask::Outsider => &[('s', "go on: the agents may read it"), ('a', "abort")],
+            Ask::Approval => &[('r', "try the merge again"), ('a', "abort")],
         }
     }
+}
+
+/// The base branch's rules refused the merge: what GitHub lets you do about
+/// it, looked up then.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Blocked {
+    /// You're a repo admin and gh says `--admin` would get past the rules.
+    #[serde(default)]
+    pub admin: bool,
+    /// The repo allows auto-merge.
+    #[serde(default)]
+    pub auto: bool,
+    /// Auto-merge is on: GitHub merges the PR once it's approved.
+    #[serde(default)]
+    pub auto_on: bool,
+    /// Said already that someone approved it.
+    #[serde(default)]
+    pub approved: bool,
+    /// When the PR was last looked at, while parked.
+    #[serde(default)]
+    pub looked: u64,
+}
+
+/// How your answer merges the PR.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum How {
+    /// A plain merge: your y, or r.
+    #[default]
+    Now,
+    /// m: with `--admin`, past the base branch's rules.
+    Admin,
+    /// w: GitHub's auto-merge, once the rules are met.
+    Auto,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -318,6 +362,13 @@ pub struct Case {
     /// Merges tried again since your y, after the base moved under one.
     #[serde(default)]
     pub merge_tries: u32,
+    /// How the merge waiting on `merge_when_ready` is made.
+    #[serde(default)]
+    pub merge_how: How,
+    /// The base branch's rules refused the merge: set while the case waits
+    /// for an approval.
+    #[serde(default)]
+    pub blocked: Option<Blocked>,
     /// The reviewer's last word on the issue (the gatekeeper's is its
     /// verdict's).
     #[serde(default)]
@@ -387,6 +438,8 @@ impl Case {
             ci_expected: true,
             merge_when_ready: false,
             merge_tries: 0,
+            merge_how: How::Now,
+            blocked: None,
             review_solves: None,
             agent: None,
             closing: Vec::new(),
@@ -451,6 +504,18 @@ impl Case {
             }
         }
         v.extend(a.keys().iter().map(|(k, w)| (*k, w.to_string())));
+        // Only what GitHub said it allows, before a.
+        if let (Ask::Approval, Some(b)) = (a, &self.blocked) {
+            let mut more = Vec::new();
+            if b.auto && !b.auto_on {
+                more.push(('w', "merge once approved (auto-merge)".to_string()));
+            }
+            if b.admin {
+                more.push(('m', "merge now as admin (--admin)".to_string()));
+            }
+            let at = v.len() - 1;
+            v.splice(at..at, more);
+        }
         v
     }
 
@@ -935,6 +1000,8 @@ pub fn handle(root: &Path, agent: Option<&crate::control::Asker>, id: &str, op: 
             }
             Ok((format!("case {id}: answered {key}\n"), Some(key)))
         }
+        // Waiting for an approval: approve tries the merge again.
+        Op::Approve if c.ask == Some(Ask::Approval) => Ok((format!("case {id}: trying the merge again\n"), Some('r'))),
         Op::Approve if c.ask != Some(Ask::Merge) => Err(format!("case {id} isn't waiting to be merged: it's {}", c.status())),
         Op::Approve => Ok((format!("case {id}: merging\n"), Some('y'))),
         Op::Abort => Ok((format!("case {id}: aborting\n"), Some('a'))),
@@ -1274,6 +1341,7 @@ fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<Strin
     // Your y was for a commit that's being replaced.
     c.merge_when_ready = false;
     c.merge_tries = 0;
+    disarm(c, env);
     note(c, env, format!("round {}: back to the fixer", c.round));
     let fixer = c.agent_name(Role::Fixer);
     // Never started (nothing was found, and CI failed): it starts from its
@@ -1329,6 +1397,9 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
         c.ask = None;
         c.why.clear();
         note(c, env, "the report came in");
+    }
+    if c.ask == Some(Ask::Approval) && look_approval(c, env) {
+        return true;
     }
     if let Some(a) = c.ask {
         let Some(key) = env.answer() else { return *c != before };
@@ -1398,7 +1469,16 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
             Ask::Merge | Ask::MergeFailed => {
                 c.merge_tries = 0;
                 // Your r: a PR that conflicts now gets the round it needs.
-                merge(c, env, a == Ask::MergeFailed);
+                merge(c, env, a == Ask::MergeFailed, How::Now);
+            }
+            Ask::Approval => {
+                c.merge_tries = 0;
+                let how = match key {
+                    'w' => How::Auto,
+                    'm' => How::Admin,
+                    _ => How::Now,
+                };
+                merge(c, env, true, how);
             }
             Ask::Setup => c.agent = None,
         }
@@ -1744,7 +1824,7 @@ fn gate(c: &mut Case, env: &mut dyn Env) {
                 ask(c, env, Ask::CiFailed, format!("CI failed ({}) and the rounds are used up", failed.join(", ")));
             }
         }
-        Ci::Green | Ci::None if c.merge_when_ready => merge(c, env, false),
+        Ci::Green | Ci::None if c.merge_when_ready => merge(c, env, false, c.merge_how),
         Ci::Green | Ci::None => {
             let ci = if state == Ci::None { "no CI checks on this PR" } else { "CI green" };
             let left = if c.needs_you.is_empty() {
@@ -1880,9 +1960,11 @@ fn close_issue(c: &mut Case, env: &mut dyn Env, after: Option<(u64, AfterMerge)>
 }
 
 /// Your y (or r after a failed merge, `retry`): merge the checked commit,
-/// if GitHub can.
-fn merge(c: &mut Case, env: &mut dyn Env, retry: bool) {
+/// if GitHub can. `how`: plainly, or, waiting for an approval, as an admin
+/// or by GitHub's auto-merge, as you chose.
+fn merge(c: &mut Case, env: &mut dyn Env, retry: bool, how: How) {
     c.merge_when_ready = false;
+    c.merge_how = how;
     let n = c.pr().number;
     match mergeable(c, env) {
         Mergeable::Unknown => {
@@ -1893,7 +1975,8 @@ fn merge(c: &mut Case, env: &mut dyn Env, retry: bool) {
         Mergeable::Conflicting => return conflict(c, env, retry),
         Mergeable::Clean => {}
     }
-    // CI again, right before: it may have changed while you looked.
+    // CI again, right before: it may have changed while you looked. An
+    // admin merge would get past red CI too: never that.
     if let (Ci::Red | Ci::Pending, failed) = ci(c, env) {
         ask(c, env, Ask::MergeFailed, if failed.is_empty() { "CI is running again: not merged yet".into() } else { format!("CI failed since: {}", failed.join(", ")) });
         return;
@@ -1905,15 +1988,24 @@ fn merge(c: &mut Case, env: &mut dyn Env, retry: bool) {
         return;
     };
     let after = after_merge(c, env);
-    match env.gh(&c.repo, &["pr", "merge", &n.to_string(), "--squash", "--match-head-commit", &sha]) {
-        Ok(_) => {
-            c.stage = Stage::Merged;
-            note(c, env, format!("merged PR #{n} (squash)"));
-            close_issue(c, env, after);
-            close_all(c, env, true);
-            remove_readonly(c, env);
-            env.say("Finished", &format!("{} · merged #{}", c.id, c.pr().number));
+    let num = n.to_string();
+    let mut args = vec!["pr", "merge", &num, "--squash", "--match-head-commit", &sha];
+    match how {
+        How::Now => {}
+        How::Admin => args.push("--admin"),
+        How::Auto => args.push("--auto"),
+    }
+    match env.gh(&c.repo, &args) {
+        Ok(_) if how == How::Auto => {
+            let b = c.blocked.get_or_insert_with(Blocked::default);
+            b.auto_on = true;
+            // Looked at the next step: it may have merged at once.
+            b.looked = 0;
+            let url = c.pr().url.clone();
+            note(c, env, format!("auto-merge is on for PR #{n}: GitHub merges it once it's approved"));
+            ask(c, env, Ask::Approval, format!("awaiting approval: auto-merge is on, GitHub merges PR #{n} once another reviewer approves it: {url}"));
         }
+        Ok(_) => finished(c, env, after, if how == How::Admin { format!("merged PR #{n} (squash, as admin)") } else { format!("merged PR #{n} (squash)") }),
         // The base moved as it merged: GitHub looks at the PR again, then
         // it's tried again (or goes to the fixer, if it conflicts now).
         Err(e) if e.contains("Base branch was modified") && c.merge_tries < MERGE_TRIES => {
@@ -1921,7 +2013,133 @@ fn merge(c: &mut Case, env: &mut dyn Env, retry: bool) {
             c.merge_when_ready = true;
             note(c, env, format!("{} moved as PR #{n} merged: trying again once GitHub has looked at it again ({} of {MERGE_TRIES})", c.pr().base, c.merge_tries));
         }
-        Err(e) => ask(c, env, Ask::MergeFailed, format!("the merge failed: {}", e.lines().next().unwrap_or("").trim())),
+        Err(e) if how == How::Now && blocked_by_policy(&e) => blocked(c, env, &e),
+        // Your w or m didn't take: still waiting for an approval.
+        Err(e) if how != How::Now => {
+            let what = if how == How::Auto { "couldn't turn auto-merge on" } else { "the admin merge failed" };
+            ask(c, env, Ask::Approval, format!("{what}: {}. Still awaiting approval: {}", first_line(&e), c.pr().url));
+        }
+        Err(e) => ask(c, env, Ask::MergeFailed, format!("the merge failed: {}", first_line(&e))),
+    }
+}
+
+fn first_line(e: &str) -> &str {
+    e.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+}
+
+/// The PR merged (by you, or on GitHub while it waited for an approval):
+/// close its issue and the agents.
+fn finished(c: &mut Case, env: &mut dyn Env, after: Option<(u64, AfterMerge)>, what: String) {
+    c.ask = None;
+    c.why.clear();
+    c.blocked = None;
+    c.stage = Stage::Merged;
+    note(c, env, what);
+    close_issue(c, env, after);
+    close_all(c, env, true);
+    remove_readonly(c, env);
+    env.say("Finished", &format!("{} · merged #{}", c.id, c.pr().number));
+}
+
+/// Whether a failed `gh pr merge` says the base branch's rules refused it:
+/// an approving review it needs, a code owner's, a protected branch. Not
+/// red or missing CI, a conflict, or a branch behind its base: those keep
+/// their own way.
+fn blocked_by_policy(err: &str) -> bool {
+    let e = err.to_lowercase();
+    if e.contains("status check") || e.contains("not up to date") || e.contains("cannot be cleanly created") || e.contains("conflict") {
+        return false;
+    }
+    [
+        // gh's own check, before it asks GitHub (mergeStateStatus BLOCKED).
+        "base branch policy prohibits the merge",
+        // GitHub's, from the merge itself.
+        "approving review is required",
+        "approving reviews are required",
+        "review required",
+        "code owner review",
+        "review from a code owner",
+        "changes requested",
+        "protected branch",
+        "repository rule violations",
+    ]
+    .iter()
+    .any(|p| e.contains(p))
+}
+
+/// What a reviewer's word on the PR stands at: GitHub's reviewDecision.
+fn review_decision(c: &Case, env: &mut dyn Env) -> Option<String> {
+    let out = env.gh(&c.repo, &["pr", "view", &c.pr().number.to_string(), "--json", "reviewDecision"]).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    v["reviewDecision"].as_str().map(String::from)
+}
+
+/// The base branch's rules refused the merge: say why plainly and park the
+/// case until someone approves, with what GitHub lets you do meanwhile.
+fn blocked(c: &mut Case, env: &mut dyn Env, err: &str) {
+    let (n, base, url) = (c.pr().number, c.pr().base.clone(), c.pr().url.clone());
+    let repo = env
+        .gh(&c.repo, &["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", "query=query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { viewerPermission autoMergeAllowed } }"])
+        .ok()
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok());
+    let r = repo.as_ref().map(|v| &v["data"]["repository"]);
+    // gh suggests --admin only where it can get past the rules: offered
+    // when it does, and you're an admin.
+    let admin = r.is_some_and(|r| r["viewerPermission"] == "ADMIN") && err.contains("--admin");
+    let auto = r.is_some_and(|r| r["autoMergeAllowed"] == true);
+    // Tried again while waiting: what was on stays on, and said once.
+    let (auto_on, approved) = c.blocked.as_ref().map_or((false, false), |b| (b.auto_on, b.approved));
+    c.blocked = Some(Blocked { admin, auto, auto_on, approved, looked: env.now() });
+    let why = match review_decision(c, env).as_deref() {
+        Some("REVIEW_REQUIRED") => format!("PR #{n} needs another reviewer's approval: {base}'s branch rules don't let you merge it on your own"),
+        Some("CHANGES_REQUESTED") => format!("a reviewer asked for changes on PR #{n}: {base}'s branch rules block the merge until they approve"),
+        _ => format!("{base}'s branch rules block merging PR #{n} ({})", first_line(err)),
+    };
+    note(c, env, format!("not merged: {}", first_line(err)));
+    ask(c, env, Ask::Approval, format!("awaiting approval: {why}: {url}"));
+}
+
+/// How often a case waiting for an approval looks at the PR.
+const APPROVAL_LOOK: u64 = 60;
+
+/// Waiting for an approval: once in a while, whether the PR merged on
+/// GitHub (auto-merge, or someone merged it), or was approved, which is
+/// said. Returns whether it finished.
+fn look_approval(c: &mut Case, env: &mut dyn Env) -> bool {
+    let now = env.now();
+    let b = c.blocked.get_or_insert_with(Blocked::default);
+    if b.looked != 0 && now < b.looked + APPROVAL_LOOK {
+        return false;
+    }
+    b.looked = now;
+    let n = c.pr().number;
+    let Ok(out) = env.gh(&c.repo, &["pr", "view", &n.to_string(), "--json", "state,reviewDecision"]) else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) else { return false };
+    if v["state"] == "MERGED" {
+        let after = after_merge(c, env);
+        finished(c, env, after, format!("PR #{n} merged on GitHub"));
+        return true;
+    }
+    let b = c.blocked.as_mut().unwrap();
+    if v["reviewDecision"] == "APPROVED" && !b.approved && !b.auto_on {
+        b.approved = true;
+        let url = c.pr().url.clone();
+        ask(c, env, Ask::Approval, format!("PR #{n} is approved now: r merges it: {url}"));
+    }
+    false
+}
+
+/// Auto-merge you turned on is turned off: the case is aborted, or a new
+/// round replaces the commit it was for.
+fn disarm(c: &mut Case, env: &mut dyn Env) {
+    let Some(b) = c.blocked.take() else { return };
+    if !b.auto_on {
+        return;
+    }
+    let n = c.pr().number;
+    match env.gh(&c.repo, &["pr", "merge", &n.to_string(), "--disable-auto"]) {
+        Ok(_) => note(c, env, format!("auto-merge turned off for PR #{n}")),
+        Err(e) => note(c, env, format!("couldn't turn auto-merge off for PR #{n}: {} (gh pr merge {n} --disable-auto)", first_line(&e))),
     }
 }
 
@@ -2020,6 +2238,7 @@ fn abort(c: &mut Case, env: &mut dyn Env, _seen: &[Seen]) {
     c.ask = None;
     c.why.clear();
     c.stage = Stage::Aborted;
+    disarm(c, env);
     note(c, env, "aborted: the branches are as the agents left them, and the worktrees stay");
     close_all(c, env, false);
     env.say("Finished", &format!("{} · aborted", c.id));
@@ -2645,6 +2864,14 @@ mod tests {
         /// for having changes.
         locks: Vec<(String, String)>,
         changed: Vec<String>,
+        /// What the graphql look at the repo says (viewerPermission,
+        /// autoMergeAllowed); none: it fails.
+        repo_info: Option<String>,
+        /// The PR's reviewDecision and state, as `gh pr view` says them.
+        review: &'static str,
+        pr_state: &'static str,
+        /// `gh pr view --json state,reviewDecision`s: the looks while parked.
+        looks: u32,
     }
 
     impl Env for Fake {
@@ -2686,6 +2913,16 @@ mod tests {
                         _ => "CLEAN",
                     };
                     Ok(serde_json::json!({"mergeable": m, "mergeStateStatus": state}).to_string())
+                }
+                ["api", "graphql", ..] => self.repo_info.clone().ok_or_else(|| "unexpected".into()),
+                ["pr", "view", _, "--json", "reviewDecision"] => Ok(serde_json::json!({"reviewDecision": self.review}).to_string()),
+                ["pr", "view", _, "--json", "state,reviewDecision"] => {
+                    self.looks += 1;
+                    Ok(serde_json::json!({"state": self.pr_state, "reviewDecision": self.review}).to_string())
+                }
+                ["pr", "merge", _, "--disable-auto"] => {
+                    self.merged.push(args.iter().map(|s| s.to_string()).collect());
+                    Ok(String::new())
                 }
                 ["pr", "merge", ..] => {
                     if !self.merge_errors.is_empty() {
@@ -3133,6 +3370,151 @@ mod tests {
         }
         assert_eq!((c.ask, env.merged.len()), (Some(Ask::MergeFailed), 0));
         assert!(c.why.contains("Base branch was modified"), "{}", c.why);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// gh's own words when the base branch's rules block a merge.
+    const POLICY: &str = "X Pull request NVIDIA/auto-ontology#691 is not mergeable: the base branch policy prohibits the merge.\nTo have the pull request merged after all the requirements have been met, add the `--auto` flag.\nTo use administrator privileges to immediately merge the pull request, add the `--admin` flag.";
+
+    #[test]
+    fn a_merge_the_branch_rules_refuse_is_told_from_other_failures() {
+        for e in [
+            POLICY,
+            "GraphQL: Repository rule violations found\n\nAt least 1 approving review is required by reviewers with write access.\n\n (mergePullRequest)",
+            "GraphQL: At least 2 approving reviews are required by reviewers with write access. (mergePullRequest)",
+            "GraphQL: Waiting on code owner review from NVIDIA/owners. (mergePullRequest)",
+            "GraphQL: Protected branch rules not met (mergePullRequest)",
+        ] {
+            assert!(blocked_by_policy(e), "{e}");
+        }
+        for e in [
+            "X Pull request o/r#1 is not mergeable: the merge commit cannot be cleanly created.",
+            "X Pull request o/r#1 is not mergeable: the head branch is not up to date with the base branch.",
+            "GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)",
+            "GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)",
+            "GraphQL: Pull Request is not mergeable (mergePullRequest)",
+            "GraphQL: Repository rule violations found\n\nRequired status check \"test\" is expected.\n\n (mergePullRequest)",
+            "HTTP 502: Bad Gateway",
+        ] {
+            assert!(!blocked_by_policy(e), "{e}");
+        }
+    }
+
+    fn repo_info(perm: &str, auto: bool) -> Option<String> {
+        Some(serde_json::json!({"data": {"repository": {"viewerPermission": perm, "autoMergeAllowed": auto}}}).to_string())
+    }
+
+    #[test]
+    fn a_merge_that_needs_another_reviewer_waits_for_an_approval() {
+        let (root, mut c) = fixture("needs-approval");
+        // Not an admin, no auto-merge: r and a only.
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![POLICY.into()], repo_info: repo_info("WRITE", false), review: "REVIEW_REQUIRED", pr_state: "OPEN", ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.stage, env.merged.len()), (Some(Ask::Approval), Stage::Gate, 0));
+        assert!(c.why.contains("awaiting approval: PR #12 needs another reviewer's approval") && c.why.ends_with("https://example.com/pr/12"), "{}", c.why);
+        let keys: Vec<char> = c.keys(Ask::Approval).iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!['r', 'a']);
+        // Parked: looked at once a minute, not at every step.
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.looks, 0);
+        env.now += APPROVAL_LOOK;
+        step(&mut c, &root, &mut env);
+        assert_eq!((env.looks, c.ask), (1, Some(Ask::Approval)));
+        // Someone approves: said, once.
+        env.review = "APPROVED";
+        env.now += APPROVAL_LOOK;
+        step(&mut c, &root, &mut env);
+        assert!(c.why.contains("PR #12 is approved now: r merges it"), "{}", c.why);
+        let asked = env.said.iter().filter(|(e, _)| e == "Question").count();
+        env.now += APPROVAL_LOOK;
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.said.iter().filter(|(e, _)| e == "Question").count(), asked);
+        // r: merged, plainly.
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.ask, c.blocked.clone()), (Stage::Merged, None, None));
+        assert_eq!(env.merged, vec![vec!["pr", "merge", "12", "--squash", "--match-head-commit", "headsha"].into_iter().map(String::from).collect::<Vec<_>>()]);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn an_admin_may_merge_past_the_branch_rules_only_when_they_say_so() {
+        let (root, mut c) = fixture("admin-merge");
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![POLICY.into()], repo_info: repo_info("ADMIN", true), review: "REVIEW_REQUIRED", pr_state: "OPEN", ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        let keys: Vec<char> = c.keys(Ask::Approval).iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!['r', 'w', 'm', 'a']);
+        // y isn't an answer to it: nothing merges past the rules by itself.
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, env.merged.len()), (Some(Ask::Approval), 0));
+        env.keys.push('m');
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Merged);
+        assert_eq!(env.merged[0].last().unwrap(), "--admin");
+        assert!(c.log.iter().any(|(_, l)| l == "merged PR #12 (squash, as admin)"));
+        // An admin, but gh didn't say --admin would do: no m.
+        let (root, mut c) = fixture("admin-no-hint");
+        let refused = "GraphQL: Repository rule violations found\n\nAt least 1 approving review is required by reviewers with write access.\n\n (mergePullRequest)";
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![refused.into()], repo_info: repo_info("ADMIN", false), review: "REVIEW_REQUIRED", pr_state: "OPEN", ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        let keys: Vec<char> = c.keys(Ask::Approval).iter().map(|(k, _)| *k).collect();
+        assert_eq!((c.ask, keys), (Some(Ask::Approval), vec!['r', 'a']));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn auto_merge_finishes_the_case_once_github_merges_it_and_is_turned_off_on_abort() {
+        let (root, mut c) = fixture("auto-merge");
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![POLICY.into()], repo_info: repo_info("WRITE", true), review: "REVIEW_REQUIRED", pr_state: "OPEN", ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.push('y');
+        step(&mut c, &root, &mut env);
+        env.keys.push('w');
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.merged[0].last().unwrap(), "--auto");
+        assert_eq!((c.ask, c.stage), (Some(Ask::Approval), Stage::Gate));
+        assert!(c.why.contains("auto-merge is on"), "{}", c.why);
+        let keys: Vec<char> = c.keys(Ask::Approval).iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!['r', 'a']);
+        // Approved and merged on GitHub: the case finishes, without asking.
+        env.review = "APPROVED";
+        env.pr_state = "MERGED";
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.ask), (Stage::Merged, None));
+        assert!(c.log.iter().any(|(_, l)| l == "PR #12 merged on GitHub"));
+        // Aborted while it's on: turned off.
+        let (root, mut c) = fixture("auto-merge-abort");
+        let mut env = Fake { now: 1_795_000_000, merge_errors: vec![POLICY.into()], repo_info: repo_info("WRITE", true), review: "REVIEW_REQUIRED", pr_state: "OPEN", ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        step(&mut c, &root, &mut env);
+        env.keys.extend(['y', 'w', 'a']);
+        for _ in 0..3 {
+            step(&mut c, &root, &mut env);
+        }
+        assert_eq!(c.stage, Stage::Aborted);
+        assert_eq!(env.merged.last().unwrap(), &vec!["pr", "merge", "12", "--disable-auto"].into_iter().map(String::from).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn approve_while_awaiting_approval_tries_the_merge_again() {
+        let (root, mut c) = fixture("approve-approval");
+        c.stage = Stage::Gate;
+        c.ask = Some(Ask::Approval);
+        c.why = "awaiting approval".into();
+        store(&root, &c).unwrap();
+        assert_eq!(handle(&root, None, &c.id, Op::Approve).unwrap().1, Some('r'));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
