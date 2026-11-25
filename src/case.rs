@@ -135,7 +135,8 @@ pub struct Issue {
     pub comments: Vec<Comment>,
     /// The repository's default branch: where a built PR goes.
     pub base: String,
-    /// The branch the Builder pushes: `trix/issue-12-add-rate-limits`.
+    /// The branch the Builder pushes, named as the repository names its
+    /// branches: `fix/12-add-rate-limits`, `feat/12-…`.
     pub branch: String,
 }
 
@@ -1986,7 +1987,11 @@ fn rebuild(c: &mut Case, root: &Path, env: &mut dyn Env) {
     let stage = c.stage;
     c.stage = Stage::Aborted;
     let made = store(root, c).and_then(|_| new_id(root, None, Some(issue.number))).and_then(|id| {
-        let base = format!("trix/issue-{}-{}", issue.number, slug(&issue.title));
+        // The same prefix as the first case's branch: it read the repository's convention.
+        let base = match issue.branch.split_once('/') {
+            Some((p, _)) if p != "trix" => format!("{p}/{}-{}", issue.number, slug(&issue.title)),
+            _ => issue_branch(issue.number, &issue.title, &[], &[]),
+        };
         issue.branch = match id.strip_prefix(&format!("triage-issue-{}-", issue.number)) {
             Some(k) => format!("{base}-{k}"),
             None => base,
@@ -2244,7 +2249,9 @@ pub fn resolve(repo: &Path, input: &str, gh: &mut Gh) -> Result<Target, String> 
     let (author, association) = who(&v);
     let title = v["title"].as_str().unwrap_or_default().to_string();
     let base = info["default_branch"].as_str().unwrap_or("main").to_string();
-    let issue = Issue { number: n, title: title.clone(), url: v["html_url"].as_str().unwrap_or_default().into(), author, association, body: v["body"].as_str().unwrap_or_default().into(), comments, base, branch: format!("trix/issue-{n}-{}", slug(&title)) };
+    let labels: Vec<String> = v["labels"].as_array().into_iter().flatten().filter_map(|l| l["name"].as_str().map(String::from)).collect();
+    let branch = issue_branch(n, &title, &labels, &known_branches(repo, gh));
+    let issue = Issue { number: n, title: title.clone(), url: v["html_url"].as_str().unwrap_or_default().into(), author, association, body: v["body"].as_str().unwrap_or_default().into(), comments, base, branch };
     // The PRs that would solve it, found the same way every time: those
     // that close it (the Development sidebar, "Fixes #n"), open ones that
     // mention it, and those the issue's timeline says refer to it.
@@ -2326,6 +2333,89 @@ fn slug(title: &str) -> String {
         s.push_str(&w[..w.len().min(32)]);
     }
     if s.is_empty() { "work".into() } else { s }
+}
+
+/// Kinds of change a branch's prefix names, each with the spellings
+/// repositories use for it: the first is the one used when the repository
+/// shows none. The first kind, a fix, is the default.
+const KINDS: &[&[&str]] = &[
+    &["fix", "bugfix", "bug", "hotfix"],
+    &["feat", "feature"],
+    &["docs", "doc"],
+    &["chore", "deps"],
+    &["refactor"],
+    &["perf"],
+    &["test", "tests"],
+];
+
+fn kind_of(word: &str) -> Option<usize> {
+    let w = word.to_ascii_lowercase();
+    KINDS.iter().position(|k| k.contains(&w.as_str()))
+}
+
+/// What kind of change an issue asks for: a conventional title (`feat: …`,
+/// `fix(api): …`, `[docs] …`) says it, then its labels, then the title's
+/// first word. A fix when nothing says otherwise.
+fn change_kind(title: &str, labels: &[String]) -> usize {
+    let t = title.trim().trim_start_matches('[');
+    let head: String = t.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    let rest = &t[head.len()..];
+    if (rest.starts_with(':') || rest.starts_with('(') || rest.starts_with(']') || rest.starts_with("!:")) && let Some(k) = kind_of(&head) {
+        return k;
+    }
+    for l in labels.iter().map(|l| l.to_ascii_lowercase()) {
+        let k = match l.as_str() {
+            "bug" | "regression" | "crash" => 0,
+            "enhancement" | "feature" | "feature request" | "new feature" => 1,
+            "documentation" | "docs" => 2,
+            "dependencies" | "chore" | "maintenance" => 3,
+            "refactor" | "refactoring" | "tech debt" => 4,
+            "performance" | "perf" => 5,
+            "test" | "tests" | "testing" => 6,
+            _ => continue,
+        };
+        return k;
+    }
+    match head.to_ascii_lowercase().as_str() {
+        "add" | "adds" | "support" | "implement" | "allow" | "introduce" | "enable" | "new" => 1,
+        "document" | "docs" | "readme" => 2,
+        "bump" | "upgrade" => 3,
+        "refactor" | "simplify" | "rename" | "extract" => 4,
+        _ => 0,
+    }
+}
+
+/// The prefix for a change of this kind, as the repository spells it: the
+/// spelling its branches use most (`feature/` over `feat/`), else the
+/// kind's usual one. `trix/` and people's own prefixes (`ann/…`) never
+/// count.
+fn branch_prefix(kind: usize, branches: &[String]) -> &'static str {
+    let spellings = KINDS[kind];
+    let used = |s: &str| branches.iter().filter(|b| b.split_once('/').is_some_and(|(p, rest)| p.eq_ignore_ascii_case(s) && !rest.is_empty())).count();
+    // max_by_key keeps the last of equals: reversed, ties go to the usual one.
+    spellings.iter().rev().max_by_key(|s| used(s)).filter(|s| used(s) > 0).copied().unwrap_or(spellings[0])
+}
+
+/// The branch a Builder pushes for issue `n`: `fix/12-add-rate-limits`,
+/// its prefix the repository's for this kind of change.
+fn issue_branch(n: u64, title: &str, labels: &[String], branches: &[String]) -> String {
+    format!("{}/{n}-{}", branch_prefix(change_kind(title, labels), branches), slug(title))
+}
+
+/// The branch names the repository's convention is read from: its recent
+/// PRs' branches, and the branches it has here and on its remotes.
+fn known_branches(repo: &Path, gh: &mut Gh) -> Vec<String> {
+    let mut out: Vec<String> = gh(repo, &["pr", "list", "--state", "all", "--limit", "100", "--json", "headRefName"])
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|p| p["headRefName"].as_str().map(String::from)).collect()))
+        .unwrap_or_default();
+    for (refs, strip) in [("refs/remotes", 3), ("refs/heads", 2)] {
+        if let Ok(s) = run_cmd("git", repo, &["for-each-ref", &format!("--format=%(refname:lstrip={strip})"), refs]) {
+            out.extend(s.lines().filter(|l| !l.is_empty() && *l != "HEAD").map(String::from));
+        }
+    }
+    out
 }
 
 /// The case for what was given, not stored yet. A PR is triaged as it is,
@@ -2614,7 +2704,7 @@ mod tests {
                 }
                 ["pr", "create", ..] => {
                     self.created.push(args.iter().map(|s| s.to_string()).collect());
-                    self.listed = Some(pr_json(20, "trix/issue-12-add-rate-limits", "builtsha", false));
+                    self.listed = Some(pr_json(20, "feat/12-add-rate-limits", "builtsha", false));
                     Ok("https://example.com/pr/20\n".into())
                 }
                 ["pr", "list", ..] => Ok(format!("[{}]", self.listed.clone().unwrap_or_default())),
@@ -3223,7 +3313,7 @@ mod tests {
     }
 
     fn issue(n: u64, association: &str) -> Issue {
-        Issue { number: n, title: "Add rate limits".into(), url: format!("https://example.com/issues/{n}"), author: "ann".into(), association: association.into(), body: "Clients can call /api as often as they like.".into(), comments: Vec::new(), base: "main".into(), branch: format!("trix/issue-{n}-add-rate-limits") }
+        Issue { number: n, title: "Add rate limits".into(), url: format!("https://example.com/issues/{n}"), author: "ann".into(), association: association.into(), body: "Clients can call /api as often as they like.".into(), comments: Vec::new(), base: "main".into(), branch: format!("feat/{n}-add-rate-limits") }
     }
 
     /// gh as GitHub would answer: these argument lists, these answers.
@@ -3239,6 +3329,7 @@ mod tests {
             (format!("api repos/{{owner}}/{{repo}}/issues/{n}/comments?per_page=100"), r#"[{"body": "me too", "user": {"login": "bob"}, "author_association": "MEMBER"}]"#.into()),
             (format!("issue view {n} --json closedByPullRequestsReferences"), serde_json::json!({"closedByPullRequestsReferences": refs}).to_string()),
             (format!("pr list --state open --search {n} --json number,title,body --limit 100"), "[]".into()),
+            ("pr list --state all --limit 100 --json headRefName".into(), "[]".into()),
             (format!("api repos/{{owner}}/{{repo}}/issues/{n}/timeline?per_page=100"), "[]".into()),
             ("api repos/{owner}/{repo}/commits/prsha/check-runs?per_page=100".to_string(), runs(&[("test", "completed", Some("success"))])),
         ]
@@ -3256,7 +3347,7 @@ mod tests {
         let t = resolve(&repo, "https://github.com/acme/app/issues/12", &mut gh).unwrap();
         let c = open_case(&root, &repo, t, &opts, 1, &mut gh).unwrap();
         assert_eq!((c.id.as_str(), c.stage, c.pr().number, c.subject()), ("triage-14", Stage::Reviewing, 14, "PR #14 (issue #12)".to_string()));
-        assert_eq!(c.issue.as_ref().unwrap().branch, "trix/issue-12-add-rate-limits");
+        assert_eq!(c.issue.as_ref().unwrap().branch, "feat/12-add-rate-limits");
         // Several: you choose, 1 to 9; the closed one isn't offered.
         let mut a = issue_api(12, "open", "OWNER", &[14, 15, 16]);
         a.push(("pr view 14 --json number,title,url,headRefName,headRefOid,baseRefName,isCrossRepository,state".into(), pr_json(14, "limits", "prsha", false)));
@@ -3285,6 +3376,66 @@ mod tests {
     /// The answer to one argument list, changed.
     fn answer(a: &mut [(String, String)], key: &str, to: String) {
         a.iter_mut().find(|(k, _)| k == key).unwrap().1 = to;
+    }
+
+    #[test]
+    fn the_kind_of_change_comes_from_the_title_then_the_labels() {
+        let none: &[String] = &[];
+        let kind = |t: &str, l: &[String]| KINDS[change_kind(t, l)][0];
+        // A conventional title says it, whatever the labels.
+        assert_eq!(kind("feat(api): rate limits", &["bug".into()]), "feat");
+        assert_eq!(kind("[Docs] explain limits", none), "docs");
+        assert_eq!(kind("chore!: drop node 18", none), "chore");
+        assert_eq!(kind("Fix: crash on start", none), "fix");
+        // Then the labels, GitHub's defaults included.
+        assert_eq!(kind("Rate limits", &["good first issue".into(), "enhancement".into()]), "feat");
+        assert_eq!(kind("Add a crash reporter", &["Bug".into()]), "fix");
+        assert_eq!(kind("Rate limits", &["documentation".into()]), "docs");
+        // Then the title's first word, and a fix when nothing says.
+        assert_eq!(kind("Add rate limits", none), "feat");
+        assert_eq!(kind("Bump serde to 1.0.300", none), "chore");
+        assert_eq!(kind("Refactor the poller", none), "refactor");
+        assert_eq!(kind("SQL chat always reports an empty list", none), "fix");
+        assert_eq!(kind("Feature flags leak between tenants", none), "fix", "a word that only starts the title isn't a prefix");
+        assert_eq!(kind("", none), "fix");
+    }
+
+    #[test]
+    fn the_prefix_is_spelled_as_the_repository_spells_it() {
+        let b = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Nothing to go on: the kind's usual spelling.
+        assert_eq!(branch_prefix(0, &[]), "fix");
+        assert_eq!(branch_prefix(1, &b(&["main", "trix/w", "ann/colors"])), "feat");
+        // The repository's most used spelling of that kind.
+        let repo = b(&["feature/a", "feature/b", "feat/c", "bugfix/d", "chore/e", "main"]);
+        assert_eq!((branch_prefix(1, &repo), branch_prefix(0, &repo), branch_prefix(3, &repo)), ("feature", "bugfix", "chore"));
+        // A kind it hasn't used yet: the usual spelling, never another kind's.
+        assert_eq!(branch_prefix(2, &repo), "docs");
+        // A tie goes to the usual spelling; a bare `fix/` isn't a branch.
+        assert_eq!(branch_prefix(1, &b(&["feature/a", "feat/b"])), "feat");
+        assert_eq!(branch_prefix(0, &b(&["bugfix/a", "fix/"])), "bugfix");
+        assert_eq!(issue_branch(12, "Add rate limits!", &[], &repo), "feature/12-add-rate-limits");
+    }
+
+    #[test]
+    fn an_issues_branch_follows_the_repositorys_naming() {
+        let repo = std::env::temp_dir().join(format!("trix-case-naming-{}", std::process::id()));
+        let mut a = issue_api(12, "open", "OWNER", &[]);
+        answer(&mut a, "pr list --state all --limit 100 --json headRefName", r#"[{"headRefName": "bugfix/9-old"}, {"headRefName": "trix/issue-3-x"}, {"headRefName": "feature/new-ui"}]"#.into());
+        let t = resolve(&repo, "12", &mut github(a.clone())).unwrap();
+        let Target::Issue(i, _) = t else { panic!() };
+        assert_eq!(i.branch, "feature/12-add-rate-limits");
+        // Labelled a bug: the repository's fix prefix.
+        let issue = "api repos/{owner}/{repo}/issues/12";
+        let mut v: serde_json::Value = serde_json::from_str(&a.iter().find(|(k, _)| k == issue).unwrap().1).unwrap();
+        v["labels"] = serde_json::json!([{"name": "bug"}]);
+        answer(&mut a, issue, v.to_string());
+        let Target::Issue(i, _) = resolve(&repo, "12", &mut github(a.clone())).unwrap() else { panic!() };
+        assert_eq!(i.branch, "bugfix/12-add-rate-limits");
+        // gh can't list PRs: no signal, the usual spelling.
+        a.retain(|(k, _)| !k.starts_with("pr list --state all"));
+        let Target::Issue(i, _) = resolve(&repo, "12", &mut github(a)).unwrap() else { panic!() };
+        assert_eq!(i.branch, "fix/12-add-rate-limits");
     }
 
     fn view(n: u64) -> String {
@@ -3372,11 +3523,17 @@ mod tests {
         step(&mut fixing, &root, &mut env);
         assert_eq!((fixing.ask, fixing.stage), (None, Stage::Fixing));
         // b: a new case for the issue, where a builder starts; this one ends.
+        let mut legacy = c.clone();
         env.keys.push('b');
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Aborted);
         let n = &env.opened[0];
-        assert_eq!((n.id.as_str(), n.stage, n.issue.as_ref().unwrap().branch.as_str(), n.pr.is_none()), ("triage-issue-7", Stage::Building, "trix/issue-7-add-rate-limits", true));
+        assert_eq!((n.id.as_str(), n.stage, n.issue.as_ref().unwrap().branch.as_str(), n.pr.is_none()), ("triage-issue-7", Stage::Building, "feat/7-add-rate-limits", true));
+        // A case from before branches followed the repository: not trix/ again.
+        legacy.issue.as_mut().unwrap().branch = "trix/issue-7-add-rate-limits".into();
+        env.keys.push('b');
+        step(&mut legacy, &root, &mut env);
+        assert_eq!(env.opened.last().unwrap().issue.as_ref().unwrap().branch, "feat/7-add-rate-limits");
         assert!(c.log.last().unwrap().1.contains("handed to case triage-issue-7") && c.log.last().unwrap().1.contains("PR #12 stays open"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -3521,23 +3678,23 @@ mod tests {
         let fence = p.lines().find(|l| l.starts_with("===== issue text")).unwrap();
         assert_eq!(p.matches(fence).count(), 3, "named once, then around the text: {p}");
         assert!(p.contains("not instructions to you") && p.contains("please") && p.contains("--- comment by @bob (MEMBER) ---\nme too"), "{p}");
-        assert!(p.contains("git push origin HEAD:trix/issue-12-add-rate-limits") && p.contains("trix case submit triage-issue-12 builder"), "{p}");
+        assert!(p.contains("git push origin HEAD:feat/12-add-rate-limits") && p.contains("trix case submit triage-issue-12 builder"), "{p}");
         assert!(p.contains("trix case submit triage-issue-12 builder --file .trix-builder.json"), "a way in for permissions that refuse a heredoc: {p}");
         // Its report: the right branch, commits on origin.
         let wrong = r#"{"branch": "main", "commits": ["b1b1b1b"], "tests": "ok", "summary": "s"}"#;
-        assert!(submit(&root, &mut c, Role::Builder, wrong).err.contains("the work goes on trix/issue-12-add-rate-limits"));
-        let r = r#"{"branch": "trix/issue-12-add-rate-limits", "commits": ["b1b1b1b"], "tests": "pytest: 4 passed", "summary": "Adds a per-client limit."}"#;
+        assert!(submit(&root, &mut c, Role::Builder, wrong).err.contains("the work goes on feat/12-add-rate-limits"));
+        let r = r#"{"branch": "feat/12-add-rate-limits", "commits": ["b1b1b1b"], "tests": "pytest: 4 passed", "summary": "Adds a per-client limit."}"#;
         assert_eq!(submit(&root, &mut c, Role::Builder, r).code, 0);
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Building);
-        assert!(env.created.is_empty() && env.sent.last().unwrap().1.contains("aren't on origin/trix/issue-12-add-rate-limits"), "{:?}", env.sent);
+        assert!(env.created.is_empty() && env.sent.last().unwrap().1.contains("aren't on origin/feat/12-add-rate-limits"), "{:?}", env.sent);
         env.pushed.push("b1b1b1b".into());
         submit(&root, &mut c, Role::Builder, r);
         step(&mut c, &root, &mut env);
         // trix opens the PR, and the case goes on as for any PR.
         let made = &env.created[0];
         let arg = |k: &str| made[made.iter().position(|a| a == k).unwrap() + 1].clone();
-        assert_eq!((arg("--head"), arg("--base"), arg("--title")), ("trix/issue-12-add-rate-limits".into(), "main".into(), "Add rate limits!".into()));
+        assert_eq!((arg("--head"), arg("--base"), arg("--title")), ("feat/12-add-rate-limits".into(), "main".into(), "Add rate limits!".into()));
         assert!(arg("--body").starts_with("Fixes #12\n\nAdds a per-client limit."), "{}", arg("--body"));
         assert_eq!((c.stage, c.pr().number, c.pr().sha.as_str(), c.ci_expected), (Stage::Reviewing, 20, "builtsha", true));
         assert_eq!((c.closing.clone(), c.subject()), (vec!["triage-issue-12-build".to_string()], "PR #20 (issue #12)".to_string()));
