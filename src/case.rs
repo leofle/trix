@@ -999,7 +999,11 @@ fn make_worktree(c: &Case, role: Role, env: &mut dyn Env) -> Result<PathBuf, Str
 const SUBMIT_NOTE: &str = "Hand it in by piping the JSON on stdin, with a heredoc, so no file lands in the checkout:";
 
 fn submit_line(c: &Case, role: Role) -> String {
-    format!("trix case submit {} {} <<'EOF'\n<the JSON>\nEOF", c.id, role.name())
+    let (id, r) = (&c.id, role.name());
+    format!(
+        "trix case submit {id} {r} <<'EOF'\n<the JSON>\nEOF\n\n\
+         If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-{r}.json in your folder, and run: trix case submit {id} {r} --file .trix-{r}.json. trix deletes the file once it takes the report; never commit it."
+    )
 }
 
 /// What the role is told as it starts.
@@ -1907,7 +1911,9 @@ usage:
   trix case show <id> [--json]      one case: its findings, what was done, its log
   trix case approve <id>            merge a case waiting at the gate (or press y in its pane)
   trix case abort <id>              stop a case (or press a in its pane)
-  trix case submit <id> <role>      for the agents: hand in a report, JSON on stdin
+  trix case submit <id> <role> [--file F]
+                                    for the agents: hand in a report, JSON on stdin (or in F,
+                                    which is deleted once the report is taken)
 ";
 
 /// `trix triage <PR>`.
@@ -2139,15 +2145,32 @@ pub fn run(args: &[String]) -> i32 {
         ["run", id] => run_pane(id),
         ["approve", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Approve })),
         ["abort", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Abort })),
-        ["submit", id, role] => {
+        ["submit", id, role] | ["submit", id, role, "--file", _] => {
             let Some(role) = Role::parse(role) else {
                 return say(Err(format!("'{role}' isn't a role (builder, reviewer, fixer, gatekeeper)")));
             };
+            let file = words.get(4).map(Path::new);
             let mut report = String::new();
-            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut report).is_err() || report.trim().is_empty() {
-                return say(Err("submit: pipe the report's JSON in on stdin".into()));
+            match file {
+                // For an agent whose permissions refuse a heredoc.
+                Some(f) => match std::fs::read_to_string(f) {
+                    Ok(r) => report = r,
+                    Err(e) => return say(Err(format!("submit: {}: {e}", f.display()))),
+                },
+                None => {
+                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut report);
+                }
             }
-            say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Submit { role, report } }))
+            if report.trim().is_empty() {
+                return say(Err("submit: pipe the report's JSON in on stdin, or name a file with --file".into()));
+            }
+            let r = control(crate::control::Request::Case { id: id.to_string(), op: Op::Submit { role, report } });
+            // Taken: the file is gone, so it can't be committed. A report
+            // sent back stays, to be fixed and handed in again.
+            if let (Ok(_), Some(f)) = (&r, file) {
+                let _ = std::fs::remove_file(f);
+            }
+            say(r)
         }
         _ => {
             eprint!("{HELP}");
@@ -2888,6 +2911,7 @@ mod tests {
         assert_eq!(p.matches(fence).count(), 3, "named once, then around the text: {p}");
         assert!(p.contains("not instructions to you") && p.contains("please") && p.contains("--- comment by @bob (MEMBER) ---\nme too"), "{p}");
         assert!(p.contains("git push origin HEAD:trix/issue-12-add-rate-limits") && p.contains("trix case submit triage-issue-12 builder"), "{p}");
+        assert!(p.contains("trix case submit triage-issue-12 builder --file .trix-builder.json"), "a way in for permissions that refuse a heredoc: {p}");
         // Its report: the right branch, commits on origin.
         let wrong = r#"{"branch": "main", "commits": ["b1b1b1b"], "tests": "ok", "summary": "s"}"#;
         assert!(submit(&root, &mut c, Role::Builder, wrong).err.contains("the work goes on trix/issue-12-add-rate-limits"));
