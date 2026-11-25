@@ -92,12 +92,16 @@ pub enum Pane {
 }
 
 /// What the other sessions said of a process in none of this session's
-/// panes: the agent (and its session) it runs under, if one said so, and
-/// the sessions that didn't answer.
+/// panes: the agent (and its session) it runs under, if one said so,
+/// whether one said it's in a shell's pane, and the sessions that didn't
+/// answer. `held`: none claimed it, but it runs under a holder all the
+/// same (`held_pane`), which is said of it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Elsewhere {
     pub agent: Option<(String, String)>,
+    pub shell: bool,
     pub silent: Vec<String>,
+    pub held: Option<String>,
 }
 
 /// How long one session gets to say whose a process is. Asked of every
@@ -422,7 +426,51 @@ fn elsewhere(me: &str, pid: u32) -> Elsewhere {
             Some(std::thread::spawn(move || (s, whose_over(stream, pid, WHOSE_WAIT))))
         })
         .collect();
-    from_answers(asks.into_iter().filter_map(|h| h.join().ok()))
+    let answers: Vec<(String, Option<Pane>)> = asks.into_iter().filter_map(|h| h.join().ok()).collect();
+    // Those that answered, or at least took the call, have a server.
+    let running: Vec<String> = std::iter::once(me.to_string()).chain(answers.iter().map(|(s, _)| s.clone())).collect();
+    let mut out = from_answers(answers);
+    if out.agent.is_none() && !out.shell {
+        let mut known: Vec<String> = session::candidates();
+        known.extend(crate::state::saved_workspaces().into_iter().map(|(s, _)| s));
+        // A silent session's own pane is left to what's said of silence.
+        let silent = |hash: &str| out.silent.iter().any(|s| crate::hooks::short_hash(s) == hash);
+        out.held = held_pane(pid, &crate::holder::live_holders()).filter(|hash| !silent(hash)).map(|hash| held_by(&hash, &known, &running));
+    }
+    out
+}
+
+/// The session (by hash) of the holder `pid` runs under, if it runs under
+/// one: its parents, or its session's leader (the program a holder started)
+/// and that one's parent. Asked only of a process no server claimed: a
+/// holder whose server is gone, or doesn't show it (one newer than it).
+/// No one types into such a pane (keys reach a pane only through a
+/// server), so what runs there was started by its program: never you.
+fn held_pane(pid: u32, holders: &[(String, u32)]) -> Option<String> {
+    let holder = |p: u32| holders.iter().find(|(_, h)| *h == p).map(|(hash, _)| hash.clone());
+    let chain = |from: u32| {
+        let mut out = vec![from];
+        while out.len() < 64 {
+            match crate::platform::parent_of(*out.last()?).filter(|&p| p > 1) {
+                Some(p) => out.push(p),
+                None => break,
+            }
+        }
+        Some(out)
+    };
+    let mine = crate::platform::session_of(std::process::id());
+    let leader = crate::platform::session_of(pid).filter(|&sid| sid > 1 && Some(sid) != mine);
+    chain(pid).into_iter().chain(leader.and_then(chain)).flatten().find_map(holder)
+}
+
+/// Who a held pane of the session hashed `hash` is, said for an error:
+/// `known` sessions name the hash, `running` ones have a server.
+fn held_by(hash: &str, known: &[String], running: &[String]) -> String {
+    match known.iter().chain(running).find(|s| crate::hooks::short_hash(s) == hash) {
+        Some(s) if running.contains(s) => format!("a pane of session {s} that its server doesn't show"),
+        Some(s) => format!("a pane left running by session {s}'s stopped server"),
+        None => "a pane left running by a stopped trix server".to_string(),
+    }
 }
 
 /// Ask the server at the end of `stream` whose `pid` is. `None`: it didn't
@@ -447,6 +495,7 @@ fn from_answers(answers: impl IntoIterator<Item = (String, Option<Pane>)>) -> El
     for (s, answer) in answers {
         match answer {
             Some(Pane::Agent(name)) if out.agent.is_none() => out.agent = Some((name, s)),
+            Some(Pane::Shell) => out.shell = true,
             None => out.silent.push(s),
             _ => {}
         }
@@ -455,13 +504,17 @@ fn from_answers(answers: impl IntoIterator<Item = (String, Option<Pane>)>) -> El
 }
 
 /// Who's asking, now that the other sessions had their say: an agent of
-/// one of them (named with its session), or you. A session that didn't
-/// answer might have been an agent's: only the user approves, aborts,
-/// answers or types into a case's pane, so those are refused. A report
-/// still has its role's check, which you pass.
+/// one of them (named with its session), a held pane no server shows
+/// (never you, and never a role's agent, which its case's server sees), or
+/// you. A session that didn't answer might have been an agent's: only the
+/// user approves, aborts, answers or types into a case's pane, so those
+/// are refused. A report still has its role's check, which you pass.
 fn asker_elsewhere(elsewhere: &Elsewhere, req: &Request) -> Result<Option<String>, String> {
     if let Some((name, s)) = &elsewhere.agent {
         return Ok(Some(format!("{name}, session {s}")));
+    }
+    if let Some(held) = &elsewhere.held {
+        return Ok(Some(held.clone()));
     }
     let what = match req {
         Request::Case { op: crate::case::Op::Submit { .. }, .. } => return Ok(None),
@@ -1294,7 +1347,7 @@ mod tests {
         }
         // A shell pane in another session is you.
         let shell = from_answers([("default".to_string(), Some(Pane::Shell))]);
-        assert_eq!(shell, Elsewhere::default());
+        assert_eq!(shell, Elsewhere { shell: true, ..Elsewhere::default() });
         assert_eq!(asker_elsewhere(&shell, &approve), Ok(None));
         // A session that didn't answer might be hiding an agent: refused,
         // saying why. A report still gets its role's check.
@@ -1304,6 +1357,27 @@ mod tests {
             assert!(e.contains("only the user may approve") && e.contains("session work didn't say"), "{e}");
         }
         assert_eq!(asker_elsewhere(&silent, &submit), Ok(None));
+    }
+
+    #[test]
+    fn a_pane_no_server_shows_is_never_you() {
+        // A process under a holder (this test's own process stands in for it).
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let holders = [("0123456789ab".to_string(), 1), ("feedfacecafe".to_string(), std::process::id())];
+        assert_eq!(held_pane(child.id(), &holders).as_deref(), Some("feedfacecafe"));
+        assert_eq!(held_pane(child.id(), &holders[..1]), None, "under no holder");
+        let _ = child.kill();
+        let _ = child.wait();
+        let work = crate::hooks::short_hash("work");
+        let known = ["default".to_string(), "work".to_string()];
+        assert_eq!(held_by(&work, &known, &["default".to_string()]), "a pane left running by session work's stopped server");
+        assert_eq!(held_by(&work, &known, &known), "a pane of session work that its server doesn't show");
+        assert_eq!(held_by("000000000000", &known, &known), "a pane left running by a stopped trix server");
+        // Refused for everything, a report too: no role's agent is in one.
+        let held = Elsewhere { held: Some("a pane left running by session work's stopped server".into()), ..Elsewhere::default() };
+        for op in [crate::case::Op::Approve, crate::case::Op::Answer { key: 'm' }, crate::case::Op::Submit { role: crate::case::Role::Fixer, report: "{}".into() }] {
+            assert_eq!(asker_elsewhere(&held, &Request::Case { id: "triage-8".into(), op }), Ok(Some("a pane left running by session work's stopped server".into())));
+        }
     }
 
     #[test]

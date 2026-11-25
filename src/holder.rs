@@ -421,6 +421,11 @@ pub fn discover_all() -> Vec<(u32, PathBuf)> {
     discover_in(&crate::hooks::socket_dirs(), None)
 }
 
+/// Every session's live holders: the hash of its session, and its pid.
+pub fn live_holders() -> Vec<(String, u32)> {
+    discover_all().iter().filter_map(|(_, p)| p.file_name().and_then(|n| n.to_str()).and_then(parse_name).map(|(hash, _, pid)| (hash.to_string(), pid))).collect()
+}
+
 fn discover_in(dirs: &[PathBuf], session: Option<&str>) -> Vec<(u32, PathBuf)> {
     let want = session.map(crate::hooks::short_hash);
     let mut found = Vec::new();
