@@ -58,8 +58,9 @@ usage:
   trix view                 watch the running workspace read-only (q leaves)
   trix ls [--json] [--all]  list agents and their state without attaching;
                             --all lists every session, even from inside a pane
-  trix triage <PR>          a case: a reviewer, a fixer and a gatekeeper take the PR
-                            from findings to a merge you approve (trix case --help)
+  trix triage <PR|issue>    a case: a reviewer, a fixer and a gatekeeper take the PR
+                            from findings to a merge you approve; an issue's PR, or
+                            a builder makes one (trix case --help)
   trix spend [YYYY-MM] [--json]
                             what agents spent in a month (this one by default),
                             per model, every session's, against monthly_budget

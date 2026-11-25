@@ -39,6 +39,8 @@ pub struct TriageOpts {
     /// USD per case.
     pub budget: f64,
     pub max_rounds: u32,
+    /// Builds the PR for an issue that has none (`trix triage <issue>`).
+    pub builder: Role,
     pub reviewer: Role,
     pub fixer: Role,
     pub gatekeeper: Role,
@@ -58,7 +60,7 @@ impl Default for TriageOpts {
         // wait for you there. The gatekeeper's independence is its own
         // agent in a fresh checkout that never sees the fixer's reasoning.
         let role = |agent: &str| Role { agent: agent.into(), args: Vec::new() };
-        TriageOpts { budget: 10.0, max_rounds: 2, reviewer: role("claude"), fixer: role("claude"), gatekeeper: role("claude") }
+        TriageOpts { budget: 10.0, max_rounds: 2, builder: role("claude"), reviewer: role("claude"), fixer: role("claude"), gatekeeper: role("claude") }
     }
 }
 
@@ -382,6 +384,7 @@ struct File {
 struct FileTriage {
     budget: Option<f64>,
     max_rounds: Option<i64>,
+    builder: Option<FileRole>,
     reviewer: Option<FileRole>,
     fixer: Option<FileRole>,
     gatekeeper: Option<FileRole>,
@@ -603,7 +606,7 @@ fn triage_opts(f: FileTriage) -> Result<TriageOpts, String> {
             _ => Err(format!("triage.{what}.agent: '{agent}' isn't an agent that takes a prompt (claude, codex, …)")),
         }
     };
-    Ok(TriageOpts { budget, max_rounds, reviewer: role("reviewer", f.reviewer, d.reviewer)?, fixer: role("fixer", f.fixer, d.fixer)?, gatekeeper: role("gatekeeper", f.gatekeeper, d.gatekeeper)? })
+    Ok(TriageOpts { budget, max_rounds, builder: role("builder", f.builder, d.builder)?, reviewer: role("reviewer", f.reviewer, d.reviewer)?, fixer: role("fixer", f.fixer, d.fixer)?, gatekeeper: role("gatekeeper", f.gatekeeper, d.gatekeeper)? })
 }
 
 fn worktree_opts(f: FileWorktree) -> Result<WorktreeOpts, String> {
@@ -1086,6 +1089,8 @@ mod tests {
         let read = |s: &str| parse(s, Path::new("/"));
         let d = read("").unwrap().triage;
         assert_eq!((d.budget, d.max_rounds, d.reviewer.agent.as_str(), d.fixer.agent.as_str(), d.gatekeeper.agent.as_str()), (10.0, 2, "claude", "claude", "claude"));
+        assert_eq!(d.builder.agent, "claude");
+        assert_eq!(read("[triage.builder]\nagent = \"codex\"\n").unwrap().triage.builder.agent, "codex");
         let t = read("[triage]\nbudget = 4.5\nmax_rounds = 3\n[triage.gatekeeper]\nagent = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5-5\"]\n").unwrap().triage;
         assert_eq!((t.budget, t.max_rounds, t.gatekeeper.args.len(), t.fixer.agent.as_str()), (4.5, 3, 2, "claude"));
         assert!(read("[triage.fixer]\nagent = \"shell\"\n").unwrap_err().contains("triage.fixer.agent"));
