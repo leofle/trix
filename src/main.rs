@@ -58,6 +58,9 @@ usage:
   trix view                 watch the running workspace read-only (q leaves)
   trix ls [--json] [--all]  list agents and their state without attaching;
                             --all lists every session, even from inside a pane
+  trix ls --busy [--all]    print the agents still at work (working, needs you,
+                            starting), one per line; exits 0 if any, 1 if none,
+                            e.g. before `trix kill`. A pane leaves itself out
   trix triage <PR|issue>    a case: a reviewer, a fixer and a gatekeeper take the PR
                             from findings to a merge you approve; an issue's PR, or
                             a builder makes one (trix case --help)
@@ -193,6 +196,29 @@ fn ls_sessions(explicit: bool, all: bool, name: &str, candidates: Vec<String>) -
     if explicit && !all { vec![name.to_string()] } else { candidates }
 }
 
+/// The agents in `lists` (each session's `trix ls --json`) still at work:
+/// working, waiting on you or starting. The pane asking (`you`) is left out,
+/// or an agent checking would always find itself busy. One line each:
+/// session, name, state, activity, tab-separated.
+fn busy_lines(lists: &[serde_json::Value]) -> Vec<String> {
+    lists
+        .iter()
+        .flat_map(|list| {
+            let session = list["session"].as_str().unwrap_or_default();
+            list["agents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|a| !a["you"].as_bool().unwrap_or(false))
+                .filter(|a| matches!(a["state"].as_str(), Some("working" | "needs-you" | "starting")))
+                .map(move |a| {
+                    let field = |k: &str| a[k].as_str().unwrap_or_default().to_string();
+                    format!("{session}\t{}\t{}\t{}", field("name"), field("state"), field("activity"))
+                })
+        })
+        .collect()
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // The copy of trix that posts macOS notifications, and nothing else.
@@ -240,6 +266,30 @@ fn main() -> anyhow::Result<()> {
         Some("-V" | "--version") => {
             println!("trix {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
+        }
+        Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--busy") => {
+            let all = args.iter().skip(1).any(|a| a == "--all" || a == "-a");
+            let in_pane = std::env::var("TRIX_SESSION").ok();
+            let lists: Vec<serde_json::Value> = ls_sessions(explicit, all, session::name(), session::candidates())
+                .iter()
+                .filter_map(|n| {
+                    // Its own session marks the asking pane `you`.
+                    let from = if in_pane.as_deref() == Some(n.as_str()) {
+                        std::env::var("TRIX_AGENT_ID").ok().and_then(|id| id.parse().ok())
+                    } else {
+                        None
+                    };
+                    let ask = ClientMsg::Control { protocol: control::CONTROL, from, req: control::Request::List { json: true } };
+                    session::ask(n, &ask).ok().flatten()
+                })
+                .filter_map(|text| serde_json::from_str::<control::Reply>(&text).ok())
+                .filter_map(|r| serde_json::from_str(&r.out).ok())
+                .collect();
+            let busy = busy_lines(&lists);
+            for line in &busy {
+                println!("{line}");
+            }
+            std::process::exit(if busy.is_empty() { 1 } else { 0 });
         }
         Some("ls" | "list") if args.iter().skip(1).any(|a| a == "--json") => {
             if !args.iter().skip(1).any(|a| a == "--all" || a == "-a") {
@@ -770,7 +820,27 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 
 #[cfg(test)]
 mod tests {
-    use super::take_session;
+    use super::{busy_lines, take_session};
+
+    #[test]
+    fn busy_lines_lists_agents_at_work_but_not_the_asker() {
+        let lists = vec![
+            serde_json::json!({"session": "default", "agents": [
+                {"name": "api", "state": "working", "activity": "Bash cargo test", "you": false},
+                {"name": "web", "state": "needs-you", "activity": "approve Bash rm", "you": false},
+                {"name": "docs", "state": "idle", "activity": "", "you": false},
+                {"name": "lead", "state": "working", "activity": "Bash trix ls --busy", "you": true},
+                {"name": "new", "state": "starting", "activity": "", "you": false},
+            ]}),
+            serde_json::json!({"session": "work", "agents": [
+                {"name": "old", "state": "done", "activity": "", "you": false},
+                {"name": "gone", "state": "exited", "activity": "", "you": false},
+            ]}),
+        ];
+        assert_eq!(busy_lines(&lists), vec!["default\tapi\tworking\tBash cargo test", "default\tweb\tneeds-you\tapprove Bash rm", "default\tnew\tstarting\t"]);
+        assert!(busy_lines(&lists[1..]).is_empty());
+        assert!(busy_lines(&[]).is_empty());
+    }
 
     #[test]
     fn ls_all_lists_every_session_even_from_a_pane() {

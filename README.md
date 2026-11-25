@@ -117,6 +117,7 @@ trix attach               # attach only; fails if nothing is running
 trix view                 # watch read-only from another terminal (q leaves)
 trix ls                   # agents, states and activity, without attaching
 trix ls --json            # the same, for scripts and agents
+trix ls --busy            # only the agents still at work; exits 1 when there are none
 trix kill                 # stop the workspace and every agent in it
 
 trix -s work              # the same, for a named session (works with every command)
