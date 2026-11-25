@@ -306,7 +306,10 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
     let r = match req {
         Request::List { json: true } => Reply::ok(listing_json(app, from)),
         Request::List { json: false } => Reply::ok(app.listing()),
-        Request::Send { target, text, force } => send(app, from, &target, &text, force),
+        Request::Send { target, text, force } => {
+            let asker = asking_agent(app, crate::platform::peer_pid(&stream)).or_else(|| caller_name(app, from).filter(|n| app.agents.iter().any(|a| a.name == *n && a.kind != Kind::Shell)));
+            send(app, from, asker.as_deref(), &target, &text, force)
+        }
         Request::Read { target, lines } => read(app, &target, lines),
         Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree),
         Request::Close { target, force, clean } => match close(app, from, &target, force, clean) {
@@ -331,15 +334,34 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
 /// The agent whose pane the process `pid` runs in: its parents, up to an
 /// agent's program or holder. A shell's pane is yours: `None`, as is a
 /// process outside trix.
+/// A process that left its pane on purpose (forked twice, so its parent is
+/// init) is still found by its session: each agent leads its own, and the
+/// orphan keeps it unless it starts another. Best effort against one that
+/// does that too.
 fn asking_agent(app: &App, pid: Option<u32>) -> Option<String> {
-    let mut pid = pid?;
+    let peer = pid?;
+    let pane = |p: u32| app.agents.iter().find(|a| a.pid == p || a.holder == Some(p));
+    let mut pid = peer;
+    let mut found = None;
     for _ in 0..64 {
-        if let Some(a) = app.agents.iter().find(|a| a.pid == pid || a.holder == Some(pid)) {
-            return (a.kind != Kind::Shell).then(|| a.name.clone());
+        if let Some(a) = pane(pid) {
+            found = Some(a);
+            break;
         }
-        pid = crate::platform::parent_of(pid).filter(|&p| p > 1)?;
+        match crate::platform::parent_of(pid).filter(|&p| p > 1) {
+            Some(p) => pid = p,
+            None => break,
+        }
     }
-    None
+    let found = found.or_else(|| crate::platform::session_of(peer).filter(|&sid| sid > 1 && Some(sid) != crate::platform::session_of(std::process::id())).and_then(pane))?;
+    (found.kind != Kind::Shell).then(|| found.name.clone())
+}
+
+/// The pane a triage case runs in (`trix case run <id>`), by its command:
+/// it takes stdin lines as your answers, so no agent may type into it.
+pub(crate) fn is_case_pane(app: &App, a: &crate::agent::Agent) -> bool {
+    let words = app.specs.get(&a.id).and_then(|s| s.command.as_deref()).and_then(|c| shell_words::split(c).ok()).unwrap_or_default();
+    a.kind == Kind::Custom && (matches!(words.as_slice(), [.., c, r, _] if c == "case" && r == "run") || a.command_line.contains(" case run "))
 }
 
 /// `trix case …` in the server. An approve or abort is typed into the
@@ -412,11 +434,17 @@ pub fn send_refusal(a: &Agent) -> Option<String> {
     }
 }
 
-fn send(app: &mut App, from: Option<u32>, target: &str, text: &str, force: bool) -> Reply {
+fn send(app: &mut App, from: Option<u32>, asker: Option<&str>, target: &str, text: &str, force: bool) -> Reply {
     let i = match find(app, target) {
         Ok(i) => i,
         Err(e) => return Reply::fail(e),
     };
+    // What's typed there is your answer: a merge, an abort. Not even --force.
+    if let Some(who) = asker
+        && is_case_pane(app, &app.agents[i])
+    {
+        return Reply::fail(format!("'{}' is a triage case's pane: only the user answers it, not {who}", app.agents[i].name));
+    }
     if let Err(e) = not_self(&app.agents[i], from, "send to") {
         return Reply::fail(e);
     }
@@ -1031,6 +1059,61 @@ mod tests {
         assert_eq!(asking_agent(&app, Some(child.id())), None);
         let _ = child.kill();
         let _ = child.wait();
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn no_agent_types_into_a_cases_pane() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        let mut pane = crate::agent::test_agent(Kind::Custom);
+        pane.name = "triage-12".into();
+        pane.command_line = "/bin/sh -c \"/usr/local/bin/trix case run triage-12\"".into();
+        pane.set_state(State::Blocked, false);
+        let mut other = crate::agent::test_agent(Kind::Custom);
+        other.name = "server".into();
+        other.command_line = "/bin/sh -c \"npm run dev\"".into();
+        app.agents.push(pane);
+        app.agents.push(other);
+        assert!(is_case_pane(&app, &app.agents[0]) && !is_case_pane(&app, &app.agents[1]));
+        // The fixer's `trix send triage-12 y`, forced or not, is refused.
+        for force in [false, true] {
+            let r = send(&mut app, None, Some("triage-12-fix"), "triage-12", "y", force);
+            assert!(r.code == 1 && r.err.contains("only the user answers it, not triage-12-fix"), "{}", r.err);
+        }
+        // Yours, from a shell pane or a terminal, goes through (it needs you: --force).
+        assert_eq!(send(&mut app, None, None, "triage-12", "y", true).code, 0);
+        for a in &app.agents {
+            a.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_process_that_left_its_pane_is_still_its_agents() {
+        use std::os::unix::process::CommandExt;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        // An agent leading its own session leaves a process behind, orphaned.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "(sleep 5 >/dev/null 2>&1 & echo $!)"]).stdout(std::process::Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let leader = cmd.spawn().unwrap();
+        let leader_pid = leader.id();
+        let out = leader.wait_with_output().unwrap();
+        let orphan: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let mut a = crate::agent::test_agent(Kind::Claude);
+        a.name = "triage-12-fix".into();
+        a.pid = leader_pid;
+        app.agents.push(a);
+        assert_eq!(asking_agent(&app, Some(orphan)).as_deref(), Some("triage-12-fix"), "found by its session");
+        unsafe { libc::kill(orphan as i32, libc::SIGKILL) };
         for a in &app.agents {
             a.shutdown();
         }
