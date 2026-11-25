@@ -1683,7 +1683,9 @@ fn gate(c: &mut Case, env: &mut dyn Env) {
                 let ids: Vec<&str> = c.needs_you.iter().map(|(id, _)| id.as_str()).collect();
                 format!(". Left for you, not done: {} (trix case show {})", ids.join(", "), c.id)
             };
-            ask(c, env, Ask::Merge, format!("ready to merge PR #{}: {ci}, the gatekeeper passed it{left}", c.pr().number));
+            // Sent on by you when the reviewer found nothing: no gatekeeper ran.
+            let who = if c.verdict.is_some() { "the gatekeeper passed it" } else { "the reviewer found nothing, and no gatekeeper ran" };
+            ask(c, env, Ask::Merge, format!("ready to merge PR #{}: {ci}, {who}{left}", c.pr().number));
         }
     }
 }
@@ -2181,7 +2183,11 @@ pub fn run(args: &[String]) -> i32 {
         ["ls"] if json => say(serde_json::to_string_pretty(&all(&root).iter().map(summary).collect::<Vec<_>>()).map(|s| s + "\n").map_err(|e| e.to_string())),
         ["ls"] => say(Ok(listing(&all(&root)))),
         ["show", id] if json => say(load(&root, id).and_then(|c| serde_json::to_string_pretty(&c).map(|s| s + "\n").map_err(|e| e.to_string()))),
-        ["show", id] => say(load(&root, id).map(|c| show(&c))),
+        ["show", id] => say(load(&root, id).map(|c| {
+            // What its agents spend now, as the workspace has it: none if it isn't running.
+            let live = Live { keys: std::sync::mpsc::channel().1, said: Default::default() }.agents().unwrap_or_default();
+            show(&c).replacen('\n', &format!("\n{}\n", spent_line(&c, &live)), 1)
+        })),
         ["run", id] => run_pane(id),
         ["approve", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Approve })),
         ["abort", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Abort })),
@@ -2237,6 +2243,14 @@ fn listing(cases: &[Case]) -> String {
     let what: Vec<String> = cases.iter().map(Case::subject).collect();
     let v = what.iter().map(String::len).max().unwrap_or(0);
     cases.iter().zip(&what).map(|(c, s)| format!("{:<w$}  {s:<v$}  {}  ·  {}\n", c.id, c.status(), c.title())).collect()
+}
+
+/// `spent $1.20 of $10.00`, and of that what agents still open spend.
+fn spent_line(c: &Case, live: &[Seen]) -> String {
+    let total = cost_of(c, live);
+    let open = total - c.spent_closed;
+    let open = if open > 0.0 { format!(" ({} by agents still open)", crate::cost::usd(open)) } else { String::new() };
+    format!("spent {} of {}{open}", crate::cost::usd(total), crate::cost::usd(c.budget))
 }
 
 fn show(c: &Case) -> String {
@@ -2529,7 +2543,7 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!((c.ask, c.stage), (None, Stage::Gate));
         step(&mut c, &root, &mut env);
-        assert!(c.ask == Some(Ask::Merge) && c.why.contains("no CI checks"), "{}", c.why);
+        assert!(c.ask == Some(Ask::Merge) && c.why.contains("no CI checks") && c.why.contains("no gatekeeper ran"), "{}", c.why);
         // Merged pinned to what the reviewer read, not the branch as it is now.
         env.keys.push('y');
         step(&mut c, &root, &mut env);
@@ -2865,6 +2879,8 @@ mod tests {
         assert_eq!(c.ask, Some(Ask::Merge));
         assert!(c.why.contains("Left for you, not done: F1 (trix case show triage-12)"), "{}", c.why);
         assert!(show(&c).contains("left for you (the fixer's needs_you):\n  F1  a per-client window"), "{}", show(&c));
+        c.spent_closed = 1.5;
+        assert_eq!(spent_line(&c, &env.seen), "spent $3.50 of $10.00 ($2.00 by agents still open)");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
