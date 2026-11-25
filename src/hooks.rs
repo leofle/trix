@@ -1034,6 +1034,19 @@ pub fn tell(source: &str, event: &str) {
     send(&sock, &msg);
 }
 
+/// Tell the trix pane this runs in what it's doing, in its own words:
+/// `Working`, `Finished` or `Question` (needs you), with `detail` as its
+/// activity.
+pub fn say(source: &str, event: &str, detail: &str) {
+    let (Ok(sock), Ok(id)) = (std::env::var("TRIX_SOCKET"), std::env::var("TRIX_AGENT_ID")) else {
+        return;
+    };
+    let Ok(agent) = id.parse::<u32>() else { return };
+    let seq = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+    let msg = HookMsg { agent, source: source.into(), event: event.into(), tool: None, detail: Some(detail.into()), session: None, transcript: None, seq };
+    send(&sock, &msg);
+}
+
 fn send(sock: &str, msg: &HookMsg) {
     if let Ok(mut stream) = UnixStream::connect(sock) {
         let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));

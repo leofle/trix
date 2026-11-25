@@ -73,6 +73,8 @@ pub enum Request {
     Open { name: String, agents: Vec<crate::layout::LayoutAgent>, resume: bool },
     /// Follow what these agents (none: all of them) do (`trix events`).
     Events { targets: Vec<String> },
+    /// A triage case: a report handed in, or your approval (`case.rs`).
+    Case { id: String, op: crate::case::Op },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq)]
@@ -315,6 +317,7 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Args { target, set, clear } => extra_args(app, from, &target, set, clear),
         Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
         Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
+        Request::Case { id, op } => crate::case::handle(&crate::case::root(), from, &id, op),
         Request::Wait { .. } | Request::Events { .. } => unreachable!(),
     };
     reply(&mut stream, &r);
@@ -520,6 +523,7 @@ fn outside_the_sandbox(req: &Request) -> Option<&'static str> {
         Request::Close { clean: true, .. } => Some("close --clean (it removes a worktree and its branch)"),
         Request::Args { set, clear, .. } if set.is_some() || *clear => Some("change the arguments an agent starts with"),
         Request::Open { .. } => Some("open a layout (its agents can have any arguments and commands)"),
+        Request::Case { op: crate::case::Op::Approve | crate::case::Op::Abort, .. } => Some("approve or abort a triage case"),
         _ => None,
     }
 }
@@ -979,6 +983,10 @@ mod tests {
     fn what_a_sandbox_may_ask_for() {
         let open = |a: &[&str]| outside_the_sandbox(&p(a).unwrap()).is_none();
         assert!(outside_the_sandbox(&Request::List { json: true }).is_none());
+        // An agent hands in its triage report from its sandbox; only you approve.
+        let case = |op| Request::Case { id: "triage-1".into(), op };
+        assert!(outside_the_sandbox(&case(crate::case::Op::Submit { role: crate::case::Role::Gatekeeper, report: "{}".into() })).is_none());
+        assert!(outside_the_sandbox(&case(crate::case::Op::Approve)).is_some() && outside_the_sandbox(&case(crate::case::Op::Abort)).is_some());
         for ok in [&["send", "web", "hi"][..], &["read", "web"], &["wait", "web"], &["events"], &["args", "web"], &["close", "web"],
                    &["spawn", "claude"], &["spawn", "codex", "--prompt", "fix it", "--worktree"], &["spawn", "claude", "--args", " "]] {
             assert!(open(ok), "{ok:?} stays open");

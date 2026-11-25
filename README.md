@@ -5,7 +5,7 @@ A terminal workspace for coding agents. Run Claude Code, Codex, Grok, OpenCode, 
 ![trix demo: starting trix in a project and working with agents side by side](assets/trix.gif)
 
 **Get started:** [Install](#install) · [Quick start](#quick-start) · [Keys](#keys) · [macOS](#macos) · [Supported agents](#supported-agents) · [Codex](#codex)<br>
-**Features:** [Search](#search) · [Runnable worktrees](#runnable-worktrees) · [Review](#review) · [Clone](#clone) · [Agent control](#agent-control) · [Layouts](#layouts) · [Restore](#restore) · [Sessions](#sessions) · [Viewers](#viewers) · [Context gauge](#context-gauge) · [Cost and tokens](#cost-and-tokens)<br>
+**Features:** [Search](#search) · [Runnable worktrees](#runnable-worktrees) · [Review](#review) · [Clone](#clone) · [Agent control](#agent-control) · [Triage](#triage) · [Layouts](#layouts) · [Restore](#restore) · [Sessions](#sessions) · [Viewers](#viewers) · [Context gauge](#context-gauge) · [Cost and tokens](#cost-and-tokens)<br>
 **Configure:** [Settings](#settings) · [Config](#config) · [Environment variables](#environment-variables) · [Themes](#themes) · [Your instructions](#your-instructions)<br>
 **Reference:** [Security](#security) · [Troubleshooting](#troubleshooting) · [Development](#development) · [License](#license)
 
@@ -248,6 +248,30 @@ To make a manager, start a Claude pane and tell it what it's for. For example:
 
 Inside a pane, these commands act on that pane's session. Elsewhere, add `-s <name>` for a named session.
 
+### Triage
+
+`trix triage <PR>` (a number or a URL) starts a **case**: three agents, each with one job, take a pull request from findings to a merge, and trix itself runs the case. No lead agent and no instructions of your own are needed.
+
+```sh
+trix triage 123                # opens the case's pane, triage-123, and starts the reviewer
+trix case ls                   # every case and where it is
+trix case show triage-123      # its findings, what was done to each, its log (--json too)
+trix case approve triage-123   # merge it, once it's at the gate (or press y in its pane)
+trix case abort triage-123     # stop it (or press a)
+```
+
+1. **The reviewer** (Claude) gets a detached checkout of the PR's head and reports what's wrong: each finding with its file, line, severity and how it fails. It doesn't edit anything.
+2. **The fixer** (Claude) gets a worktree on `trix/<case>-fix`, starting at the PR's branch. It fixes each finding with a test, or says why it isn't a bug, and pushes to the PR's branch (`git push origin HEAD:<branch>`, never forced). trix checks its commits are on origin before it takes the report.
+3. **The gatekeeper** (Codex, so the fix is checked by another vendor's model than the one that wrote it) gets a fresh checkout of what was pushed, and not the fixer's reasoning. It checks each fix, looks for anything the fixes broke, and reads CI: pass, or changes. Changes go back to the fixer with the reasons, for up to `max_rounds` rounds.
+4. **The gate**: trix waits for CI, and asks you. Your `y` merges the PR, squashed, and only the commit the gatekeeper checked (`gh pr merge --match-head-commit`), with CI checked again first. Red CI at the gate becomes a finding for the fixer like any other. Then trix closes the case's agents and removes their worktrees, those that are safe to remove.
+
+- **Hand-offs are reports, not chat.** Each agent hands in JSON with `trix case submit <case> <role>`, on stdin. The server checks it against the case before taking it (whose turn it is, every finding answered once, a pass with nothing failing), and a report that doesn't fit goes back to its agent with what's wrong. This works from Codex's sandbox too.
+- **The case's pane** is where it asks you: it shows as needing you, like an agent, with the reason (`triage-123 · ready to merge PR #123`), and you answer there with a key and Enter. It asks when the reviewer finds nothing (`m` goes to the gate anyway), when the rounds are used up (`r` for one more), when the case's budget is spent (`b` adds it again), when an agent stops twice without its report (`n` nudges it, or starts it again if it exited), and at the merge. `a` aborts at any of these, and leaves the PR and the worktrees as they are.
+- **Only you approve.** An agent can hand in a report but can't approve or abort a case, from a sandbox or not. Agents never merge.
+- **What it costs** is the case's agents' spend, against `[triage] budget` ($10 by default); the reviewer and the gatekeeper close as soon as their report is in.
+- Each case is a folder in `~/.local/state/trix/cases/` (`$XDG_STATE_HOME` if set). Its pane is restored like any agent, and picks the case up where it was.
+- For now, a case takes a PR whose branch is in the same repository (not a fork), on GitHub, with `gh` signed in.
+
 ### Layouts
 
 A layout is a named set of tabs you can open again whenever you like: the three repos you always work in, a shell per service, a dev server.
@@ -348,6 +372,13 @@ input = 2
 output = 10
 cache_read = 0.1                  # optional: a tenth of input by default
 cache_write = 2                   # optional: input by default (cache_write_1h too, for Claude's hour-long writes)
+
+[triage]
+budget = 10                       # USD a case may spend before it asks you (10 by default)
+max_rounds = 2                    # fix rounds before it asks you (1 to 10, 2 by default)
+[triage.gatekeeper]               # also [triage.reviewer] and [triage.fixer]
+agent = "codex"                   # which agent takes the role (reviewer and fixer: claude; gatekeeper: codex)
+args = ["--model", "gpt-6.1"]     # its extra arguments
 
 [worktree]
 ports = true                      # give each trix worktree a block of ports (on by default)
@@ -781,6 +812,7 @@ src/search.rs  search across agent scrollbacks
 src/review.rs  alt+v's diff review: diff parsing, notes and the prompt they make, commit / push / PR / merge / clean up
 src/layout.rs  saved layouts: save / open / ls / rm, TOML files
 src/usage.rs   context gauge and token counts: follows Claude / Codex conversation logs
+src/case.rs    trix triage: a case's roles, reports, the runner in its pane, the merge gate
 src/cost.rs    prices per model, what agents' tokens cost, budget levels
 src/ledger.rs  each month's spend on disk, per day and model; trix spend
 src/prices.rs  the live price list: fetched daily, cached, read into prices per model

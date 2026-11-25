@@ -29,6 +29,36 @@ pub struct Config {
     pub cost: CostOpts,
     pub worktree: WorktreeOpts,
     pub session: SessionOpts,
+    pub triage: TriageOpts,
+}
+
+/// `trix triage`: what a case may spend, how many fix rounds it gets, and
+/// which agent takes each role (`case.rs`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriageOpts {
+    /// USD per case.
+    pub budget: f64,
+    pub max_rounds: u32,
+    pub reviewer: Role,
+    pub fixer: Role,
+    pub gatekeeper: Role,
+}
+
+/// The agent a role starts, and its extra arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Role {
+    pub agent: String,
+    pub args: Vec<String>,
+}
+
+impl Default for TriageOpts {
+    fn default() -> TriageOpts {
+        // The fix is checked by another vendor's model than the one that
+        // wrote it. Codex checks rather than fixes: its sandbox can't commit
+        // in a worktree, whose git data is in the main checkout.
+        let role = |agent: &str| Role { agent: agent.into(), args: Vec::new() };
+        TriageOpts { budget: 10.0, max_rounds: 2, reviewer: role("claude"), fixer: role("claude"), gatekeeper: role("codex") }
+    }
 }
 
 /// When a session left alone gets a hint in `trix ls`.
@@ -342,6 +372,26 @@ struct File {
     worktree: FileWorktree,
     #[serde(default)]
     session: FileSession,
+    #[serde(default)]
+    triage: FileTriage,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileTriage {
+    budget: Option<f64>,
+    max_rounds: Option<i64>,
+    reviewer: Option<FileRole>,
+    fixer: Option<FileRole>,
+    gatekeeper: Option<FileRole>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRole {
+    agent: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -529,7 +579,30 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         None => SessionOpts::default(),
         Some(s) => SessionOpts { idle_after: crate::idle::parse_after(s).map_err(|e| format!("session.idle_after: {e}"))? },
     };
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree, session })
+    let triage = triage_opts(f.triage)?;
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree, session, triage })
+}
+
+fn triage_opts(f: FileTriage) -> Result<TriageOpts, String> {
+    let d = TriageOpts::default();
+    let budget = match f.budget {
+        Some(x) if !(x.is_finite() && x > 0.0) => return Err(format!("triage.budget: {x} is not an amount (USD, more than 0)")),
+        v => v.unwrap_or(d.budget),
+    };
+    let max_rounds = match f.max_rounds {
+        None => d.max_rounds,
+        Some(n @ 1..=10) => n as u32,
+        Some(n) => return Err(format!("triage.max_rounds: {n} is not from 1 to 10")),
+    };
+    let role = |what: &str, r: Option<FileRole>, default: Role| -> Result<Role, String> {
+        let Some(r) = r else { return Ok(default) };
+        let agent = r.agent.unwrap_or(default.agent);
+        match crate::agent::Kind::from_label(&agent) {
+            Some(k) if k.takes_prompts() => Ok(Role { agent, args: r.args }),
+            _ => Err(format!("triage.{what}.agent: '{agent}' isn't an agent that takes a prompt (claude, codex, …)")),
+        }
+    };
+    Ok(TriageOpts { budget, max_rounds, reviewer: role("reviewer", f.reviewer, d.reviewer)?, fixer: role("fixer", f.fixer, d.fixer)?, gatekeeper: role("gatekeeper", f.gatekeeper, d.gatekeeper)? })
 }
 
 fn worktree_opts(f: FileWorktree) -> Result<WorktreeOpts, String> {
@@ -1005,6 +1078,19 @@ mod tests {
         assert_ne!(stamp_of(&link), Some(before));
         assert_eq!(stamp_of(&dir.join("missing.toml")), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn triage_roles_budget_and_rounds() {
+        let read = |s: &str| parse(s, Path::new("/"));
+        let d = read("").unwrap().triage;
+        assert_eq!((d.budget, d.max_rounds, d.reviewer.agent.as_str(), d.fixer.agent.as_str(), d.gatekeeper.agent.as_str()), (10.0, 2, "claude", "claude", "codex"));
+        let t = read("[triage]\nbudget = 4.5\nmax_rounds = 3\n[triage.gatekeeper]\nagent = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5-5\"]\n").unwrap().triage;
+        assert_eq!((t.budget, t.max_rounds, t.gatekeeper.args.len(), t.fixer.agent.as_str()), (4.5, 3, 2, "claude"));
+        assert!(read("[triage.fixer]\nagent = \"shell\"\n").unwrap_err().contains("triage.fixer.agent"));
+        assert!(read("[triage]\nmax_rounds = 0\n").unwrap_err().contains("triage.max_rounds"));
+        assert!(read("[triage]\nbudget = -1\n").unwrap_err().contains("triage.budget"));
+        assert!(read("[triage]\nmerge = \"auto\"\n").is_err(), "not in M1");
     }
 
     #[test]

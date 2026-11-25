@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod case;
 mod cleanup;
 mod config;
 mod cost;
@@ -57,6 +58,8 @@ usage:
   trix view                 watch the running workspace read-only (q leaves)
   trix ls [--json] [--all]  list agents and their state without attaching;
                             --all lists every session, even from inside a pane
+  trix triage <PR>          a case: a reviewer, a fixer and a gatekeeper take the PR
+                            from findings to a merge you approve (trix case --help)
   trix spend [YYYY-MM] [--json]
                             what agents spent in a month (this one by default),
                             per model, every session's, against monthly_budget
@@ -331,6 +334,8 @@ fn main() -> anyhow::Result<()> {
         }
         Some("worktrees") => std::process::exit(worktrees::run(&args[1..])),
         Some("spend") => std::process::exit(ledger::run(&args[1..])),
+        Some("triage") => std::process::exit(case::triage(&args[1..])),
+        Some("case") => std::process::exit(case::run(&args[1..])),
         Some("forget") => {
             let yes = args.iter().skip(1).any(|a| a == "--yes" || a == "-y");
             if !flagged || args.iter().skip(1).any(|a| a != "--yes" && a != "-y") {
