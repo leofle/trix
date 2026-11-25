@@ -586,7 +586,7 @@ fn outside_the_sandbox(req: &Request) -> Option<&'static str> {
         Request::Close { clean: true, .. } => Some("close --clean (it removes a worktree and its branch)"),
         Request::Args { set, clear, .. } if set.is_some() || *clear => Some("change the arguments an agent starts with"),
         Request::Open { .. } => Some("open a layout (its agents can have any arguments and commands)"),
-        Request::Case { op: crate::case::Op::Approve | crate::case::Op::Abort, .. } => Some("approve or abort a triage case"),
+        Request::Case { op: crate::case::Op::Approve | crate::case::Op::Abort | crate::case::Op::Answer { .. }, .. } => Some("approve, abort or answer a triage case"),
         _ => None,
     }
 }
@@ -1127,6 +1127,7 @@ mod tests {
         let case = |op| Request::Case { id: "triage-1".into(), op };
         assert!(outside_the_sandbox(&case(crate::case::Op::Submit { role: crate::case::Role::Gatekeeper, report: "{}".into() })).is_none());
         assert!(outside_the_sandbox(&case(crate::case::Op::Approve)).is_some() && outside_the_sandbox(&case(crate::case::Op::Abort)).is_some());
+        assert!(outside_the_sandbox(&case(crate::case::Op::Answer { key: 'n' })).is_some());
         for ok in [&["send", "web", "hi"][..], &["read", "web"], &["wait", "web"], &["events"], &["args", "web"], &["close", "web"],
                    &["spawn", "claude"], &["spawn", "codex", "--prompt", "fix it", "--worktree"], &["spawn", "claude", "--args", " "]] {
             assert!(open(ok), "{ok:?} stays open");
