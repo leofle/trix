@@ -1411,8 +1411,8 @@ mod tests {
                 _ => Err("unexpected".into()),
             }
         }
-        fn spawn(&mut self, name: &str, agent: &RoleAgent, _cwd: &Path, prompt: &str) -> Result<(), String> {
-            self.seen.push(Seen { name: name.into(), state: "working".into(), cost: if agent.agent == "codex" { 0.25 } else { 1.0 } });
+        fn spawn(&mut self, name: &str, _agent: &RoleAgent, _cwd: &Path, prompt: &str) -> Result<(), String> {
+            self.seen.push(Seen { name: name.into(), state: "working".into(), cost: 1.0 });
             self.prompts.push((name.into(), prompt.into()));
             Ok(())
         }

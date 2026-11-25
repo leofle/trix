@@ -53,11 +53,12 @@ pub struct Role {
 
 impl Default for TriageOpts {
     fn default() -> TriageOpts {
-        // The fix is checked by another vendor's model than the one that
-        // wrote it. Codex checks rather than fixes: its sandbox can't commit
-        // in a worktree, whose git data is in the main checkout.
+        // Claude for every role: it starts work in a new folder at once,
+        // where Codex first asks whether to trust it, and the case would
+        // wait for you there. The gatekeeper's independence is its own
+        // agent in a fresh checkout that never sees the fixer's reasoning.
         let role = |agent: &str| Role { agent: agent.into(), args: Vec::new() };
-        TriageOpts { budget: 10.0, max_rounds: 2, reviewer: role("claude"), fixer: role("claude"), gatekeeper: role("codex") }
+        TriageOpts { budget: 10.0, max_rounds: 2, reviewer: role("claude"), fixer: role("claude"), gatekeeper: role("claude") }
     }
 }
 
@@ -1084,7 +1085,7 @@ mod tests {
     fn triage_roles_budget_and_rounds() {
         let read = |s: &str| parse(s, Path::new("/"));
         let d = read("").unwrap().triage;
-        assert_eq!((d.budget, d.max_rounds, d.reviewer.agent.as_str(), d.fixer.agent.as_str(), d.gatekeeper.agent.as_str()), (10.0, 2, "claude", "claude", "codex"));
+        assert_eq!((d.budget, d.max_rounds, d.reviewer.agent.as_str(), d.fixer.agent.as_str(), d.gatekeeper.agent.as_str()), (10.0, 2, "claude", "claude", "claude"));
         let t = read("[triage]\nbudget = 4.5\nmax_rounds = 3\n[triage.gatekeeper]\nagent = \"claude\"\nargs = [\"--model\", \"claude-sonnet-5-5\"]\n").unwrap().triage;
         assert_eq!((t.budget, t.max_rounds, t.gatekeeper.args.len(), t.fixer.agent.as_str()), (4.5, 3, 2, "claude"));
         assert!(read("[triage.fixer]\nagent = \"shell\"\n").unwrap_err().contains("triage.fixer.agent"));

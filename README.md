@@ -262,7 +262,7 @@ trix case abort triage-123     # stop it (or press a)
 
 1. **The reviewer** (Claude) gets a detached checkout of the PR's head and reports what's wrong: each finding with its file, line, severity and how it fails. It doesn't edit anything.
 2. **The fixer** (Claude) gets a worktree on `trix/<case>-fix`, starting at the PR's branch. It fixes each finding with a test, or says why it isn't a bug, and pushes to the PR's branch (`git push origin HEAD:<branch>`, never forced). trix checks its commits are on origin before it takes the report.
-3. **The gatekeeper** (Codex, so the fix is checked by another vendor's model than the one that wrote it) gets a fresh checkout of what was pushed, and not the fixer's reasoning. It checks each fix, looks for anything the fixes broke, and reads CI: pass, or changes. Changes go back to the fixer with the reasons, for up to `max_rounds` rounds.
+3. **The gatekeeper** (Claude) is a separate agent in a fresh checkout of what was pushed, and never sees the fixer's reasoning: only the findings and the fixer's report. It checks each fix, looks for anything the fixes broke, and reads CI: pass, or changes. Changes go back to the fixer with the reasons, for up to `max_rounds` rounds.
 4. **The gate**: trix waits for CI on the commit that was checked (not whatever the branch holds now), and asks you. A PR that had checks when the case began is waited for until checks show up on the pushed commit, so "none yet" never reads as "no CI". Your `y` merges the PR, squashed, and only the checked commit (`gh pr merge --match-head-commit`), with CI checked again first. When the reviewer found nothing and you sent it to the gate, the checked commit is the one the reviewer read. Red CI at the gate becomes a finding for the fixer like any other. Then trix closes the case's agents and removes their worktrees, those that are safe to remove.
 
 - **Hand-offs are reports, not chat.** Each agent hands in JSON with `trix case submit <case> <role>`, on stdin. The server checks it against the case before taking it (whose turn it is, every finding answered once, commit ids that are commit ids, a pass with nothing failing), and a report that doesn't fit goes back to its agent with what's wrong. This works from Codex's sandbox too.
@@ -377,8 +377,9 @@ cache_write = 2                   # optional: input by default (cache_write_1h t
 budget = 10                       # USD a case may spend before it asks you (10 by default)
 max_rounds = 2                    # fix rounds before it asks you (1 to 10, 2 by default)
 [triage.gatekeeper]               # also [triage.reviewer] and [triage.fixer]
-agent = "codex"                   # which agent takes the role (reviewer and fixer: claude; gatekeeper: codex)
-args = ["--model", "gpt-6.1"]     # its extra arguments
+agent = "claude"                  # which agent takes the role (all three: claude by default). agent = "codex" works too, but Codex
+                                  # asks to trust each new folder first, so the case waits for you there
+args = ["--model", "claude-sonnet-5-5"]  # its extra arguments
 
 [worktree]
 ports = true                      # give each trix worktree a block of ports (on by default)
