@@ -1249,10 +1249,24 @@ fn ci(c: &Case, env: &mut dyn Env) -> (Ci, Vec<String>) {
     }
 }
 
-/// Another round: the Fixer gets what to change, and answers these.
-fn next_round(c: &mut Case, env: &mut dyn Env, what: String, open: Vec<String>) {
+/// Another round: the Fixer gets what to change, and answers these. One
+/// that answers the PR conflicting with its base, however it came (the
+/// gate, the gatekeeper's changes, your r), gets the steps for that, and
+/// the base as origin has it now.
+fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<String>) {
     c.round += 1;
     c.open = open;
+    if conflicts(c) {
+        let base = c.pr().base.clone();
+        // The fixer's worktree shares this checkout's refs: the base it merges is the new one.
+        if let Err(e) = fetch(c, env, &base) {
+            note(c, env, format!("couldn't fetch origin/{base}: {}", e.lines().next().unwrap_or_default()));
+        }
+        let steps = conflict_steps(c);
+        if !what.contains(&steps) {
+            what = format!("{what}\n\n{steps}");
+        }
+    }
     c.stage = Stage::Fixing;
     c.fix = None;
     c.nudged = false;
@@ -1795,10 +1809,6 @@ fn conflict(c: &mut Case, env: &mut dyn Env, more: bool) {
         c.max_rounds = c.max_rounds.max(c.round + 1);
     }
     if c.round < c.max_rounds {
-        // The fixer's worktree shares this checkout's refs: the base it merges is the new one.
-        if let Err(e) = fetch(c, env, &base) {
-            note(c, env, format!("couldn't fetch origin/{base}: {}", e.lines().next().unwrap_or_default()));
-        }
         let what = conflict_steps(c);
         next_round(c, env, what, vec![id]);
     } else {
@@ -2932,6 +2942,42 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::Merge));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_round_for_a_conflict_the_gatekeeper_still_sees_has_the_merge_steps() {
+        let (root, mut c) = fixture("conflict-again");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        at_gate(&mut c, &mut env);
+        c.findings.push(Finding { id: "CONFLICT1".into(), file: "merge".into(), line: None, severity: Severity::Important, summary: "the PR conflicts with main".into(), failure: "f".into(), evidence: None });
+        // The gatekeeper says main moved on again: changes, rounds used up.
+        c.stage = Stage::Verifying;
+        c.open = vec!["CONFLICT1".into()];
+        c.fix = Some(serde_json::from_str(r#"{"commits": [], "tests": "ok", "findings": [{"id": "CONFLICT1", "outcome": "fixed"}]}"#).unwrap());
+        c.round = c.max_rounds;
+        let changes = r#"{"verdict": "changes", "findings": [{"id": "CONFLICT1", "ok": false, "reason": "main moved on to aa74af0: merge origin/main again"}], "ci": "none"}"#;
+        env.seen.push(Seen { name: c.agent_name(Role::Gatekeeper), state: "working".into(), cost: 0.0 });
+        c.agent = Some(c.agent_name(Role::Gatekeeper));
+        assert_eq!(submit(&root, &mut c, Role::Gatekeeper, changes).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::RoundLimit));
+        // Your r: the gatekeeper's word, and how to merge, with main fetched first.
+        env.gits.clear();
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.round), (Stage::Fixing, 3));
+        let told = &env.sent.last().unwrap().1;
+        assert!(told.contains("main moved on to aa74af0") && told.contains("git merge origin/main") && told.contains("never by rebasing"), "{told}");
+        assert_eq!(env.gits.first().map(String::as_str), Some("fetch --quiet origin +refs/heads/main:refs/remotes/origin/main"), "{:?}", env.gits);
+        // Said once, from the conflict path too.
+        let (root2, mut c2) = fixture("conflict-once");
+        let mut env2 = Fake { now: 1_795_000_000, mergeable: vec!["CONFLICTING"], ..Fake::default() };
+        at_gate(&mut c2, &mut env2);
+        step(&mut c2, &root2, &mut env2);
+        assert_eq!(env2.sent.last().unwrap().1.matches("never by rebasing").count(), 1);
+        assert_eq!(env2.gits.iter().filter(|g| g.starts_with("fetch --quiet origin +refs/heads/main:")).count(), 1, "{:?}", env2.gits);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(root2.parent().unwrap());
     }
 
     #[test]

@@ -455,40 +455,71 @@ fn elsewhere(me: &str, pid: u32) -> Elsewhere {
         })
         .collect();
     let answers: Vec<(String, Option<Pane>)> = asks.into_iter().filter_map(|h| h.join().ok()).collect();
+    let mut known: Vec<String> = session::candidates();
+    known.extend(crate::state::saved_workspaces().into_iter().map(|(s, _)| s));
+    settle(me, pid, answers, &crate::holder::live_holders(), &known, &|p| crate::platform::args_of(p).is_some_and(|a| trix_host(&a)))
+}
+
+/// What the sessions' answers come to. A process with no trix holder or
+/// server among its forebears is in no session's pane: it's you, though a
+/// session didn't answer (it can't be hiding an agent there). One under a
+/// holder no answering session claims is held, or, if the holder is a
+/// silent session's, left to what's said of silence. `is_host`: a process
+/// that is a trix holder or server, by what it runs.
+fn settle(me: &str, pid: u32, answers: Vec<(String, Option<Pane>)>, holders: &[(String, u32)], known: &[String], is_host: &dyn Fn(u32) -> bool) -> Elsewhere {
     // Those that answered, or at least took the call, have a server.
     let running: Vec<String> = std::iter::once(me.to_string()).chain(answers.iter().map(|(s, _)| s.clone())).collect();
     let mut out = from_answers(answers);
-    if out.agent.is_none() && !out.shell {
-        let mut known: Vec<String> = session::candidates();
-        known.extend(crate::state::saved_workspaces().into_iter().map(|(s, _)| s));
-        // A silent session's own pane is left to what's said of silence.
-        let silent = |hash: &str| out.silent.iter().any(|s| crate::hooks::short_hash(s) == hash);
-        out.held = held_pane(pid, &crate::holder::live_holders()).filter(|hash| !silent(hash)).map(|hash| held_by(&hash, &known, &running));
+    if out.agent.is_some() || out.shell {
+        return out;
     }
+    let forebears = ancestry(pid);
+    if !forebears.iter().any(|&p| holders.iter().any(|(_, h)| *h == p) || is_host(p)) {
+        out.silent.clear();
+        return out;
+    }
+    let silent = |hash: &str| out.silent.iter().any(|s| crate::hooks::short_hash(s) == hash);
+    out.held = held_pane(&forebears, holders).filter(|hash| !silent(hash)).map(|hash| held_by(&hash, known, &running));
     out
 }
 
-/// The session (by hash) of the holder `pid` runs under, if it runs under
-/// one: its parents, or its session's leader (the program a holder started)
-/// and that one's parent. Asked only of a process no server claimed: a
-/// holder whose server is gone, or doesn't show it (one newer than it).
-/// No one types into such a pane (keys reach a pane only through a
-/// server), so what runs there was started by its program: never you.
-fn held_pane(pid: u32, holders: &[(String, u32)]) -> Option<String> {
-    let holder = |p: u32| holders.iter().find(|(_, h)| *h == p).map(|(hash, _)| hash.clone());
+/// `pid` and its parents, then its session's leader (the program a holder
+/// started, for a process that left its pane) and that one's parents.
+fn ancestry(pid: u32) -> Vec<u32> {
     let chain = |from: u32| {
         let mut out = vec![from];
         while out.len() < 64 {
-            match crate::platform::parent_of(*out.last()?).filter(|&p| p > 1) {
+            match out.last().and_then(|&p| crate::platform::parent_of(p)).filter(|&p| p > 1) {
                 Some(p) => out.push(p),
                 None => break,
             }
         }
-        Some(out)
+        out
     };
     let mine = crate::platform::session_of(std::process::id());
     let leader = crate::platform::session_of(pid).filter(|&sid| sid > 1 && Some(sid) != mine);
-    chain(pid).into_iter().chain(leader.and_then(chain)).flatten().find_map(holder)
+    chain(pid).into_iter().chain(leader.map(chain).into_iter().flatten()).collect()
+}
+
+/// Is this a trix holder or server, by its arguments: `trix holder`,
+/// `trix server`, or the same after `-s <session>`. A pane's program runs
+/// under one of them (under the server when its holder couldn't start).
+fn trix_host(args: &[String]) -> bool {
+    let named_trix = args.first().and_then(|a| std::path::Path::new(a).file_name()).is_some_and(|n| n.to_string_lossy().starts_with("trix"));
+    let what = match args.get(1).map(String::as_str) {
+        Some("-s" | "--session") => args.get(3),
+        _ => args.get(1),
+    };
+    named_trix && what.is_some_and(|w| w == "holder" || w == "server")
+}
+
+/// The session (by hash) of the holder among `forebears` (`ancestry`), if
+/// there's one. Asked only of a process no server claimed: a holder whose
+/// server is gone, or doesn't show it (one newer than it). No one types
+/// into such a pane (keys reach a pane only through a server), so what
+/// runs there was started by its program: never you.
+fn held_pane(forebears: &[u32], holders: &[(String, u32)]) -> Option<String> {
+    forebears.iter().find_map(|&p| holders.iter().find(|(_, h)| *h == p).map(|(hash, _)| hash.clone()))
 }
 
 /// Who a held pane of the session hashed `hash` is, said for an error:
@@ -553,7 +584,10 @@ fn asker_elsewhere(elsewhere: &Elsewhere, req: &Request) -> Result<Option<Asker>
         [] => Ok(None),
         silent => {
             let (sessions, it) = if silent.len() == 1 { (format!("session {}", silent[0]), "it") } else { (format!("sessions {}", silent.join(", ")), "they") };
-            Err(format!("only the user may {what}, and trix can't tell this is you: {sessions} didn't say whether this runs in one of {} agents' panes ({it} may be busy, or from an older trix: restart {} to use this). Try again", if silent.len() == 1 { "its" } else { "their" }, if silent.len() == 1 { "it" } else { "them" }))
+            Err(format!(
+                "only the user may {what}, and trix can't tell this is you: this runs in a trix pane, and {sessions} didn't say whether it's one of {} agents' ({it} may be busy, or from an older trix). Try again, restart {sessions} on this trix, or run it from a terminal outside trix",
+                if silent.len() == 1 { "its" } else { "their" }
+            ))
         }
     }
 }
@@ -1392,8 +1426,8 @@ mod tests {
         // A process under a holder (this test's own process stands in for it).
         let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
         let holders = [("0123456789ab".to_string(), 1), ("feedfacecafe".to_string(), std::process::id())];
-        assert_eq!(held_pane(child.id(), &holders).as_deref(), Some("feedfacecafe"));
-        assert_eq!(held_pane(child.id(), &holders[..1]), None, "under no holder");
+        assert_eq!(held_pane(&ancestry(child.id()), &holders).as_deref(), Some("feedfacecafe"));
+        assert_eq!(held_pane(&ancestry(child.id()), &holders[..1]), None, "under no holder");
         let _ = child.kill();
         let _ = child.wait();
         let work = crate::hooks::short_hash("work");
@@ -1409,6 +1443,48 @@ mod tests {
         // Said as what it is: it may be a shell's pane, not an agent's.
         assert_eq!(Asker::Held("a pane left running by session work's stopped server".into()).said(), "a pane left running by session work's stopped server");
         assert_eq!(Asker::Agent("web".into()).said(), "an agent (web)");
+    }
+
+    #[test]
+    fn a_process_in_no_pane_is_you_though_a_session_is_silent() {
+        // The user's terminal: a login shell, then trix. Nothing above it
+        // is a trix holder or server (this test's own forebears may be, so
+        // what counts as one is played here).
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let silent = || vec![("default".to_string(), None)];
+        let nobody = |_: u32| false;
+        let outside = settle("triage-live", child.id(), silent(), &[], &[], &nobody);
+        assert_eq!(outside, Elsewhere::default());
+        for op in [crate::case::Op::Approve, crate::case::Op::Answer { key: 'r' }] {
+            assert_eq!(asker_elsewhere(&outside, &Request::Case { id: "triage-8".into(), op }), Ok(None));
+        }
+        // Under a holder of that silent session (a shell pane of an old
+        // server, say): it might be an agent's, so refused, saying what to do.
+        let mine = std::process::id();
+        let held = settle("triage-live", child.id(), silent(), &[(crate::hooks::short_hash("default"), mine)], &["default".to_string()], &nobody);
+        assert_eq!((held.silent.clone(), held.held.clone()), (vec!["default".to_string()], None));
+        let e = asker_elsewhere(&held, &Request::Case { id: "triage-8".into(), op: crate::case::Op::Approve }).unwrap_err();
+        assert!(e.contains("restart session default on this trix, or run it from a terminal outside trix"), "{e}");
+        // Under a trix server or holder known by what it runs: the same.
+        let hosted = settle("triage-live", child.id(), silent(), &[], &[], &|p| p == mine);
+        assert_eq!(hosted.silent, vec!["default".to_string()]);
+        // Under an unclaimed holder of a session that answered: held.
+        let answered = vec![("default".to_string(), Some(Pane::Outside))];
+        let work = crate::hooks::short_hash("work");
+        let held = settle("triage-live", child.id(), answered, &[(work, mine)], &["work".to_string()], &nobody);
+        assert_eq!(held.held.as_deref(), Some("a pane left running by session work's stopped server"));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn trix_holders_and_servers_are_known_by_what_they_run() {
+        let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(trix_host(&a(&["/opt/homebrew/bin/trix", "holder"])) && trix_host(&a(&["trix", "server"])));
+        assert!(trix_host(&a(&["/home/x/.local/share/trix-triage-live/bin/trix", "-s", "work", "server"])));
+        // The user's own trix, and a session named like one, are neither.
+        assert!(!trix_host(&a(&["trix"])) && !trix_host(&a(&["trix", "-s", "server", "case", "approve", "triage-1"])));
+        assert!(!trix_host(&a(&["trix", "case", "run", "triage-1"])) && !trix_host(&a(&["/bin/zsh", "-l"])) && !trix_host(&a(&["holder"])));
     }
 
     #[test]

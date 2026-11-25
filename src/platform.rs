@@ -224,6 +224,51 @@ pub fn parent_of(_pid: u32) -> Option<u32> {
     None
 }
 
+/// A process's arguments, its program's name first. `None` if it isn't
+/// running, isn't ours to read, or there's no way to ask here.
+#[cfg(target_os = "linux")]
+pub fn args_of(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    (!args.is_empty()).then_some(args)
+}
+
+/// `KERN_PROCARGS2`: the argument count, the executable's path, padding,
+/// then the arguments, each ending in a NUL.
+#[cfg(target_os = "macos")]
+pub fn args_of(pid: u32) -> Option<Vec<String>> {
+    let mut max: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 2, (&raw mut max).cast(), &mut size, std::ptr::null_mut(), 0) } != 0 || max <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; max as usize];
+    let mut size = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    procargs(buf.get(..size)?)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn procargs(buf: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let rest = buf.get(4..)?;
+    // Past the executable's path, and the NULs that pad it.
+    let start = rest.iter().position(|&b| b == 0)?;
+    let rest = &rest[start..];
+    let rest = &rest[rest.iter().position(|&b| b != 0)?..];
+    let args: Vec<String> = rest.split(|&b| b == 0).take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    (!args.is_empty()).then_some(args)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn args_of(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
 /// Is `pid` still a child of this process? Once a child is gone and
 /// reaped, its pid may go to anything else: this is what makes signalling
 /// it safe.
@@ -406,6 +451,31 @@ pub fn copy(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_processes_arguments_are_read() {
+        let mut child = std::process::Command::new("sleep").arg("7").spawn().unwrap();
+        let mut args = None;
+        for _ in 0..50 {
+            args = super::args_of(child.id()).filter(|a| a.len() == 2);
+            if args.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let args = args.expect("sleep's arguments");
+        assert!(args[0].ends_with("sleep") && args[1] == "7", "{args:?}");
+        assert_eq!(super::args_of(u32::MAX >> 2), None, "no such process");
+    }
+
+    #[test]
+    fn procargs_skips_the_path_and_its_padding() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/local/bin/trix\0\0\0\0trix\0holder\0TRIX_SESSION=x\0");
+        assert_eq!(super::procargs(&buf), Some(vec!["trix".to_string(), "holder".to_string()]));
+    }
+
     use super::*;
 
     #[test]
