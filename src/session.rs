@@ -78,6 +78,9 @@ pub enum SessionEvent {
     List(UnixStream),
     /// `sandboxed`: the process asking is inside a sandbox (`platform::sandboxed`).
     Control { stream: UnixStream, from: Option<u32>, req: crate::control::Request, sandboxed: bool },
+    /// A control request that waited for the other sessions to say whose
+    /// pane the asking process is in (`control::ask_elsewhere`).
+    Asked { stream: UnixStream, from: Option<u32>, req: crate::control::Request, elsewhere: crate::control::Elsewhere },
     /// Held open until the server has stopped, so `trix kill` can wait for it.
     Kill(UnixStream),
 }
@@ -214,7 +217,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     Ok((head[0], payload))
 }
 
-fn send_msg(w: &mut impl Write, msg: &ClientMsg) -> io::Result<()> {
+pub fn send_msg(w: &mut impl Write, msg: &ClientMsg) -> io::Result<()> {
     let json = serde_json::to_vec(msg).map_err(io::Error::other)?;
     write_frame(w, MSG, &json)
 }
@@ -847,7 +850,7 @@ fn left_running_note(agents: usize, session: &str) -> Option<String> {
     (agents > 0).then(|| format!("{agents} {are} still running from a server that died: `{trix}` picks {them} up, `{trix} kill` stops {them}"))
 }
 
-fn connect_to(session: &str) -> Option<UnixStream> {
+pub fn connect_to(session: &str) -> Option<UnixStream> {
     UnixStream::connect(control_path_for(session)).ok()
 }
 

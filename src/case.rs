@@ -886,6 +886,9 @@ pub enum Op {
 /// agent, and no agent approves or aborts. `Ok` holds what to reply, and
 /// for approve and abort the key to type into the case's pane.
 pub fn handle(root: &Path, agent: Option<&str>, id: &str, op: Op) -> Result<(String, Option<char>), String> {
+    if let (Op::Approve | Op::Abort | Op::Answer { .. }, Some(who)) = (&op, agent) {
+        return Err(format!("an agent ({who}) can't approve, abort or answer a case: the user does, in the case's pane, or with trix case approve / answer from a terminal"));
+    }
     let c = load(root, id)?;
     match op {
         Op::Submit { role, report } => {
@@ -897,7 +900,6 @@ pub fn handle(root: &Path, agent: Option<&str>, id: &str, op: Op) -> Result<(Str
             write_atomic(&report_file(root, &c, role), kept.as_bytes())?;
             Ok((format!("{} report taken for case {id}\n", role.name()), None))
         }
-        Op::Approve | Op::Abort | Op::Answer { .. } if agent.is_some() => Err("an agent can't approve, abort or answer a case: the user does, in the case's pane, or with trix case approve / answer from a terminal".into()),
         Op::Approve | Op::Abort | Op::Answer { .. } if c.stage.over() => Err(format!("case {id} is already {}", c.stage.label())),
         Op::Answer { key: 'y' } => Err("a merge is only ever trix case approve, or y in the case's pane".into()),
         Op::Answer { key } => {
@@ -2487,13 +2489,17 @@ mod tests {
         assert_eq!(env.said.last().unwrap().0, "Question");
         // An agent can't approve, you can: the server types y into the pane.
         store(&root, &c).unwrap();
-        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Approve).unwrap_err().contains("an agent can't approve"));
+        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Approve).unwrap_err().contains("an agent (triage-12-fix) can't approve"));
+        // Another session's agent is named with its session (`control::asker_elsewhere`).
+        for op in [Op::Approve, Op::Answer { key: 'a' }] {
+            assert!(handle(&root, Some("alpha dog, session default"), &c.id, op).unwrap_err().contains("an agent (alpha dog, session default) can't approve"));
+        }
         assert_eq!(handle(&root, None, &c.id, Op::Approve).unwrap().1, Some('y'));
         // Any other answer, from a terminal: only one the question takes, never a merge.
         assert_eq!(handle(&root, None, &c.id, Op::Answer { key: 'a' }).unwrap().1, Some('a'));
         assert!(handle(&root, None, &c.id, Op::Answer { key: 'y' }).unwrap_err().contains("only ever trix case approve"));
         assert!(handle(&root, None, &c.id, Op::Answer { key: 'n' }).unwrap_err().contains("'n' isn't an answer to it (y: merge · a: abort)"));
-        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Answer { key: 'a' }).unwrap_err().contains("an agent can't approve, abort or answer"));
+        assert!(handle(&root, Some("triage-12-fix"), &c.id, Op::Answer { key: 'a' }).unwrap_err().contains("an agent (triage-12-fix) can't approve, abort or answer"));
         env.keys.push('y');
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Merged);

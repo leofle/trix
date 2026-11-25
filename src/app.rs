@@ -1706,6 +1706,11 @@ impl App {
         }
     }
 
+    /// Where a thread sends what it found back to the loop.
+    pub fn sender(&self) -> Sender<AppEvent> {
+        self.tx.clone()
+    }
+
     pub fn toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         self.toast = Some(Toast { text: text.into(), kind, at: Instant::now() });
         self.dirty = true;
