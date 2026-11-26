@@ -2074,7 +2074,13 @@ fn take_review(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, name: &
             kept.push(Finding { evidence: k.evidence.clone(), ..f });
         }
     }
-    rv.optional.extend(r.optional.into_iter().map(|o| Optional { by: Some(tag.into()), ..o }));
+    // Listed again in its check: once is enough.
+    for o in r.optional {
+        let o = Optional { by: Some(tag.into()), ..o };
+        if !rv.optional.iter().any(|x| x.file == o.file && x.line == o.line && x.summary.trim() == o.summary.trim()) {
+            rv.optional.push(o);
+        }
+    }
     if r.solves.is_some() {
         rv.solves = r.solves;
     }
@@ -4685,7 +4691,8 @@ mod tests {
 
     /// The first reviewer: the window bug, with a test the fixer keeps, and a nit.
     const R1: &str = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "summary": "the window never resets", "failure": "after 60s a client is still refused", "proof": {"test": "limit_resets_after_60s", "observed": "refused at t=61", "expected": "allowed at t=61", "patch": "+#[test] fn limit_resets_after_60s() {}"}}], "optional": [{"file": "src/limit.rs", "line": 3, "summary": "call it window, not w"}]}"#;
-    const R1_OK: &str = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "limit_resets_after_60s: refused at t=61"}]}"#;
+    /// Its nit listed again in its check, as agents do: kept once.
+    const R1_OK: &str = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "limit_resets_after_60s: refused at t=61"}], "optional": [{"file": "src/limit.rs", "line": 3, "summary": "call it window, not w"}]}"#;
     /// The second: the same bug two lines off, and one of its own.
     const R2: &str = r#"{"findings": [{"id": "F1", "file": "./src/limit.rs", "line": 42, "summary": "reset compares the wrong clock", "failure": "never resets", "proof": {"repro": "cargo run -- --burst 61", "observed": "61st call refused after 70s", "expected": "allowed"}}, {"id": "F2", "file": "src/api.rs", "line": 9, "summary": "a refused call returns 200", "failure": "clients can't tell", "proof": {"repro": "curl -i /api after 60 calls", "observed": "HTTP/1.1 200", "expected": "HTTP/1.1 429"}}]}"#;
     const R2_OK: &str = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "refused after 70s again"}, {"id": "F2", "confirmed": true, "evidence": "HTTP/1.1 200 again"}], "optional": [{"file": "src/api.rs", "summary": "might race under load", "unproven": true}]}"#;
