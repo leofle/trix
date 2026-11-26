@@ -504,7 +504,7 @@ fn ancestry(pid: u32) -> Vec<u32> {
 /// Is this a trix holder or server, by its arguments: `trix holder`,
 /// `trix server`, or the same after `-s <session>`. A pane's program runs
 /// under one of them (under the server when its holder couldn't start).
-fn trix_host(args: &[String]) -> bool {
+pub(crate) fn trix_host(args: &[String]) -> bool {
     let named_trix = args.first().and_then(|a| std::path::Path::new(a).file_name()).is_some_and(|n| n.to_string_lossy().starts_with("trix"));
     let what = match args.get(1).map(String::as_str) {
         Some("-s" | "--session") => args.get(3),
