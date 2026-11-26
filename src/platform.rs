@@ -2,6 +2,7 @@
 //! working folders, the terminal's foreground job, and the desktop
 //! (notifications, sound, clipboard). Everything else in trix is plain Unix.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -233,10 +234,29 @@ pub fn args_of(pid: u32) -> Option<Vec<String>> {
     (!args.is_empty()).then_some(args)
 }
 
+/// The environment a process started with (what its parent gave it, not
+/// what it set for itself since). `None` if it isn't running, isn't ours to
+/// read, or there's no way to ask here.
+#[cfg(target_os = "linux")]
+pub fn env_of(pid: u32) -> Option<Vec<(OsString, OsString)>> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(raw.split(|&b| b == 0).filter_map(env_pair).collect())
+}
+
 /// `KERN_PROCARGS2`: the argument count, the executable's path, padding,
 /// then the arguments, each ending in a NUL.
 #[cfg(target_os = "macos")]
 pub fn args_of(pid: u32) -> Option<Vec<String>> {
+    procargs(&procargs2(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+pub fn env_of(pid: u32) -> Option<Vec<(OsString, OsString)>> {
+    procenv(&procargs2(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+fn procargs2(pid: u32) -> Option<Vec<u8>> {
     let mut max: libc::c_int = 0;
     let mut size = std::mem::size_of::<libc::c_int>();
     let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -249,23 +269,54 @@ pub fn args_of(pid: u32) -> Option<Vec<String>> {
     if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0 {
         return None;
     }
-    procargs(buf.get(..size)?)
+    buf.truncate(size);
+    Some(buf)
+}
+
+/// The argument count and the strings after the executable's path and the
+/// NULs that pad it: the arguments, then the environment.
+#[cfg(any(target_os = "macos", test))]
+fn procstrings(buf: &[u8]) -> Option<(usize, &[u8])> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let rest = buf.get(4..)?;
+    let start = rest.iter().position(|&b| b == 0)?;
+    let rest = &rest[start..];
+    let rest = &rest[rest.iter().position(|&b| b != 0)?..];
+    Some((argc, rest))
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn procargs(buf: &[u8]) -> Option<Vec<String>> {
-    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
-    let rest = buf.get(4..)?;
-    // Past the executable's path, and the NULs that pad it.
-    let start = rest.iter().position(|&b| b == 0)?;
-    let rest = &rest[start..];
-    let rest = &rest[rest.iter().position(|&b| b != 0)?..];
-    let args: Vec<String> = rest.split(|&b| b == 0).take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    let (argc, strings) = procstrings(buf)?;
+    let args: Vec<String> = strings.split(|&b| b == 0).take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     (!args.is_empty()).then_some(args)
+}
+
+/// The environment follows the arguments and ends at the first empty
+/// string: what comes after the padding there is macOS's own (`ptr_munge=`
+/// and the like), not the process's.
+#[cfg(any(target_os = "macos", test))]
+fn procenv(buf: &[u8]) -> Option<Vec<(OsString, OsString)>> {
+    let (argc, strings) = procstrings(buf)?;
+    Some(strings.split(|&b| b == 0).skip(argc).take_while(|s| !s.is_empty()).filter_map(env_pair).collect())
+}
+
+/// `NAME=value` as a pair. Names may not be empty or hold `=`, so an entry
+/// that starts with one isn't a variable.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn env_pair(entry: &[u8]) -> Option<(OsString, OsString)> {
+    use std::os::unix::ffi::OsStringExt;
+    let eq = entry.iter().position(|&b| b == b'=').filter(|&i| i > 0)?;
+    Some((OsString::from_vec(entry[..eq].to_vec()), OsString::from_vec(entry[eq + 1..].to_vec())))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn args_of(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn env_of(_pid: u32) -> Option<Vec<(OsString, OsString)>> {
     None
 }
 
@@ -474,6 +525,39 @@ mod tests {
         let mut buf = 2i32.to_ne_bytes().to_vec();
         buf.extend_from_slice(b"/usr/local/bin/trix\0\0\0\0trix\0holder\0TRIX_SESSION=x\0");
         assert_eq!(super::procargs(&buf), Some(vec!["trix".to_string(), "holder".to_string()]));
+    }
+
+    #[test]
+    fn procenv_is_what_follows_the_arguments_up_to_macos_own_strings() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/local/bin/trix\0\0\0trix\0holder\0HOME=/h\0EMPTY=\0A=b=c\0\0\0\0ptr_munge=\0main_stack=\0");
+        let env = super::procenv(&buf).unwrap();
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.to_str().unwrap(), v.to_str().unwrap())).collect();
+        assert_eq!(env, [("HOME", "/h"), ("EMPTY", ""), ("A", "b=c")]);
+        assert_eq!(super::env_pair(b"=x"), None);
+        assert_eq!(super::env_pair(b"junk"), None);
+    }
+
+    /// Something to read the environment of. Not `sleep`: macOS keeps its own
+    /// programs' environment to themselves, as it doesn't a trix holder's.
+    #[test]
+    #[ignore = "run by env_of_reads_what_a_child_started_with"]
+    fn sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn env_of_reads_what_a_child_started_with() {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = Command::new(exe).args(["--exact", "platform::tests::sleeper", "--ignored"]).env("TRIX_ENV_OF_TEST", "yes").stdout(Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let env = env_of(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let env = env.expect("our own child's environment is ours to read");
+            assert!(env.iter().any(|(k, v)| k == "TRIX_ENV_OF_TEST" && v == "yes"));
+        }
     }
 
     use super::*;
