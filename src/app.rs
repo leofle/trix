@@ -184,6 +184,9 @@ pub struct NewForm {
     pub error: Option<String>,
     /// You answered the trust dialog with "not this time".
     pub skip_setup: bool,
+    /// Enter found no such folder and offered to make it: Enter again on
+    /// the same path does. Any other key takes the offer back.
+    pub create: Option<PathBuf>,
 }
 
 /// A repository's `.trix.toml` wants to run things: yours to read first.
@@ -1785,6 +1788,7 @@ impl App {
             args: TextInput::default(),
             error: None,
             skip_setup: false,
+            create: None,
         };
         f.name = TextInput::new(&self.suggest_name(&dir));
         self.modal = Some(Modal::New(f));
@@ -2001,9 +2005,26 @@ impl App {
         // A relative path starts where the form opened, as its completions do.
         let mut cwd = f.folders.resolve(&f.dir.text);
         let chosen = cwd.clone();
-        if f.dir.text.trim().is_empty() || !cwd.is_dir() {
-            f.error = Some(format!("folder not found: {}", f.dir.text));
+        if f.dir.text.trim().is_empty() {
+            f.error = Some("folder not found: ".into());
             return;
+        }
+        if !cwd.is_dir() {
+            // A file there can't become a folder: say so, offer nothing.
+            if cwd.exists() {
+                f.error = Some(format!("not a folder: {}", f.dir.text));
+                return;
+            }
+            if f.create.as_ref() != Some(&cwd) {
+                f.error = Some(format!("folder not found: {} · enter again to create it", f.dir.text));
+                f.create = Some(cwd);
+                return;
+            }
+            f.create = None;
+            if let Err(e) = std::fs::create_dir_all(&cwd) {
+                f.error = Some(format!("could not create {}: {e}", f.dir.text));
+                return;
+            }
         }
         if kind == Kind::Custom && f.args.text.trim().is_empty() {
             f.error = Some("custom agents need a command".into());
@@ -3526,6 +3547,9 @@ impl App {
             },
             Modal::New(f) => {
                 f.error = None;
+                if k.code != KeyCode::Enter {
+                    f.create = None;
+                }
                 if f.field == 1 && f.folder_key(&k) {
                     return;
                 }
@@ -5789,7 +5813,7 @@ mod tests {
     }
 
     fn worktree_form(dir: &Path, name: &str) -> Modal {
-        Modal::New(NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: true, dir: TextInput::new(&dir.display().to_string()), folders: Folders::new(dir.to_path_buf(), Vec::new(), ""), prompt: TextInput::default(), worktree: true, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false })
+        Modal::New(NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: true, dir: TextInput::new(&dir.display().to_string()), folders: Folders::new(dir.to_path_buf(), Vec::new(), ""), prompt: TextInput::default(), worktree: true, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false, create: None })
     }
 
     fn asked(app: &mut App, dir: &Path, name: &str) {
@@ -6694,7 +6718,7 @@ mod tests {
         app.agents.push(a);
         let tmp = std::env::temp_dir();
         let form = |name: &str, touched: bool| {
-            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), folders: Folders::new(tmp.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false };
+            let mut f = NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new(name), name_touched: touched, dir: TextInput::new(&tmp.display().to_string()), folders: Folders::new(tmp.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false, create: None };
             f.args = TextInput::new("exec sleep 60");
             Modal::New(f)
         };
@@ -6725,6 +6749,43 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    #[test]
+    fn a_missing_folder_is_made_on_a_second_enter() {
+        let mut app = test_app();
+        let root = std::env::temp_dir().join(format!("trix-mkdir-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let want = root.join("new/nested");
+        let enter = |app: &mut App| app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let error = |app: &App| match &app.modal {
+            Some(Modal::New(f)) => f.error.clone(),
+            _ => None,
+        };
+        app.modal = Some(Modal::New(NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new("mk"), name_touched: true, dir: TextInput::new(&want.display().to_string()), folders: Folders::new(root.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false, create: None }));
+        // The first enter only offers.
+        enter(&mut app);
+        assert!(error(&app).unwrap().ends_with("enter again to create it"));
+        assert!(!want.exists(), "nothing made yet");
+        // Another key takes the offer back: enter offers again.
+        app.modal_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        enter(&mut app);
+        assert!(!want.exists() && error(&app).is_some(), "the offer was taken back");
+        // Enter again: made, parents too, and the agent starts in it.
+        enter(&mut app);
+        assert!(want.is_dir() && app.modal.is_none());
+        assert_eq!(app.agents.last().unwrap().cwd, want);
+        // A file in the way is no folder to make.
+        let file = root.join("file");
+        std::fs::write(&file, "").unwrap();
+        app.modal = Some(Modal::New(NewForm { kind: Kind::Custom, main: Vec::new(), more: false, field: 0, top: Default::default(), name: TextInput::new("mk2"), name_touched: true, dir: TextInput::new(&file.display().to_string()), folders: Folders::new(root.clone(), Vec::new(), ""), prompt: TextInput::default(), worktree: false, args: TextInput::new("exec sleep 60"), error: None, skip_setup: false, create: None }));
+        enter(&mut app);
+        enter(&mut app);
+        assert!(error(&app).unwrap().starts_with("not a folder"));
+        for a in &app.agents {
+            a.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7227,7 +7288,7 @@ mod tests {
         f.dir = TextInput::new("/nonexistent-folder");
         key(&mut app, KeyCode::Enter);
         let Some(Modal::New(f)) = &app.modal else { panic!("the form stays open") };
-        assert_eq!((f.kind, f.error.as_deref()), (Kind::OpenCode, Some("folder not found: /nonexistent-folder")), "it tried to launch");
+        assert_eq!((f.kind, f.error.as_deref()), (Kind::OpenCode, Some("folder not found: /nonexistent-folder · enter again to create it")), "it tried to launch");
 
         // Opening on one of more's ([new] agent, or the one started last):
         // in sight from the start.
