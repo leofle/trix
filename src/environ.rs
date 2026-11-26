@@ -17,8 +17,10 @@
 //!
 //! So a server started under an agent undoes what that agent did: the
 //! agent's program started with the pane's environment, and the difference
-//! between that and what it gave the first process it started (its shell, a
-//! tool's server) is what the agent changed. Whatever the agent set there
+//! between that and what reached the first process below it that isn't the
+//! agent's own (its shell, a tool's server) is what the agent changed. An
+//! agent may be several processes (Codex's npm wrapper and its binary,
+//! opencode's `run`, `serve` and `opencode-pty`): they're told by name. Whatever the agent set there
 //! and is still unchanged goes; what it changed gets the pane's value back;
 //! what it took away comes back. Changes made further down are kept, since
 //! someone meant them: a script's or a tool's own `HOME`, `XDG_RUNTIME_DIR`
@@ -26,9 +28,9 @@
 //! command was typed into a shell pane (nothing but shells between it and
 //! its holder) is its environment kept whole. Either way, what trix set for
 //! the pane and what an agent is known to set for its commands are left out
-//! (`AGENT_SET`, `PANE_SET`): that covers agents that set more in processes
-//! further down (Codex's wrapper and its binary), environments that can't be
-//! read, and a session that an older trix started from an agent. Names an
+//! (`AGENT_SET`, `PANE_SET`): that covers environments that can't be read
+//! (an agent's sandbox may not let trix look), and a session that an older
+//! trix started from an agent. Names an
 //! agent shares with people (`AGENT`) go by that list only when nothing
 //! could be read. This replaces #113's list of Claude's variables (Yoav),
 //! which is part of `AGENT_SET` now.
@@ -135,6 +137,35 @@ enum Source {
     Own,
 }
 
+/// Runtimes an agent's program may run under: its name is then the script's.
+const RUNTIMES: &[&str] = &["node", "bun", "deno", "python", "python3", "ruby"];
+
+/// A program's name, for telling an agent's own processes apart: `codex`
+/// for `/…/bin/codex` and for `node /…/bin/codex.js` alike.
+fn program(args: &[String]) -> Option<String> {
+    let base = |a: &str| std::path::Path::new(a.trim_start_matches('-')).file_stem().map(|n| n.to_string_lossy().into_owned());
+    let first = base(args.first()?)?;
+    if RUNTIMES.contains(&first.as_str()) {
+        return args[1..].iter().find(|a| !a.starts_with('-')).and_then(|a| base(a)).or(Some(first));
+    }
+    Some(first)
+}
+
+/// Where the agent's own processes end, going down from its program at
+/// `top`: the first process below that isn't the agent's, by its name
+/// (Codex's npm wrapper and its binary, opencode's `run`, `serve` and
+/// `opencode-pty`, Gemini starting itself again). That one got what the
+/// agent gave its commands. A tool the agent started (another program)
+/// ends it there, so what the tool set for its own commands is kept.
+fn below_agent(forebears: &[Option<Vec<String>>], top: usize) -> usize {
+    let Some(agent) = forebears[top].as_deref().and_then(program) else { return top - 1 };
+    let mut i = top - 1;
+    while i > 0 && forebears[i].as_deref().and_then(program).is_some_and(|p| p.starts_with(&agent)) {
+        i -= 1;
+    }
+    i
+}
+
 fn is_shell(args: &[String]) -> bool {
     let name = args.first().and_then(|a| std::path::Path::new(a.trim_start_matches('-')).file_name().map(|n| n.to_string_lossy().into_owned()));
     name.is_some_and(|n| SHELLS.contains(&n.as_str()))
@@ -185,17 +216,20 @@ fn forebears() -> Vec<u32> {
 pub fn for_new_server() -> Env {
     let pids = forebears();
     let args: Vec<Option<Vec<String>>> = pids.iter().map(|&p| crate::platform::args_of(p)).collect();
-    resolve(&args, || std::env::vars_os().collect(), |i| crate::platform::env_of(pids[i]))
+    // macOS keeps its own programs' environment (`/bin/zsh`, `/bin/sh`) to
+    // themselves: an empty one is one we couldn't read.
+    resolve(&args, || std::env::vars_os().collect(), |i| crate::platform::env_of(pids[i]).filter(|e| !e.is_empty()))
 }
 
 /// `own` is this process's environment, `env_at` reads the one the forebear
 /// at that place started with.
 fn resolve(forebears: &[Option<Vec<String>>], own: impl FnOnce() -> Env, env_at: impl Fn(usize) -> Option<Env>) -> Env {
     match source(forebears) {
-        // The agent's program is right under its host, and its first
-        // process right under that (`source` leaves at least one between).
-        Source::Host(h) if h >= 2 => match (env_at(h - 1), env_at(h - 2)) {
-            (Some(started), Some(gave)) => clean(undo(own(), &started, &gave), true),
+        // The agent's program is right under its host, and what it gave
+        // its commands is in the first process below it that isn't its own
+        // (`source` leaves at least one between).
+        Source::Host(h) if h >= 2 => match (env_at(h - 1), gave(forebears, below_agent(forebears, h - 1), &env_at)) {
+            (Some(started), Some((gave, meant))) => clean(undo(own(), &started, &gave, &meant), true),
             // Nothing to compare with: what's here is the agent's command's.
             _ => clean(own(), false),
         },
@@ -205,16 +239,75 @@ fn resolve(forebears: &[Option<Vec<String>>], own: impl FnOnce() -> Env, env_at:
     }
 }
 
+/// What the agent gave its commands, from the process at `from` or, when
+/// that one can't be read (a shell of macOS's own), the next one below that
+/// can, with the names set on the way, in the unread processes' command
+/// lines (`FOO=1 trix …`, `export FOO=…`): someone meant those. `None` when
+/// an unread process runs a script file: what that set can't be seen, so
+/// nothing past it can be told apart from what the agent did.
+fn gave(forebears: &[Option<Vec<String>>], from: usize, env_at: &impl Fn(usize) -> Option<Env>) -> Option<(Env, Vec<String>)> {
+    // What any shell sets for itself, never the agent's to undo.
+    let mut meant: Vec<String> = SHELL_SET.iter().map(|s| s.to_string()).collect();
+    for i in (0..=from).rev() {
+        if let Some(env) = env_at(i) {
+            return Some((env, meant));
+        }
+        let args = forebears[i].as_deref()?;
+        if runs_a_script(args) {
+            return None;
+        }
+        meant.extend(args.iter().flat_map(|a| assigned(a)));
+    }
+    None
+}
+
+/// What a shell sets as it starts, whoever started it.
+const SHELL_SET: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// Does this run a script from a file (`bash ./run.sh`, `node build.js`),
+/// rather than a command line it was given (`zsh -c "…"`, `node -e "…"`)?
+/// Only a shell's or a runtime's: for anything else, its arguments are all
+/// there is to read.
+fn runs_a_script(args: &[String]) -> bool {
+    let Some(name) = program(&args[..1]) else { return false };
+    let shell = SHELLS.contains(&name.as_str());
+    if !shell && !RUNTIMES.contains(&name.as_str()) {
+        return false;
+    }
+    let mut rest = args[1..].iter();
+    for a in rest.by_ref() {
+        let inline = if shell { a.starts_with('-') && !a.starts_with("--") && a.contains('c') } else { matches!(a.as_str(), "-e" | "-c" | "-p" | "--eval" | "--print") };
+        if inline {
+            return false;
+        }
+        if !a.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+/// The names a shell command line assigns: `FOO=1 cmd`, `export FOO=1`,
+/// `a; BAR=2 b`.
+fn assigned(line: &str) -> Vec<String> {
+    line.split(|c: char| c.is_whitespace() || ";&|()'\"".contains(c))
+        .filter_map(|w| w.split_once('=').map(|(name, _)| name))
+        .filter(|n| n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .map(String::from)
+        .collect()
+}
+
 /// `env` with what an agent did undone: `started` is what its program
-/// started with, `gave` what it gave its first process. A variable it set
+/// started with, `gave` what it gave the first process that isn't its own. A variable it set
 /// or changed goes, or gets `started`'s value back, unless something since
 /// changed it again; one it took away comes back unless it was set since.
-fn undo(env: Env, started: &Env, gave: &Env) -> Env {
+/// `meant`: names set on purpose since, left as they are.
+fn undo(env: Env, started: &Env, gave: &Env, meant: &[String]) -> Env {
     let get = |e: &Env, k: &OsString| e.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     let mut out: Env = env
         .into_iter()
         .filter_map(|(k, v)| {
-            let agents = get(gave, &k).filter(|g| get(started, &k).as_ref() != Some(g));
+            let agents = get(gave, &k).filter(|g| get(started, &k).as_ref() != Some(g) && !meant.iter().any(|m| k == m.as_str()));
             match agents {
                 Some(g) if g == v => get(started, &k).map(|s| (k, s)),
                 _ => Some((k, v)),
@@ -346,6 +439,109 @@ mod tests {
             // With the values the pane had: SSH_AUTH_SOCK, Antigravity took.
             assert_eq!(got.iter().find(|(k, _)| k == "SSH_AUTH_SOCK").map(|(_, v)| v.clone()), Some("/private/tmp/launchd/Listeners".into()), "{agent}");
         }
+    }
+
+    #[test]
+    fn an_agents_own_processes_are_told_by_name() {
+        assert_eq!(program(&["/usr/local/bin/codex".into()]).as_deref(), Some("codex"));
+        assert_eq!(program(&["node".into(), "--no-warnings".into(), "/x/@openai/codex/bin/codex.js".into()]).as_deref(), Some("codex"));
+        assert_eq!(program(&["-zsh".into()]).as_deref(), Some("zsh"));
+        assert_eq!(program(&["node".into()]).as_deref(), Some("node"));
+        // Codex on an older Node: its wrapper, then its binary, then the shell.
+        let codex = [a(&["trix", "-s", "work"]), a(&["/bin/zsh", "-lc", "trix -s work"]), a(&["/x/vendor/aarch64-apple-darwin/codex/codex", "exec"]), a(&["node", "/x/bin/codex.js"]), a(&["trix", "holder"])];
+        assert_eq!(below_agent(&codex, 3), 1);
+        // opencode: run, serve, its pty daemon, then the shell.
+        let opencode = [a(&["trix"]), a(&["sh", "-c", "trix"]), a(&["/x/opencode-pty", "daemon"]), a(&["/x/opencode", "serve"]), a(&["opencode"]), a(&["trix", "holder"])];
+        assert_eq!(below_agent(&opencode, 4), 1);
+        // A tool's server under the agent ends the agent there.
+        let probe = [a(&["trix"]), a(&["python3", "-m", "probe"]), a(&["claude"]), a(&["trix", "holder"])];
+        assert_eq!(below_agent(&probe, 2), 1);
+        // An agent that runs trix itself, no shell between.
+        assert_eq!(below_agent(&[a(&["trix"]), a(&["claude"]), a(&["trix", "holder"])], 1), 0);
+        // Arguments it can't read: just its first process.
+        assert_eq!(below_agent(&[a(&["trix"]), a(&["zsh"]), None, a(&["trix", "holder"])], 2), 1);
+    }
+
+    #[test]
+    fn what_a_later_process_of_the_agent_set_goes_too() {
+        // Codex's binary, under its wrapper, sets NO_COLOR and its pagers:
+        // the wrapper's environment has none of it, the shell's has.
+        let codex = vec![a(&["trix", "-s", "work"]), a(&["/bin/zsh", "-lc", "trix -s work"]), a(&["/x/codex"]), a(&["node", "/x/bin/codex.js"]), a(&["trix", "holder"])];
+        let mut wrapper = pane();
+        wrapper.push(("CODEX_MANAGED_BY_NPM".into(), "1".into()));
+        let shell = under("codex");
+        let got = resolve(&codex, || shell.clone(), |i| match i {
+            3 => Some(pane()),
+            2 => Some(wrapper.clone()),
+            1 => Some(shell.clone()),
+            _ => None,
+        });
+        assert_eq!(names(&got), names(&clean(pane(), true)));
+        assert!(!got.iter().any(|(k, _)| k == "NO_COLOR" || k == "LC_ALL" || k == "GIT_PAGER"));
+    }
+
+    #[test]
+    fn past_a_shell_that_cant_be_read_what_it_was_told_to_set_stays() {
+        assert_eq!(assigned("XDG_CONFIG_HOME=/c trix -s x; export FOO=1 && (BAR=2 b) 'Q=3' --flag=x a=b=c"), ["XDG_CONFIG_HOME", "FOO", "BAR", "Q", "a"]);
+        // Claude runs its command through /bin/zsh, which macOS won't let
+        // trix read: what reached trix itself stands in for it.
+        let mut own = under("claude");
+        own.push(("NO_COLOR".into(), "1".into()));
+        own.push(("XDG_CONFIG_HOME".into(), "/c".into()));
+        let forebears = vec![a(&["trix", "-s", "x"]), a(&["/bin/zsh", "-c", "XDG_CONFIG_HOME=/c trix -s x"]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            2 => Some(pane()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        let has = |k: &str| got.iter().any(|(n, _)| n == k);
+        assert!(has("XDG_CONFIG_HOME"), "set on the command line: meant");
+        assert!(!has("NO_COLOR") && !has("CLAUDE_CODE_CHILD_SESSION"), "the agent's");
+        assert!(has("SSH_AUTH_SOCK") && has("HOME"));
+    }
+
+    #[test]
+    fn past_an_unread_script_nothing_but_the_agents_known_ids_goes() {
+        assert!(runs_a_script(&["/bin/bash".into(), "./run.sh".into()]));
+        assert!(runs_a_script(&["node".into(), "--no-warnings".into(), "build.js".into()]));
+        assert!(!runs_a_script(&["/bin/zsh".into(), "-lc".into(), "bash ./run.sh".into()]));
+        assert!(!runs_a_script(&["/bin/zsh".into(), "-c".into(), "trix".into()]));
+        assert!(!runs_a_script(&["node".into(), "-e".into(), "x()".into()]));
+        assert!(!runs_a_script(&["-zsh".into()]));
+        assert!(!runs_a_script(&["/usr/bin/env".into(), "FOO=1".into(), "trix".into()]));
+        // claude → /bin/zsh -c "bash ./run.sh" → /bin/bash ./run.sh (which
+        // exports a sandbox's HOME, PATH and runtime folder) → trix. Neither
+        // shell can be read, and the script's exports aren't on any command
+        // line: they stay, and only what Claude is known to set goes.
+        let mut own = under("claude");
+        own.retain(|(k, _)| k != "HOME" && k != "PATH");
+        own.extend(env(&[("HOME", "/tmp/sandbox"), ("PATH", "/tmp/sandbox/bin"), ("XDG_RUNTIME_DIR", "/tmp/sandbox/run")]));
+        let forebears = vec![a(&["trix"]), a(&["/bin/bash", "./run.sh"]), a(&["/bin/zsh", "-c", "bash ./run.sh"]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            3 => Some(pane()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        let val = |k: &str| got.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(val("HOME").as_deref(), Some("/tmp/sandbox"));
+        assert_eq!(val("PATH").as_deref(), Some("/tmp/sandbox/bin"));
+        assert_eq!(val("XDG_RUNTIME_DIR").as_deref(), Some("/tmp/sandbox/run"));
+        assert_eq!(val("CLAUDE_CODE_CHILD_SESSION"), None);
+    }
+
+    #[test]
+    fn what_a_shell_sets_for_itself_stays() {
+        let mut own = under("claude");
+        own.extend(env(&[("PWD", "/work"), ("SHLVL", "3")]));
+        let mut started = pane();
+        started.extend(env(&[("PWD", "/pane"), ("SHLVL", "1")]));
+        let forebears = vec![a(&["trix"]), a(&["/bin/zsh", "-c", "trix"]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            2 => Some(started.clone()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        assert!(got.iter().any(|(k, v)| k == "PWD" && v == "/work") && got.iter().any(|(k, v)| k == "SHLVL" && v == "3"));
     }
 
     #[test]
