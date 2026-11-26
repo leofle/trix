@@ -1005,6 +1005,15 @@ pub enum Mode {
     View,
 }
 
+/// Sets its flag when dropped, whichever way `run_client` returns.
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Run the client on an already-prepared terminal until the server says bye
 /// or goes away.
 pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Result<Ended> {
@@ -1017,13 +1026,25 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
     };
     send_msg(&mut s, &hello)?;
     let mut w = s.try_clone()?;
+    // Stopped when this returns: a terminal that attaches again starts a new one, and this one
+    // must not read the next key first and lose it on the old socket
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
     std::thread::Builder::new().name("trix-input".into()).spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
+        while !stopped.load(Ordering::Acquire) {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(false) => continue,
+                Ok(true) if stopped.load(Ordering::Acquire) => break,
+                Ok(true) => {}
+                Err(_) => break,
+            }
+            let Ok(ev) = crossterm::event::read() else { break };
             if send_msg(&mut w, &ClientMsg::Event(ev)).is_err() {
                 break;
             }
         }
     })?;
+    let _stop_input = StopOnDrop(stop);
     let mut r = BufReader::with_capacity(1 << 16, s);
     let mut out = io::stdout().lock();
     let mut heard = false;
