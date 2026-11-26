@@ -245,6 +245,10 @@ enum Job {
 /// A few seconds of full-screen frames.
 const MAX_BEHIND: usize = 8 << 20;
 
+/// Backlog past which a terminal gets no new frames until it catches up: one
+/// that falls behind would otherwise only fall further, to `MAX_BEHIND`.
+const SLOW_BEHIND: usize = 1 << 20;
+
 impl Peer {
     fn new(stream: UnixStream) -> Peer {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
@@ -319,6 +323,11 @@ impl Peer {
 
     fn hang_up(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Too much queued for this terminal to send it another frame yet.
+    fn behind(&self) -> bool {
+        self.queued.load(Ordering::Relaxed) > SLOW_BEHIND
     }
 
     /// Wait until the writer is done (after `close`), but not past `until`.
@@ -414,6 +423,13 @@ impl Out {
         self.link().client.is_some()
     }
 
+    /// The controller has a frame's worth and more still queued: skip drawing
+    /// until it catches up. Frames are diffs against the last one drawn, so the
+    /// next draw brings it up to date.
+    pub fn controller_behind(&self) -> bool {
+        self.link().client.as_ref().is_some_and(|(_, p)| p.behind())
+    }
+
     pub fn viewers(&self) -> usize {
         self.link().viewers.len()
     }
@@ -447,6 +463,10 @@ impl Out {
             return;
         }
         l.viewers.retain_mut(|v| {
+            // Behind: this frame is skipped, and the next is a diff from what it shows
+            if v.peer.behind() {
+                return true;
+            }
             let next = viewer_frame(frame, v.size, badge);
             let bytes = paint(v.shown.as_ref(), &next);
             if !v.peer.send(OUT, &bytes) {
@@ -1005,12 +1025,30 @@ pub enum Mode {
     View,
 }
 
-/// Sets its flag when dropped, whichever way `run_client` returns.
-struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+/// Where the input thread sends events: the connection `run_client` is on, or nowhere.
+fn input_target() -> &'static Mutex<Option<UnixStream>> {
+    static TARGET: OnceLock<Mutex<Option<UnixStream>>> = OnceLock::new();
+    TARGET.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("trix-input".into()).spawn(|| {
+            while let Ok(ev) = crossterm::event::read() {
+                let mut target = input_target().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(w) = target.as_mut()
+                    && send_msg(w, &ClientMsg::Event(ev)).is_err()
+                {
+                    *target = None;
+                }
+            }
+        });
+        Mutex::new(None)
+    })
+}
 
-impl Drop for StopOnDrop {
+/// Stops input going to a connection `run_client` has left, whichever way it returns.
+struct DetachInput;
+
+impl Drop for DetachInput {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        *input_target().lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -1025,26 +1063,10 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
         Mode::View => ClientMsg::View { protocol: PROTOCOL, cols, rows },
     };
     send_msg(&mut s, &hello)?;
-    let mut w = s.try_clone()?;
-    // Stopped when this returns: a terminal that attaches again starts a new one, and this one
-    // must not read the next key first and lose it on the old socket
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stopped = stop.clone();
-    std::thread::Builder::new().name("trix-input".into()).spawn(move || {
-        while !stopped.load(Ordering::Acquire) {
-            match crossterm::event::poll(Duration::from_millis(50)) {
-                Ok(false) => continue,
-                Ok(true) if stopped.load(Ordering::Acquire) => break,
-                Ok(true) => {}
-                Err(_) => break,
-            }
-            let Ok(ev) = crossterm::event::read() else { break };
-            if send_msg(&mut w, &ClientMsg::Event(ev)).is_err() {
-                break;
-            }
-        }
-    })?;
-    let _stop_input = StopOnDrop(stop);
+    // One input thread for the process, sending to whichever connection is current: a terminal
+    // that attaches again keeps it, so no second one reads a key first and loses it
+    *input_target().lock().unwrap_or_else(|e| e.into_inner()) = Some(s.try_clone()?);
+    let _detach_input = DetachInput;
     let mut r = BufReader::with_capacity(1 << 16, s);
     let mut out = io::stdout().lock();
     let mut heard = false;
@@ -1069,6 +1091,20 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_that_stops_reading_gets_no_new_frames_until_it_catches_up() {
+        let out = Out::default();
+        let (server_end, _client_end) = UnixStream::pair().unwrap();
+        out.attach(1, server_end, (80, 24));
+        assert!(!out.controller_behind());
+        // Past what the socket buffers, the rest waits in the queue
+        for _ in 0..40 {
+            out.send(&[b'x'; 64 << 10]);
+        }
+        assert!(out.controller_behind(), "over SLOW_BEHIND queued");
+        assert!(out.controlled(), "still attached: behind, not yet dropped");
+    }
 
     #[test]
     fn a_viewer_that_never_reads_cannot_block_the_server() {

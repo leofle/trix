@@ -803,7 +803,9 @@ fn attach_once(stream: std::os::unix::net::UnixStream, mode: Mode, reset: fn()) 
         // a terminal speaking the kitty protocol (iTerm2, Ghostty, kitty, WezTerm)
         // sends alt+$ as alt+shift+4, which reads as alt+4, a jump to agent 4,
         // and a pane gets alt+4 for it too.
-        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        // Asked once: on a reattach the input thread holds the terminal's input, and the answer is the same
+        static ENHANCED_KEYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ENHANCED_KEYS.get_or_init(|| crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)) {
             queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS))?;
         }
     }
@@ -954,7 +956,8 @@ fn server() -> anyhow::Result<()> {
         if anim.is_some_and(|t| now >= t) && now >= last_draw + ANIM {
             app.dirty = true;
         }
-        if app.dirty && now >= last_draw + FRAME {
+        // A controller still sending the last frames waits for the next one: it would only fall further behind
+        if app.dirty && now >= last_draw + FRAME && !out.controller_behind() {
             app.dirty = false;
             last_draw = now;
             // Output errors only ever mean the client left; `Out` handles it.
