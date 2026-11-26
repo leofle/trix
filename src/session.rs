@@ -890,7 +890,9 @@ pub fn connect_to(session: &str) -> Option<UnixStream> {
 
 /// Start a detached server and wait for it to accept connections.
 pub fn start_server() -> anyhow::Result<UnixStream> {
-    let exe = std::env::current_exe()?;
+    // The server learns its own path from how it was started: hand it the one
+    // that outlives an upgrade.
+    let exe = crate::platform::trix_exe()?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path())?;
     let mut cmd = Command::new(exe);
     // Not the environment of whatever started it (an agent, often): the

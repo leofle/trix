@@ -500,8 +500,80 @@ pub fn copy(text: &str) {
     }
 }
 
+/// This trix, by a path that outlives an upgrade, for what it hands on: the
+/// server it starts, agents' hooks and plugins, holders, case panes. On Linux
+/// `current_exe` is the binary itself, Homebrew's `Cellar/trix/<version>/
+/// bin/trix`, which `brew upgrade` deletes from under everything still
+/// launching it. The path trix was started by (`bin/trix`, a link to the
+/// latest) stays. Without one that leads to this same binary, `current_exe`.
+pub fn trix_exe() -> std::io::Result<PathBuf> {
+    let real = std::env::current_exe()?;
+    let alias = std::env::args_os().next().and_then(|arg0| {
+        let cwd = std::env::current_dir().ok()?;
+        stable_alias(&arg0, std::env::var_os("PATH").as_deref(), &cwd, &real)
+    });
+    Ok(alias.unwrap_or(real))
+}
+
+/// The path `arg0` names (found on `path` when it's a bare name), when it
+/// goes through a link and still leads to `real`.
+fn stable_alias(arg0: &std::ffi::OsStr, path: Option<&std::ffi::OsStr>, cwd: &std::path::Path, real: &std::path::Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let named = std::path::Path::new(arg0);
+    let candidate = if arg0.as_bytes().contains(&b'/') {
+        std::path::absolute(cwd.join(named)).ok()?
+    } else {
+        std::env::split_paths(path?).filter(|d| d.is_absolute()).map(|d| d.join(named)).find(|p| p.is_file())?
+    };
+    let resolved = std::fs::canonicalize(&candidate).ok()?;
+    // `real` itself is no better than `real`, even when a folder on the way is
+    // a link (macOS's /var is /private/var).
+    (resolved == std::fs::canonicalize(real).ok()? && candidate != resolved && candidate != real).then_some(candidate)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    /// Homebrew's layout: `bin/trix`, a link to `Cellar/trix/1.0/bin/trix`.
+    #[test]
+    fn trix_is_named_by_the_link_that_outlives_an_upgrade() {
+        use super::stable_alias;
+        use std::ffi::OsStr;
+        let root = std::env::temp_dir().join(format!("trix-stable-exe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cellar = root.join("Cellar/trix/1.0/bin");
+        let (bin, other) = (root.join("bin"), root.join("other"));
+        for d in [&cellar, &bin, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let real = cellar.join("trix");
+        std::fs::write(&real, b"trix 1.0").unwrap();
+        std::os::unix::fs::symlink("../Cellar/trix/1.0/bin/trix", bin.join("trix")).unwrap();
+        std::fs::write(other.join("trix"), b"another trix").unwrap();
+        let link = bin.join("trix");
+        let path = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
+
+        assert_eq!(stable_alias(link.as_os_str(), None, &root, &real), Some(link.clone()), "started by the link");
+        assert_eq!(stable_alias(OsStr::new("bin/trix"), None, &root, &real), Some(link.clone()), "a relative link, made absolute");
+        assert_eq!(stable_alias(OsStr::new("./bin/trix"), None, &root, &real), Some(link.clone()), "without its ./");
+        assert_eq!(stable_alias(OsStr::new("trix"), Some(&path(&[Path::new("rel"), &bin])), &root, &real), Some(link.clone()), "found on PATH, skipping a relative entry");
+        assert_eq!(stable_alias(real.as_os_str(), None, &root, &real), None, "started by the binary itself: nothing better than it");
+        assert_eq!(stable_alias(OsStr::new("trix"), Some(&path(&[&other, &bin])), &root, &real), None, "PATH's first trix is another one");
+        assert_eq!(stable_alias(OsStr::new("trix"), None, &root, &real), None, "a bare name and no PATH");
+        assert_eq!(stable_alias(OsStr::new("gone/trix"), None, &root, &real), None);
+
+        // `brew upgrade`: 1.1 in, 1.0 out, the link moved. What 1.0 handed on
+        // is the link, which still starts a trix.
+        std::fs::create_dir_all(root.join("Cellar/trix/1.1/bin")).unwrap();
+        std::fs::write(root.join("Cellar/trix/1.1/bin/trix"), b"trix 1.1").unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("../Cellar/trix/1.1/bin/trix", &link).unwrap();
+        std::fs::remove_dir_all(root.join("Cellar/trix/1.0")).unwrap();
+        assert!(!real.exists() && std::fs::read(&link).unwrap() == b"trix 1.1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_processes_arguments_are_read() {
         let mut child = std::process::Command::new("sleep").arg("7").spawn().unwrap();

@@ -864,7 +864,7 @@ fn server() -> anyhow::Result<()> {
         return Ok(());
     };
     platform::raise_fd_limit();
-    let exe = std::env::current_exe()?;
+    let exe = platform::trix_exe()?;
     let (tx, rx) = mpsc::channel::<AppEvent>();
     hooks::sweep_stale();
     let socket = hooks::socket_path();
