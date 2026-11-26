@@ -60,6 +60,8 @@ pub const AGENT_SET: &[(&str, &[&str])] = &[
             "CLAUDE_CODE_MESSAGING_SOCKET",
             "CLAUDE_CODE_MESSAGING_TOKEN",
             "CLAUDE_CODE_TOOL_USE_ID",
+            // Only Claude's value: yours (an editor) stays.
+            "GIT_EDITOR=true",
         ],
     ),
     (
@@ -187,9 +189,18 @@ fn source(forebears: &[Option<Vec<String>>]) -> Source {
 /// commands. `seen`: what the agent did was undone already, so the names
 /// agents share with people (`SHARED`) left are yours and stay.
 fn clean(env: Env, seen: bool) -> Env {
-    let agents = |k: &str| AGENT_SET.iter().any(|(_, vars)| vars.contains(&k)) && !(seen && SHARED.contains(&k));
-    let drop = |k: &OsString| k.to_str().is_some_and(|k| PANE_SET.contains(&k) || agents(k));
-    env.into_iter().filter(|(k, _)| !drop(k)).collect()
+    let agents = |k: &str, v: &OsString| AGENT_SET.iter().any(|(_, vars)| vars.iter().any(|e| listed(e, k, v))) && !(seen && SHARED.contains(&k));
+    let drop = |k: &OsString, v: &OsString| k.to_str().is_some_and(|k| PANE_SET.contains(&k) || agents(k, v));
+    env.into_iter().filter(|(k, v)| !drop(k, v)).collect()
+}
+
+/// Is `name=value` what an `AGENT_SET` entry says: the name, or with
+/// `NAME=value` that name with that value only.
+fn listed(entry: &str, name: &str, value: &OsString) -> bool {
+    match entry.split_once('=') {
+        Some((n, v)) => n == name && value == v,
+        None => entry == name,
+    }
 }
 
 /// This process and its parents, then its session's leader and that one's
@@ -253,13 +264,35 @@ fn gave(forebears: &[Option<Vec<String>>], from: usize, env_at: &impl Fn(usize) 
             return Some((env, meant));
         }
         let args = forebears[i].as_deref()?;
-        if runs_a_script(args) {
+        if runs_a_script(args) || args[1..].iter().any(|a| names_a_script(a)) {
             return None;
         }
         meant.extend(args.iter().flat_map(|a| assigned(a)));
     }
     None
 }
+
+/// Does a command line an unread shell was given run a script file: `bash
+/// run.sh`, `./run.sh`, `source env.sh`? With `exec`, the script becomes
+/// the next process itself (trix, by then), and nothing shows what it set.
+/// A file sourced first is the agent's own setup (Claude's shell snapshot:
+/// `source ~/.claude/shell-snapshots/….sh && … eval '<command>'`), and
+/// `./…/trix` is trix itself, not a script.
+fn names_a_script(line: &str) -> bool {
+    let words: Vec<&str> = line.split(|c: char| c.is_whitespace() || ";&|()'\"`".contains(c)).filter(|w| !w.is_empty()).collect();
+    let trix = |w: &str| std::path::Path::new(w).file_name().is_some_and(|n| n.to_string_lossy().starts_with("trix"));
+    words.iter().enumerate().any(|(i, &w)| {
+        let preamble = i == 1 && matches!(words[0], "source" | ".");
+        let sourced = matches!(w, "source" | ".") && i > 0 && words.get(i + 1).is_some();
+        let run = !preamble && !trix(w) && (w.starts_with("./") || w.starts_with("../") || w.starts_with("~/") || SCRIPT_FILES.iter().any(|x| w.ends_with(x)));
+        let by_shell = program(&[w.to_string()]).is_some_and(|p| SHELLS.contains(&p.as_str()) || RUNTIMES.contains(&p.as_str()))
+            && runs_a_script(&words[i..].iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        sourced || run || by_shell
+    })
+}
+
+/// What a script file's name ends with.
+const SCRIPT_FILES: &[&str] = &[".sh", ".bash", ".zsh", ".fish", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb"];
 
 /// What a shell sets as it starts, whoever started it.
 const SHELL_SET: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
@@ -527,6 +560,63 @@ mod tests {
         assert_eq!(val("PATH").as_deref(), Some("/tmp/sandbox/bin"));
         assert_eq!(val("XDG_RUNTIME_DIR").as_deref(), Some("/tmp/sandbox/run"));
         assert_eq!(val("CLAUDE_CODE_CHILD_SESSION"), None);
+    }
+
+    /// Claude's own wrapping of a command, as `/bin/zsh -c` gets it.
+    fn claude_runs(command: &str) -> String {
+        format!("source /Users/you/.claude/shell-snapshots/snapshot-zsh-1-abc.sh 2>/dev/null || true && \\builtin setopt NO_EXTENDED_GLOB 2>/dev/null || true && {{ \\builtin unalias -- 'which'; }} >/dev/null 2>&1 || true && eval '{command}' < /dev/null && pwd -P >| /tmp/claude-1-cwd")
+    }
+
+    #[test]
+    fn a_script_named_on_an_unread_command_line_is_one_we_cant_see_into() {
+        for script in ["bash run.sh", "sh ./x", "./run.sh", "~/bin/go", "/tmp/run.sh", "source env.sh && trix -s x", ". ./env && trix", "python3 tool.py", "exec bash run.sh"] {
+            assert!(names_a_script(&claude_runs(script)), "{script}");
+        }
+        for plain in ["trix -s zz layout open L", "FOO=1 trix -s x", "./target/debug/trix -s x", "cd /tmp && trix -s x", "bash -c 'trix -s x'", "zsh -lc trix"] {
+            assert!(!names_a_script(&claude_runs(plain)), "{plain}");
+        }
+    }
+
+    #[test]
+    fn an_execd_script_keeps_what_it_exported() {
+        // `bash run.sh` with `exec trix …` at its end: trix is what bash
+        // became, and the zsh above it can't be read. The script's exports
+        // stay; only what Claude is known to set goes.
+        let mut own = under("claude");
+        own.retain(|(k, _)| k != "PATH");
+        own.extend(env(&[("PATH", "/tmp/x:/opt/homebrew/bin:/usr/bin:/bin"), ("MY_SCRIPT_MARK", "from-script"), ("GIT_EDITOR", "true")]));
+        let forebears = vec![a(&["trix", "-s", "zz", "layout", "open", "L"]), Some(vec!["/bin/zsh".into(), "-c".into(), claude_runs("bash run.sh")]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            2 => Some(pane()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        let val = |k: &str| got.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(val("MY_SCRIPT_MARK").as_deref(), Some("from-script"));
+        assert_eq!(val("PATH").as_deref(), Some("/tmp/x:/opt/homebrew/bin:/usr/bin:/bin"));
+        assert_eq!(val("CLAUDE_CODE_CHILD_SESSION"), None);
+        assert_eq!(val("GIT_EDITOR"), None, "Claude's value");
+    }
+
+    #[test]
+    fn claudes_plain_command_still_undoes_what_claude_set() {
+        let mut own = under("claude");
+        own.extend(env(&[("NO_COLOR", "1"), ("GIT_EDITOR", "true")]));
+        let forebears = vec![a(&["trix", "-s", "zz"]), Some(vec!["/bin/zsh".into(), "-c".into(), claude_runs("trix -s zz layout open L")]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            2 => Some(pane()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        assert!(!got.iter().any(|(k, _)| k == "NO_COLOR" || k == "GIT_EDITOR" || k == "CLAUDE_CODE_CHILD_SESSION"));
+        assert!(got.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn your_own_git_editor_stays_on_the_fallback() {
+        let yours = env(&[("PATH", "/bin"), ("GIT_EDITOR", "vim")]);
+        assert_eq!(names(&clean(yours, false)), ["GIT_EDITOR", "PATH"]);
+        assert_eq!(names(&clean(env(&[("PATH", "/bin"), ("GIT_EDITOR", "true")]), false)), ["PATH"]);
     }
 
     #[test]
