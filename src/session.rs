@@ -232,6 +232,8 @@ struct Peer {
     tx: Sender<Job>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
     done: Arc<std::sync::atomic::AtomicBool>,
+    /// Hung up for falling behind: logged once.
+    dropped: std::sync::atomic::AtomicBool,
 }
 
 enum Job {
@@ -257,9 +259,13 @@ impl Peer {
                 for job in rx {
                     match job {
                         Job::Frame(b) => {
-                            let ok = w.write_all(&b).and_then(|()| w.flush()).is_ok();
+                            let wrote = w.write_all(&b).and_then(|()| w.flush());
                             queued.fetch_sub(b.len(), Ordering::Relaxed);
-                            if !ok {
+                            if let Err(e) = wrote {
+                                // A terminal that left is a broken pipe; one that stopped reading times out
+                                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                                    eprintln!("trix: hung up on a terminal that read nothing for 10s");
+                                }
                                 break;
                             }
                         }
@@ -273,14 +279,22 @@ impl Peer {
         } else {
             done.store(true, Ordering::Release);
         }
-        Peer { stream, tx, queued, done }
+        Peer { stream, tx, queued, done, dropped: Default::default() }
     }
 
     /// Queue one frame. False when the client is gone or too far behind,
     /// and then it has been hung up on.
     fn send(&self, kind: u8, payload: &[u8]) -> bool {
         let len = payload.len() + 5;
-        if self.done.load(Ordering::Acquire) || self.queued.load(Ordering::Relaxed) + len > MAX_BEHIND {
+        if self.done.load(Ordering::Acquire) {
+            self.hang_up();
+            return false;
+        }
+        if self.queued.load(Ordering::Relaxed) + len > MAX_BEHIND {
+            // Said in the log, or the terminal's "lost the workspace server" reads as a crash
+            if !self.dropped.swap(true, Ordering::Relaxed) {
+                eprintln!("trix: hung up on a terminal {} MB behind on screen updates", MAX_BEHIND >> 20);
+            }
             self.hang_up();
             return false;
         }
