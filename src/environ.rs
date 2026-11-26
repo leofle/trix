@@ -15,18 +15,23 @@
 //!   askpass and config (Copilot, Cursor), its sandbox's proxies (Muse);
 //! - and what it removed: Antigravity drops `SSH_AUTH_SOCK`.
 //!
-//! So a server started under a trix holder or server takes that one's
-//! environment instead, the one its session was started with: what the
-//! agent added goes, and what it took away comes back, whichever agent it
-//! is. Only when the command was typed into a shell pane (nothing but
-//! shells between it and its holder) does it keep its own, since what's
-//! there is what you exported. Either way, what trix set for the pane and
-//! what an agent is known to set for its commands are left out
-//! (`AGENT_SET`, `PANE_SET`): that covers the rest, a server whose holder
-//! can't be read, and a session that an older trix started from an agent.
-//! Names an agent shares with people (`AGENT`) go only in the first case.
-//! This replaces #113's list of Claude's variables (Yoav), which is part of
-//! `AGENT_SET` now.
+//! So a server started under an agent undoes what that agent did: the
+//! agent's program started with the pane's environment, and the difference
+//! between that and what it gave the first process it started (its shell, a
+//! tool's server) is what the agent changed. Whatever the agent set there
+//! and is still unchanged goes; what it changed gets the pane's value back;
+//! what it took away comes back. Changes made further down are kept, since
+//! someone meant them: a script's or a tool's own `HOME`, `XDG_RUNTIME_DIR`
+//! and `PATH` (a sandbox's), an agent's `FOO=1 trix …`. Only when the
+//! command was typed into a shell pane (nothing but shells between it and
+//! its holder) is its environment kept whole. Either way, what trix set for
+//! the pane and what an agent is known to set for its commands are left out
+//! (`AGENT_SET`, `PANE_SET`): that covers agents that set more in processes
+//! further down (Codex's wrapper and its binary), environments that can't be
+//! read, and a session that an older trix started from an agent. Names an
+//! agent shares with people (`AGENT`) go by that list only when nothing
+//! could be read. This replaces #113's list of Claude's variables (Yoav),
+//! which is part of `AGENT_SET` now.
 
 use std::ffi::OsString;
 
@@ -37,7 +42,7 @@ pub type Env = Vec<(OsString, OsString)>;
 /// sockets. Measured from each one's shell tool (`env` there against a
 /// plain shell's). Settings a person may export (`CLAUDE_EFFORT`,
 /// `CLAUDE_CODE_USE_BEDROCK`, `NO_COLOR`, `GIT_ASKPASS`, proxies…) aren't
-/// here: they go only by taking the holder's environment.
+/// here: they go only when the agent is seen setting them (`undo`).
 pub const AGENT_SET: &[(&str, &[&str])] = &[
     (
         "claude",
@@ -107,9 +112,9 @@ pub const AGENT_SET: &[(&str, &[&str])] = &[
 ];
 
 /// Names in `AGENT_SET` that aren't any one agent's, and a person might set
-/// too: `AGENT` (opencode sets `AGENT=1`, amp sets it as well). One in the
-/// holder's environment is the session's, so it stays; one only an agent's
-/// command has goes.
+/// too: `AGENT` (opencode sets `AGENT=1`, amp sets it as well). They go when
+/// the agent is seen setting them, and by name only when nothing could be
+/// read.
 const SHARED: &[&str] = &["AGENT", "TRACEPARENT"];
 
 /// What trix gives a pane of its own (agent.rs): that pane's socket, id,
@@ -148,10 +153,10 @@ fn source(forebears: &[Option<Vec<String>>]) -> Source {
 }
 
 /// `env` without what trix set for a pane and what an agent set for its
-/// commands. `from_holder`: it's the session's own, so the names agents
-/// share with people (`SHARED`) are yours there and stay.
-fn clean(env: Env, from_holder: bool) -> Env {
-    let agents = |k: &str| AGENT_SET.iter().any(|(_, vars)| vars.contains(&k)) && !(from_holder && SHARED.contains(&k));
+/// commands. `seen`: what the agent did was undone already, so the names
+/// agents share with people (`SHARED`) left are yours and stay.
+fn clean(env: Env, seen: bool) -> Env {
+    let agents = |k: &str| AGENT_SET.iter().any(|(_, vars)| vars.contains(&k)) && !(seen && SHARED.contains(&k));
     let drop = |k: &OsString| k.to_str().is_some_and(|k| PANE_SET.contains(&k) || agents(k));
     env.into_iter().filter(|(k, _)| !drop(k)).collect()
 }
@@ -180,22 +185,48 @@ fn forebears() -> Vec<u32> {
 pub fn for_new_server() -> Env {
     let pids = forebears();
     let args: Vec<Option<Vec<String>>> = pids.iter().map(|&p| crate::platform::args_of(p)).collect();
-    resolve(&args, || std::env::vars_os().collect(), |h| crate::platform::env_of(pids[h]))
+    resolve(&args, || std::env::vars_os().collect(), |i| crate::platform::env_of(pids[i]))
 }
 
-/// `own` is this process's environment, `host_env` reads the one of the
-/// forebear at that place.
-fn resolve(forebears: &[Option<Vec<String>>], own: impl FnOnce() -> Env, host_env: impl FnOnce(usize) -> Option<Env>) -> Env {
+/// `own` is this process's environment, `env_at` reads the one the forebear
+/// at that place started with.
+fn resolve(forebears: &[Option<Vec<String>>], own: impl FnOnce() -> Env, env_at: impl Fn(usize) -> Option<Env>) -> Env {
     match source(forebears) {
-        Source::Host(h) => match host_env(h) {
-            Some(env) => clean(env, true),
-            // Under an agent, with nothing to compare with: what's ours is
-            // the agent's command's.
-            None => clean(own(), false),
+        // The agent's program is right under its host, and its first
+        // process right under that (`source` leaves at least one between).
+        Source::Host(h) if h >= 2 => match (env_at(h - 1), env_at(h - 2)) {
+            (Some(started), Some(gave)) => clean(undo(own(), &started, &gave), true),
+            // Nothing to compare with: what's here is the agent's command's.
+            _ => clean(own(), false),
         },
+        Source::Host(_) => clean(own(), false),
         // Yours: a shell pane's, or a terminal's outside trix.
         Source::Own => clean(own(), true),
     }
+}
+
+/// `env` with what an agent did undone: `started` is what its program
+/// started with, `gave` what it gave its first process. A variable it set
+/// or changed goes, or gets `started`'s value back, unless something since
+/// changed it again; one it took away comes back unless it was set since.
+fn undo(env: Env, started: &Env, gave: &Env) -> Env {
+    let get = |e: &Env, k: &OsString| e.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let mut out: Env = env
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let agents = get(gave, &k).filter(|g| get(started, &k).as_ref() != Some(g));
+            match agents {
+                Some(g) if g == v => get(started, &k).map(|s| (k, s)),
+                _ => Some((k, v)),
+            }
+        })
+        .collect();
+    for (k, v) in started {
+        if get(gave, k).is_none() && get(&out, k).is_none() {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -216,7 +247,7 @@ mod tests {
         n
     }
 
-    /// What a session was started with, as the holder has it.
+    /// What a session was started with.
     const SESSION: &[(&str, &str)] = &[
         ("HOME", "/Users/you"),
         ("PATH", "/opt/homebrew/bin:/usr/bin:/bin"),
@@ -267,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn under_an_agent_the_server_takes_the_holders_environment() {
+    fn under_an_agent_it_finds_the_agent_under_its_holder() {
         let claude = [a(&["trix", "-s", "work", "layout", "open"]), a(&["/bin/zsh", "-c", "trix -s work layout open"]), a(&["claude"]), a(&["/opt/homebrew/bin/trix", "holder"]), a(&["/sbin/launchd"])];
         assert_eq!(source(&claude), Source::Host(3));
         // Under the server, when the pane's holder couldn't start.
@@ -296,17 +327,65 @@ mod tests {
         vec![a(&["trix", "-s", "work", "layout", "open"]), a(&["/bin/zsh", "-c", "trix -s work layout open"]), a(&[agent]), a(&["/opt/homebrew/bin/trix", "holder"])]
     }
 
-    #[test]
-    fn under_every_agent_the_server_gets_the_sessions_environment_back() {
-        for (agent, added, removed) in MEASURED {
-            let got = resolve(&run_by(agent), || under(agent), |h| (h == 3).then(|| env(SESSION)));
-            assert_eq!(names(&got), names(&env(SESSION)), "{agent} added {added:?}, removed {removed:?}");
+    /// `env_at` for `run_by`: the agent started with the pane's, and gave its
+    /// shell `gave`.
+    fn seen(gave: Env) -> impl Fn(usize) -> Option<Env> {
+        move |i| match i {
+            2 => Some(pane()),
+            1 => Some(gave.clone()),
+            _ => None,
         }
     }
 
     #[test]
-    fn when_the_holder_cant_be_read_what_the_agent_set_still_goes() {
-        // A holder that isn't ours to read, or a session an older trix
+    fn under_every_agent_the_server_gets_the_panes_environment_back() {
+        for (agent, added, removed) in MEASURED {
+            let got = resolve(&run_by(agent), || under(agent), seen(under(agent)));
+            assert_eq!(got.iter().filter(|(k, _)| k != "TERM").count(), env(SESSION).len(), "{agent}");
+            assert_eq!(names(&got), names(&clean(pane(), true)), "{agent} added {added:?}, removed {removed:?}");
+            // With the values the pane had: SSH_AUTH_SOCK, Antigravity took.
+            assert_eq!(got.iter().find(|(k, _)| k == "SSH_AUTH_SOCK").map(|(_, v)| v.clone()), Some("/private/tmp/launchd/Listeners".into()), "{agent}");
+        }
+    }
+
+    #[test]
+    fn what_an_agent_changed_gets_its_value_back() {
+        let mut gave = pane();
+        for (k, v) in gave.iter_mut() {
+            if k == "TERM" {
+                *v = "dumb".into();
+            }
+        }
+        let got = resolve(&run_by("gemini"), || gave.clone(), seen(gave.clone()));
+        assert_eq!(got.iter().find(|(k, _)| k == "TERM").map(|(_, v)| v.clone()), Some("xterm-256color".into()));
+    }
+
+    #[test]
+    fn what_was_changed_after_the_agent_stays() {
+        // A tool's sandbox (or a script, or `FOO=1 trix`) under the agent:
+        // its own HOME, runtime folder and PATH, and the agent's ids, which
+        // it passed on untouched.
+        let mut own = under("claude");
+        own.retain(|(k, _)| k != "HOME" && k != "PATH");
+        own.extend(env(&[("HOME", "/tmp/sandbox/home"), ("PATH", "/tmp/sandbox/bin:/usr/bin"), ("XDG_RUNTIME_DIR", "/tmp/sandbox/run"), ("CLAUDE_EFFORT", "low")]));
+        own.retain(|(k, v)| !(k == "CLAUDE_EFFORT" && v == "high"));
+        let got = resolve(&run_by("claude"), || own.clone(), seen(under("claude")));
+        let val = |k: &str| got.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(val("HOME").as_deref(), Some("/tmp/sandbox/home"));
+        assert_eq!(val("PATH").as_deref(), Some("/tmp/sandbox/bin:/usr/bin"));
+        assert_eq!(val("XDG_RUNTIME_DIR").as_deref(), Some("/tmp/sandbox/run"));
+        assert_eq!(val("CLAUDE_EFFORT").as_deref(), Some("low"));
+        assert_eq!(val("CLAUDE_CODE_CHILD_SESSION"), None);
+        // The tool's own server sits between the agent and the command: its
+        // first process is that one, not a shell.
+        let probe = vec![a(&["trix"]), a(&["python3", "-m", "probe"]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&probe, || own.clone(), seen(under("claude")));
+        assert!(got.iter().any(|(k, v)| k == "HOME" && v == "/tmp/sandbox/home"));
+    }
+
+    #[test]
+    fn when_nothing_can_be_read_what_the_agent_set_still_goes() {
+        // Processes that aren't ours to read, or a session an older trix
         // started from an agent: what that agent set for its commands goes,
         // your settings stay.
         for (agent, _, _) in MEASURED {
@@ -345,12 +424,17 @@ mod tests {
     #[test]
     fn an_agent_variable_of_yours_stays_unless_only_the_agents_command_has_it() {
         let yours = env(&[("PATH", "/bin"), ("AGENT", "mine"), ("OPENCODE_SESSION_ID", "s")]);
-        // In the holder's (the session's) environment: yours.
-        let got = resolve(&run_by("opencode"), || panic!("not ours"), |_| Some(yours.clone()));
+        // In the pane's environment, and left alone by the agent: yours.
+        let started = env(&[("PATH", "/bin"), ("AGENT", "mine")]);
+        let got = resolve(&run_by("opencode"), || yours.clone(), |i| [None, Some(yours.clone()), Some(started.clone())].get(i).cloned().flatten());
         assert_eq!(names(&got), ["AGENT", "PATH"]);
+        // Set by the agent: its.
+        let gave = env(&[("PATH", "/bin"), ("AGENT", "1")]);
+        let got = resolve(&run_by("opencode"), || gave.clone(), |i| [None, Some(gave.clone()), Some(env(&[("PATH", "/bin")]))].get(i).cloned().flatten());
+        assert_eq!(names(&got), ["PATH"]);
         // Typed into a shell pane, or outside trix: yours too.
         assert_eq!(names(&resolve(&[a(&["trix"]), a(&["-zsh"]), a(&["trix", "holder"])], || yours.clone(), |_| None)), ["AGENT", "PATH"]);
-        // Under an agent, with no holder to read: the agent's.
+        // Under an agent, with nothing to read: the agent's.
         assert_eq!(names(&resolve(&run_by("opencode"), || yours.clone(), |_| None)), ["PATH"]);
     }
 
