@@ -1549,6 +1549,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Everything an agent runs to reach trix names the path trix was handed,
+    /// a link that outlives `brew upgrade`, and never what it leads to.
+    #[test]
+    fn hooks_and_plugins_keep_a_linked_trix_unresolved() {
+        let dir = std::env::temp_dir().join(format!("trix-linked-exe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Cellar/trix/1.0/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("Cellar/trix/1.0/bin/trix"), b"").unwrap();
+        let link = dir.join("bin/trix");
+        std::os::unix::fs::symlink("../Cellar/trix/1.0/bin/trix", &link).unwrap();
+        let want = format!("'{}' hook ", link.display());
+        assert_eq!(hook_command(&link, "claude"), format!("{want}claude"));
+        let made = [cursor_hooks(&link).to_string(), copilot_hooks(&link).to_string(), muse_hooks(&link).to_string(), opencode_plugin_source(&link, true)];
+        for text in made {
+            assert!(text.contains(&link.display().to_string()) && !text.contains("Cellar"), "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn c(v: Value) -> HookMsg {
         condense(7, "claude", &v)
     }

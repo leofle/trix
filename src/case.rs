@@ -3231,7 +3231,7 @@ fn start(input: &str) -> Result<String, String> {
 
 /// The pane a stored case runs in. If it can't start, the case is gone.
 fn case_pane(root: &Path, id: &str, repo: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = crate::platform::trix_exe().map_err(|e| e.to_string())?;
     let command = shell_words::join([exe.display().to_string(), "case".into(), "run".into(), id.to_string()]);
     if let Err(e) = control(crate::control::Request::Spawn { kind: "custom".into(), name: Some(id.into()), cwd: repo.to_path_buf(), command: Some(command), prompt: None, worktree: false }) {
         let _ = std::fs::remove_dir_all(dir_of(root, id));
