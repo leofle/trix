@@ -242,16 +242,49 @@ fn resolve(forebears: &[Option<Vec<String>>], own: impl FnOnce() -> Env, env_at:
 /// What the agent gave its commands, from the process at `from` or, when
 /// that one can't be read (a shell of macOS's own), the next one below that
 /// can, with the names set on the way, in the unread processes' command
-/// lines (`FOO=1 trix …`, `export FOO=…`): someone meant those.
+/// lines (`FOO=1 trix …`, `export FOO=…`): someone meant those. `None` when
+/// an unread process runs a script file: what that set can't be seen, so
+/// nothing past it can be told apart from what the agent did.
 fn gave(forebears: &[Option<Vec<String>>], from: usize, env_at: &impl Fn(usize) -> Option<Env>) -> Option<(Env, Vec<String>)> {
-    let mut meant = Vec::new();
+    // What any shell sets for itself, never the agent's to undo.
+    let mut meant: Vec<String> = SHELL_SET.iter().map(|s| s.to_string()).collect();
     for i in (0..=from).rev() {
         if let Some(env) = env_at(i) {
             return Some((env, meant));
         }
-        meant.extend(forebears[i].iter().flatten().flat_map(|a| assigned(a)));
+        let args = forebears[i].as_deref()?;
+        if runs_a_script(args) {
+            return None;
+        }
+        meant.extend(args.iter().flat_map(|a| assigned(a)));
     }
     None
+}
+
+/// What a shell sets as it starts, whoever started it.
+const SHELL_SET: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// Does this run a script from a file (`bash ./run.sh`, `node build.js`),
+/// rather than a command line it was given (`zsh -c "…"`, `node -e "…"`)?
+/// Only a shell's or a runtime's: for anything else, its arguments are all
+/// there is to read.
+fn runs_a_script(args: &[String]) -> bool {
+    let Some(name) = program(&args[..1]) else { return false };
+    let shell = SHELLS.contains(&name.as_str());
+    if !shell && !RUNTIMES.contains(&name.as_str()) {
+        return false;
+    }
+    let mut rest = args[1..].iter();
+    for a in rest.by_ref() {
+        let inline = if shell { a.starts_with('-') && !a.starts_with("--") && a.contains('c') } else { matches!(a.as_str(), "-e" | "-c" | "-p" | "--eval" | "--print") };
+        if inline {
+            return false;
+        }
+        if !a.starts_with('-') {
+            return true;
+        }
+    }
+    false
 }
 
 /// The names a shell command line assigns: `FOO=1 cmd`, `export FOO=1`,
@@ -465,6 +498,50 @@ mod tests {
         assert!(has("XDG_CONFIG_HOME"), "set on the command line: meant");
         assert!(!has("NO_COLOR") && !has("CLAUDE_CODE_CHILD_SESSION"), "the agent's");
         assert!(has("SSH_AUTH_SOCK") && has("HOME"));
+    }
+
+    #[test]
+    fn past_an_unread_script_nothing_but_the_agents_known_ids_goes() {
+        assert!(runs_a_script(&["/bin/bash".into(), "./run.sh".into()]));
+        assert!(runs_a_script(&["node".into(), "--no-warnings".into(), "build.js".into()]));
+        assert!(!runs_a_script(&["/bin/zsh".into(), "-lc".into(), "bash ./run.sh".into()]));
+        assert!(!runs_a_script(&["/bin/zsh".into(), "-c".into(), "trix".into()]));
+        assert!(!runs_a_script(&["node".into(), "-e".into(), "x()".into()]));
+        assert!(!runs_a_script(&["-zsh".into()]));
+        assert!(!runs_a_script(&["/usr/bin/env".into(), "FOO=1".into(), "trix".into()]));
+        // claude → /bin/zsh -c "bash ./run.sh" → /bin/bash ./run.sh (which
+        // exports a sandbox's HOME, PATH and runtime folder) → trix. Neither
+        // shell can be read, and the script's exports aren't on any command
+        // line: they stay, and only what Claude is known to set goes.
+        let mut own = under("claude");
+        own.retain(|(k, _)| k != "HOME" && k != "PATH");
+        own.extend(env(&[("HOME", "/tmp/sandbox"), ("PATH", "/tmp/sandbox/bin"), ("XDG_RUNTIME_DIR", "/tmp/sandbox/run")]));
+        let forebears = vec![a(&["trix"]), a(&["/bin/bash", "./run.sh"]), a(&["/bin/zsh", "-c", "bash ./run.sh"]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            3 => Some(pane()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        let val = |k: &str| got.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(val("HOME").as_deref(), Some("/tmp/sandbox"));
+        assert_eq!(val("PATH").as_deref(), Some("/tmp/sandbox/bin"));
+        assert_eq!(val("XDG_RUNTIME_DIR").as_deref(), Some("/tmp/sandbox/run"));
+        assert_eq!(val("CLAUDE_CODE_CHILD_SESSION"), None);
+    }
+
+    #[test]
+    fn what_a_shell_sets_for_itself_stays() {
+        let mut own = under("claude");
+        own.extend(env(&[("PWD", "/work"), ("SHLVL", "3")]));
+        let mut started = pane();
+        started.extend(env(&[("PWD", "/pane"), ("SHLVL", "1")]));
+        let forebears = vec![a(&["trix"]), a(&["/bin/zsh", "-c", "trix"]), a(&["claude"]), a(&["trix", "holder"])];
+        let got = resolve(&forebears, || own.clone(), |i| match i {
+            2 => Some(started.clone()),
+            0 => Some(own.clone()),
+            _ => None,
+        });
+        assert!(got.iter().any(|(k, v)| k == "PWD" && v == "/work") && got.iter().any(|(k, v)| k == "SHLVL" && v == "3"));
     }
 
     #[test]
