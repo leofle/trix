@@ -108,6 +108,10 @@ pub struct Watch {
     /// Since when it has been seen stopped, without working in between.
     #[serde(default)]
     pub stopped_at: Option<u64>,
+    /// What the case would ask you about it, held while it asks about the
+    /// other reviewer: asked once that's answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
 }
 
 /// One reviewer's part: its review, then its own check of it, done beside
@@ -1580,7 +1584,17 @@ fn open_findings(c: &Case) -> Vec<&Finding> {
 
 /// Asks you about this role's agent: while the reviewers work side by
 /// side, the answer is for this one.
+/// While it asks about the other one already, it's held, said once, and
+/// asked once that's answered.
 fn ask_about(c: &mut Case, env: &mut dyn Env, role: Role, a: Ask, why: impl Into<String>) {
+    if let (Some(_), Some(other)) = (c.ask, c.about.filter(|o| *o != role)) {
+        let why = why.into();
+        if c.watch_of(role).held.is_none() {
+            note(c, env, format!("{why}: asked once the {}'s question is answered", other.label()));
+        }
+        c.watch_mut(role).held = Some(why);
+        return;
+    }
     ask(c, env, a, why);
     c.about = Some(role);
 }
@@ -1738,15 +1752,17 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
         c.why.clear();
         note(c, env, "the report came in");
     }
-    // Asked about one reviewer: the other goes on meanwhile.
+    // Asked about one reviewer: the other goes on meanwhile, started,
+    // taken, reminded, and what it would ask you held (`ask_about`). One
+    // that couldn't start isn't tried again until you've answered.
     if c.stage == Stage::Reviewing && matches!(c.ask, Some(Ask::NoReport | Ask::Setup)) {
         let about = c.about;
         for role in c.reviewers().into_iter().filter(|r| Some(*r) != about) {
-            if c.review(role).is_some_and(|r| !r.done && r.w.agent.is_some())
-                && let Some(text) = take_report(root, c, role)
-            {
-                take(c, root, env, role, &text);
+            let w = c.watch_of(role);
+            if c.review(role).is_none_or(|r| r.done) || (w.held.is_some() && w.agent.is_none()) {
+                continue;
             }
+            work_on(c, root, env, &seen, role);
         }
     }
     if c.ask == Some(Ask::Approval) && look_approval(c, env) {
@@ -1896,6 +1912,10 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
 /// The role's agent: started if it isn't, its report taken if it's in, or
 /// watched. False when it couldn't be started.
 fn work_on(c: &mut Case, root: &Path, env: &mut dyn Env, seen: &[Seen], role: Role) -> bool {
+    // Nothing else asked: what was held is asked now, if it still holds.
+    if c.ask.is_none() {
+        c.watch_mut(role).held = None;
+    }
     // Just started: the agents seen were looked at before it was.
     let started = c.watch_of(role).agent.is_none() && !seen.iter().any(|a| a.name == c.agent_name(role));
     if c.watch_of(role).agent.is_none() && !ensure_agent(c, role, seen, env) {
@@ -2047,13 +2067,7 @@ fn take_review(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, name: &
         gave_work(c, role, env);
         let _ = store(root, c);
         if let Err(e) = env.send(name, &verify_text(c, role)) {
-            let why = format!("couldn't ask the {label} to check its findings: {e}");
-            // Asked about the other reviewer already: said, and this one's asked about next.
-            if c.ask.is_some() {
-                note(c, env, why);
-            } else {
-                ask_about(c, env, role, Ask::NoReport, why);
-            }
+            ask_about(c, env, role, Ask::NoReport, format!("couldn't ask the {label} to check its findings: {e}"));
         }
         return;
     }
@@ -3424,8 +3438,9 @@ mod tests {
         pr_state: &'static str,
         /// `gh pr view --json state,reviewDecision`s: the looks while parked.
         looks: u32,
-        /// Agents that fail to start.
+        /// Agents that fail to start, and every try to start one.
         refuse: Vec<String>,
+        tries: Vec<String>,
     }
 
     impl Env for Fake {
@@ -3503,6 +3518,7 @@ mod tests {
             }
         }
         fn spawn(&mut self, name: &str, agent: &RoleAgent, _cwd: &Path, prompt: &str) -> Result<(), String> {
+            self.tries.push(name.into());
             if self.refuse.iter().any(|n| n == name) {
                 return Err(format!("{} isn't installed", agent.agent));
             }
@@ -4898,6 +4914,69 @@ mod tests {
         let closed: Vec<&str> = env.closed.iter().map(|(n, _)| n.as_str()).collect();
         assert!(closed.contains(&"triage-12-review") && closed.contains(&"triage-12-review-2"), "{closed:?}");
         assert!((c.spent_closed - 10.0).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn while_the_case_asks_about_one_reviewer_the_other_is_started_and_watched() {
+        let (root, mut c) = two_fixture("other-goes-on");
+        let mut env = Fake { now: 1_795_000_000, refuse: vec!["triage-12-review".into()], ..Fake::default() };
+        // The first can't start: asked about, and the second never got its turn.
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.about), (Some(Ask::Setup), Some(Role::Reviewer)));
+        assert!(env.prompts.is_empty());
+        // It's started while you're asked.
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.prompts.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["triage-12-review-2"]);
+        assert_eq!((c.ask, c.about), (Some(Ask::Setup), Some(Role::Reviewer)));
+        // It works, then stops without its report: reminded, as any other.
+        set_state(&mut env, "triage-12-review-2", "working");
+        step(&mut c, &root, &mut env);
+        set_state(&mut env, "triage-12-review-2", "done");
+        step(&mut c, &root, &mut env);
+        env.now += SETTLE_SECS;
+        step(&mut c, &root, &mut env);
+        assert!(env.sent.last().is_some_and(|(n, t)| n == "triage-12-review-2" && t.contains("waiting for your report as the reviewer2")), "{:?}", env.sent);
+        // It exits: what it would ask is held, said once, and the question stays the first's.
+        set_state(&mut env, "triage-12-review-2", "exited");
+        for _ in 0..3 {
+            step(&mut c, &root, &mut env);
+        }
+        assert_eq!((c.ask, c.about), (Some(Ask::Setup), Some(Role::Reviewer)));
+        assert!(c.why.starts_with("couldn't start the reviewer"), "{}", c.why);
+        assert_eq!(c.log.iter().filter(|(_, l)| l.contains("second reviewer (triage-12-review-2) exited without its report: asked once the reviewer's question is answered")).count(), 1, "{:?}", c.log);
+        // Kept over a restart; your r starts the first, and then you're asked about the second.
+        store(&root, &c).unwrap();
+        let mut c = load(&root, "triage-12").unwrap();
+        assert!(c.reviews[1].w.held.is_some());
+        env.refuse.clear();
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.prompts.last().unwrap().0, "triage-12-review");
+        assert_eq!((c.ask, c.about, c.reviews[1].w.held.clone()), (Some(Ask::NoReport), Some(Role::Reviewer2), None));
+        assert!(c.why.contains("second reviewer (triage-12-review-2) exited"), "{}", c.why);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_second_reviewer_that_cant_start_either_waits_for_your_answer() {
+        let (root, mut c) = two_fixture("both-refused");
+        let mut env = Fake { now: 1_795_000_000, refuse: vec!["triage-12-review".into(), "triage-12-review-2".into()], ..Fake::default() };
+        for _ in 0..4 {
+            step(&mut c, &root, &mut env);
+        }
+        // One question; the second's failure held, said once, not tried every look.
+        assert_eq!((c.ask, c.about), (Some(Ask::Setup), Some(Role::Reviewer)));
+        assert_eq!(c.log.iter().filter(|(_, l)| l.starts_with("couldn't start the second reviewer")).count(), 1, "{:?}", c.log);
+        assert_eq!(env.tries, ["triage-12-review", "triage-12-review-2"], "the first is tried again only once you answer, the second once");
+        // Your r: the first starts; the second is tried again, and asked about.
+        env.refuse = vec!["triage-12-review-2".into()];
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.about), (Some(Ask::Setup), Some(Role::Reviewer2)));
+        assert!(c.reviews[0].w.agent.is_some());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
