@@ -694,7 +694,6 @@ fn restore_view() {
 /// The terminal side: connect (starting the server if allowed), take over the
 /// terminal, and relay until detached.
 fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
-    let view = matches!(mode, Mode::View);
     let stream = match session::connect() {
         Some(s) => s,
         None if start => session::start_server()?,
@@ -707,14 +706,93 @@ fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+    attach(stream, mode)
+}
 
+/// Reattaches allowed in `REATTACH_WINDOW`, so a terminal that keeps falling
+/// behind stops trying instead of looping.
+const REATTACH_LIMIT: usize = 3;
+const REATTACH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a terminal the server dropped may attach again at `now`, given when
+/// it did before (`past`, pruned to the window and added to when it may).
+fn may_reattach(past: &mut Vec<std::time::Instant>, now: std::time::Instant) -> bool {
+    past.retain(|t| now.duration_since(*t) < REATTACH_WINDOW);
+    if past.len() >= REATTACH_LIMIT {
+        return false;
+    }
+    past.push(now);
+    true
+}
+
+/// What a terminal does once its server connection breaks without a goodbye.
+#[derive(Debug, PartialEq)]
+enum AfterLost {
+    /// The server lets go of a terminal that falls behind and carries on: attach again.
+    Again,
+    /// Another terminal is in control now. A frozen one never hears the goodbye
+    /// that says so, and attaching again would kick the one in use.
+    TakenOver,
+    /// Let go too often in a minute: stop, though the workspace runs on.
+    KeepsFallingBehind,
+    Gone,
+}
+
+/// `controller` is whether the server says a terminal is in control now (None:
+/// no server answered). `may` is asked last, so only a reattach counts.
+fn after_lost(controller: Option<bool>, view: bool, may: impl FnOnce() -> bool) -> AfterLost {
+    match controller {
+        None => AfterLost::Gone,
+        Some(true) if !view => AfterLost::TakenOver,
+        Some(_) if !may() => AfterLost::KeepsFallingBehind,
+        Some(_) => AfterLost::Again,
+    }
+}
+
+/// Whether a terminal is in control of this session now, or None when no server answers.
+/// A server that has just let go of this terminal may not have noticed yet: it is asked again.
+fn controller_attached() -> Option<bool> {
+    let ask = || {
+        let msg = ClientMsg::Control { protocol: control::CONTROL, from: None, req: control::Request::List { json: true } };
+        let text = session::ask(session::name(), &msg).ok().flatten()?;
+        let reply: control::Reply = serde_json::from_str(&text).ok()?;
+        serde_json::from_str::<serde_json::Value>(&reply.out).ok()?["attached"].as_bool()
+    };
+    match ask()? {
+        true => {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            ask()
+        }
+        false => Some(false),
+    }
+}
+
+static REATTACHES: std::sync::Mutex<Vec<std::time::Instant>> = std::sync::Mutex::new(Vec::new());
+
+fn attach(stream: std::os::unix::net::UnixStream, mode: Mode) -> anyhow::Result<()> {
+    let view = matches!(mode, Mode::View);
     let reset = if view { restore_view } else { restore };
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         reset();
         prev_hook(info);
     }));
+    let (mut stream, mut mode) = (stream, mode);
+    loop {
+        match attach_once(stream, mode, reset)? {
+            Some(again) => {
+                stream = again;
+                // Nothing to spawn again: the agents asked for at start are running
+                mode = if view { Mode::View } else { Mode::Control(Vec::new()) };
+            }
+            None => return Ok(()),
+        }
+    }
+}
 
+/// One attachment of this terminal. Some(stream) when it is to attach again on it.
+fn attach_once(stream: std::os::unix::net::UnixStream, mode: Mode, reset: fn()) -> anyhow::Result<Option<std::os::unix::net::UnixStream>> {
+    let view = matches!(mode, Mode::View);
     enable_raw_mode()?;
     let mut out = stdout();
     if view {
@@ -725,7 +803,9 @@ fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
         // a terminal speaking the kitty protocol (iTerm2, Ghostty, kitty, WezTerm)
         // sends alt+$ as alt+shift+4, which reads as alt+4, a jump to agent 4,
         // and a pane gets alt+4 for it too.
-        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        // Asked once: on a reattach the input thread holds the terminal's input, and the answer is the same
+        static ENHANCED_KEYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ENHANCED_KEYS.get_or_init(|| crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)) {
             queue!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS))?;
         }
     }
@@ -734,23 +814,43 @@ fn client(mode: Mode, start: bool) -> anyhow::Result<()> {
 
     let ended = session::run_client(stream, cols, rows, mode);
     reset();
+    let log = session::log_path();
     match ended? {
         Ended::Bye(msg) => {
             if !msg.is_empty() {
                 println!("{msg}");
             }
-            Ok(())
+            Ok(None)
         }
         Ended::Lost => {
-            eprintln!("trix: lost the workspace server (log: {})", session::log_path().display());
-            std::process::exit(1);
+            let next = after_lost(controller_attached(), view, || {
+                REATTACHES.lock().is_ok_and(|mut past| may_reattach(&mut past, std::time::Instant::now()))
+            });
+            match (next, session::connect()) {
+                (AfterLost::Again, Some(stream)) => {
+                    eprintln!("trix: the workspace server let go of this terminal; attaching again (log: {})", log.display());
+                    Ok(Some(stream))
+                }
+                (AfterLost::TakenOver, _) => {
+                    eprintln!("trix: another terminal has taken over the workspace");
+                    Ok(None)
+                }
+                (AfterLost::KeepsFallingBehind, _) => {
+                    eprintln!("trix: the workspace server keeps letting go of this terminal (log: {}); the workspace is still running: `{} attach` comes back to it", log.display(), session::command());
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("trix: lost the workspace server (log: {})", log.display());
+                    std::process::exit(1);
+                }
+            }
         }
         Ended::Refused if view => {
             eprintln!("trix: the running workspace was started by an older trix that can't be watched — restart it (alt+q, then `{}`) to use `trix view`", session::command());
             std::process::exit(1);
         }
         Ended::Refused => {
-            eprintln!("trix: the workspace server hung up (log: {})", session::log_path().display());
+            eprintln!("trix: the workspace server hung up (log: {})", log.display());
             std::process::exit(1);
         }
     }
@@ -856,7 +956,8 @@ fn server() -> anyhow::Result<()> {
         if anim.is_some_and(|t| now >= t) && now >= last_draw + ANIM {
             app.dirty = true;
         }
-        if app.dirty && now >= last_draw + FRAME {
+        // A controller still sending the last frames waits for the next one: it would only fall further behind
+        if app.dirty && now >= last_draw + FRAME && !out.controller_behind() {
             app.dirty = false;
             last_draw = now;
             // Output errors only ever mean the client left; `Out` handles it.
@@ -960,7 +1061,27 @@ fn on_session(ev: SessionEvent, app: &mut App, terminal: &mut Terminal<RemoteBac
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerTrix, busy_lines, busy_of, busy_targets, take_session, version_note, version_order};
+    use super::{AfterLost, ServerTrix, busy_lines, busy_of, busy_targets, after_lost, may_reattach, take_session, version_note, version_order};
+
+    #[test]
+    fn a_dropped_terminal_never_takes_control_from_the_one_in_use() {
+        let never = || -> bool { panic!("only a reattach asks the limit") };
+        assert_eq!(after_lost(None, false, never), AfterLost::Gone);
+        assert_eq!(after_lost(Some(true), false, never), AfterLost::TakenOver);
+        assert_eq!(after_lost(Some(false), false, || true), AfterLost::Again);
+        assert_eq!(after_lost(Some(true), true, || true), AfterLost::Again, "a viewer kicks nobody");
+        assert_eq!(after_lost(Some(false), false, || false), AfterLost::KeepsFallingBehind);
+    }
+
+    #[test]
+    fn a_dropped_terminal_reattaches_at_most_three_times_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |s: u64| start + std::time::Duration::from_secs(s);
+        let mut past = Vec::new();
+        assert!(may_reattach(&mut past, at(0)) && may_reattach(&mut past, at(10)) && may_reattach(&mut past, at(20)));
+        assert!(!may_reattach(&mut past, at(30)), "a fourth inside the minute gives up");
+        assert!(may_reattach(&mut past, at(61)), "the first has left the window");
+    }
 
     #[test]
     fn version_note_says_which_trix_runs_and_advises_a_restart_only_forward() {

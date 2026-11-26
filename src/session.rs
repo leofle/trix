@@ -232,6 +232,8 @@ struct Peer {
     tx: Sender<Job>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
     done: Arc<std::sync::atomic::AtomicBool>,
+    /// Hung up for falling behind: logged once.
+    dropped: std::sync::atomic::AtomicBool,
 }
 
 enum Job {
@@ -242,6 +244,10 @@ enum Job {
 
 /// A few seconds of full-screen frames.
 const MAX_BEHIND: usize = 8 << 20;
+
+/// Backlog past which a terminal gets no new frames until it catches up: one
+/// that falls behind would otherwise only fall further, to `MAX_BEHIND`.
+const SLOW_BEHIND: usize = 1 << 20;
 
 impl Peer {
     fn new(stream: UnixStream) -> Peer {
@@ -257,9 +263,13 @@ impl Peer {
                 for job in rx {
                     match job {
                         Job::Frame(b) => {
-                            let ok = w.write_all(&b).and_then(|()| w.flush()).is_ok();
+                            let wrote = w.write_all(&b).and_then(|()| w.flush());
                             queued.fetch_sub(b.len(), Ordering::Relaxed);
-                            if !ok {
+                            if let Err(e) = wrote {
+                                // A terminal that left is a broken pipe; one that stopped reading times out
+                                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                                    eprintln!("trix: hung up on a terminal that read nothing for 10s");
+                                }
                                 break;
                             }
                         }
@@ -273,14 +283,22 @@ impl Peer {
         } else {
             done.store(true, Ordering::Release);
         }
-        Peer { stream, tx, queued, done }
+        Peer { stream, tx, queued, done, dropped: Default::default() }
     }
 
     /// Queue one frame. False when the client is gone or too far behind,
     /// and then it has been hung up on.
     fn send(&self, kind: u8, payload: &[u8]) -> bool {
         let len = payload.len() + 5;
-        if self.done.load(Ordering::Acquire) || self.queued.load(Ordering::Relaxed) + len > MAX_BEHIND {
+        if self.done.load(Ordering::Acquire) {
+            self.hang_up();
+            return false;
+        }
+        if self.queued.load(Ordering::Relaxed) + len > MAX_BEHIND {
+            // Said in the log, or the terminal's "lost the workspace server" reads as a crash
+            if !self.dropped.swap(true, Ordering::Relaxed) {
+                eprintln!("trix: hung up on a terminal {} MB behind on screen updates", MAX_BEHIND >> 20);
+            }
             self.hang_up();
             return false;
         }
@@ -305,6 +323,11 @@ impl Peer {
 
     fn hang_up(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Too much queued for this terminal to send it another frame yet.
+    fn behind(&self) -> bool {
+        self.queued.load(Ordering::Relaxed) > SLOW_BEHIND
     }
 
     /// Wait until the writer is done (after `close`), but not past `until`.
@@ -400,6 +423,13 @@ impl Out {
         self.link().client.is_some()
     }
 
+    /// The controller has a frame's worth and more still queued: skip drawing
+    /// until it catches up. Frames are diffs against the last one drawn, so the
+    /// next draw brings it up to date.
+    pub fn controller_behind(&self) -> bool {
+        self.link().client.as_ref().is_some_and(|(_, p)| p.behind())
+    }
+
     pub fn viewers(&self) -> usize {
         self.link().viewers.len()
     }
@@ -433,6 +463,10 @@ impl Out {
             return;
         }
         l.viewers.retain_mut(|v| {
+            // Behind: this frame is skipped, and the next is a diff from what it shows
+            if v.peer.behind() {
+                return true;
+            }
             let next = viewer_frame(frame, v.size, badge);
             let bytes = paint(v.shown.as_ref(), &next);
             if !v.peer.send(OUT, &bytes) {
@@ -991,6 +1025,33 @@ pub enum Mode {
     View,
 }
 
+/// Where the input thread sends events: the connection `run_client` is on, or nowhere.
+fn input_target() -> &'static Mutex<Option<UnixStream>> {
+    static TARGET: OnceLock<Mutex<Option<UnixStream>>> = OnceLock::new();
+    TARGET.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("trix-input".into()).spawn(|| {
+            while let Ok(ev) = crossterm::event::read() {
+                let mut target = input_target().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(w) = target.as_mut()
+                    && send_msg(w, &ClientMsg::Event(ev)).is_err()
+                {
+                    *target = None;
+                }
+            }
+        });
+        Mutex::new(None)
+    })
+}
+
+/// Stops input going to a connection `run_client` has left, whichever way it returns.
+struct DetachInput;
+
+impl Drop for DetachInput {
+    fn drop(&mut self) {
+        *input_target().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// Run the client on an already-prepared terminal until the server says bye
 /// or goes away.
 pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Result<Ended> {
@@ -1002,14 +1063,10 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
         Mode::View => ClientMsg::View { protocol: PROTOCOL, cols, rows },
     };
     send_msg(&mut s, &hello)?;
-    let mut w = s.try_clone()?;
-    std::thread::Builder::new().name("trix-input".into()).spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
-            if send_msg(&mut w, &ClientMsg::Event(ev)).is_err() {
-                break;
-            }
-        }
-    })?;
+    // One input thread for the process, sending to whichever connection is current: a terminal
+    // that attaches again keeps it, so no second one reads a key first and loses it
+    *input_target().lock().unwrap_or_else(|e| e.into_inner()) = Some(s.try_clone()?);
+    let _detach_input = DetachInput;
     let mut r = BufReader::with_capacity(1 << 16, s);
     let mut out = io::stdout().lock();
     let mut heard = false;
@@ -1034,6 +1091,20 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_that_stops_reading_gets_no_new_frames_until_it_catches_up() {
+        let out = Out::default();
+        let (server_end, _client_end) = UnixStream::pair().unwrap();
+        out.attach(1, server_end, (80, 24));
+        assert!(!out.controller_behind());
+        // Past what the socket buffers, the rest waits in the queue
+        for _ in 0..40 {
+            out.send(&[b'x'; 64 << 10]);
+        }
+        assert!(out.controller_behind(), "over SLOW_BEHIND queued");
+        assert!(out.controlled(), "still attached: behind, not yet dropped");
+    }
 
     #[test]
     fn a_viewer_that_never_reads_cannot_block_the_server() {
