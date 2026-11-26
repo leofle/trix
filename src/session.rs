@@ -854,12 +854,43 @@ pub fn connect_to(session: &str) -> Option<UnixStream> {
     UnixStream::connect(control_path_for(session)).ok()
 }
 
+/// What a running Claude Code sets in its own environment for the commands it
+/// runs: its session, its parent's messaging socket and token, and the marker
+/// that it is a child session, which turns off saving the transcript. A server
+/// started from inside an agent (`trix -s work layout open …`, as a lead agent
+/// does) would hand them to every agent it starts: those agents then save no
+/// transcript, so `--resume` can't bring them back, and they all hold the
+/// parent's token. Settings a person exports, like `CLAUDE_CODE_USE_BEDROCK`,
+/// aren't among them and stay.
+const AGENT_SESSION_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_CHILD_NOTES_DIR",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+];
+
+/// The variables in `names` that the agent this runs in set for itself, and a
+/// new server must not pass on (`AGENT_SESSION_VARS`).
+fn left_by_an_agent<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    names.filter(|n| AGENT_SESSION_VARS.contains(n)).collect()
+}
+
 /// Start a detached server and wait for it to accept connections.
 pub fn start_server() -> anyhow::Result<UnixStream> {
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path())?;
     let mut cmd = Command::new(exe);
     cmd.arg("server").env("TRIX_SESSION", name()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
+    let vars: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
+    for var in left_by_an_agent(vars.iter().map(String::as_str)) {
+        cmd.env_remove(var);
+    }
     // New session: no controlling terminal, so closing this one can't SIGHUP it.
     unsafe {
         cmd.pre_exec(|| {
@@ -1031,6 +1062,16 @@ pub fn run_client(mut s: UnixStream, cols: u16, rows: u16, mode: Mode) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_started_in_an_agent_drops_that_agents_session_not_your_settings() {
+        let env = ["PATH", "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "ANTHROPIC_API_KEY", "TRIX_SESSION"];
+        assert_eq!(
+            left_by_an_agent(env.into_iter()),
+            ["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ID"]
+        );
+        assert!(left_by_an_agent(["PATH", "HOME"].into_iter()).is_empty());
+    }
 
     #[test]
     fn a_viewer_that_never_reads_cannot_block_the_server() {
