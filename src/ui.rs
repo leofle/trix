@@ -666,7 +666,13 @@ fn card_text(f: &mut Frame, app: &App, i: usize, r: Rect, compact: bool, size: S
     }
     let diff_w = diff.as_ref().map(|(a, d)| a.width() + d.width()).unwrap_or(0);
     if let Some(b) = &a.branch {
-        git = format!("  {}", trunc(b, w.saturating_sub(used + diff_w + 3)));
+        // The icon and its space come out of the name's room: just the
+        // icon when there's none left for the name.
+        git = match w.saturating_sub(used + diff_w + 3) {
+            0 => String::new(),
+            1 | 2 => format!("  {}", branch_icon(app)),
+            room => format!("  {} {}", branch_icon(app), trunc(b, room - 2)),
+        };
     }
     spans.push(Span::styled(git, Style::new().fg(t.dim)));
     if let Some((ad, de)) = diff {
@@ -809,6 +815,15 @@ const PIN: &str = "⚲";
 /// The Nerd Font pin (nf-oct-pin), for `[ui] nerd_font = true`.
 const PIN_NERD: &str = "\u{f435}";
 
+/// Before a branch name: the branch symbol, one cell wide, in any font.
+const BRANCH: &str = "⎇";
+/// The Nerd Font git branch (nf-dev-git_branch), for `[ui] nerd_font = true`.
+const BRANCH_NERD: &str = "\u{e725}";
+
+fn branch_icon(app: &App) -> &'static str {
+    if app.config.ui.nerd_font { BRANCH_NERD } else { BRANCH }
+}
+
 /// Where a pane's pin is: on its title, right after the corner and "─ ".
 fn pin_rect(pane: Rect) -> Rect {
     Rect { x: pane.x + 3, y: pane.y, width: 1.min(pane.width.saturating_sub(3)), height: 1 }
@@ -887,7 +902,7 @@ fn pane_title(app: &App, a: &Agent, border: Color, width: u16, compact: bool, t:
             right.push(Span::styled(format!(" {}", tilde(&a.cwd)), Style::new().fg(t.dim)));
         }
         if let Some(b) = a.branch.as_ref().filter(|_| fit.branch) {
-            right.push(Span::styled(format!("  {b}"), Style::new().fg(t.magenta)));
+            right.push(Span::styled(format!("  {} {b}", branch_icon(app)), Style::new().fg(t.magenta)));
         }
         if let Some((files, add, del)) = a.diff
             && files > 0
