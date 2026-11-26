@@ -42,6 +42,11 @@ pub struct TriageOpts {
     /// Builds the PR for an issue that has none (`trix triage <issue>`).
     pub builder: Role,
     pub reviewer: Role,
+    /// The second reviewer, working beside the first on its own: another
+    /// agent or model gives the gatekeeper a second view.
+    pub reviewer2: Role,
+    /// 2, or 1 for the first reviewer alone.
+    pub reviewers: u32,
     pub fixer: Role,
     pub gatekeeper: Role,
 }
@@ -60,7 +65,7 @@ impl Default for TriageOpts {
         // wait for you there. The gatekeeper's independence is its own
         // agent in a fresh checkout that never sees the fixer's reasoning.
         let role = |agent: &str| Role { agent: agent.into(), args: Vec::new() };
-        TriageOpts { budget: 10.0, max_rounds: 2, builder: role("claude"), reviewer: role("claude"), fixer: role("claude"), gatekeeper: role("claude") }
+        TriageOpts { budget: 10.0, max_rounds: 2, builder: role("claude"), reviewer: role("claude"), reviewer2: role("claude"), reviewers: 2, fixer: role("claude"), gatekeeper: role("claude") }
     }
 }
 
@@ -384,8 +389,10 @@ struct File {
 struct FileTriage {
     budget: Option<f64>,
     max_rounds: Option<i64>,
+    reviewers: Option<i64>,
     builder: Option<FileRole>,
     reviewer: Option<FileRole>,
+    reviewer2: Option<FileRole>,
     fixer: Option<FileRole>,
     gatekeeper: Option<FileRole>,
 }
@@ -598,6 +605,11 @@ fn triage_opts(f: FileTriage) -> Result<TriageOpts, String> {
         Some(n @ 1..=10) => n as u32,
         Some(n) => return Err(format!("triage.max_rounds: {n} is not from 1 to 10")),
     };
+    let reviewers = match f.reviewers {
+        None => d.reviewers,
+        Some(n @ 1..=2) => n as u32,
+        Some(n) => return Err(format!("triage.reviewers: {n} is not 1 or 2")),
+    };
     let role = |what: &str, r: Option<FileRole>, default: Role| -> Result<Role, String> {
         let Some(r) = r else { return Ok(default) };
         let agent = r.agent.unwrap_or(default.agent);
@@ -606,7 +618,7 @@ fn triage_opts(f: FileTriage) -> Result<TriageOpts, String> {
             _ => Err(format!("triage.{what}.agent: '{agent}' isn't an agent that takes a prompt (claude, codex, …)")),
         }
     };
-    Ok(TriageOpts { budget, max_rounds, builder: role("builder", f.builder, d.builder)?, reviewer: role("reviewer", f.reviewer, d.reviewer)?, fixer: role("fixer", f.fixer, d.fixer)?, gatekeeper: role("gatekeeper", f.gatekeeper, d.gatekeeper)? })
+    Ok(TriageOpts { budget, max_rounds, builder: role("builder", f.builder, d.builder)?, reviewer: role("reviewer", f.reviewer, d.reviewer)?, reviewer2: role("reviewer2", f.reviewer2, d.reviewer2)?, reviewers, fixer: role("fixer", f.fixer, d.fixer)?, gatekeeper: role("gatekeeper", f.gatekeeper, d.gatekeeper)? })
 }
 
 fn worktree_opts(f: FileWorktree) -> Result<WorktreeOpts, String> {
@@ -1097,6 +1109,12 @@ mod tests {
         assert!(read("[triage]\nmax_rounds = 0\n").unwrap_err().contains("triage.max_rounds"));
         assert!(read("[triage]\nbudget = -1\n").unwrap_err().contains("triage.budget"));
         assert!(read("[triage]\nmerge = \"auto\"\n").is_err(), "not in M1");
+        // A second reviewer, claude unless it's set; 1 turns it off.
+        assert_eq!((d.reviewers, d.reviewer2.agent.as_str()), (2, "claude"));
+        let t = read("[triage]\nreviewers = 1\n[triage.reviewer2]\nagent = \"codex\"\nargs = [\"-m\", \"o9\"]\n").unwrap().triage;
+        assert_eq!((t.reviewers, t.reviewer2.agent.as_str(), t.reviewer2.args.len()), (1, "codex", 2));
+        assert!(read("[triage]\nreviewers = 3\n").unwrap_err().contains("triage.reviewers"));
+        assert!(read("[triage.reviewer2]\nagent = \"shell\"\n").unwrap_err().contains("triage.reviewer2.agent"));
     }
 
     #[test]

@@ -7,18 +7,23 @@
 //! The issue's text is anyone's on a public repository: the Builder gets it
 //! fenced as data, and an issue from outside the project asks you first.
 //!
-//! - The **Reviewer** reads the PR in a checkout of its own and reports
-//!   what's wrong: file, line, how it fails.
+//! - Two **Reviewers**, side by side and each in a checkout of its own,
+//!   report what's must-fix: a real defect, file, line, how it fails, and
+//!   its proof (a failing test, or a command or repro that was run). Each
+//!   checks its own review, and once both are in, their findings are put
+//!   together, a defect both raised once, tagged with who raised it. What
+//!   isn't must-fix, or isn't proven, is optional: never the Fixer's.
+//!   `[triage] reviewers = 1` keeps one.
 //! - The **Fixer** fixes each finding on the PR's branch, with a test, and
 //!   pushes.
 //! - The **Gatekeeper**, in a fresh checkout and without the Fixer's
-//!   reasoning, checks each fix and that CI is green: pass, or changes,
-//!   which go back to the Fixer (`max_rounds`).
+//!   reasoning, sees both reviews side by side, checks each fix and that
+//!   CI is green: pass, or changes (must-fix and proven), which go back to the Fixer (`max_rounds`).
 //! - Then trix merges, squashed, the commit the Gatekeeper checked, once CI
 //!   is green and you say so. No agent can merge or approve. A PR that
 //!   conflicts with its base goes back to the Fixer, which merges the base
 //!   in (never a rebase), and a fresh Gatekeeper checks it. A case from an
-//!   issue closes the issue after the merge, when both the Reviewer and the
+//!   issue closes the issue after the merge, when both Reviewers and the
 //!   Gatekeeper said the PR solves it and the PR doesn't close it itself.
 //!   A merge the base branch's rules refuse (it needs another reviewer's
 //!   approval) waits for one, said plainly: r tries again, w turns on
@@ -32,7 +37,8 @@
 //! agent that wrote it, at once.
 //!
 //! Each case is a folder in `<state>/cases/<id>/`: `case.json` and the
-//! reports (`reviewer-1.json`, `fixer-1.json`, `gatekeeper-1.json`, …).
+//! reports (`reviewer-1.json`, `reviewer2-1.json`, `fixer-1.json`,
+//! `gatekeeper-1.json`, …).
 //!
 //! Who's asking is the kernel's word, not the environment's: the server
 //! walks the asking process's parents to the pane it runs in. A report is
@@ -51,6 +57,8 @@ use std::path::{Path, PathBuf};
 pub enum Role {
     Builder,
     Reviewer,
+    /// The second reviewer: the same job, beside the first and on its own.
+    Reviewer2,
     Fixer,
     Gatekeeper,
 }
@@ -60,13 +68,71 @@ impl Role {
         match self {
             Role::Builder => "builder",
             Role::Reviewer => "reviewer",
+            Role::Reviewer2 => "reviewer2",
             Role::Fixer => "fixer",
             Role::Gatekeeper => "gatekeeper",
         }
     }
-    pub fn parse(s: &str) -> Option<Role> {
-        [Role::Builder, Role::Reviewer, Role::Fixer, Role::Gatekeeper].into_iter().find(|r| r.name() == s)
+    /// How the log says it: `the second reviewer`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Reviewer2 => "second reviewer",
+            r => r.name(),
+        }
     }
+    pub fn parse(s: &str) -> Option<Role> {
+        [Role::Builder, Role::Reviewer, Role::Reviewer2, Role::Fixer, Role::Gatekeeper].into_iter().find(|r| r.name() == s)
+    }
+    fn reviews(self) -> bool {
+        matches!(self, Role::Reviewer | Role::Reviewer2)
+    }
+}
+
+/// A working agent as the runner watches it: whether it stopped without
+/// its report.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Watch {
+    /// The agent, once it's started.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// It was reminded once to hand in its report.
+    #[serde(default)]
+    pub nudged: bool,
+    /// When it was last given work, and whether it has been seen working
+    /// since: an agent's pane reads idle for a moment before it takes up a
+    /// prompt, which isn't stopping.
+    #[serde(default)]
+    pub given: u64,
+    #[serde(default)]
+    pub worked: bool,
+    /// Since when it has been seen stopped, without working in between.
+    #[serde(default)]
+    pub stopped_at: Option<u64>,
+}
+
+/// One reviewer's part: its review, then its own check of it, done beside
+/// the other reviewer's and without seeing it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Review {
+    /// Its must-fix findings: as handed in, then as it confirmed them.
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    /// What it noted that isn't must-fix, or that it couldn't prove: never
+    /// the fixer's.
+    #[serde(default)]
+    pub optional: Vec<Optional>,
+    #[serde(default)]
+    pub solves: Option<Solves>,
+    #[serde(default)]
+    pub retracted: Vec<Retracted>,
+    /// It handed in its findings and is checking them.
+    #[serde(default)]
+    pub verifying: bool,
+    /// Both reports are in.
+    #[serde(default)]
+    pub done: bool,
+    #[serde(flatten)]
+    pub w: Watch,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +142,7 @@ pub enum Stage {
     Choosing,
     /// The issue has none: the Builder makes one.
     Building,
+    /// The reviewers, side by side: done once both have checked their own.
     Reviewing,
     Fixing,
     Verifying,
@@ -310,12 +377,24 @@ pub struct Case {
     /// You said the Builder may start on an issue written from outside.
     #[serde(default)]
     pub trusted: bool,
-    /// The Reviewer has handed in its findings and is checking them.
-    #[serde(default)]
+    /// Before there were two reviewers: the Reviewer is checking its
+    /// findings. Read once, into `reviews`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub verifying: bool,
+    /// Each reviewer's part, the first's then the second's.
+    #[serde(default)]
+    pub reviews: Vec<Review>,
+    /// What the reviewers (and the gatekeeper) noted that isn't must-fix,
+    /// or isn't proven: shown, never sent to the fixer.
+    #[serde(default)]
+    pub optional: Vec<Optional>,
+    /// Which reviewer the case asks you about, while they work side by side.
+    #[serde(default)]
+    pub about: Option<Role>,
     #[serde(default)]
     pub retracted: Vec<Retracted>,
-    /// The Reviewer's, then the Gatekeeper's word on the issue.
+    /// The reviewers' (the one that says least), then the Gatekeeper's word
+    /// on the issue.
     #[serde(default)]
     pub solves: Option<Solves>,
     /// Findings the Fixer left to you, and why: told at the gate.
@@ -333,8 +412,13 @@ pub struct Case {
     #[serde(default = "claude")]
     pub builder: RoleAgent,
     pub reviewer: RoleAgent,
+    /// None: one reviewer (`[triage] reviewers = 1`, or a case from before).
+    #[serde(default)]
+    pub reviewer2: Option<RoleAgent>,
     pub fixer: RoleAgent,
     pub gatekeeper: RoleAgent,
+    /// The verified must-fix findings, both reviewers' merged, each with who
+    /// raised it, and the gatekeeper's new ones.
     #[serde(default)]
     pub findings: Vec<Finding>,
     /// The findings this round's fix answers.
@@ -369,32 +453,19 @@ pub struct Case {
     /// for an approval.
     #[serde(default)]
     pub blocked: Option<Blocked>,
-    /// The reviewer's last word on the issue (the gatekeeper's is its
-    /// verdict's).
+    /// The first reviewer's last word on the issue (the gatekeeper's is its
+    /// verdict's, each reviewer's in `reviews`).
     #[serde(default)]
     pub review_solves: Option<Answer>,
-    /// The agent working on this stage, once it's started.
-    #[serde(default)]
-    pub agent: Option<String>,
+    /// The agent working on this stage (the reviewers have their own).
+    #[serde(flatten)]
+    pub w: Watch,
     /// Agents done with their part, to close once they've stopped working.
     #[serde(default)]
     pub closing: Vec<String>,
     /// What closed agents spent.
     #[serde(default)]
     pub spent_closed: f64,
-    /// The agent was reminded once to hand in its report.
-    #[serde(default)]
-    pub nudged: bool,
-    /// When the agent was last given work, and whether it has been seen
-    /// working since: an agent's pane reads idle for a moment before it
-    /// takes up a prompt, which isn't stopping.
-    #[serde(default)]
-    pub given: u64,
-    #[serde(default)]
-    pub worked: bool,
-    /// Since when it has been seen stopped, without working in between.
-    #[serde(default)]
-    pub stopped_at: Option<u64>,
     #[serde(default)]
     pub ask: Option<Ask>,
     /// Why it asks, in a line.
@@ -417,6 +488,9 @@ impl Case {
             choices: Vec::new(),
             trusted: false,
             verifying: false,
+            reviews: vec![Review::default(); if opts.reviewers >= 2 { 2 } else { 1 }],
+            optional: Vec::new(),
+            about: None,
             retracted: Vec::new(),
             solves: None,
             needs_you: Vec::new(),
@@ -427,6 +501,7 @@ impl Case {
             budget_step: opts.budget,
             builder: role(&opts.builder),
             reviewer: role(&opts.reviewer),
+            reviewer2: (opts.reviewers >= 2).then(|| role(&opts.reviewer2)),
             fixer: role(&opts.fixer),
             gatekeeper: role(&opts.gatekeeper),
             findings: Vec::new(),
@@ -441,13 +516,9 @@ impl Case {
             merge_how: How::Now,
             blocked: None,
             review_solves: None,
-            agent: None,
+            w: Watch::default(),
             closing: Vec::new(),
             spent_closed: 0.0,
-            nudged: false,
-            given: 0,
-            worked: false,
-            stopped_at: None,
             ask: None,
             why: String::new(),
             log: Vec::new(),
@@ -460,15 +531,73 @@ impl Case {
         match role {
             Role::Builder => format!("{}-build", self.id),
             Role::Reviewer => format!("{}-review", self.id),
+            Role::Reviewer2 => format!("{}-review-2", self.id),
             Role::Fixer => format!("{}-fix", self.id),
             Role::Gatekeeper => format!("{}-gate-{}", self.id, self.round),
         }
+    }
+
+    /// The reviewers this case has: one, or two side by side.
+    pub fn reviewers(&self) -> Vec<Role> {
+        [Role::Reviewer, Role::Reviewer2].into_iter().take(self.reviews.len().clamp(1, 2)).collect()
+    }
+
+    /// A reviewer's part. A case from before two reviewers has one, made
+    /// from what it kept (`upgrade`).
+    pub fn review(&self, role: Role) -> Option<&Review> {
+        self.reviews.get(if role == Role::Reviewer2 { 1 } else { 0 }).filter(|_| role.reviews())
+    }
+
+    fn review_mut(&mut self, role: Role) -> Option<&mut Review> {
+        self.reviews.get_mut(if role == Role::Reviewer2 { 1 } else { 0 }).filter(|_| role.reviews())
+    }
+
+    /// Who watches the role's agent: a reviewer's own, or the stage's.
+    fn watch_of(&self, role: Role) -> &Watch {
+        self.review(role).map_or(&self.w, |r| &r.w)
+    }
+
+    fn watch_mut(&mut self, role: Role) -> &mut Watch {
+        if role.reviews() && !self.reviews.is_empty() {
+            return &mut self.review_mut(role).unwrap().w;
+        }
+        &mut self.w
+    }
+
+    /// Whether the case waits for this role's report now.
+    fn waits_for(&self, role: Role) -> bool {
+        match self.stage {
+            Stage::Reviewing => self.reviewers().contains(&role) && self.review(role).is_some_and(|r| !r.done),
+            s => s.role() == Some(role),
+        }
+    }
+
+    /// The role the case asks you about: a reviewer's, or the stage's.
+    fn asked_role(&self) -> Option<Role> {
+        self.about.filter(|_| self.stage == Stage::Reviewing).or(self.stage.role())
+    }
+
+    /// A case from before two reviewers, mid-review: its one reviewer's
+    /// part, from what it kept then.
+    fn upgrade(&mut self) {
+        if !self.reviews.is_empty() || !matches!(self.stage, Stage::Choosing | Stage::Building | Stage::Reviewing) {
+            return;
+        }
+        let mut r = Review { verifying: std::mem::take(&mut self.verifying), ..Review::default() };
+        if self.stage == Stage::Reviewing {
+            r.findings = std::mem::take(&mut self.findings);
+            r.solves = self.solves.take();
+            r.w = std::mem::take(&mut self.w);
+        }
+        self.reviews.push(r);
+        self.reviewer2 = None;
     }
 
     fn role_agent(&self, role: Role) -> &RoleAgent {
         match role {
             Role::Builder => &self.builder,
             Role::Reviewer => &self.reviewer,
+            Role::Reviewer2 => self.reviewer2.as_ref().unwrap_or(&self.reviewer),
             Role::Fixer => &self.fixer,
             Role::Gatekeeper => &self.gatekeeper,
         }
@@ -525,9 +654,25 @@ impl Case {
             return format!("needs you: {}", self.why);
         }
         match self.stage {
-            Stage::Reviewing if self.verifying => "reviewing · checking its findings".into(),
+            Stage::Reviewing if self.reviews.len() > 1 => {
+                let each: Vec<String> = self.reviewers().iter().map(|&r| format!("{} {}", r.name(), self.review(r).map_or("", Review::state))).collect();
+                format!("reviewing · {}", each.join(", "))
+            }
+            Stage::Reviewing if self.review(Role::Reviewer).is_some_and(|r| r.verifying) => "reviewing · checking its findings".into(),
             Stage::Fixing | Stage::Verifying if self.round > 1 => format!("{} · round {}", self.stage.label(), self.round),
             s => s.label().into(),
+        }
+    }
+}
+
+impl Review {
+    fn state(&self) -> &'static str {
+        if self.done {
+            "done"
+        } else if self.verifying {
+            "checking its findings"
+        } else {
+            "reviewing"
         }
     }
 }
@@ -554,8 +699,66 @@ fn yes() -> bool {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
+    /// Must-fix: every finding a report hands in now is.
     Important,
+    /// From before findings were must-fix only.
     Minor,
+}
+
+fn important() -> Severity {
+    Severity::Important
+}
+
+/// What shows a must-fix finding is a bug: a failing test, or a command or
+/// repro that was run, with what it showed. Reading the code isn't proof.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Proof {
+    /// The failing test: its name or path, and how it's run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    /// Or the exact command or repro steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repro: Option<String>,
+    /// What it showed: the failing output, the wrong result, the crash.
+    #[serde(default)]
+    pub observed: Option<String>,
+    /// What it should show.
+    #[serde(default)]
+    pub expected: Option<String>,
+    /// A test written for it that the PR doesn't have, as a diff the fixer
+    /// applies (git apply) and keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+}
+
+/// A finding that isn't must-fix (style, a refactor, a nice-to-have), or
+/// that couldn't be proven: listed, and never the fixer's.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Optional {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    pub summary: String,
+    /// It may be a bug, but there's no proof.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unproven: bool,
+    /// Who noted it: set by trix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+}
+
+/// The proof run again after the fix: the fixer's word that it passes now.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProofRun {
+    /// What was run again: the finding's test or repro.
+    pub ran: String,
+    /// What it shows now.
+    pub output: String,
+    pub passes: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -565,14 +768,25 @@ pub struct Finding {
     pub file: String,
     #[serde(default)]
     pub line: Option<u64>,
+    #[serde(default = "important")]
     pub severity: Severity,
     pub summary: String,
     /// How it fails: the inputs or state, and the wrong result.
     pub failure: String,
-    /// What shows it: a failing test or command and its output, or the
-    /// lines. The Reviewer's verify step fills it in.
+    /// What shows it's a bug. Every must-fix finding handed in has one;
+    /// trix's own (red CI, a conflict) and those from before don't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Proof>,
+    /// The proof run again by the reviewer's verify step, and what it showed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// Who raised it, with their id for it: `reviewer F2`, `reviewer2 F1`.
+    /// Set by trix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by: Vec<String>,
+    /// The same defect, as the other reviewer put it. Set by trix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub also: Option<String>,
 }
 
 /// Does the PR solve the issue?
@@ -602,6 +816,9 @@ pub struct Solves {
 #[serde(deny_unknown_fields)]
 pub struct Verified {
     pub findings: Vec<Confirm>,
+    /// What it retracts as not must-fix, or unproven, but still notes.
+    #[serde(default)]
+    pub optional: Vec<Optional>,
     #[serde(default)]
     pub solves: Option<Solves>,
     #[serde(default)]
@@ -630,7 +847,10 @@ pub struct Retracted {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Findings {
+    /// Must-fix only, each with its proof.
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub optional: Vec<Optional>,
     /// When the case has an issue.
     #[serde(default)]
     pub solves: Option<Solves>,
@@ -658,6 +878,9 @@ pub struct FixOutcome {
     /// The test that covers it.
     #[serde(default)]
     pub test: Option<String>,
+    /// The finding's proof run again after the fix.
+    #[serde(default)]
+    pub proof: Option<ProofRun>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -707,6 +930,9 @@ pub struct Check {
     pub ok: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    /// What shows it isn't fixed: needed when it isn't ok.
+    #[serde(default)]
+    pub proof: Option<Proof>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -714,9 +940,12 @@ pub struct Check {
 pub struct Verdict {
     pub verdict: Pass,
     pub findings: Vec<Check>,
-    /// Anything the fixes broke, or the Reviewer missed.
+    /// Anything must-fix the fixes broke, or the reviewers missed, with proof.
     #[serde(default)]
     pub new: Vec<Finding>,
+    /// What isn't must-fix: noted, never a reason for changes.
+    #[serde(default)]
+    pub optional: Vec<Optional>,
     pub ci: Ci,
     /// When the case has an issue: on the checked commit.
     #[serde(default)]
@@ -725,6 +954,8 @@ pub struct Verdict {
     pub notes: Option<String>,
 }
 
+/// A must-fix finding as an agent hands it in: filled in, its own id, and
+/// proven.
 fn check_finding(f: &Finding, ids: &mut BTreeSet<String>) -> Result<(), String> {
     if f.id.trim().is_empty() || f.summary.trim().is_empty() || f.failure.trim().is_empty() || f.file.trim().is_empty() {
         return Err(format!("finding '{}': id, file, summary and failure must all be filled in", f.id));
@@ -732,8 +963,34 @@ fn check_finding(f: &Finding, ids: &mut BTreeSet<String>) -> Result<(), String> 
     if !ids.insert(f.id.clone()) {
         return Err(format!("finding id '{}' is used twice: each needs its own", f.id));
     }
+    if f.severity == Severity::Minor {
+        return Err(format!("finding {}: findings are must-fix only. Something minor goes in optional, or is left out", f.id));
+    }
+    check_proof(&format!("finding {}", f.id), f.proof.as_ref())
+}
+
+/// A proof is a test or a repro, with what it showed and what it should.
+fn check_proof(what: &str, p: Option<&Proof>) -> Result<(), String> {
+    let unproven = format!(
+        "{what}: no proof. A must-fix finding shows the bug: a failing test (proof.test, its failing output in proof.observed) or the exact command or repro steps you ran (proof.repro, what happened in proof.observed), and proof.expected. Reading the code isn't proof: if you can't show it, put it in optional with \"unproven\": true"
+    );
+    let Some(p) = p else { return Err(unproven) };
+    if blank(&p.test) && blank(&p.repro) {
+        return Err(unproven);
+    }
+    if blank(&p.observed) || blank(&p.expected) {
+        return Err(format!("{what}: proof needs observed (what the test or repro showed) and expected (what it should show)"));
+    }
     Ok(())
 }
+
+fn check_optional(o: &[Optional]) -> Result<(), String> {
+    match o.iter().find(|o| o.summary.trim().is_empty()) {
+        Some(_) => Err("optional: each one needs a summary".into()),
+        None => Ok(()),
+    }
+}
+
 
 /// Each of `want` answered exactly once in `got`.
 fn covers(what: &str, want: &[String], got: &[&str]) -> Result<(), String> {
@@ -758,7 +1015,7 @@ fn blank(s: &Option<String>) -> bool {
 }
 
 /// With an issue, a report says whether the PR solves it, with evidence,
-/// and what's missing is an important finding (`important`: one is there).
+/// and what's missing is a must-fix finding (`important`: one is there).
 fn check_solves(c: &Case, s: Option<&Solves>, important: bool) -> Result<(), String> {
     if c.issue.is_none() {
         return Ok(());
@@ -769,7 +1026,7 @@ fn check_solves(c: &Case, s: Option<&Solves>, important: bool) -> Result<(), Str
         return Err("solves: give your evidence: what you ran (tests, a repro of the issue's problem on this head) and what it showed".into());
     }
     if s.answer != Answer::Yes && (blank(&s.missing) || !important) {
-        return Err(format!("solves: {} needs `missing`, and each thing missing as a finding with severity important", snake(&s.answer)));
+        return Err(format!("solves: {} needs `missing`, and each thing missing as a must-fix finding, with its proof", snake(&s.answer)));
     }
     Ok(())
 }
@@ -793,7 +1050,7 @@ pub fn check_report(c: &Case, role: Role, text: &str) -> Result<String, String> 
     if c.stage.over() {
         return Err(format!("case {} is {}: it takes no more reports", c.id, c.stage.label()));
     }
-    if c.stage.role() != Some(role) || c.ask.is_some_and(|a| a == Ask::RoundLimit) {
+    if !c.waits_for(role) || c.ask.is_some_and(|a| a == Ask::RoundLimit) {
         return Err(format!("case {} isn't waiting for the {}'s report: it's {}", c.id, role.name(), c.status()));
     }
     let bad = |e: serde_json::Error| format!("the report isn't what the {} hands in: {e}", role.name());
@@ -816,34 +1073,48 @@ pub fn check_report(c: &Case, role: Role, text: &str) -> Result<String, String> 
             }
             serde_json::to_string_pretty(&r)
         }
-        Role::Reviewer if c.verifying => {
+        Role::Reviewer | Role::Reviewer2 if c.review(role).is_some_and(|v| v.verifying) => {
             let r: Verified = serde_json::from_str(text).map_err(bad)?;
-            let ids: Vec<String> = c.findings.iter().map(|f| f.id.clone()).collect();
+            let mine = &c.review(role).unwrap().findings;
+            let ids: Vec<String> = mine.iter().map(|f| f.id.clone()).collect();
             covers("findings", &ids, &r.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>())?;
             for f in &r.findings {
                 if f.confirmed && blank(&f.evidence) {
-                    return Err(format!("findings: {} is confirmed without evidence: give the failing test or command and its output, or the exact lines, or retract it", f.id));
+                    return Err(format!("findings: {} is confirmed without evidence: run its proof again and give what it showed, or retract it", f.id));
                 }
                 if !f.confirmed && blank(&f.why) {
                     return Err(format!("findings: say why {} is retracted, in `why`", f.id));
                 }
             }
-            let important = r.findings.iter().any(|k| k.confirmed && c.findings.iter().any(|f| f.id == k.id && f.severity == Severity::Important));
-            check_solves(c, r.solves.as_ref(), important)?;
+            check_optional(&r.optional)?;
+            check_solves(c, r.solves.as_ref(), r.findings.iter().any(|k| k.confirmed))?;
             serde_json::to_string_pretty(&r)
         }
-        Role::Reviewer => {
+        Role::Reviewer | Role::Reviewer2 => {
             let r: Findings = serde_json::from_str(text).map_err(bad)?;
             let mut ids = BTreeSet::new();
             for f in &r.findings {
                 check_finding(f, &mut ids)?;
             }
-            check_solves(c, r.solves.as_ref(), r.findings.iter().any(|f| f.severity == Severity::Important))?;
+            check_optional(&r.optional)?;
+            check_solves(c, r.solves.as_ref(), !r.findings.is_empty())?;
             serde_json::to_string_pretty(&r)
         }
         Role::Fixer => {
             let r: FixReport = serde_json::from_str(text).map_err(bad)?;
             covers("findings", &c.open, &r.findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>())?;
+            // A proven finding is fixed once its proof passes: run again, and said.
+            for o in r.findings.iter().filter(|o| o.outcome == Outcome::Fixed) {
+                if !c.findings.iter().any(|f| f.id == o.id && f.proof.is_some()) {
+                    continue;
+                }
+                match &o.proof {
+                    None => return Err(format!("findings: {} is fixed: run its proof again (the test or repro in the finding) and say what it shows now, in proof: {{\"ran\": \"…\", \"output\": \"…\", \"passes\": true}}", o.id)),
+                    Some(p) if p.ran.trim().is_empty() || p.output.trim().is_empty() => return Err(format!("findings: {}'s proof: say what you ran (ran) and what it showed (output)", o.id)),
+                    Some(p) if !p.passes => return Err(format!("findings: {} isn't fixed while its proof still fails: fix it, or give it another outcome", o.id)),
+                    Some(_) => {}
+                }
+            }
             check_commits(&r.commits)?;
             if r.findings.iter().any(|f| f.outcome == Outcome::Fixed) && r.commits.is_empty() {
                 return Err("commits: a finding is fixed, but no commit is named: push the fix and list its commits".into());
@@ -863,21 +1134,26 @@ pub fn check_report(c: &Case, role: Role, text: &str) -> Result<String, String> 
             for f in &r.new {
                 check_finding(f, &mut ids)?;
             }
-            let failing = r.findings.iter().any(|f| !f.ok) || r.new.iter().any(|f| f.severity == Severity::Important) || r.ci == Ci::Red;
+            check_optional(&r.optional)?;
+            let failing = r.findings.iter().any(|f| !f.ok) || !r.new.is_empty() || r.ci == Ci::Red;
             check_solves(c, r.solves.as_ref(), true)?;
             let unsolved = r.solves.as_ref().is_some_and(|s| s.answer != Answer::Yes);
             if unsolved && r.findings.iter().all(|f| f.ok) && r.new.is_empty() {
-                return Err("solves: say what the PR still lacks as a new finding (important), so the fixer has it to answer".into());
+                return Err("solves: say what the PR still lacks as a new must-fix finding, with its proof, so the fixer has it to answer".into());
             }
             let failing = failing || unsolved;
             if r.verdict == Pass::Pass && failing {
-                return Err("verdict: pass needs every finding ok, nothing important that's new, CI not red, and the issue solved; otherwise it's changes".into());
+                return Err("verdict: pass needs every finding ok, nothing must-fix that's new, CI not red, and the issue solved; otherwise it's changes".into());
             }
             if r.verdict == Pass::Changes && !failing {
-                return Err("verdict: changes needs a finding that isn't ok, something important that's new, or red CI to say what to change".into());
+                return Err("verdict: changes needs a finding that isn't ok, a new must-fix finding, or red CI to say what to change; what isn't must-fix goes in optional".into());
             }
             if r.findings.iter().any(|f| !f.ok && f.reason.as_deref().is_none_or(|n| n.trim().is_empty())) {
                 return Err("findings: say why in `reason` for each one that isn't ok".into());
+            }
+            // Changes are asked for what's shown still broken, the same rule as a finding.
+            for k in r.findings.iter().filter(|k| !k.ok) {
+                check_proof(&format!("findings: {} isn't ok", k.id), k.proof.as_ref())?;
             }
             serde_json::to_string_pretty(&r)
         }
@@ -898,7 +1174,9 @@ pub fn dir_of(root: &Path, id: &str) -> PathBuf {
 pub fn load(root: &Path, id: &str) -> Result<Case, String> {
     let p = dir_of(root, id).join("case.json");
     let b = std::fs::read(&p).map_err(|_| format!("no case named '{id}' (trix case ls)"))?;
-    serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))
+    let mut c: Case = serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))?;
+    c.upgrade();
+    Ok(c)
 }
 
 pub fn store(root: &Path, c: &Case) -> Result<(), String> {
@@ -919,8 +1197,8 @@ fn report_path(root: &Path, id: &str, role: Role, round: u32) -> PathBuf {
 /// Where the report the case waits for goes: the Reviewer's second, its
 /// verify step, has a file of its own.
 fn report_file(root: &Path, c: &Case, role: Role) -> PathBuf {
-    if role == Role::Reviewer && c.verifying {
-        return dir_of(root, &c.id).join(format!("reviewer-{}-verify.json", c.round));
+    if c.review(role).is_some_and(|r| r.verifying) {
+        return dir_of(root, &c.id).join(format!("{}-{}-verify.json", role.name(), c.round));
     }
     report_path(root, &c.id, role, c.round)
 }
@@ -1048,6 +1326,7 @@ fn note(c: &mut Case, env: &mut dyn Env, text: impl Into<String>) {
 }
 
 fn ask(c: &mut Case, env: &mut dyn Env, a: Ask, why: impl Into<String>) {
+    c.about = None;
     c.ask = Some(a);
     c.why = why.into();
     let keys: Vec<String> = c.keys(a).iter().map(|(k, w)| format!("{k}: {w}")).collect();
@@ -1059,7 +1338,9 @@ fn worktree(c: &Case, role: Role) -> PathBuf {
     let dir = match role {
         Role::Gatekeeper => format!("{}-gate-{}", c.id, c.round),
         Role::Builder => format!("{}-build", c.id),
-        r => format!("{}-{}", c.id, if r == Role::Reviewer { "review" } else { "fix" }),
+        Role::Reviewer => format!("{}-review", c.id),
+        Role::Reviewer2 => format!("{}-review-2", c.id),
+        Role::Fixer => format!("{}-fix", c.id),
     };
     c.repo.join(".trix/worktrees").join(dir)
 }
@@ -1092,7 +1373,7 @@ fn make_worktree(c: &Case, role: Role, env: &mut dyn Env) -> Result<PathBuf, Str
             }
             env.git(&c.repo, &["worktree", "add", "--quiet", "-b", &i.branch, &p, &format!("refs/remotes/origin/{}", i.base)])?
         }
-        Role::Reviewer => {
+        Role::Reviewer | Role::Reviewer2 => {
             // The PR may be nowhere in this checkout yet: pushed from elsewhere.
             fetch_head(c, env)?;
             env.git(&c.repo, &["worktree", "add", "--quiet", "--detach", &p, &c.pr().sha])?
@@ -1130,36 +1411,41 @@ pub fn prompt(c: &Case, role: Role) -> String {
     let issue = c.issue.as_ref().map(|i| (i.number, issue_block(c)));
     let solves_json = if issue.is_some() { r#", "solves": {"answer": "yes|partly|no", "missing": "what the issue needs that the PR doesn't do", "evidence": "what you ran, and what it showed"}"# } else { "" };
     match role {
-        Role::Reviewer if c.verifying => format!("{head}\n\n{}", verify_text(c)),
-        Role::Reviewer => format!(
-            "{head}\n\nYour folder is a detached checkout of the PR's head ({sha}). Find the real bugs this PR brings in or leaves: wrong results, crashes, lost data, security holes, broken tests. Read the diff (git diff origin/{base}...HEAD) and the code around it; build and run the tests if that helps. Don't edit, commit or push anything: you only report. Report only what you're confident of, no style points.{solves}\n\n\
-             Each finding: an id (F1, F2, …), the file, the line, a severity (important: a real bug; minor: worth fixing, low risk), a one-line summary, and how it fails (the inputs or state, and the wrong result). If you find nothing, hand in {{\"findings\": []{solves_json}}}. Then you'll be asked to check each finding again, with evidence, before any of it reaches the fixer.\n\n\
-             {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"findings\": [{{\"id\": \"F1\", \"file\": \"src/x.rs\", \"line\": 12, \"severity\": \"important\", \"summary\": \"…\", \"failure\": \"…\"}}]{solves_json}, \"notes\": \"optional\"}}\n\n{rules}",
+        Role::Reviewer | Role::Reviewer2 if c.review(role).is_some_and(|r| r.verifying) => format!("{head}\n\n{}", verify_text(c, role)),
+        Role::Reviewer | Role::Reviewer2 => format!(
+            "{head}{beside}\n\nYour folder is a detached checkout of the PR's head ({sha}). Find the must-fix defects this PR brings in or leaves. Read the diff (git diff origin/{base}...HEAD) and the code around it; build it and run the tests.\n\n\
+             {MUST_FIX}{solves}\n\n\
+             {PROOF_TEST}\n\n\
+             Each must-fix finding: an id (F1, F2, …), the file, the line, a one-line summary, how it fails (the inputs or state, and the wrong result), and its proof. If nothing is must-fix, hand in {{\"findings\": []{solves_json}}}: that's a good answer, not a failure. Then you'll be asked to check each finding again before any of it reaches the fixer.\n\n\
+             {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"findings\": [{{\"id\": \"F1\", \"file\": \"src/x.rs\", \"line\": 12, \"summary\": \"…\", \"failure\": \"…\", \"proof\": {{\"test\": \"the test's name or path, and how to run it\", \"observed\": \"its failing output\", \"expected\": \"what it should show\", \"patch\": \"the test as a diff, if the PR doesn't have it\"}}}}, {{\"id\": \"F2\", \"file\": \"src/y.rs\", \"line\": 3, \"summary\": \"…\", \"failure\": \"…\", \"proof\": {{\"repro\": \"the exact command or steps\", \"observed\": \"what happened\", \"expected\": \"what should have\"}}}}], \"optional\": [{{\"file\": \"src/z.rs\", \"line\": 7, \"summary\": \"…\", \"unproven\": false}}]{solves_json}, \"notes\": \"optional\"}}. optional may be empty, and stays short.\n\n{rules}",
             sha = pr.sha,
             base = pr.base,
-            solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\n\nThis PR is meant to solve issue #{n}: check that too. Does it do what the issue asks? Try the issue's problem on this head if you can. Each thing the issue needs that the PR doesn't do is a finding too, severity important.\n\n{block}")),
+            beside = if c.reviewers().len() > 1 { " Another reviewer reviews the same PR beside you, on its own: you don't see each other's work, and trix puts the two together." } else { "" },
+            solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\n\nThis PR is meant to solve issue #{n}: check that too. Does it do what the issue asks? Try the issue's problem on this head. Each thing the issue needs that the PR doesn't do is a must-fix finding, with its proof (the repro, run on this head).\n\n{block}")),
             submit = submit_line(c, role),
         ),
         Role::Fixer => format!(
-            "{head}\n\nYour folder is on branch trix/{id}-fix, which starts at the PR's branch as origin has it. The Reviewer found, and checked with the evidence shown:\n\n{findings}\n{solves}{conflict}\n\
-             Keep the PR's work: fix or complete it in place, no rewrite. For each finding, fix it with a test that fails without the fix, or, if it isn't a bug, say why. If a fix is too risky or too large to do safely, or is a design choice, don't guess: mark it needs_you and say why, and the user decides. Commit, then push to the PR's branch with: git push origin HEAD:{branch} (never force). Don't merge the PR.\n\n\
-             Then hand in what you did. {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"commits\": [\"<sha>\"], \"tests\": \"what you ran, and how it went\", \"findings\": [{{\"id\": \"F1\", \"outcome\": \"fixed\", \"test\": \"the test's name\"}}, {{\"id\": \"F2\", \"outcome\": \"not_a_bug\", \"note\": \"why\"}}]}}. outcome is fixed, not_a_bug, wont_fix or needs_you; each finding gets one, and a note for any that isn't fixed. trix checks the commits are on origin before it takes the report.\n\n{rules}",
+            "{head}\n\nYour folder is on branch trix/{id}-fix, which starts at the PR's branch as origin has it. These are the must-fix findings, each proven and checked again (evidence); `by` says who raised it, and `also` how the other reviewer put the same defect:\n\n{findings}\n{solves}{conflict}\n\
+             Keep the PR's work: fix or complete it in place, no rewrite. For each finding, start from its proof: apply proof.patch if it has one (git apply), and see the test or repro fail. Fix it, run the proof again and see it pass, and commit the test with the fix (one that fails without it). If it isn't a bug, say why. If a fix is too risky or too large to do safely, or is a design choice, don't guess: mark it needs_you and say why, and the user decides. Commit, then push to the PR's branch with: git push origin HEAD:{branch} (never force). Don't merge the PR.\n\n\
+             Then hand in what you did. {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"commits\": [\"<sha>\"], \"tests\": \"what you ran, and how it went\", \"findings\": [{{\"id\": \"F1\", \"outcome\": \"fixed\", \"test\": \"the test's name\", \"proof\": {{\"ran\": \"the finding's test or repro, run again\", \"output\": \"what it shows now\", \"passes\": true}}}}, {{\"id\": \"F2\", \"outcome\": \"not_a_bug\", \"note\": \"why\"}}]}}. outcome is fixed, not_a_bug, wont_fix or needs_you; each finding gets one, and a note for any that isn't fixed. A fixed finding that has a proof needs proof, run again and passing. trix checks the commits are on origin before it takes the report.\n\n{rules}",
             id = c.id,
             findings = serde_json::to_string_pretty(&open_findings(c)).unwrap_or_default(),
-            solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\nThe PR is meant to solve issue #{n}. The reviewer says: {}\n\n{block}", c.solves.as_ref().and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default())),
+            solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\nThe PR is meant to solve issue #{n}. {}\n\n{block}", reviewers_said(c))),
             branch = pr.head,
             conflict = if conflicts(c) { format!("\n{}\n", conflict_steps(c)) } else { String::new() },
             submit = submit_line(c, role),
         ),
         Role::Gatekeeper => format!(
             "{head}\n\nYour folder is a fresh checkout of the PR's branch after the Fixer's work ({sha}). You check that work on your own: you haven't seen the Fixer's reasoning, and you don't need it.\n\n\
-             The findings, with the reviewer's evidence:\n{findings}\n\nWhat the Fixer says it did:\n{fix}\n{solves}{gate_conflict}\n\
-             For each finding, is it really fixed (read the code and the test, run the tests)? For one called not_a_bug or wont_fix, is that right? For one called needs_you, is it right to leave it to the user (they're told at the merge gate)? Did the fixes break anything else? Check CI with: gh pr checks {n}. Don't edit, commit or push anything.\n\n\
-             {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"verdict\": \"pass\", \"findings\": [{{\"id\": \"F1\", \"ok\": true}}, {{\"id\": \"F2\", \"ok\": false, \"reason\": \"why, and what to change\"}}], \"new\": [], \"ci\": \"green\"{solves_json}}}. verdict is pass or changes; ci is green, red, pending or none; new lists anything else you found, as findings with new ids. Pass only when every finding is ok, nothing important is new, CI isn't red{pass_solves}.\n\n{rules}",
+             The must-fix findings, each with its proof and the reviewer's evidence; `by` says who raised it:\n{findings}\n{compare}\nWhat the Fixer says it did:\n{fix}\n{solves}{gate_conflict}\n\
+             For each finding, is it really fixed? Run its proof again (apply proof.patch if the fix didn't commit it), read the code and the test, run the tests. For one called not_a_bug or wont_fix, is that right? For one called needs_you, is it right to leave it to the user (they're told at the merge gate)? Then judge the fix's own diff (the fixer's commits) for new must-fix defects. Check CI with: gh pr checks {n}. Don't edit, commit or push anything.\n\n\
+             Ask for changes only for must-fix defects you've shown, the reviewers' rule: {MUST_FIX_SHORT} A finding that isn't ok needs its proof (its test or repro run again, still failing, or your own); a new finding needs file, line, summary, failure and proof, and a new id. Anything else goes in optional, which never holds the PR back.\n\n\
+             {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"verdict\": \"pass\", \"findings\": [{{\"id\": \"F1\", \"ok\": true}}, {{\"id\": \"F2\", \"ok\": false, \"reason\": \"why, and what to change\", \"proof\": {{\"repro\": \"…\", \"observed\": \"…\", \"expected\": \"…\"}}}}], \"new\": [], \"optional\": [], \"ci\": \"green\"{solves_json}}}. verdict is pass or changes; ci is green, red, pending or none. Pass only when every finding is ok, nothing must-fix is new, CI isn't red{pass_solves}.\n\n{rules}",
             sha = c.checked.as_deref().unwrap_or("its head"),
             findings = serde_json::to_string_pretty(&open_findings(c)).unwrap_or_default(),
             fix = c.fix.as_ref().and_then(|f| serde_json::to_string_pretty(f).ok()).unwrap_or_default(),
-            solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\nThe PR is meant to solve issue #{n}: does it, on this commit? Try the issue's problem here. Anything it still lacks is a new finding, severity important.\n\n{block}")),
+            compare = compare_reviews(c),
+            solves = issue.as_ref().map_or(String::new(), |(n, block)| format!("\nThe PR is meant to solve issue #{n}: does it, on this commit? Try the issue's problem here. {} Anything it still lacks is a new must-fix finding, with the repro as its proof.\n\n{block}", reviewers_said(c))),
             pass_solves = if issue.is_some() { ", and solves is yes" } else { "" },
             gate_conflict = if conflicts(c) {
                 format!("\nThe PR conflicted with {base}. For that finding, check origin/{base} was merged in, not rebased (git fetch origin {base}, then git merge-base --is-ancestor origin/{base} HEAD), that each conflict kept what both sides meant, and that the tests pass. Check GitHub can merge it now: gh pr view {n} --json mergeable.\n", base = pr.base, n = pr.number)
@@ -1173,20 +1459,67 @@ pub fn prompt(c: &Case, role: Role) -> String {
     }
 }
 
-/// The Reviewer's second step: its own findings again, with evidence.
-fn verify_text(c: &Case) -> String {
-    let ids: Vec<&str> = c.findings.iter().map(|f| f.id.as_str()).collect();
+/// What's must-fix, for the reviewers' prompts.
+const MUST_FIX: &str = "A finding is must-fix only if it's a real defect this PR brings in or leaves (wrong behaviour, a crash, a security hole, lost data, a broken build or tests, or it doesn't solve the issue) and you've proved it: a failing test, or you ran the code (a command, a repro) and saw the wrong output, crash or behaviour. Reading the code alone isn't proof. Style, naming, refactors, \"could also\", missing nice-to-have tests and guesses aren't must-fix: put them in a short optional list, or leave them out. One you think is a bug but can't show goes in optional with \"unproven\": true. Nothing in optional reaches the fixer. Don't pad the review: \"no must-fix findings\" is a good, expected answer.";
+
+/// The same, for the gatekeeper's change requests.
+const MUST_FIX_SHORT: &str = "a real defect (wrong behaviour, a crash, security, lost data, a broken build or tests, or the issue not solved), proved by a failing test or a command or repro you ran. Style, naming, refactors, nice-to-haves and guesses aren't.";
+
+/// A test the fixer can keep.
+const PROOF_TEST: &str = "Prefer a failing test as the proof, one the fixer can keep: write it in your checkout, run it and see it fail, then put it in proof.patch as a diff (git add -N for new files, then git diff), and put your checkout back as it was (git reset -q, git checkout -- ., and remove the files you added). Never commit or push anything: you only report. A repro (the exact command or steps, with what happened and what should have) proves it too.";
+
+/// The Reviewer's second step: its own findings again, each proof run again.
+fn verify_text(c: &Case, role: Role) -> String {
+    let mine = c.review(role).map(|r| r.findings.as_slice()).unwrap_or_default();
+    let ids: Vec<&str> = mine.iter().map(|f| f.id.as_str()).collect();
     let solves = if c.issue.is_some() { " Check your solves answer the same way: its evidence is what you ran (tests, a repro of the issue's problem on this head) and what it showed." } else { "" };
     let solves_json = if c.issue.is_some() { r#", "solves": {"answer": "yes|partly|no", "missing": "…", "evidence": "…"}"# } else { "" };
     format!(
         "Now check your own review, before any of it reaches the fixer. Your findings were:\n{}\n\n\
-         For each one ({}), re-read the code at its file and line on the PR's head ({}, your folder), and either confirm it with evidence (a failing test or command and its output, or the exact lines that show it) or retract it, saying why. Retract anything you can't show.{solves}\n\n\
-         Hand in this second report the same way:\n{}\n\nThe JSON: {{\"findings\": [{{\"id\": \"F1\", \"confirmed\": true, \"evidence\": \"…\"}}, {{\"id\": \"F2\", \"confirmed\": false, \"why\": \"…\"}}]{solves_json}}}. Each finding gets one answer; only confirmed ones go to the fixer.",
-        serde_json::to_string_pretty(&c.findings).unwrap_or_default(),
+         For each one ({}), run its proof again on the PR's head ({}, your folder: apply proof.patch first if it has one, then put the checkout back) and confirm it, with what the run showed as evidence, or retract it, saying why. Retract one whose proof doesn't hold up, and one that isn't must-fix after all (style, a refactor, a nice-to-have, a guess); either may go in optional instead, unproven if that's why.{solves}\n\n\
+         Hand in this second report the same way:\n{}\n\nThe JSON: {{\"findings\": [{{\"id\": \"F1\", \"confirmed\": true, \"evidence\": \"the proof run again: what it showed\"}}, {{\"id\": \"F2\", \"confirmed\": false, \"why\": \"…\"}}], \"optional\": []{solves_json}}}. Each finding gets one answer; only confirmed ones go to the fixer.",
+        serde_json::to_string_pretty(mine).unwrap_or_default(),
         ids.join(", "),
         c.pr.as_ref().map_or("", |p| p.sha.as_str()),
-        submit_line(c, Role::Reviewer),
+        submit_line(c, role),
     )
+}
+
+/// Each reviewer's word on the issue, side by side.
+fn reviewers_said(c: &Case) -> String {
+    let said: Vec<String> = c.reviewers().iter().filter_map(|&r| Some(format!("The {} says: {}", r.label(), serde_json::to_string(c.review(r)?.solves.as_ref()?).ok()?))).collect();
+    if said.is_empty() {
+        return c.solves.as_ref().and_then(|s| serde_json::to_string(s).ok()).map_or(String::new(), |s| format!("The reviewer says: {s}"));
+    }
+    let answers: BTreeSet<String> = c.reviewers().iter().filter_map(|&r| c.review(r)?.solves.as_ref().map(|s| snake(&s.answer))).collect();
+    let differ = if answers.len() > 1 { " They disagree: see for yourself." } else { "" };
+    format!("{}.{differ}", said.join(". "))
+}
+
+/// Where the two reviews agree and where they don't, for the gatekeeper:
+/// nothing with one reviewer.
+fn compare_reviews(c: &Case) -> String {
+    if c.reviewers().len() < 2 {
+        return String::new();
+    }
+    let raised = |f: &Finding, r: Role| f.by.iter().any(|b| b.split(' ').next() == Some(r.name()));
+    let ids = |pick: &dyn Fn(&Finding) -> bool| -> String {
+        let v: Vec<&str> = c.findings.iter().filter(|f| !f.by.is_empty() && pick(f)).map(|f| f.id.as_str()).collect();
+        if v.is_empty() { "none".into() } else { v.join(", ") }
+    };
+    let mut s = String::from("\nTwo reviewers reviewed the PR, each on its own. How their reviews compare:\n");
+    s.push_str(&format!("- Both raised: {}\n", ids(&|f| raised(f, Role::Reviewer) && raised(f, Role::Reviewer2))));
+    s.push_str(&format!("- Only the reviewer raised: {}\n", ids(&|f| raised(f, Role::Reviewer) && !raised(f, Role::Reviewer2))));
+    s.push_str(&format!("- Only the second reviewer raised: {}\n", ids(&|f| !raised(f, Role::Reviewer) && raised(f, Role::Reviewer2))));
+    let gone: Vec<String> = c.retracted.iter().map(|r| format!("{} ({})", r.finding.by.join(", "), r.why)).collect();
+    if !gone.is_empty() {
+        s.push_str(&format!("- Retracted by the one who raised it, on checking: {}\n", gone.join("; ")));
+    }
+    if c.issue.is_some() {
+        s.push_str(&format!("- On the issue: {}\n", reviewers_said(c)));
+    }
+    s.push_str("Where only one raised something, or they disagree, weigh it yourself: the other may have missed it, or it may not hold.\n");
+    s
 }
 
 /// A line that isn't in `text`: what fences it.
@@ -1222,7 +1555,7 @@ fn build_prompt(c: &Case) -> String {
     let Some(i) = &c.issue else { return String::new() };
     format!(
         "You're the builder in trix triage case {id}, for issue #{n} ({url}).\n\n\
-         Your folder is on a new branch, {branch}, from origin/{base}. Implement what the issue asks, with tests that fail without your change. Keep to what it asks. Commit, then push with: git push origin HEAD:{branch} (never force, no other branch). Don't open a pull request: trix opens it from your report, and then a reviewer, a fixer and a gatekeeper take it on.\n\n\
+         Your folder is on a new branch, {branch}, from origin/{base}. Implement what the issue asks, with tests that fail without your change. Keep to what it asks. Commit, then push with: git push origin HEAD:{branch} (never force, no other branch). Don't open a pull request: trix opens it from your report, and then reviewers, a fixer and a gatekeeper take it on.\n\n\
          {block}\n\
          Then hand in what you did. {SUBMIT_NOTE}\n{submit}\n\nThe JSON: {{\"branch\": \"{branch}\", \"commits\": [\"<sha>\"], \"tests\": \"what you ran, and how it went\", \"summary\": \"what you changed, for the PR's description\", \"notes\": \"optional\"}}. trix checks the commits are on origin before it takes the report.\n\n\
          Follow the repository's own rules (CLAUDE.md, AGENTS.md). If the submit command says the report is wrong, fix it and submit again.",
@@ -1245,12 +1578,19 @@ fn open_findings(c: &Case) -> Vec<&Finding> {
     c.findings.iter().filter(|f| c.open.contains(&f.id)).collect()
 }
 
-/// Start the stage's agent, if it isn't running: its checkout, then the
+/// Asks you about this role's agent: while the reviewers work side by
+/// side, the answer is for this one.
+fn ask_about(c: &mut Case, env: &mut dyn Env, role: Role, a: Ask, why: impl Into<String>) {
+    ask(c, env, a, why);
+    c.about = Some(role);
+}
+
+/// Start the role's agent, if it isn't running: its checkout, then the
 /// agent. False when that failed (the case then asks you).
 fn ensure_agent(c: &mut Case, role: Role, seen: &[Seen], env: &mut dyn Env) -> bool {
     let name = c.agent_name(role);
     if seen.iter().any(|a| a.name == name) {
-        c.agent = Some(name);
+        c.watch_mut(role).agent = Some(name);
         return true;
     }
     let started = make_worktree(c, role, env).and_then(|path| {
@@ -1262,22 +1602,22 @@ fn ensure_agent(c: &mut Case, role: Role, seen: &[Seen], env: &mut dyn Env) -> b
     });
     match started {
         Ok(path) => {
-            note(c, env, format!("started the {} ({}, {name}) in {}", role.name(), c.role_agent(role).agent, crate::app::tilde(&path)));
-            c.agent = Some(name);
-            c.nudged = false;
-            gave_work(c, env);
+            note(c, env, format!("started the {} ({}, {name}) in {}", role.label(), c.role_agent(role).agent, crate::app::tilde(&path)));
+            c.watch_mut(role).agent = Some(name);
+            c.watch_mut(role).nudged = false;
+            gave_work(c, role, env);
             true
         }
         Err(e) => {
-            ask(c, env, Ask::Setup, format!("couldn't start the {}: {e}", role.name()));
+            ask_about(c, env, role, Ask::Setup, format!("couldn't start the {}: {e}", role.label()));
             false
         }
     }
 }
 
-/// The current agent's work is in: close it once it stops, and go on.
-fn done_with(c: &mut Case, name: &str) {
-    c.agent = None;
+/// The role's agent's work is in: close it once it stops, and go on.
+fn done_with(c: &mut Case, role: Role, name: &str) {
+    c.watch_mut(role).agent = None;
     if !c.closing.iter().any(|n| n == name) {
         c.closing.push(name.to_string());
     }
@@ -1337,7 +1677,7 @@ fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<Strin
     }
     c.stage = Stage::Fixing;
     c.fix = None;
-    c.nudged = false;
+    c.w.nudged = false;
     // Your y was for a commit that's being replaced.
     c.merge_when_ready = false;
     c.merge_tries = 0;
@@ -1347,7 +1687,7 @@ fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<Strin
     // Never started (nothing was found, and CI failed): it starts from its
     // prompt, which lists what's open.
     if !env.agents().unwrap_or_default().iter().any(|a| a.name == fixer && a.state != "exited") {
-        c.agent = None;
+        c.w.agent = None;
         return;
     }
     let text = format!(
@@ -1358,8 +1698,8 @@ fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<Strin
         c.pr().head,
         submit_line(c, Role::Fixer)
     );
-    c.agent = Some(fixer.clone());
-    gave_work(c, env);
+    c.w.agent = Some(fixer.clone());
+    gave_work(c, Role::Fixer, env);
     if let Err(e) = env.send(&fixer, &text) {
         ask(c, env, Ask::NoReport, format!("couldn't tell the fixer about round {}: {e}", c.round));
     }
@@ -1393,10 +1733,21 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
     }
 
     // The report came after all: no need for your answer.
-    if c.ask == Some(Ask::NoReport) && c.stage.role().is_some_and(|r| take_report(root, c, r).is_some()) {
+    if c.ask == Some(Ask::NoReport) && c.asked_role().is_some_and(|r| take_report(root, c, r).is_some()) {
         c.ask = None;
         c.why.clear();
         note(c, env, "the report came in");
+    }
+    // Asked about one reviewer: the other goes on meanwhile.
+    if c.stage == Stage::Reviewing && matches!(c.ask, Some(Ask::NoReport | Ask::Setup)) {
+        let about = c.about;
+        for role in c.reviewers().into_iter().filter(|r| Some(*r) != about) {
+            if c.review(role).is_some_and(|r| !r.done && r.w.agent.is_some())
+                && let Some(text) = take_report(root, c, role)
+            {
+                take(c, root, env, role, &text);
+            }
+        }
     }
     if c.ask == Some(Ask::Approval) && look_approval(c, env) {
         return true;
@@ -1454,14 +1805,16 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
                 note(c, env, format!("budget raised to {}", crate::cost::usd(c.budget)));
             }
             Ask::NoReport => {
-                c.nudged = false;
-                let Some(name) = c.agent.clone() else { return true };
+                let role = c.asked_role().unwrap_or(Role::Reviewer);
+                c.about = None;
+                c.watch_mut(role).nudged = false;
+                let Some(name) = c.watch_of(role).agent.clone() else { return true };
                 if seen.iter().all(|a| a.name != name || a.state == "exited") {
                     // Started again, from its prompt, at the next look.
                     let _ = env.close(&name, false);
-                    c.agent = None;
+                    c.watch_mut(role).agent = None;
                     note(c, env, format!("starting {name} again"));
-                } else if let Err(e) = nudge(c, env, &name) {
+                } else if let Err(e) = nudge(c, env, role, &name) {
                     note(c, env, format!("couldn't nudge {name}: {e}"));
                 }
             }
@@ -1480,7 +1833,14 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
                 };
                 merge(c, env, true, how);
             }
-            Ask::Setup => c.agent = None,
+            Ask::Setup => {
+                let role = c.asked_role();
+                c.about = None;
+                match role {
+                    Some(r) => c.watch_mut(r).agent = None,
+                    None => c.w.agent = None,
+                }
+            }
         }
         return true;
     }
@@ -1506,17 +1866,21 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
             ask(c, env, Ask::Outsider, format!("issue #{} has text from outside the project ({who}): read it before the agents work from it", c.issue.as_ref().map_or(0, |i| i.number)));
             return true;
         }
-        Stage::Building | Stage::Reviewing | Stage::Fixing | Stage::Verifying => {
-            let role = c.stage.role().unwrap();
-            // Just started: the agents seen were looked at before it was.
-            let started = c.agent.is_none() && !seen.iter().any(|a| a.name == c.agent_name(role));
-            if c.agent.is_none() && !ensure_agent(c, role, &seen, env) {
-                return true;
+        // Both reviewers at once, each on its own; on once both are in.
+        Stage::Reviewing => {
+            for role in c.reviewers() {
+                if c.review(role).is_none_or(|r| r.done) {
+                    continue;
+                }
+                if !work_on(c, root, env, &seen, role) || c.ask.is_some() || c.stage != Stage::Reviewing {
+                    break;
+                }
             }
-            if let Some(text) = take_report(root, c, role) {
-                take(c, root, env, role, &text);
-            } else if let Some(name) = c.agent.clone().filter(|_| !started) {
-                watch(c, env, &seen, &name, role);
+        }
+        Stage::Building | Stage::Fixing | Stage::Verifying => {
+            let role = c.stage.role().unwrap();
+            if !work_on(c, root, env, &seen, role) {
+                return true;
             }
         }
         Stage::Gate => gate(c, env),
@@ -1529,13 +1893,29 @@ pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
     *c != before
 }
 
+/// The role's agent: started if it isn't, its report taken if it's in, or
+/// watched. False when it couldn't be started.
+fn work_on(c: &mut Case, root: &Path, env: &mut dyn Env, seen: &[Seen], role: Role) -> bool {
+    // Just started: the agents seen were looked at before it was.
+    let started = c.watch_of(role).agent.is_none() && !seen.iter().any(|a| a.name == c.agent_name(role));
+    if c.watch_of(role).agent.is_none() && !ensure_agent(c, role, seen, env) {
+        return false;
+    }
+    if let Some(text) = take_report(root, c, role) {
+        take(c, root, env, role, &text);
+    } else if let Some(name) = c.watch_of(role).agent.clone().filter(|_| !started) {
+        watch(c, env, seen, &name, role);
+    }
+    true
+}
+
 fn take_report(root: &Path, c: &Case, role: Role) -> Option<String> {
     std::fs::read_to_string(report_file(root, c, role)).ok()
 }
 
 /// A report is in: what it changes.
 fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
-    let name = c.agent.clone().unwrap_or_else(|| c.agent_name(role));
+    let name = c.watch_of(role).agent.clone().unwrap_or_else(|| c.agent_name(role));
     match role {
         Role::Builder => {
             let Ok(r) = serde_json::from_str::<BuildReport>(text) else { return };
@@ -1545,7 +1925,7 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 let list = missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
                 let _ = std::fs::remove_file(report_file(root, c, role));
                 note(c, env, format!("the builder's commits aren't on origin/{}: {list}", r.branch));
-                gave_work(c, env);
+                gave_work(c, role, env);
                 let _ = env.send(&name, &format!("Your report for case {} names commits that aren't on origin/{} yet: {list}. Push them with git push origin HEAD:{} (never force), then hand in the report again.", c.id, r.branch, r.branch));
                 return;
             }
@@ -1557,74 +1937,14 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                     c.ci_expected = fetch(c, env, &base).map_or(true, |sha| expects_ci(c, env, &sha));
                     c.pr = Some(pr);
                     c.build = Some(r);
-                    done_with(c, &name);
+                    done_with(c, role, &name);
                     c.stage = Stage::Reviewing;
-                    c.nudged = false;
+                    c.w.nudged = false;
                 }
                 Err(e) => ask(c, env, Ask::Setup, format!("couldn't open the PR: {}", e.lines().next().unwrap_or("").trim())),
             }
         }
-        Role::Reviewer if !c.verifying => {
-            let Ok(r) = serde_json::from_str::<Findings>(text) else { return };
-            let important = r.findings.iter().filter(|f| f.severity == Severity::Important).count();
-            c.findings = r.findings;
-            c.solves = r.solves;
-            if c.findings.is_empty() && c.issue.is_none() {
-                done_with(c, &name);
-                note(c, env, "the reviewer found nothing");
-                ask(c, env, Ask::NothingFound, "the reviewer found nothing to fix");
-                return;
-            }
-            // Its own findings again, with evidence, before the fixer sees any.
-            if c.findings.is_empty() {
-                note(c, env, "the reviewer found no bugs: it checks its word on the issue now");
-            } else {
-                note(c, env, format!("the reviewer found {} ({important} important): it checks them now", plural(c.findings.len(), "finding")));
-            }
-            c.verifying = true;
-            c.nudged = false;
-            // Stored first: the server checks its answer against this.
-            gave_work(c, env);
-            let _ = store(root, c);
-            if let Err(e) = env.send(&name, &verify_text(c)) {
-                ask(c, env, Ask::NoReport, format!("couldn't ask the reviewer to check its findings: {e}"));
-            }
-        }
-        Role::Reviewer => {
-            let Ok(r) = serde_json::from_str::<Verified>(text) else { return };
-            done_with(c, &name);
-            c.verifying = false;
-            let mut kept = Vec::new();
-            for f in std::mem::take(&mut c.findings) {
-                let Some(k) = r.findings.iter().find(|k| k.id == f.id) else { continue };
-                if k.confirmed {
-                    kept.push(Finding { evidence: k.evidence.clone(), ..f });
-                } else {
-                    let why = clean(k.why.as_deref().unwrap_or_default());
-                    c.retracted.push(Retracted { finding: f, why });
-                }
-            }
-            let gone: Vec<String> = c.retracted.iter().map(|r| format!("{} ({})", r.finding.id, r.why.chars().take(80).collect::<String>())).collect();
-            note(c, env, format!("the reviewer confirmed {}{}", kept.len(), if gone.is_empty() { String::new() } else { format!(" and retracted {}: {}", gone.len(), gone.join("; ")) }));
-            c.open = kept.iter().map(|f| f.id.clone()).collect();
-            c.findings = kept;
-            if r.solves.is_some() {
-                c.solves = r.solves;
-            }
-            let answer = c.solves.as_ref().map(|s| s.answer);
-            c.review_solves = answer;
-            if let Some(a) = answer {
-                note(c, env, format!("the reviewer says the PR solves the issue: {}", snake(&a)));
-            }
-            if answer == Some(Answer::No) {
-                ask(c, env, Ask::Unsolved, format!("the reviewer says PR #{} doesn't solve issue #{} (trix case show {})", c.pr().number, c.issue.as_ref().map_or(0, |i| i.number), c.id));
-            } else if c.findings.is_empty() {
-                ask(c, env, Ask::NothingFound, "the reviewer found nothing to fix");
-            } else {
-                c.stage = Stage::Fixing;
-                c.nudged = false;
-            }
-        }
+        Role::Reviewer | Role::Reviewer2 => take_review(c, root, env, role, &name, text),
         Role::Fixer => {
             if c.fix.is_some() {
                 return;
@@ -1638,7 +1958,7 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 let _ = std::fs::remove_file(report_file(root, c, role));
                 let head = c.pr().head.clone();
                 note(c, env, format!("the fixer's commits aren't on origin/{head}: {list}"));
-                gave_work(c, env);
+                gave_work(c, role, env);
                 let _ = env.send(&name, &format!("Your report for case {} names commits that aren't on origin/{head} yet: {list}. Push them with git push origin HEAD:{head} (never force), then hand in the report again.", c.id));
                 return;
             }
@@ -1653,14 +1973,15 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 }
             }
             c.fix = Some(r);
-            c.agent = None;
+            c.w.agent = None;
             c.stage = Stage::Verifying;
-            c.nudged = false;
+            c.w.nudged = false;
         }
         Role::Gatekeeper => {
             let Ok(v) = serde_json::from_str::<Verdict>(text) else { return };
-            done_with(c, &name);
-            c.findings.extend(v.new.iter().cloned());
+            done_with(c, role, &name);
+            c.findings.extend(v.new.iter().cloned().map(|f| Finding { by: vec![format!("gatekeeper {}", f.id)], also: None, ..f }));
+            c.optional.extend(v.optional.iter().cloned().map(|o| Optional { by: Some(format!("gatekeeper {}", c.round)), ..o }));
             if v.solves.is_some() {
                 c.solves = v.solves.clone();
             }
@@ -1678,6 +1999,187 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 ask(c, env, Ask::RoundLimit, format!("{} done and the gatekeeper still asks for changes", plural(c.round as usize, "round")));
             }
         }
+    }
+}
+
+/// A must-fix finding without its proof is optional, unproven: never the
+/// fixer's. The server refuses one; this is for any that got past it.
+fn unproven(f: &Finding, by: &str) -> Option<Optional> {
+    check_proof("", f.proof.as_ref()).err().map(|_| Optional { file: Some(f.file.clone()), line: f.line, summary: f.summary.clone(), unproven: true, by: Some(by.into()) })
+}
+
+/// A reviewer's report: its findings, then its own check of them. Once
+/// both reviewers' checks are in, the reviews are put together.
+fn take_review(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, name: &str, text: &str) {
+    let (label, tag) = (role.label(), role.name());
+    if c.review(role).is_none() {
+        return;
+    }
+    if !c.review(role).is_some_and(|r| r.verifying) {
+        let Ok(r) = serde_json::from_str::<Findings>(text) else { return };
+        let rv = c.review_mut(role).unwrap();
+        rv.optional = r.optional.into_iter().map(|o| Optional { by: Some(tag.into()), ..o }).collect();
+        rv.findings.clear();
+        for f in r.findings {
+            match unproven(&f, tag) {
+                Some(o) => rv.optional.push(o),
+                None => rv.findings.push(Finding { by: Vec::new(), also: None, evidence: None, ..f }),
+            }
+        }
+        rv.solves = r.solves;
+        let (n, optional) = (rv.findings.len(), rv.optional.len());
+        let opt = if optional > 0 { format!(" ({optional} optional)") } else { String::new() };
+        if n == 0 && c.issue.is_none() {
+            c.review_mut(role).unwrap().done = true;
+            done_with(c, role, name);
+            note(c, env, format!("the {label} found nothing must-fix{opt}"));
+            return reviews_in(c, env);
+        }
+        // Its own findings again, each proof run again, before the fixer sees any.
+        if n == 0 {
+            note(c, env, format!("the {label} found nothing must-fix{opt}: it checks its word on the issue now"));
+        } else {
+            note(c, env, format!("the {label} found {}{opt}: it checks them now", plural(n, "must-fix finding")));
+        }
+        c.review_mut(role).unwrap().verifying = true;
+        c.watch_mut(role).nudged = false;
+        // Stored first: the server checks its answer against this.
+        gave_work(c, role, env);
+        let _ = store(root, c);
+        if let Err(e) = env.send(name, &verify_text(c, role)) {
+            let why = format!("couldn't ask the {label} to check its findings: {e}");
+            // Asked about the other reviewer already: said, and this one's asked about next.
+            if c.ask.is_some() {
+                note(c, env, why);
+            } else {
+                ask_about(c, env, role, Ask::NoReport, why);
+            }
+        }
+        return;
+    }
+    let Ok(r) = serde_json::from_str::<Verified>(text) else { return };
+    done_with(c, role, name);
+    let rv = c.review_mut(role).unwrap();
+    rv.verifying = false;
+    rv.done = true;
+    let mut kept = Vec::new();
+    for f in std::mem::take(&mut rv.findings) {
+        let Some(k) = r.findings.iter().find(|k| k.id == f.id) else { continue };
+        if !k.confirmed {
+            let why = clean(k.why.as_deref().unwrap_or_default());
+            rv.retracted.push(Retracted { finding: Finding { by: vec![format!("{tag} {}", f.id)], ..f }, why });
+        } else if let Some(o) = unproven(&f, tag) {
+            rv.optional.push(o);
+        } else {
+            kept.push(Finding { evidence: k.evidence.clone(), ..f });
+        }
+    }
+    // Listed again in its check: once is enough.
+    for o in r.optional {
+        let o = Optional { by: Some(tag.into()), ..o };
+        if !rv.optional.iter().any(|x| x.file == o.file && x.line == o.line && x.summary.trim() == o.summary.trim()) {
+            rv.optional.push(o);
+        }
+    }
+    if r.solves.is_some() {
+        rv.solves = r.solves;
+    }
+    let gone: Vec<String> = rv.retracted.iter().map(|r| format!("{} ({})", r.finding.id, r.why.chars().take(80).collect::<String>())).collect();
+    let n = kept.len();
+    rv.findings = kept;
+    note(c, env, format!("the {label} confirmed {n}{}", if gone.is_empty() { String::new() } else { format!(" and retracted {}: {}", gone.len(), gone.join("; ")) }));
+    reviews_in(c, env);
+}
+
+/// The same defect, raised by both reviewers: the same file, and lines a
+/// few apart or the same failing test, or no line and the same summary.
+fn same_defect(a: &Finding, b: &Finding) -> bool {
+    let file = |f: &Finding| f.file.trim().trim_start_matches("./").to_string();
+    if file(a) != file(b) {
+        return false;
+    }
+    let test = |f: &Finding| f.proof.as_ref().and_then(|p| p.test.as_deref()).map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
+    if test(a).is_some() && test(a) == test(b) {
+        return true;
+    }
+    let words = |f: &Finding| f.summary.to_lowercase().split(|ch: char| !ch.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+    match (a.line, b.line) {
+        (Some(x), Some(y)) => x.abs_diff(y) <= 3,
+        (None, None) => words(a) == words(b),
+        _ => false,
+    }
+}
+
+/// How much an answer says the PR solves the issue: least first.
+fn rank(a: Answer) -> u8 {
+    match a {
+        Answer::No => 0,
+        Answer::Partly => 1,
+        Answer::Yes => 2,
+    }
+}
+
+/// Once every reviewer is done: their verified must-fix findings, a
+/// defect both raised once and tagged with both, to the fixer; what they
+/// say of the issue; or nothing to fix.
+fn reviews_in(c: &mut Case, env: &mut dyn Env) {
+    if c.reviews.iter().any(|r| !r.done) {
+        return;
+    }
+    let roles = c.reviewers();
+    let two = roles.len() > 1;
+    let mut merged: Vec<Finding> = Vec::new();
+    for &role in &roles {
+        let tag = role.name();
+        let rv = c.review(role).cloned().unwrap_or_default();
+        for f in rv.findings {
+            let by = format!("{tag} {}", f.id);
+            let mine = format!("{tag} ");
+            match merged.iter_mut().find(|g| !g.by.iter().any(|b| b.starts_with(&mine)) && same_defect(g, &f)) {
+                Some(g) => {
+                    g.by.push(by.clone());
+                    g.also = Some(format!("{by}: {} ({}:{}) {}", f.summary, f.file, f.line.map_or(String::new(), |l| l.to_string()), f.failure));
+                }
+                // One reviewer's ids stay its own; two get one numbering.
+                None => {
+                    let id = if two { format!("F{}", merged.len() + 1) } else { f.id.clone() };
+                    merged.push(Finding { id, by: vec![by], also: None, ..f });
+                }
+            }
+        }
+        c.retracted.extend(rv.retracted);
+        c.optional.extend(rv.optional);
+    }
+    if two {
+        let both = merged.iter().filter(|f| f.by.len() > 1).count();
+        let tags: Vec<String> = merged.iter().map(|f| format!("{} ({})", f.id, f.by.join(" + "))).collect();
+        let optional = if c.optional.is_empty() { String::new() } else { format!(", {} optional", c.optional.len()) };
+        note(c, env, format!("both reviews are in: {} ({both} raised by both){optional}{}", plural(merged.len(), "must-fix finding"), if tags.is_empty() { String::new() } else { format!(": {}", tags.join(", ")) }));
+    }
+    c.open = merged.iter().map(|f| f.id.clone()).collect();
+    c.findings = merged;
+    // The issue: each reviewer's word, and the one that says least goes on.
+    let said: Vec<(Role, Solves)> = roles.iter().filter_map(|&r| Some((r, c.review(r)?.solves.clone()?))).collect();
+    c.review_solves = c.review(Role::Reviewer).and_then(|r| r.solves.as_ref()).map(|s| s.answer);
+    if let Some((_, least)) = said.iter().min_by_key(|(_, s)| rank(s.answer)) {
+        c.solves = Some(least.clone());
+    }
+    for (r, s) in &said {
+        note(c, env, format!("the {} says the PR solves the issue: {}", r.label(), snake(&s.answer)));
+    }
+    let no: Vec<Role> = said.iter().filter(|(_, s)| s.answer == Answer::No).map(|(r, _)| *r).collect();
+    let who = if two { "the reviewers" } else { "the reviewer" };
+    if let Some(first) = no.first() {
+        let (n, m) = (c.pr().number, c.issue.as_ref().map_or(0, |i| i.number));
+        let others: Vec<String> = said.iter().filter(|(r, _)| !no.contains(r)).map(|(r, s)| format!("the {} says {}", r.label(), snake(&s.answer))).collect();
+        let speaker = if no.len() > 1 { "both reviewers say".to_string() } else { format!("the {} says", first.label()) };
+        let differ = if others.is_empty() { String::new() } else { format!("; {}", others.join(", ")) };
+        ask(c, env, Ask::Unsolved, format!("{speaker} PR #{n} doesn't solve issue #{m}{differ} (trix case show {})", c.id));
+    } else if c.findings.is_empty() {
+        ask(c, env, Ask::NothingFound, format!("{who} found nothing to fix"));
+    } else {
+        c.stage = Stage::Fixing;
+        c.w.nudged = false;
     }
 }
 
@@ -1708,7 +2210,7 @@ fn open_pr(c: &Case, env: &mut dyn Env, r: &BuildReport) -> Result<Pr, String> {
     if let Some(pr) = find(env)? {
         return Ok(pr);
     }
-    let body = format!("Fixes #{}\n\n{}\n\n---\nBuilt by trix triage case {}: a reviewer, a fixer and a gatekeeper check it before it's merged.", i.number, r.summary.trim(), c.id);
+    let body = format!("Fixes #{}\n\n{}\n\n---\nBuilt by trix triage case {}: reviewers, a fixer and a gatekeeper check it before it's merged.", i.number, r.summary.trim(), c.id);
     env.gh(&c.repo, &["pr", "create", "--head", &i.branch, "--base", &i.base, "--title", &i.title, "--body", &body])?;
     find(env)?.ok_or_else(|| format!("gh made no PR for {}", i.branch))
 }
@@ -1720,11 +2222,12 @@ fn expects_ci(c: &Case, env: &mut dyn Env, sha: &str) -> bool {
 
 fn verdict_text(v: &Verdict) -> String {
     let mut s = String::from("The gatekeeper asks for changes:");
+    let proof = |p: Option<&Proof>| p.map_or(String::new(), |p| format!(" Proof: {} → {} (expected {})", p.test.as_deref().or(p.repro.as_deref()).unwrap_or_default(), p.observed.as_deref().unwrap_or_default(), p.expected.as_deref().unwrap_or_default()));
     for f in v.findings.iter().filter(|f| !f.ok) {
-        s.push_str(&format!("\n- {}: {}", f.id, f.reason.as_deref().unwrap_or("not fixed")));
+        s.push_str(&format!("\n- {}: {}{}", f.id, f.reason.as_deref().unwrap_or("not fixed"), proof(f.proof.as_ref())));
     }
     for f in &v.new {
-        s.push_str(&format!("\n- {} (new, {}): {} — {}:{} — {}", f.id, if f.severity == Severity::Important { "important" } else { "minor" }, f.summary, f.file, f.line.map_or(String::new(), |l| l.to_string()), f.failure));
+        s.push_str(&format!("\n- {} (new, must-fix): {} — {}:{} — {}{}", f.id, f.summary, f.file, f.line.map_or(String::new(), |l| l.to_string()), f.failure, proof(f.proof.as_ref())));
     }
     if v.ci == Ci::Red {
         s.push_str("\n- CI is red.");
@@ -1739,18 +2242,19 @@ fn plural(n: usize, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
-fn nudge(c: &mut Case, env: &mut dyn Env, name: &str) -> Result<(), String> {
-    let role = c.stage.role().unwrap_or(Role::Reviewer);
-    c.nudged = true;
-    gave_work(c, env);
+fn nudge(c: &mut Case, env: &mut dyn Env, role: Role, name: &str) -> Result<(), String> {
+    c.watch_mut(role).nudged = true;
+    gave_work(c, role, env);
     env.send(name, &format!("trix case {} is waiting for your report as the {}. {SUBMIT_NOTE}\n{}", c.id, role.name(), submit_line(c, role)))
 }
 
 /// The agent has work: it's stopped only once it's been seen at it.
-fn gave_work(c: &mut Case, env: &mut dyn Env) {
-    c.given = env.now();
-    c.worked = false;
-    c.stopped_at = None;
+fn gave_work(c: &mut Case, role: Role, env: &mut dyn Env) {
+    let now = env.now();
+    let w = c.watch_mut(role);
+    w.given = now;
+    w.worked = false;
+    w.stopped_at = None;
 }
 
 /// How long an agent must stay stopped before it counts: one that ends a
@@ -1766,32 +2270,34 @@ const TAKE_UP_SECS: u64 = 120;
 fn watch(c: &mut Case, env: &mut dyn Env, seen: &[Seen], name: &str, role: Role) {
     let Some(a) = seen.iter().find(|a| a.name == name) else {
         // Gone (closed by hand): start it again.
-        c.agent = None;
+        c.watch_mut(role).agent = None;
         return;
     };
+    let now = env.now();
+    let w = c.watch_mut(role);
     if a.state == "working" {
-        c.worked = true;
-        c.stopped_at = None;
+        w.worked = true;
+        w.stopped_at = None;
     }
     if matches!(a.state.as_str(), "done" | "idle") {
-        let now = env.now();
-        let since = *c.stopped_at.get_or_insert(now);
-        if !c.worked && now.saturating_sub(c.given) < TAKE_UP_SECS {
+        let since = *w.stopped_at.get_or_insert(now);
+        if !w.worked && now.saturating_sub(w.given) < TAKE_UP_SECS {
             return;
         }
         if now.saturating_sub(since) < SETTLE_SECS {
             return;
         }
     }
+    let nudged = w.nudged;
     match a.state.as_str() {
-        "exited" => ask(c, env, Ask::NoReport, format!("the {} ({name}) exited without its report", role.name())),
-        "done" | "idle" if !c.nudged => {
-            note(c, env, format!("the {} stopped without its report: reminded it", role.name()));
-            if nudge(c, env, name).is_err() {
-                ask(c, env, Ask::NoReport, format!("the {} ({name}) stopped without its report", role.name()));
+        "exited" => ask_about(c, env, role, Ask::NoReport, format!("the {} ({name}) exited without its report", role.label())),
+        "done" | "idle" if !nudged => {
+            note(c, env, format!("the {} stopped without its report: reminded it", role.label()));
+            if nudge(c, env, role, name).is_err() {
+                ask_about(c, env, role, Ask::NoReport, format!("the {} ({name}) stopped without its report", role.label()));
             }
         }
-        "done" | "idle" => ask(c, env, Ask::NoReport, format!("the {} ({name}) stopped again without its report", role.name())),
+        "done" | "idle" => ask_about(c, env, role, Ask::NoReport, format!("the {} ({name}) stopped again without its report", role.label())),
         _ => {}
     }
 }
@@ -1815,7 +2321,7 @@ fn gate(c: &mut Case, env: &mut dyn Env) {
             let what = format!("CI fails on the PR: {}", failed.join(", "));
             note(c, env, what.clone());
             if !c.findings.iter().any(|f| f.id == id) {
-                c.findings.push(Finding { id: id.clone(), file: "CI".into(), line: None, severity: Severity::Important, summary: what.clone(), failure: format!("gh pr checks {} shows them failing", c.pr().number), evidence: None });
+                c.findings.push(Finding { id: id.clone(), file: "CI".into(), line: None, severity: Severity::Important, summary: what.clone(), failure: format!("gh pr checks {} shows them failing", c.pr().number), evidence: None, proof: None, by: Vec::new(), also: None });
             }
             if c.round < c.max_rounds {
                 next_round(c, env, format!("{what}. See gh pr checks {}.", c.pr().number), vec![id]);
@@ -1884,7 +2390,7 @@ fn conflict(c: &mut Case, env: &mut dyn Env, more: bool) {
     let id = format!("CONFLICT{}", c.round);
     note(c, env, format!("PR #{n} conflicts with {base}: GitHub can't merge it"));
     if !c.findings.iter().any(|f| f.id == id) {
-        c.findings.push(Finding { id: id.clone(), file: "merge".into(), line: None, severity: Severity::Important, summary: format!("the PR conflicts with {base}: GitHub can't merge it"), failure: format!("gh pr view {n} --json mergeable says CONFLICTING"), evidence: None });
+        c.findings.push(Finding { id: id.clone(), file: "merge".into(), line: None, severity: Severity::Important, summary: format!("the PR conflicts with {base}: GitHub can't merge it"), failure: format!("gh pr view {n} --json mergeable says CONFLICTING"), evidence: None, proof: None, by: Vec::new(), also: None });
     }
     if more {
         c.max_rounds = c.max_rounds.max(c.round + 1);
@@ -1906,12 +2412,12 @@ const MERGE_TRIES: u32 = 3;
 enum AfterMerge {
     /// GitHub closes it: the PR says it closes it.
     PrCloses,
-    /// trix closes it: the reviewer and the gatekeeper both said it's solved.
+    /// trix closes it: the reviewers and the gatekeeper all said it's solved.
     TrixCloses,
     StaysOpen,
 }
 
-const STAYS_OPEN: &str = "the reviewer and the gatekeeper didn't both say the PR solves it";
+const STAYS_OPEN: &str = "the reviewers and the gatekeeper didn't all say the PR solves it";
 
 /// The reviewer's last word on the issue: kept since the upgrade that
 /// keeps it, read from the log for a case from before.
@@ -1920,6 +2426,15 @@ fn review_said(c: &Case) -> Option<Answer> {
         let said = c.log.iter().rev().find_map(|(_, l)| l.strip_prefix("the reviewer says the PR solves the issue: "))?;
         serde_json::from_value(serde_json::Value::String(said.trim().to_string())).ok()
     })
+}
+
+/// Every reviewer said the PR solves the issue. A case from before two
+/// reviewers has its one reviewer's word kept elsewhere.
+fn reviewers_say_yes(c: &Case) -> bool {
+    if c.reviews.iter().any(|r| r.solves.is_some()) {
+        return c.reviews.iter().all(|r| r.solves.as_ref().map(|s| s.answer) == Some(Answer::Yes));
+    }
+    review_said(c) == Some(Answer::Yes)
 }
 
 /// The case's issue, and what the merge does to it. `None`: no issue.
@@ -1933,7 +2448,7 @@ fn after_merge(c: &Case, env: &mut dyn Env) -> Option<(u64, AfterMerge)> {
         m,
         if closes {
             AfterMerge::PrCloses
-        } else if review_said(c) == Some(Answer::Yes) && gate == Some(Answer::Yes) {
+        } else if reviewers_say_yes(c) && gate == Some(Answer::Yes) {
             AfterMerge::TrixCloses
         } else {
             AfterMerge::StaysOpen
@@ -2161,7 +2676,10 @@ fn close_all(c: &mut Case, env: &mut dyn Env, clean: bool) {
         }
     }
     c.closing.clear();
-    c.agent = None;
+    c.w.agent = None;
+    for r in &mut c.reviews {
+        r.w.agent = None;
+    }
     for line in said {
         note(c, env, line);
     }
@@ -2173,7 +2691,7 @@ fn close_all(c: &mut Case, env: &mut dyn Env, clean: bool) {
 /// back on if git keeps the checkout; someone else's lock stays, and so
 /// does the checkout.
 fn remove_readonly(c: &mut Case, env: &mut dyn Env) {
-    let mut paths = vec![worktree(c, Role::Reviewer)];
+    let mut paths: Vec<PathBuf> = [Role::Reviewer, Role::Reviewer2].iter().map(|&r| worktree(c, r)).collect();
     let round = c.round;
     for r in 1..=round {
         c.round = r;
@@ -2215,7 +2733,16 @@ fn rebuild(c: &mut Case, root: &Path, env: &mut dyn Env) {
             None => base,
         };
         let role = |r: &RoleAgent| crate::config::Role { agent: r.agent.clone(), args: r.args.clone() };
-        let opts = crate::config::TriageOpts { budget: c.budget_step, max_rounds: c.max_rounds, builder: role(&c.builder), reviewer: role(&c.reviewer), fixer: role(&c.fixer), gatekeeper: role(&c.gatekeeper) };
+        let opts = crate::config::TriageOpts {
+            budget: c.budget_step,
+            max_rounds: c.max_rounds,
+            builder: role(&c.builder),
+            reviewer: role(&c.reviewer),
+            reviewer2: role(c.reviewer2.as_ref().unwrap_or(&c.reviewer)),
+            reviewers: if c.reviewer2.is_some() { 2 } else { 1 },
+            fixer: role(&c.fixer),
+            gatekeeper: role(&c.gatekeeper),
+        };
         let mut n = Case::new(&id, None, Some(issue), c.repo.clone(), &opts, env.now());
         n.trusted = c.trusted;
         env.open_case(&n).map(|_| id)
@@ -2351,7 +2878,11 @@ pub fn run_pane(id: &str) -> i32 {
     let mut env = Live { keys: rx, said: Default::default() };
     let url = c.pr.as_ref().map(|p| p.url.clone()).or(c.issue.as_ref().map(|i| i.url.clone())).unwrap_or_default();
     let builder = if c.pr.is_none() && c.issue.is_some() { format!("Builder {}, reviewer", c.builder.agent) } else { "Reviewer".into() };
-    println!("trix triage · {} · {} {}\n{}\n{builder} {}, fixer {}, gatekeeper {} · budget {} · up to {}\n", c.id, c.subject(), c.title(), clean(&url), c.reviewer.agent, c.fixer.agent, c.gatekeeper.agent, crate::cost::usd(c.budget), plural(c.max_rounds as usize, "round"));
+    let reviewers = match &c.reviewer2 {
+        Some(r2) => format!("{builder}s {} and {}", c.reviewer.agent, r2.agent),
+        None => format!("{builder} {}", c.reviewer.agent),
+    };
+    println!("trix triage · {} · {} {}\n{}\n{reviewers}, fixer {}, gatekeeper {} · budget {} · up to {}\n", c.id, c.subject(), c.title(), clean(&url), c.fixer.agent, c.gatekeeper.agent, crate::cost::usd(c.budget), plural(c.max_rounds as usize, "round"));
     for (at, text) in &c.log {
         let (_, _, secs) = crate::ledger::local(*at);
         println!("{:02}:{:02}  {text}", secs / 3600, secs / 60 % 60);
@@ -2389,7 +2920,7 @@ pub fn run_pane(id: &str) -> i32 {
 
 const HELP: &str = "\
 usage:
-  trix triage <PR or issue>        start a case: a reviewer, a fixer and a gatekeeper take
+  trix triage <PR or issue>        start a case: two reviewers, a fixer and a gatekeeper take
                                     the PR from findings to a merge you approve. An issue
                                     (number or URL) is triaged through its open PR, or a
                                     builder makes one
@@ -2725,7 +3256,7 @@ pub fn run(args: &[String]) -> i32 {
         ["answer", id, key] if key.chars().count() == 1 => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Answer { key: key.chars().next().unwrap_or(' ').to_ascii_lowercase() } })),
         ["submit", id, role] | ["submit", id, role, "--file", _] => {
             let Some(role) = Role::parse(role) else {
-                return say(Err(format!("'{role}' isn't a role (builder, reviewer, fixer, gatekeeper)")));
+                return say(Err(format!("'{role}' isn't a role (builder, reviewer, reviewer2, fixer, gatekeeper)")));
             };
             let file = words.get(4).map(Path::new);
             let mut report = String::new();
@@ -2762,7 +3293,7 @@ fn summary(c: &Case) -> serde_json::Value {
         "id": c.id, "pr": c.pr.as_ref().map(|p| p.number), "issue": c.issue.as_ref().map(|i| i.number), "title": c.title(),
         "url": c.pr.as_ref().map(|p| p.url.clone()).or(c.issue.as_ref().map(|i| i.url.clone())),
         "stage": c.stage, "round": c.round, "needs_you": c.ask.is_some(), "why": c.why,
-        "findings": c.findings.len(), "budget_usd": c.budget, "spent_closed_usd": c.spent_closed,
+        "findings": c.findings.len(), "optional": c.optional.len(), "reviewers": c.reviews.len().max(1), "budget_usd": c.budget, "spent_closed_usd": c.spent_closed,
     })
 }
 
@@ -2801,7 +3332,28 @@ fn show(c: &Case) -> String {
         for f in &c.findings {
             let outcome = c.fix.as_ref().and_then(|x| x.findings.iter().find(|o| o.id == f.id)).map(|o| format!(" → {}", snake(&o.outcome))).unwrap_or_default();
             let ok = c.verdict.as_ref().and_then(|v| v.findings.iter().find(|k| k.id == f.id)).map(|k| if k.ok { ", checked ok" } else { ", not ok" }).unwrap_or("");
-            s.push_str(&format!("  {} {:?} {}:{}  {}{outcome}{ok}\n", f.id, f.severity, f.file, f.line.map_or(String::new(), |l| l.to_string()), f.summary).replace("Important", "important").replace("Minor", "minor"));
+            let by = if f.by.is_empty() { String::new() } else { format!("  [{}]", f.by.join(" + ")) };
+            let minor = if f.severity == Severity::Minor { " (minor)" } else { "" };
+            s.push_str(&format!("  {}{minor} {}:{}  {}{outcome}{ok}{by}\n", f.id, clean(&f.file), f.line.map_or(String::new(), |l| l.to_string()), clean(&f.summary)));
+        }
+    }
+    // While they review, each reviewer's part; once in, what they said.
+    if c.reviews.len() > 1 || c.stage == Stage::Reviewing {
+        s.push_str("\nreviews:\n");
+        for &r in &c.reviewers() {
+            let Some(v) = c.review(r) else { continue };
+            let agent = c.role_agent(r).agent.clone();
+            let solves = v.solves.as_ref().map_or(String::new(), |x| format!(" · solves: {}", snake(&x.answer)));
+            let what = if v.done { format!("{} confirmed, {} retracted, {} optional", v.findings.len(), v.retracted.len(), v.optional.len()) } else { v.state().to_string() };
+            s.push_str(&format!("  {} ({agent}): {what}{solves}\n", r.label()));
+        }
+    }
+    let optional: Vec<&Optional> = if c.optional.is_empty() { c.reviews.iter().flat_map(|r| &r.optional).collect() } else { c.optional.iter().collect() };
+    if !optional.is_empty() {
+        s.push_str("\noptional (not must-fix, never sent to the fixer):\n");
+        for o in optional {
+            let at = o.file.as_deref().map_or(String::new(), |f| format!("{}:{}  ", clean(f), o.line.map_or(String::new(), |l| l.to_string())));
+            s.push_str(&format!("  {at}{}{}{}\n", clean(&o.summary), if o.unproven { " (unproven)" } else { "" }, o.by.as_deref().map_or(String::new(), |b| format!("  [{b}]"))));
         }
     }
     if let Some(x) = &c.solves {
@@ -2814,9 +3366,9 @@ fn show(c: &Case) -> String {
         }
     }
     if !c.retracted.is_empty() {
-        s.push_str("\nretracted by the reviewer:\n");
+        s.push_str("\nretracted by the reviewers:\n");
         for r in &c.retracted {
-            s.push_str(&format!("  {} {}:{}  {}  · {}\n", r.finding.id, clean(&r.finding.file), r.finding.line.map_or(String::new(), |l| l.to_string()), clean(&r.finding.summary), r.why));
+            s.push_str(&format!("  {} {}:{}  {}  · {}\n", if r.finding.by.is_empty() { r.finding.id.clone() } else { r.finding.by.join(" + ") }, clean(&r.finding.file), r.finding.line.map_or(String::new(), |l| l.to_string()), clean(&r.finding.summary), r.why));
         }
     }
     if !c.log.is_empty() {
@@ -2872,6 +3424,8 @@ mod tests {
         pr_state: &'static str,
         /// `gh pr view --json state,reviewDecision`s: the looks while parked.
         looks: u32,
+        /// Agents that fail to start.
+        refuse: Vec<String>,
     }
 
     impl Env for Fake {
@@ -2948,7 +3502,10 @@ mod tests {
                 _ => Err("unexpected".into()),
             }
         }
-        fn spawn(&mut self, name: &str, _agent: &RoleAgent, _cwd: &Path, prompt: &str) -> Result<(), String> {
+        fn spawn(&mut self, name: &str, agent: &RoleAgent, _cwd: &Path, prompt: &str) -> Result<(), String> {
+            if self.refuse.iter().any(|n| n == name) {
+                return Err(format!("{} isn't installed", agent.agent));
+            }
             self.seen.push(Seen { name: name.into(), state: "working".into(), cost: 1.0 });
             self.prompts.push((name.into(), prompt.into()));
             Ok(())
@@ -2978,13 +3535,23 @@ mod tests {
         fn print(&mut self, _line: &str) {}
     }
 
+    /// The agent at work: the stage's, or a reviewer's.
+    fn agent(c: &Case) -> Option<&str> {
+        c.w.agent.as_deref().or(c.reviews.iter().find_map(|r| r.w.agent.as_deref()))
+    }
+
+    /// One reviewer, as before there were two: most tests are about the rest.
+    fn one() -> crate::config::TriageOpts {
+        crate::config::TriageOpts { reviewers: 1, ..crate::config::TriageOpts::default() }
+    }
+
     fn fixture(name: &str) -> (PathBuf, Case) {
         let base = std::env::temp_dir().join(format!("trix-case-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (root, repo) = (base.join("cases"), base.join("repo"));
         std::fs::create_dir_all(&repo).unwrap();
         let pr = Pr { number: 12, title: "Add rate limits".into(), url: "https://example.com/pr/12".into(), head: "rate-limits".into(), base: "main".into(), sha: "prsha".into() };
-        let c = Case::new("triage-12", Some(pr), None, repo, &crate::config::TriageOpts::default(), 1_795_000_000);
+        let c = Case::new("triage-12", Some(pr), None, repo, &one(), 1_795_000_000);
         store(&root, &c).unwrap();
         (root, c)
     }
@@ -3013,7 +3580,7 @@ mod tests {
         env.seen.iter_mut().find(|a| a.name == name).unwrap().state = state.into();
     }
 
-    const FINDINGS: &str = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "severity": "important", "summary": "the window never resets", "failure": "after 60s a client is still refused"}]}"#;
+    const FINDINGS: &str = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "severity": "important", "summary": "the window never resets", "failure": "after 60s a client is still refused", "proof": {"test": "limit_resets_after_60s", "observed": "refused at t=61", "expected": "allowed at t=61"}}]}"#;
     const CONFIRMED: &str = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "test limit_resets_after_60s fails: refused at t=61"}]}"#;
 
     #[test]
@@ -3022,20 +3589,20 @@ mod tests {
         let mut env = Fake { now: 1_795_000_000, ci: runs(&[("test", "in_progress", None)]), ..Fake::default() };
         // The reviewer starts, told how to hand in its report.
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-12-review"));
+        assert_eq!(agent(&c), Some("triage-12-review"));
         assert!(env.prompts[0].1.contains("trix case submit triage-12 reviewer <<'EOF'") && env.prompts[0].1.contains("prsha"), "{}", env.prompts[0].1);
         // Its checkout is of a commit fetched first: the PR may have been pushed from anywhere.
         assert!(env.gits[0].starts_with("fetch --quiet origin +refs/heads/rate-limits:") && env.gits[2].starts_with("worktree add --quiet --detach") && env.gits[2].ends_with(" prsha"), "{:?}", env.gits);
         // Its findings, then the same agent checks them, with evidence.
         assert_eq!(submit(&root, &mut c, Role::Reviewer, FINDINGS).code, 0);
         step(&mut c, &root, &mut env);
-        assert!(c.verifying && env.sent.last().unwrap().1.contains("check your own review"), "{:?}", env.sent);
+        assert!(c.reviews[0].verifying && env.sent.last().unwrap().1.contains("check your own review"), "{:?}", env.sent);
         assert_eq!(submit(&root, &mut c, Role::Reviewer, CONFIRMED).code, 0);
         // On to the fixer; the reviewer closes once it stops.
         step(&mut c, &root, &mut env);
         assert_eq!((c.stage, c.open.clone(), c.closing.clone()), (Stage::Fixing, vec!["F1".to_string()], vec!["triage-12-review".to_string()]));
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-12-fix"));
+        assert_eq!(agent(&c), Some("triage-12-fix"));
         let fix_prompt = &env.prompts[1].1;
         assert!(fix_prompt.contains("the window never resets") && fix_prompt.contains("git push origin HEAD:rate-limits") && fix_prompt.contains("limit_resets_after_60s fails"), "{fix_prompt}");
         set_state(&mut env, "triage-12-review", "done");
@@ -3043,7 +3610,7 @@ mod tests {
         assert_eq!(env.closed, vec![("triage-12-review".to_string(), false)]);
         assert!((c.spent_closed - 1.0).abs() < 1e-9);
         // A report naming a commit that isn't pushed goes back to the fixer.
-        let fix = r#"{"commits": ["c1c1c1c"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed", "test": "window_resets"}]}"#;
+        let fix = r#"{"commits": ["c1c1c1c"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed", "test": "window_resets", "proof": {"ran": "cargo test limit_resets_after_60s", "output": "ok", "passes": true}}]}"#;
         assert_eq!(submit(&root, &mut c, Role::Fixer, fix).code, 0);
         step(&mut c, &root, &mut env);
         assert_eq!(c.stage, Stage::Fixing);
@@ -3054,21 +3621,21 @@ mod tests {
         assert_eq!(c.stage, Stage::Verifying);
         // The gatekeeper, fresh, asks for changes: round 2.
         step(&mut c, &root, &mut env);
-        assert_eq!((c.agent.as_deref(), c.checked.as_deref()), (Some("triage-12-gate-1"), Some("headsha")));
+        assert_eq!((agent(&c), c.checked.as_deref()), (Some("triage-12-gate-1"), Some("headsha")));
         let gate_prompt = &env.prompts[2].1;
         assert!(gate_prompt.contains("window_resets") && gate_prompt.contains("gh pr checks 12"), "{gate_prompt}");
-        let changes = r#"{"verdict": "changes", "findings": [{"id": "F1", "ok": false, "reason": "it resets, but per process, not per client"}], "new": [], "ci": "pending"}"#;
+        let changes = r#"{"verdict": "changes", "findings": [{"id": "F1", "ok": false, "reason": "it resets, but per process, not per client", "proof": {"repro": "two clients, 60 calls each", "observed": "the second is refused at once", "expected": "each has its own 60"}}], "new": [], "ci": "pending"}"#;
         assert_eq!(submit(&root, &mut c, Role::Gatekeeper, changes).code, 0);
         step(&mut c, &root, &mut env);
         assert_eq!((c.stage, c.round), (Stage::Fixing, 2));
         let (to, text) = env.sent.last().unwrap();
         assert!(to == "triage-12-fix" && text.contains("per process, not per client"), "{text}");
-        let fix2 = r#"{"commits": ["c2c2c2c"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
+        let fix2 = r#"{"commits": ["c2c2c2c"], "tests": "cargo test: ok", "findings": [{"id": "F1", "outcome": "fixed", "proof": {"ran": "cargo test limit_resets_after_60s", "output": "ok", "passes": true}}]}"#;
         env.pushed.push("c2c2c2c".into());
         submit(&root, &mut c, Role::Fixer, fix2);
         step(&mut c, &root, &mut env);
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-12-gate-2"));
+        assert_eq!(agent(&c), Some("triage-12-gate-2"));
         let pass = r#"{"verdict": "pass", "findings": [{"id": "F1", "ok": true}], "ci": "green"}"#;
         assert_eq!(submit(&root, &mut c, Role::Gatekeeper, pass).code, 0);
         step(&mut c, &root, &mut env);
@@ -3113,7 +3680,7 @@ mod tests {
         // Not the shape.
         let r = submit(&root, &mut c, Role::Reviewer, r#"{"findings": [{"id": "F1"}]}"#);
         assert!(r.code == 1 && r.err.contains("Fix the report and submit it again"), "{}", r.err);
-        let twice = r#"{"findings": [{"id": "F1", "file": "a", "severity": "minor", "summary": "s", "failure": "f"}, {"id": "F1", "file": "b", "severity": "minor", "summary": "s", "failure": "f"}]}"#;
+        let twice = r#"{"findings": [{"id": "F1", "file": "a", "summary": "s", "failure": "f", "proof": {"repro": "r", "observed": "o", "expected": "e"}}, {"id": "F1", "file": "b", "summary": "s", "failure": "f"}]}"#;
         assert!(submit(&root, &mut c, Role::Reviewer, twice).err.contains("used twice"));
         c.stage = Stage::Fixing;
         c.open = vec!["F1".into(), "F2".into()];
@@ -3189,7 +3756,7 @@ mod tests {
         // The report comes after all: on it goes, unasked.
         submit(&root, &mut c, Role::Reviewer, FINDINGS);
         step(&mut c, &root, &mut env);
-        assert_eq!((c.ask, c.stage, c.verifying), (None, Stage::Reviewing, true));
+        assert_eq!((c.ask, c.stage, c.reviews[0].verifying), (None, Stage::Reviewing, true));
         submit(&root, &mut c, Role::Reviewer, CONFIRMED);
         step(&mut c, &root, &mut env);
         assert_eq!((c.ask, c.stage), (None, Stage::Fixing));
@@ -3276,15 +3843,15 @@ mod tests {
         let (root, mut c) = fixture("conflict-again");
         let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
         at_gate(&mut c, &mut env);
-        c.findings.push(Finding { id: "CONFLICT1".into(), file: "merge".into(), line: None, severity: Severity::Important, summary: "the PR conflicts with main".into(), failure: "f".into(), evidence: None });
+        c.findings.push(Finding { id: "CONFLICT1".into(), file: "merge".into(), line: None, severity: Severity::Important, summary: "the PR conflicts with main".into(), failure: "f".into(), evidence: None, proof: None, by: Vec::new(), also: None });
         // The gatekeeper says main moved on again: changes, rounds used up.
         c.stage = Stage::Verifying;
         c.open = vec!["CONFLICT1".into()];
         c.fix = Some(serde_json::from_str(r#"{"commits": [], "tests": "ok", "findings": [{"id": "CONFLICT1", "outcome": "fixed"}]}"#).unwrap());
         c.round = c.max_rounds;
-        let changes = r#"{"verdict": "changes", "findings": [{"id": "CONFLICT1", "ok": false, "reason": "main moved on to aa74af0: merge origin/main again"}], "ci": "none"}"#;
+        let changes = r#"{"verdict": "changes", "findings": [{"id": "CONFLICT1", "ok": false, "reason": "main moved on to aa74af0: merge origin/main again", "proof": {"repro": "gh pr view 12 --json mergeable", "observed": "CONFLICTING", "expected": "MERGEABLE"}}], "ci": "none"}"#;
         env.seen.push(Seen { name: c.agent_name(Role::Gatekeeper), state: "working".into(), cost: 0.0 });
-        c.agent = Some(c.agent_name(Role::Gatekeeper));
+        c.w.agent = Some(c.agent_name(Role::Gatekeeper));
         assert_eq!(submit(&root, &mut c, Role::Gatekeeper, changes).code, 0);
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::RoundLimit));
@@ -3585,7 +4152,7 @@ mod tests {
         at_gate(&mut c, &mut env);
         c.review_solves = Some(Answer::Partly);
         step(&mut c, &root, &mut env);
-        assert!(c.why.contains("Issue #7 stays open: the reviewer and the gatekeeper didn't both say the PR solves it"), "{}", c.why);
+        assert!(c.why.contains("Issue #7 stays open: the reviewers and the gatekeeper didn't all say the PR solves it"), "{}", c.why);
         env.keys.push('y');
         step(&mut c, &root, &mut env);
         assert_eq!((c.stage, env.issue_closed.len()), (Stage::Merged, 0));
@@ -3682,7 +4249,7 @@ mod tests {
         assert_eq!(new_id(&root, Some(13), None).unwrap(), "triage-13");
         // An issue's case before it has a PR, and the PR it's on is taken.
         assert_eq!(new_id(&root, None, Some(12)).unwrap(), "triage-issue-12");
-        let mut i = Case::new("triage-issue-7", None, Some(issue(7, "OWNER")), root.parent().unwrap().join("repo"), &crate::config::TriageOpts::default(), 1);
+        let mut i = Case::new("triage-issue-7", None, Some(issue(7, "OWNER")), root.parent().unwrap().join("repo"), &one(), 1);
         i.pr = Some(serde_json::from_str::<serde_json::Value>(&pr_json(30, "b", "s", false)).map(|v| pr_from(&v).unwrap()).unwrap());
         store(&root, &i).unwrap();
         assert!(new_id(&root, None, Some(7)).unwrap_err().contains("triage-issue-7 is already running for PR #30 (issue #7)"));
@@ -3721,7 +4288,7 @@ mod tests {
     fn an_issue_is_triaged_through_its_pr_or_you_choose_one() {
         let (root, _) = fixture("issue-pr");
         let repo = root.parent().unwrap().join("repo");
-        let opts = crate::config::TriageOpts::default();
+        let opts = one();
         // One open PR linked to it: that PR, with the issue on the case.
         let mut a = issue_api(12, "open", "OWNER", &[14]);
         a.push(("pr view 14 --json number,title,url,headRefName,headRefOid,baseRefName,isCrossRepository,state".into(), pr_json(14, "limits", "prsha", false)));
@@ -3750,7 +4317,7 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!((c.stage, c.pr().number, c.ci_expected), (Stage::Reviewing, 16, false));
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-issue-12-review"));
+        assert_eq!(agent(&c), Some("triage-issue-12-review"));
         assert!(env.prompts[0].1.contains("pull request #16"));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -3862,12 +4429,12 @@ mod tests {
         assert!(env.prompts[0].1.contains("meant to solve issue #7") && env.prompts[0].1.contains("Clients can call /api"), "{}", env.prompts[0].1);
         // With an issue, a report says whether it's solved, with what's missing as a finding.
         assert!(submit(&root, &mut c, Role::Reviewer, FINDINGS).err.contains("solves: does the PR solve issue #7?"));
-        let two = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "severity": "important", "summary": "the window never resets", "failure": "refused at t=61"}, {"id": "F2", "file": "src/api.rs", "line": 9, "severity": "minor", "summary": "unused import", "failure": "a warning"}], "solves": {"answer": "partly", "missing": "no per-client limit", "evidence": "curl 100 times: all 200"}}"#;
+        let two = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "summary": "the window never resets", "failure": "refused at t=61", "proof": {"test": "limit_resets", "observed": "refused at t=61", "expected": "allowed"}}, {"id": "F2", "file": "src/api.rs", "line": 9, "summary": "unused import", "failure": "a warning", "proof": {"repro": "cargo build", "observed": "warning: unused import", "expected": "no warning"}}], "optional": [{"file": "src/api.rs", "line": 2, "summary": "rename lim to limit"}], "solves": {"answer": "partly", "missing": "no per-client limit", "evidence": "curl 100 times: all 200"}}"#;
         assert_eq!(submit(&root, &mut c, Role::Reviewer, two).code, 0);
         step(&mut c, &root, &mut env);
-        assert!(c.verifying);
+        assert!(c.reviews[0].verifying);
         let verify = &env.sent.last().unwrap().1;
-        assert!(verify.contains("F1, F2") && verify.contains("confirm it with evidence"), "{verify}");
+        assert!(verify.contains("F1, F2") && verify.contains("run its proof again") && verify.contains("isn't must-fix after all"), "{verify}");
         // Every finding answered once, and evidence for each confirmed one.
         assert!(submit(&root, &mut c, Role::Reviewer, r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "x"}], "solves": {"answer": "partly", "missing": "m", "evidence": "e"}}"#).err.contains("no answer for F2"));
         let bare = r#"{"findings": [{"id": "F1", "confirmed": true}, {"id": "F2", "confirmed": false, "why": "it's used in tests"}], "solves": {"answer": "partly", "missing": "m", "evidence": "e"}}"#;
@@ -3879,10 +4446,11 @@ mod tests {
         assert_eq!((c.stage, c.open.clone()), (Stage::Fixing, vec!["F1".to_string()]));
         assert_eq!(c.findings[0].evidence.as_deref(), Some("limit_resets fails: refused at t=61"));
         assert_eq!((c.retracted.len(), c.retracted[0].why.as_str()), (1, "it's used in tests"));
-        assert!(show(&c).contains("retracted by the reviewer:\n  F2 src/api.rs:9  unused import  · it's used in tests"), "{}", show(&c));
+        assert!(show(&c).contains("retracted by the reviewers:\n  reviewer F2 src/api.rs:9  unused import  · it's used in tests"), "{}", show(&c));
+        assert!(show(&c).contains("optional (not must-fix, never sent to the fixer):\n  src/api.rs:2  rename lim to limit  [reviewer]"), "{}", show(&c));
         assert!(c.log.iter().any(|(_, l)| l.contains("retracted 1: F2")));
         step(&mut c, &root, &mut env);
-        assert!(env.prompts[1].1.contains("refused at t=61") && env.prompts[1].1.contains("no per-client limit") && !env.prompts[1].1.contains("unused import"), "{}", env.prompts[1].1);
+        assert!(env.prompts[1].1.contains("refused at t=61") && env.prompts[1].1.contains("no per-client limit") && !env.prompts[1].1.contains("unused import") && !env.prompts[1].1.contains("rename lim"), "{}", env.prompts[1].1);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -3891,7 +4459,7 @@ mod tests {
         let (root, mut c) = issue_fixture("unsolved");
         let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
         step(&mut c, &root, &mut env);
-        let no = r#"{"findings": [{"id": "F1", "file": "src/api.rs", "line": 1, "severity": "important", "summary": "no limit at all", "failure": "every call passes"}], "solves": {"answer": "no", "missing": "the limit", "evidence": "curl: all 200"}}"#;
+        let no = r#"{"findings": [{"id": "F1", "file": "src/api.rs", "line": 1, "summary": "no limit at all", "failure": "every call passes", "proof": {"repro": "curl /api 100 times", "observed": "all 200", "expected": "429 after 60"}}], "solves": {"answer": "no", "missing": "the limit", "evidence": "curl: all 200"}}"#;
         submit(&root, &mut c, Role::Reviewer, no);
         step(&mut c, &root, &mut env);
         let confirmed = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "curl: all 200"}], "solves": {"answer": "no", "missing": "the limit", "evidence": "curl: all 200"}}"#;
@@ -3938,7 +4506,7 @@ mod tests {
         // The gatekeeper can't pass it while the issue isn't solved.
         let half = r#"{"verdict": "pass", "findings": [{"id": "F1", "ok": true}], "ci": "green", "solves": {"answer": "partly", "missing": "the window", "evidence": "curl"}}"#;
         assert!(submit(&root, &mut c, Role::Gatekeeper, half).err.contains("solves: say what the PR still lacks"));
-        let half = half.replace(r#""new": [], "#, "").replace(r#""ci": "green""#, r#""new": [{"id": "N1", "file": "src/api.rs", "severity": "important", "summary": "no window", "failure": "f"}], "ci": "green""#);
+        let half = half.replace(r#""new": [], "#, "").replace(r#""ci": "green""#, r#""new": [{"id": "N1", "file": "src/api.rs", "summary": "no window", "failure": "f", "proof": {"repro": "curl", "observed": "all 200", "expected": "429"}}], "ci": "green""#);
         assert!(submit(&root, &mut c, Role::Gatekeeper, &half).err.contains("and the issue solved"));
         assert!(submit(&root, &mut c, Role::Gatekeeper, r#"{"verdict": "pass", "findings": [{"id": "F1", "ok": true}], "ci": "green"}"#).err.contains("solves: does the PR solve issue #7?"));
         let pass = r#"{"verdict": "pass", "findings": [{"id": "F1", "ok": true}], "ci": "green", "solves": {"answer": "yes", "evidence": "curl: 429 after 60"}}"#;
@@ -3962,7 +4530,7 @@ mod tests {
         a.push((view(14), pr_json(14, "limits", "prsha", false)));
         let mut gh = github(a);
         let t = resolve(&repo, "12", &mut gh).unwrap();
-        let mut c = open_case(&root, &repo, t, &crate::config::TriageOpts::default(), 1, &mut gh).unwrap();
+        let mut c = open_case(&root, &repo, t, &one(), 1, &mut gh).unwrap();
         assert_eq!((c.stage, c.pr().number), (Stage::Reviewing, 14));
         let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
         step(&mut c, &root, &mut env);
@@ -3971,15 +4539,15 @@ mod tests {
         env.keys.push('s');
         step(&mut c, &root, &mut env);
         step(&mut c, &root, &mut env);
-        assert_eq!((c.ask, c.agent.as_deref(), c.trusted), (None, Some("triage-14-review"), true));
+        assert_eq!((c.ask, agent(&c), c.trusted), (None, Some("triage-14-review"), true));
         assert!(env.prompts[0].1.contains("mallory"));
         // Asked once: later stages go on.
         c.stage = Stage::Fixing;
-        c.agent = None;
+        c.w.agent = None;
         c.findings = serde_json::from_str::<Findings>(FINDINGS).unwrap().findings;
         c.open = vec!["F1".into()];
         step(&mut c, &root, &mut env);
-        assert_eq!((c.ask, c.agent.as_deref()), (None, Some("triage-14-fix")));
+        assert_eq!((c.ask, agent(&c)), (None, Some("triage-14-fix")));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -3987,7 +4555,7 @@ mod tests {
     fn only_a_formal_link_is_taken_without_asking() {
         let (root, _) = fixture("found");
         let repo = root.parent().unwrap().join("repo");
-        let opts = crate::config::TriageOpts::default();
+        let opts = one();
         let mention = "pr list --state open --search 12 --json number,title,body --limit 100";
         // One PR that only mentions the issue: you're asked, with how it was found.
         let mut a = issue_api(12, "open", "OWNER", &[]);
@@ -4008,7 +4576,7 @@ mod tests {
         step(&mut c, &root, &mut env);
         assert_eq!((c.ask, c.stage, c.pr.is_none()), (None, Stage::Building, true));
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-issue-12-build"));
+        assert_eq!(agent(&c), Some("triage-issue-12-build"));
         // One formal link and a mention: the link, unasked.
         a.push((view(14), pr_json(14, "fix", "prsha", false)));
         answer(&mut a, "issue view 12 --json closedByPullRequestsReferences", serde_json::json!({"closedByPullRequestsReferences": [{"number": 14}]}).to_string());
@@ -4051,11 +4619,11 @@ mod tests {
         let repo = root.parent().unwrap().join("repo");
         let mut gh = github(issue_api(12, "open", "OWNER", &[]));
         let t = resolve(&repo, "12", &mut gh).unwrap();
-        let mut c = open_case(&root, &repo, t, &crate::config::TriageOpts::default(), 1, &mut gh).unwrap();
+        let mut c = open_case(&root, &repo, t, &one(), 1, &mut gh).unwrap();
         assert_eq!((c.id.as_str(), c.stage, c.subject()), ("triage-issue-12", Stage::Building, "issue #12".to_string()));
         let mut env = Fake { now: 1_795_000_000, ci: runs(&[("test", "completed", Some("success"))]), ..Fake::default() };
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-issue-12-build"));
+        assert_eq!(agent(&c), Some("triage-issue-12-build"));
         let p = &env.prompts[0].1;
         let fence = p.lines().find(|l| l.starts_with("===== issue text")).unwrap();
         assert_eq!(p.matches(fence).count(), 3, "named once, then around the text: {p}");
@@ -4081,7 +4649,7 @@ mod tests {
         assert_eq!((c.stage, c.pr().number, c.pr().sha.as_str(), c.ci_expected), (Stage::Reviewing, 20, "builtsha", true));
         assert_eq!((c.closing.clone(), c.subject()), (vec!["triage-issue-12-build".to_string()], "PR #20 (issue #12)".to_string()));
         step(&mut c, &root, &mut env);
-        assert_eq!(c.agent.as_deref(), Some("triage-issue-12-review"));
+        assert_eq!(agent(&c), Some("triage-issue-12-review"));
         assert!(env.prompts[1].1.contains("pull request #20") && env.prompts[1].1.contains("builtsha") && env.prompts[1].1.contains("meant to solve issue #12"));
         // The builder's cost counts against the case.
         assert!(env.seen.iter().any(|a| a.name == "triage-issue-12-build"));
@@ -4095,7 +4663,7 @@ mod tests {
         let repo = root.parent().unwrap().join("repo");
         let mut i = issue(12, "NONE");
         i.author = "evil\u{1b}]0;x\u{7}".into();
-        let mut c = Case::new("triage-issue-12", None, Some(i), repo, &crate::config::TriageOpts::default(), 1);
+        let mut c = Case::new("triage-issue-12", None, Some(i), repo, &one(), 1);
         let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
         step(&mut c, &root, &mut env);
         assert_eq!(c.ask, Some(Ask::Outsider));
@@ -4104,9 +4672,297 @@ mod tests {
         env.keys.push('s');
         step(&mut c, &root, &mut env);
         step(&mut c, &root, &mut env);
-        assert_eq!((c.ask, c.agent.as_deref()), (None, Some("triage-issue-12-build")));
+        assert_eq!((c.ask, agent(&c)), (None, Some("triage-issue-12-build")));
         // Nothing of the issue's text is in the log.
         assert!(c.log.iter().all(|(_, l)| !l.contains("Clients can call")), "{:?}", c.log);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // ───────────── two reviewers ─────────────
+
+    /// A case for PR #12 with two reviewers, as trix starts one by default.
+    fn two_fixture(name: &str) -> (PathBuf, Case) {
+        let (root, mut c) = fixture(name);
+        let opts = crate::config::TriageOpts { reviewer2: crate::config::Role { agent: "codex".into(), args: vec!["-m".into(), "o9".into()] }, ..crate::config::TriageOpts::default() };
+        c = Case::new(&c.id, c.pr.clone(), None, c.repo.clone(), &opts, c.created);
+        store(&root, &c).unwrap();
+        (root, c)
+    }
+
+    /// The first reviewer: the window bug, with a test the fixer keeps, and a nit.
+    const R1: &str = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "summary": "the window never resets", "failure": "after 60s a client is still refused", "proof": {"test": "limit_resets_after_60s", "observed": "refused at t=61", "expected": "allowed at t=61", "patch": "+#[test] fn limit_resets_after_60s() {}"}}], "optional": [{"file": "src/limit.rs", "line": 3, "summary": "call it window, not w"}]}"#;
+    /// Its nit listed again in its check, as agents do: kept once.
+    const R1_OK: &str = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "limit_resets_after_60s: refused at t=61"}], "optional": [{"file": "src/limit.rs", "line": 3, "summary": "call it window, not w"}]}"#;
+    /// The second: the same bug two lines off, and one of its own.
+    const R2: &str = r#"{"findings": [{"id": "F1", "file": "./src/limit.rs", "line": 42, "summary": "reset compares the wrong clock", "failure": "never resets", "proof": {"repro": "cargo run -- --burst 61", "observed": "61st call refused after 70s", "expected": "allowed"}}, {"id": "F2", "file": "src/api.rs", "line": 9, "summary": "a refused call returns 200", "failure": "clients can't tell", "proof": {"repro": "curl -i /api after 60 calls", "observed": "HTTP/1.1 200", "expected": "HTTP/1.1 429"}}]}"#;
+    const R2_OK: &str = r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "refused after 70s again"}, {"id": "F2", "confirmed": true, "evidence": "HTTP/1.1 200 again"}], "optional": [{"file": "src/api.rs", "summary": "might race under load", "unproven": true}]}"#;
+
+    #[test]
+    fn two_reviewers_start_side_by_side_and_the_case_waits_for_both() {
+        let (root, mut c) = two_fixture("two");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        // Both at once, each in a checkout of its own, each told there's another.
+        let names: Vec<&str> = env.prompts.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["triage-12-review", "triage-12-review-2"]);
+        assert!(env.prompts.iter().all(|(_, p)| p.contains("Another reviewer reviews the same PR beside you") && p.contains("must-fix") && p.contains("\"no must-fix findings\" is a good, expected answer") && p.contains("Reading the code alone isn't proof")));
+        assert!(env.prompts[1].1.contains("trix case submit triage-12 reviewer2 <<'EOF'"), "{}", env.prompts[1].1);
+        assert!(c.repo.join(".trix/worktrees/triage-12-review").is_dir() && c.repo.join(".trix/worktrees/triage-12-review-2").is_dir());
+        assert_eq!((c.reviews[0].w.agent.as_deref(), c.reviews[1].w.agent.as_deref()), (Some("triage-12-review"), Some("triage-12-review-2")));
+        assert_eq!(c.status(), "reviewing · reviewer reviewing, reviewer2 reviewing");
+        // Only that reviewer's own agent hands in its report.
+        assert!(submit_as(&root, &mut c, Some("triage-12-review"), Role::Reviewer2, R2).err.contains("only triage-12-review-2 hands in the reviewer2's report"));
+        // The first finishes both its reports; the case waits for the second.
+        assert_eq!(submit(&root, &mut c, Role::Reviewer, R1).code, 0);
+        step(&mut c, &root, &mut env);
+        assert!(c.reviews[0].verifying && !c.reviews[1].verifying);
+        assert_eq!(env.sent.last().unwrap().0, "triage-12-review");
+        assert_eq!(submit(&root, &mut c, Role::Reviewer, R1_OK).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.reviews[0].done, c.reviews[1].done), (Stage::Reviewing, true, false));
+        assert_eq!(c.status(), "reviewing · reviewer done, reviewer2 reviewing");
+        assert!(c.findings.is_empty() && c.open.is_empty(), "nothing goes on before both are in");
+        // Done: no more of its reports.
+        assert!(submit(&root, &mut c, Role::Reviewer, R1_OK).err.contains("isn't waiting for the reviewer's report"));
+        assert!(show(&c).contains("reviews:\n  reviewer (claude): 1 confirmed, 0 retracted, 1 optional\n  second reviewer (codex): reviewing\n"), "{}", show(&c));
+        // The second's, then its check: on to the fixer, with both reviews merged.
+        assert_eq!(submit(&root, &mut c, Role::Reviewer2, R2).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.sent.last().unwrap().0, "triage-12-review-2");
+        assert!(env.sent.last().unwrap().1.contains("trix case submit triage-12 reviewer2"));
+        assert_eq!(submit(&root, &mut c, Role::Reviewer2, R2_OK).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Fixing);
+        assert_eq!(c.closing, ["triage-12-review", "triage-12-review-2"]);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Both reviews in: the fixer's prompt, then the gatekeeper's.
+    fn reviewed(name: &str) -> (PathBuf, Case, Fake) {
+        let (root, mut c) = two_fixture(name);
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        for (role, first, second) in [(Role::Reviewer, R1, R1_OK), (Role::Reviewer2, R2, R2_OK)] {
+            assert_eq!(submit(&root, &mut c, role, first).code, 0);
+            step(&mut c, &root, &mut env);
+            assert_eq!(submit(&root, &mut c, role, second).code, 0);
+            step(&mut c, &root, &mut env);
+        }
+        (root, c, env)
+    }
+
+    #[test]
+    fn the_same_defect_from_both_reviewers_is_one_finding_tagged_with_both() {
+        let (root, mut c, mut env) = reviewed("dedupe");
+        // F1 (reviewer) and F1 (reviewer2) are one defect; F2 is the second's alone.
+        assert_eq!(c.open, ["F1", "F2"]);
+        assert_eq!(c.findings[0].by, ["reviewer F1", "reviewer2 F1"]);
+        assert!(c.findings[0].also.as_deref().unwrap().contains("reset compares the wrong clock"));
+        assert_eq!((c.findings[1].by.clone(), c.findings[1].summary.as_str()), (vec!["reviewer2 F2".to_string()], "a refused call returns 200"));
+        assert!(c.log.iter().any(|(_, l)| l == "both reviews are in: 2 must-fix findings (1 raised by both), 2 optional: F1 (reviewer F1 + reviewer2 F1), F2 (reviewer2 F2)"), "{:?}", c.log);
+        // Different files, or lines far apart, stay two.
+        let f = |file: &str, line: u64| Finding { id: "X".into(), file: file.into(), line: Some(line), severity: Severity::Important, summary: "s".into(), failure: "f".into(), proof: None, evidence: None, by: Vec::new(), also: None };
+        assert!(same_defect(&f("a.rs", 10), &f("./a.rs", 13)) && !same_defect(&f("a.rs", 10), &f("a.rs", 20)) && !same_defect(&f("a.rs", 10), &f("b.rs", 10)));
+        // The fixer gets the union, tagged, and the test to keep; no optional ones.
+        step(&mut c, &root, &mut env);
+        let fix = &env.prompts.last().unwrap().1;
+        assert!(fix.contains("\"reviewer F1\"") && fix.contains("\"reviewer2 F2\"") && fix.contains("apply proof.patch") && fix.contains("limit_resets_after_60s() {}"), "{fix}");
+        assert!(!fix.contains("call it window") && !fix.contains("might race under load"), "optional findings never reach the fixer: {fix}");
+        assert!(show(&c).contains("might race under load (unproven)  [reviewer2]") && show(&c).contains("F1 src/limit.rs:40  the window never resets  [reviewer F1 + reviewer2 F1]"), "{}", show(&c));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn the_gatekeeper_sees_both_reviews_side_by_side() {
+        let (root, mut c, mut env) = reviewed("gate-sees");
+        c.issue = Some(issue(7, "OWNER"));
+        c.reviews[0].solves = Some(Solves { answer: Answer::Yes, missing: None, evidence: Some("curl: 429".into()) });
+        c.reviews[1].solves = Some(Solves { answer: Answer::Partly, missing: Some("no per-client window".into()), evidence: Some("two clients".into()) });
+        c.stage = Stage::Verifying;
+        c.fix = Some(serde_json::from_str(r#"{"commits": ["abcdef1"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed", "proof": {"ran": "cargo test limit_resets_after_60s", "output": "ok", "passes": true}}, {"id": "F2", "outcome": "fixed", "proof": {"ran": "curl -i", "output": "429", "passes": true}}]}"#).unwrap());
+        step(&mut c, &root, &mut env);
+        let gate = &env.prompts.last().unwrap().1;
+        assert!(gate.contains("- Both raised: F1\n- Only the reviewer raised: none\n- Only the second reviewer raised: F2\n"), "{gate}");
+        assert!(gate.contains("The reviewer says: {\"answer\":\"yes\"") && gate.contains("The second reviewer says: {\"answer\":\"partly\"") && gate.contains("They disagree"), "{gate}");
+        assert!(gate.contains("Ask for changes only for must-fix defects you've shown") && gate.contains("judge the fix's own diff"), "{gate}");
+        // Its change requests need proof, and nothing that isn't must-fix holds the PR back.
+        let unshown = r#"{"verdict": "changes", "findings": [{"id": "F1", "ok": false, "reason": "still off by one"}, {"id": "F2", "ok": true}], "ci": "green", "solves": {"answer": "partly", "missing": "m", "evidence": "e"}}"#;
+        assert!(submit(&root, &mut c, Role::Gatekeeper, unshown).err.contains("F1 isn't ok: no proof"));
+        let minor = r#"{"verdict": "changes", "findings": [{"id": "F1", "ok": true}, {"id": "F2", "ok": true}], "new": [{"id": "N1", "file": "a", "severity": "minor", "summary": "s", "failure": "f"}], "ci": "green", "solves": {"answer": "yes", "evidence": "e"}}"#;
+        assert!(submit(&root, &mut c, Role::Gatekeeper, minor).err.contains("must-fix only"));
+        let nit = r#"{"verdict": "changes", "findings": [{"id": "F1", "ok": true}, {"id": "F2", "ok": true}], "optional": [{"summary": "a nicer name"}], "ci": "green", "solves": {"answer": "yes", "evidence": "e"}}"#;
+        assert!(submit(&root, &mut c, Role::Gatekeeper, nit).err.contains("what isn't must-fix goes in optional"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn the_issue_closes_only_when_both_reviewers_and_the_gatekeeper_say_solved() {
+        for (r1, r2, closes) in [(Answer::Yes, Answer::Yes, true), (Answer::Yes, Answer::Partly, false), (Answer::Partly, Answer::Yes, false)] {
+            let (root, mut c) = two_fixture("solves-all");
+            c.issue = Some(issue(7, "OWNER"));
+            let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+            at_gate(&mut c, &mut env);
+            for (i, a) in [r1, r2].into_iter().enumerate() {
+                c.reviews[i].done = true;
+                c.reviews[i].solves = Some(Solves { answer: a, missing: None, evidence: Some("e".into()) });
+            }
+            step(&mut c, &root, &mut env);
+            assert_eq!(c.why.contains("and close issue #7"), closes, "{r1:?} {r2:?}: {}", c.why);
+            assert_eq!(c.why.contains("Issue #7 stays open: the reviewers and the gatekeeper didn't all say the PR solves it"), !closes, "{}", c.why);
+            let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        }
+        // One reviewer says no, the other yes: you're asked, told both.
+        let (root, mut c) = two_fixture("solves-no");
+        c.issue = Some(issue(7, "OWNER"));
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        let no = r#"{"findings": [{"id": "F1", "file": "src/api.rs", "line": 1, "summary": "no limit", "failure": "every call passes", "proof": {"repro": "curl 100 times", "observed": "all 200", "expected": "429"}}], "solves": {"answer": "no", "missing": "the limit", "evidence": "curl"}}"#;
+        let yes = r#"{"findings": [], "solves": {"answer": "yes", "evidence": "curl: 429 after 60"}}"#;
+        submit(&root, &mut c, Role::Reviewer, yes);
+        submit(&root, &mut c, Role::Reviewer2, no);
+        step(&mut c, &root, &mut env);
+        submit(&root, &mut c, Role::Reviewer, yes);
+        submit(&root, &mut c, Role::Reviewer2, r#"{"findings": [{"id": "F1", "confirmed": true, "evidence": "all 200"}], "solves": {"answer": "no", "missing": "the limit", "evidence": "curl"}}"#);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::Unsolved));
+        assert!(c.why.starts_with("the second reviewer says PR #12 doesn't solve issue #7; the reviewer says yes"), "{}", c.why);
+        assert_eq!(c.solves.as_ref().map(|s| s.answer), Some(Answer::No));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_case_restarted_mid_review_goes_on_with_each_reviewer_where_it_was() {
+        let (root, mut c) = two_fixture("restart");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        submit(&root, &mut c, Role::Reviewer, R1);
+        step(&mut c, &root, &mut env);
+        store(&root, &c).unwrap();
+        // The pane restarts: the case is read back, and the agents are still there.
+        let mut c = load(&root, "triage-12").unwrap();
+        assert!(c.reviews[0].verifying && !c.reviews[1].verifying && c.reviews[1].w.agent.is_some());
+        let spawned = env.prompts.len();
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.prompts.len(), spawned, "neither is started twice");
+        // The first's check goes where the server now expects it.
+        assert_eq!(submit(&root, &mut c, Role::Reviewer, R1_OK).code, 0);
+        assert!(dir_of(&root, "triage-12").join("reviewer-1-verify.json").is_file());
+        // The second stopped: you're asked about it, and the first goes on meanwhile.
+        set_state(&mut env, "triage-12-review-2", "exited");
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.about), (Some(Ask::NoReport), Some(Role::Reviewer2)));
+        assert!(c.why.contains("second reviewer (triage-12-review-2) exited"), "{}", c.why);
+        assert!(c.reviews[0].done, "the first's report was taken though the case asks about the second");
+        store(&root, &c).unwrap();
+        let mut c = load(&root, "triage-12").unwrap();
+        // n starts the second again, from its prompt; the first isn't touched.
+        env.keys.push('n');
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.reviews[1].w.agent.clone()), (None, None));
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.prompts.last().unwrap().0, "triage-12-review-2");
+        assert_eq!(env.prompts.iter().filter(|(n, _)| n == "triage-12-review").count(), 1);
+        submit(&root, &mut c, Role::Reviewer2, R2);
+        step(&mut c, &root, &mut env);
+        submit(&root, &mut c, Role::Reviewer2, R2_OK);
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.open.len()), (Stage::Fixing, 2));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_second_reviewer_that_cant_start_asks_while_the_first_goes_on() {
+        let (root, mut c) = two_fixture("setup");
+        let mut env = Fake { now: 1_795_000_000, refuse: vec!["triage-12-review-2".into()], ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.ask, c.about), (Some(Ask::Setup), Some(Role::Reviewer2)));
+        assert!(c.why.starts_with("couldn't start the second reviewer: codex isn't installed"), "{}", c.why);
+        assert_eq!(c.reviews[0].w.agent.as_deref(), Some("triage-12-review"));
+        // The first hands in meanwhile: taken, and asked to check it.
+        submit(&root, &mut c, Role::Reviewer, R1);
+        step(&mut c, &root, &mut env);
+        assert!(c.reviews[0].verifying && c.ask == Some(Ask::Setup));
+        // r tries the second again; the first isn't started twice.
+        env.refuse.clear();
+        env.keys.push('r');
+        step(&mut c, &root, &mut env);
+        step(&mut c, &root, &mut env);
+        assert_eq!(env.prompts.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["triage-12-review", "triage-12-review-2"]);
+        // The budget counts both; abort closes both.
+        env.seen.iter_mut().for_each(|a| a.cost = 5.0);
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.ask, Some(Ask::Budget));
+        env.keys.push('a');
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Aborted);
+        let closed: Vec<&str> = env.closed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(closed.contains(&"triage-12-review") && closed.contains(&"triage-12-review-2"), "{closed:?}");
+        assert!((c.spent_closed - 10.0).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_finding_needs_its_proof_to_reach_the_fixer() {
+        let (root, mut c) = fixture("proof");
+        let mut env = Fake { now: 1_795_000_000, ..Fake::default() };
+        step(&mut c, &root, &mut env);
+        // Reading the code isn't proof: the server says so, and where it goes instead.
+        let unshown = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "line": 40, "summary": "looks off by one", "failure": "maybe refused early"}]}"#;
+        let r = submit(&root, &mut c, Role::Reviewer, unshown);
+        assert!(r.err.contains("finding F1: no proof") && r.err.contains("\"unproven\": true"), "{}", r.err);
+        let half = r#"{"findings": [{"id": "F1", "file": "src/limit.rs", "summary": "s", "failure": "f", "proof": {"test": "t"}}]}"#;
+        assert!(submit(&root, &mut c, Role::Reviewer, half).err.contains("proof needs observed"));
+        assert!(submit(&root, &mut c, Role::Reviewer, r#"{"findings": [{"id": "F1", "file": "a", "severity": "minor", "summary": "s", "failure": "f"}]}"#).err.contains("must-fix only"));
+        // One that got past the server anyway (written by hand) is demoted, unproven.
+        let file = dir_of(&root, &c.id).join("reviewer-1.json");
+        std::fs::write(&file, format!(r#"{{"findings": [{}, {}]}}"#, r#"{"id": "F1", "file": "src/limit.rs", "line": 40, "summary": "the window never resets", "failure": "refused", "proof": {"test": "limit_resets_after_60s", "observed": "refused at t=61", "expected": "allowed"}}"#, r#"{"id": "F2", "file": "src/api.rs", "line": 5, "summary": "looks racy", "failure": "maybe"}"#)).unwrap();
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.reviews[0].findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["F1"]);
+        assert!(c.reviews[0].optional.iter().any(|o| o.summary == "looks racy" && o.unproven));
+        assert_eq!(submit(&root, &mut c, Role::Reviewer, CONFIRMED).code, 0);
+        step(&mut c, &root, &mut env);
+        step(&mut c, &root, &mut env);
+        let fix = &env.prompts.last().unwrap().1;
+        assert!(fix.contains("the window never resets") && fix.contains("limit_resets_after_60s") && !fix.contains("looks racy"), "{fix}");
+        assert!(show(&c).contains("looks racy (unproven)  [reviewer]"), "{}", show(&c));
+        // Fixed means its proof was run again and passes, said in the report.
+        let none = r#"{"commits": ["c1c1c1c"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed"}]}"#;
+        assert!(submit(&root, &mut c, Role::Fixer, none).err.contains("F1 is fixed: run its proof again"));
+        let fails = r#"{"commits": ["c1c1c1c"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed", "proof": {"ran": "cargo test limit_resets_after_60s", "output": "FAILED", "passes": false}}]}"#;
+        assert!(submit(&root, &mut c, Role::Fixer, fails).err.contains("F1 isn't fixed while its proof still fails"));
+        let passes = r#"{"commits": ["c1c1c1c"], "tests": "ok", "findings": [{"id": "F1", "outcome": "fixed", "proof": {"ran": "cargo test limit_resets_after_60s", "output": "test limit_resets_after_60s ... ok", "passes": true}}]}"#;
+        assert_eq!(submit(&root, &mut c, Role::Fixer, passes).code, 0);
+        env.pushed.push("c1c1c1c".into());
+        step(&mut c, &root, &mut env);
+        assert_eq!(c.stage, Stage::Verifying);
+        assert_eq!(c.fix.as_ref().unwrap().findings[0].proof.as_ref().map(|p| p.passes), Some(true));
+        // The gatekeeper sees the rerun.
+        step(&mut c, &root, &mut env);
+        assert!(env.prompts.last().unwrap().1.contains("test limit_resets_after_60s ... ok"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn a_case_from_before_two_reviewers_goes_on_with_its_one() {
+        let (root, c) = fixture("legacy");
+        // As a case mid-review was kept before: verifying, findings and agent on the case.
+        let mut v = serde_json::to_value(&c).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("reviews");
+        o.remove("reviewer2");
+        o.insert("verifying".into(), true.into());
+        o.insert("agent".into(), "triage-12-review".into());
+        o.insert("findings".into(), serde_json::from_str::<serde_json::Value>(FINDINGS).unwrap()["findings"].clone());
+        std::fs::write(dir_of(&root, "triage-12").join("case.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+        let mut c = load(&root, "triage-12").unwrap();
+        assert_eq!((c.reviews.len(), c.reviews[0].verifying, c.reviews[0].w.agent.as_deref(), c.reviews[0].findings.len(), c.findings.len()), (1, true, Some("triage-12-review"), 1, 0));
+        let mut env = Fake { now: 1_795_000_000, seen: vec![Seen { name: "triage-12-review".into(), state: "working".into(), cost: 0.0 }], ..Fake::default() };
+        assert_eq!(submit(&root, &mut c, Role::Reviewer, CONFIRMED).code, 0);
+        step(&mut c, &root, &mut env);
+        assert_eq!((c.stage, c.open.clone()), (Stage::Fixing, vec!["F1".to_string()]));
+        // Kept as it was: the flattened watch writes the same fields.
+        let kept = serde_json::to_value(&c).unwrap();
+        assert!(kept.get("agent").is_some() && kept.get("nudged").is_some() && kept.get("verifying").is_none());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

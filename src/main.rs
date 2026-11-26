@@ -63,7 +63,7 @@ usage:
                             starting), one per line; exits 0 if any, 1 if none,
                             2 if a session didn't answer. Check for 1 before a
                             `trix kill`. A pane leaves itself out
-  trix triage <PR|issue>    a case: a reviewer, a fixer and a gatekeeper take the PR
+  trix triage <PR|issue>    a case: two reviewers, a fixer, a gatekeeper take the PR
                             from findings to a merge you approve; an issue's PR, or
                             a builder makes one (trix case --help)
   trix spend [YYYY-MM] [--json]
