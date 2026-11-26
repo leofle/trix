@@ -526,7 +526,9 @@ fn stable_alias(arg0: &std::ffi::OsStr, path: Option<&std::ffi::OsStr>, cwd: &st
         std::env::split_paths(path?).filter(|d| d.is_absolute()).map(|d| d.join(named)).find(|p| p.is_file())?
     };
     let resolved = std::fs::canonicalize(&candidate).ok()?;
-    (resolved == std::fs::canonicalize(real).ok()? && candidate != resolved).then_some(candidate)
+    // `real` itself is no better than `real`, even when a folder on the way is
+    // a link (macOS's /var is /private/var).
+    (resolved == std::fs::canonicalize(real).ok()? && candidate != resolved && candidate != real).then_some(candidate)
 }
 
 #[cfg(test)]
