@@ -142,29 +142,42 @@ const UNTRACKED_BYTES: u64 = 512 * 1024;
 fn untracked(dir: &Path, path: &str, n: usize) -> (File, Vec<Line>) {
     let mut f = File { path: path.to_string(), status: "untracked".into(), added: 0, removed: 0 };
     let mut ls = vec![Line { kind: Kind::File, text: path.to_string(), file: n, old: None, new: None }];
-    let full = dir.join(path);
     let meta = |text: &str| Line { kind: Kind::Meta, text: text.into(), file: n, old: None, new: None };
-    match std::fs::metadata(&full) {
-        Ok(m) if m.len() > UNTRACKED_BYTES => ls.push(meta("too big to show")),
-        Ok(m) if m.is_file() => {
-            let bytes = std::fs::read(&full).unwrap_or_default();
-            if bytes[..bytes.len().min(8000)].contains(&0) {
-                ls.push(meta("binary file"));
-            } else {
-                let text = String::from_utf8_lossy(&bytes);
-                let all: Vec<&str> = text.lines().collect();
-                for (i, l) in all.iter().take(UNTRACKED_LINES).enumerate() {
-                    ls.push(Line { kind: Kind::Add, text: l.to_string(), file: n, old: None, new: Some(i as u32 + 1) });
-                }
-                f.added = all.len() as u32;
-                if all.len() > UNTRACKED_LINES {
-                    ls.push(meta(&format!("{} more lines", all.len() - UNTRACKED_LINES)));
-                }
+    match new_text(&dir.join(path)) {
+        Err(why) => ls.push(meta(why)),
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let all: Vec<&str> = text.lines().collect();
+            for (i, l) in all.iter().take(UNTRACKED_LINES).enumerate() {
+                ls.push(Line { kind: Kind::Add, text: l.to_string(), file: n, old: None, new: Some(i as u32 + 1) });
+            }
+            f.added = all.len() as u32;
+            if all.len() > UNTRACKED_LINES {
+                ls.push(meta(&format!("{} more lines", all.len() - UNTRACKED_LINES)));
             }
         }
-        _ => ls.push(meta("not a regular file")),
     }
     (f, ls)
+}
+
+/// An untracked file's bytes, when the review shows its lines; why not
+/// otherwise.
+fn new_text(full: &Path) -> Result<Vec<u8>, &'static str> {
+    match std::fs::metadata(full) {
+        Ok(m) if m.len() > UNTRACKED_BYTES => Err("too big to show"),
+        Ok(m) if m.is_file() => {
+            let bytes = std::fs::read(full).unwrap_or_default();
+            if bytes[..bytes.len().min(8000)].contains(&0) { Err("binary file") } else { Ok(bytes) }
+        }
+        _ => Err("not a regular file"),
+    }
+}
+
+/// The lines adding the untracked file at `full` adds, as the review counts
+/// them: none for a binary file, one too big to show, or anything that isn't
+/// a regular file.
+pub fn untracked_added(full: &Path) -> u32 {
+    new_text(full).map_or(0, |b| String::from_utf8_lossy(&b).lines().count() as u32)
 }
 
 /// Run git in `dir`: its output, or what it said went wrong.

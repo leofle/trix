@@ -4583,7 +4583,7 @@ fn spawn_git_watcher(targets: Arc<Mutex<GitTargets>>, tx: Sender<AppEvent>) {
                             let branch = git(dir, &["branch", "--show-current"])
                                 .filter(|b| !b.is_empty())
                                 .or_else(|| git(dir, &["rev-parse", "--short", "HEAD"]));
-                            let diff = branch.as_ref().and_then(|_| Some(parse_shortstat(&git(dir, DIFF_STAT)?)));
+                            let diff = branch.as_ref().and_then(|_| diff_of(dir));
                             (branch, diff)
                         })
                         .clone();
@@ -4607,6 +4607,33 @@ fn spawn_git_watcher(targets: Arc<Mutex<GitTargets>>, tx: Sender<AppEvent>) {
 /// exists". `GIT_OPTIONAL_LOCKS=0` doesn't stop it (git 2.56); plumbing
 /// never writes the index.
 const DIFF_STAT: &[&str] = &["diff-index", "-M", "--shortstat", "HEAD"];
+
+/// The files git doesn't track yet, which `DIFF_STAT` never counts though the
+/// review shows them. Read-only too.
+const UNTRACKED: &[&str] = &["ls-files", "--others", "--exclude-standard", "-z"];
+
+/// How much of the untracked files is read for their lines on each look (it
+/// comes every few seconds); past that they're counted, not read.
+const UNTRACKED_READ: u64 = 4 << 20;
+
+/// What an agent's card shows for the repository `dir` is in: files changed,
+/// lines added, lines removed, against HEAD, untracked files as the review
+/// has them. With no HEAD yet (a fresh repository), only untracked files.
+fn diff_of(dir: &Path) -> Option<(u32, u32, u32)> {
+    let top = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
+    let (mut files, mut added, removed) = git(&top, DIFF_STAT).map(|s| parse_shortstat(&s)).unwrap_or_default();
+    let mut budget = UNTRACKED_READ;
+    for path in git(&top, UNTRACKED)?.split('\0').filter(|p| !p.is_empty()) {
+        files += 1;
+        let full = top.join(path);
+        let len = std::fs::metadata(&full).map_or(0, |m| m.len());
+        if len <= budget {
+            budget -= len;
+            added += crate::review::untracked_added(&full);
+        }
+    }
+    Some((files, added, removed))
+}
 
 fn parse_shortstat(s: &str) -> (u32, u32, u32) {
     let mut r = (0, 0, 0);
@@ -7015,6 +7042,46 @@ mod tests {
         let stat = git(&dir, DIFF_STAT).expect("diff-index runs");
         assert_eq!(parse_shortstat(&stat), (2, 1, 0), "the edit, and the rename as one file: {stat}");
         assert_eq!(std::fs::metadata(&index).and_then(|m| m.modified()).unwrap(), before, "the index is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cards_diff_counts_new_files_as_the_review_does() {
+        let dir = std::env::temp_dir().join(format!("trix-test-carddiff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("new.rs"), "a\nb\nc\n").unwrap();
+        assert_eq!(diff_of(&dir), Some((1, 3, 0)), "no HEAD yet: the untracked file alone");
+
+        std::fs::write(dir.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(dir.join("kept"), "1\n2\n").unwrap();
+        run(&["add", ".gitignore", "kept"]);
+        run(&["commit", "-q", "--no-verify", "-m", "init"]);
+        std::fs::write(dir.join("kept"), "1\n").unwrap();
+        std::fs::write(dir.join("sub/deep.txt"), "x\ny").unwrap();
+        std::fs::write(dir.join("blob.bin"), [1, 0, 2]).unwrap();
+        std::fs::create_dir_all(dir.join("ignored")).unwrap();
+        std::fs::write(dir.join("ignored/out.log"), "1\n2\n3\n4\n").unwrap();
+
+        let want = (4, 5, 1);
+        assert_eq!(diff_of(&dir), Some(want), "the edit, new.rs, sub/deep.txt and blob.bin (no lines); not what's ignored");
+        assert_eq!(diff_of(&dir.join("sub")), Some(want), "the whole repository's, from a folder in it");
+        let (files, _) = crate::review::load(&dir).unwrap();
+        let review = files.iter().fold((files.len() as u32, 0, 0), |(n, a, r), f| (n, a + f.added, r + f.removed));
+        assert_eq!(review, want, "what the review shows");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
