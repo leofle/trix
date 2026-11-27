@@ -95,7 +95,7 @@ pub fn to_toml(name: &str, agents: &[LayoutAgent]) -> String {
     format!(
         "# trix layout '{name}' · `trix layout open {name}` opens these tabs again\n\
          # kind: claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell or custom · args: extra arguments (for custom, the command)\n\
-         # cwd: the folder; a relative one starts from your home folder\n\
+         # cwd: the folder; a relative one starts from your home folder. One in a trix worktree that has gone since is made again\n\
          # session: the conversation `--resume` picks up; delete the line to always start fresh\n\
          # inherited: for a clone, what its conversation had cost before it was cloned (counted once, in the original)\n\n{body}"
     )
@@ -302,6 +302,41 @@ pub fn spec_for(a: &LayoutAgent, resume: bool) -> Result<Spawn, String> {
     Ok(Spawn { kind, name: a.name.clone(), cwd, command, prompt: None, branch_note: None, resume, fork: false, runtime: Default::default() })
 }
 
+/// A tab in a worktree trix made whose folder has gone since (merged and
+/// cleaned up, say): the repository's main checkout, and the worktree's name.
+fn gone_worktree(cwd: &Path) -> Option<(PathBuf, String)> {
+    if cwd.exists() {
+        return None;
+    }
+    // Only the worktree itself gone: a folder missing inside one that's
+    // there is the agent's to make again, not trix's.
+    let tree = crate::worktree::managed_root(cwd).filter(|t| !t.exists())?;
+    let name = tree.file_name()?.to_str()?.to_string();
+    // `<repo>/.trix/worktrees/<name>`
+    let repo = tree.parent()?.parent()?.parent()?;
+    repo.is_dir().then(|| (repo.to_path_buf(), name))
+}
+
+/// Make the worktree a tab was in again, the way `trix spawn --worktree`
+/// does: on its `trix/` branch if that's still there (work not merged yet),
+/// or on a new one from the main checkout. What to say about it, and what
+/// the agent's start needs for it. `None`: nothing to make.
+fn remake_worktree(app: &mut App, a: &LayoutAgent) -> Result<Option<(String, crate::worktree::Runtime)>, String> {
+    // A tab that can't start anyway gets no worktree.
+    if Kind::from_label(&a.kind).is_none() {
+        return Ok(None);
+    }
+    let Some((repo, name)) = gone_worktree(&home_relative(&a.cwd)) else { return Ok(None) };
+    let config = crate::worktree::RepoConfig::load(&repo)?;
+    let (path, branch, reused) = app::make_worktree(&repo, &name).map_err(|e| format!("making its worktree again: {e}"))?;
+    let ready = crate::worktree::prepare(&path, config.as_ref(), reused, false, &app.config.worktree);
+    if let Some(w) = ready.warning {
+        app.toast(format!("{}: {w}", a.name), ToastKind::Bad);
+    }
+    let made = format!("worktree made again on {branch}");
+    Ok(Some((ready.note.map_or(made.clone(), |n| format!("{made} · {n}")), ready.runtime)))
+}
+
 /// A layout's folder: `~` expanded, and a relative one taken from the home
 /// folder, not from wherever the workspace happened to be started.
 fn home_relative(cwd: &str) -> PathBuf {
@@ -326,11 +361,17 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
         } else if let Some(other) = held_by {
             ("skipped", format!("its conversation is open in {other}"))
         } else {
-            match spec_for(a, resume).and_then(|spec| {
+            match remake_worktree(app, a).and_then(|made| {
+                let mut spec = spec_for(a, resume)?;
+                let note = made.map(|(note, runtime)| {
+                    spec.branch_note = Some(note.clone());
+                    spec.runtime = runtime;
+                    note
+                });
                 let resumed = spec.resume.is_some();
-                app.spawn_quiet(spec).map(|id| (id, resumed)).map_err(|e| e.to_string())
+                app.spawn_quiet(spec).map(|id| (id, resumed, note)).map_err(|e| e.to_string())
             }) {
-                Ok((id, resumed)) => {
+                Ok((id, resumed, note)) => {
                     opened += 1;
                     if let Some(x) = app.agents.iter_mut().find(|x| x.id == id) {
                         x.managed_by = by.clone();
@@ -338,7 +379,8 @@ pub fn open(app: &mut App, from: Option<u32>, name: &str, agents: Vec<LayoutAgen
                             x.inherited = a.inherited.iter().map(Inherited::pair).collect::<Spend>();
                         }
                     }
-                    ("opened", format!("{}{}", a.cwd, if resumed { " · resuming its conversation" } else { "" }))
+                    let note = note.map(|n| format!(" · {n}")).unwrap_or_default();
+                    ("opened", format!("{}{note}{}", a.cwd, if resumed { " · resuming its conversation" } else { "" }))
                 }
                 Err(e) => {
                     failed += 1;
@@ -520,6 +562,61 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    #[test]
+    fn opening_makes_a_cleaned_up_worktree_again() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let git = |at: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(at).args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README"), "hi\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        let (tree, _, _) = app::make_worktree(&dir, "w").unwrap();
+        std::fs::write(tree.join("work.txt"), "not merged yet\n").unwrap();
+        git(&tree, &["add", "."]);
+        git(&tree, &["commit", "-q", "-m", "work"]);
+        // What the review's X or `trix worktrees rm --keep-branch` leaves.
+        let remove = |tree: &Path| {
+            git(&dir, &["worktree", "unlock", &tree.display().to_string()]);
+            git(&dir, &["worktree", "remove", &tree.display().to_string()]);
+        };
+        remove(&tree);
+        assert_eq!(gone_worktree(&tree.join("src")), Some((dir.clone(), "w".into())), "a folder in it too");
+        assert_eq!(gone_worktree(&dir.join("elsewhere")), None, "only trix's worktrees");
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        app.pending_restore = None;
+        let mut job = entry("custom", "w", &tree.display().to_string());
+        job.args = Some("exec sleep 60".into());
+        let r = open(&mut app, None, "work", vec![job.clone()], false);
+        assert_eq!(r.code, 0, "{} {}", r.out, r.err);
+        assert!(r.out.contains("worktree made again on trix/w"), "{}", r.out);
+        assert_eq!(std::fs::read_to_string(tree.join("work.txt")).unwrap(), "not merged yet\n", "on its branch, with its work");
+        assert_eq!(app.agents[0].cwd, tree);
+        app.agents[0].shutdown();
+        app.agents.clear();
+
+        // Merged, and its branch gone with it: a new one from main.
+        remove(&tree);
+        git(&dir, &["branch", "-q", "-D", "trix/w"]);
+        let r = open(&mut app, None, "work", vec![job.clone()], false);
+        assert_eq!(r.code, 0, "{} {}", r.out, r.err);
+        assert!(tree.join("README").exists() && !tree.join("work.txt").exists());
+
+        // There, but a folder in it isn't: nothing to make.
+        app.agents[0].shutdown();
+        app.agents.clear();
+        job.cwd = tree.join("missing").display().to_string();
+        let r = open(&mut app, None, "work", vec![job], false);
+        assert!(r.out.contains("folder not found") && !r.out.contains("made again"), "{}", r.out);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -329,7 +329,7 @@ trix layout rm work-layout
   session = "0a955a0a-…"     # optional: what --resume picks up
   ```
 - `save` records where each shell is now, even if you `cd`'d since. It won't overwrite an existing layout without `--force`.
-- `open` adds to the workspace you're in and skips tabs that are already open under the same name, so opening twice is harmless. New tabs never steal focus. A tab whose folder is gone is reported and skipped.
+- `open` adds to the workspace you're in and skips tabs that are already open under the same name, so opening twice is harmless. New tabs never steal focus. A tab whose folder is gone is reported and skipped, except one in a trix worktree that has been cleaned up since (merged, then removed with the review's `X` or `trix worktrees prune`): `open` makes that worktree again, as `trix spawn --worktree` would, on its `trix/<name>` branch if it's still there and on a new one from the main checkout if not.
 - From a terminal outside trix, `open` starts the workspace if needed and attaches to it, unless a tab failed to start: then it reports why and leaves attaching to you. From inside a pane, it just adds the tabs, so an agent can run it too: "open my work layout". `trix -s <name> layout open …` from a pane starts that session if needed and opens the tabs there.
 - `--resume` only applies to Claude, Codex, Grok, OpenCode, Cursor, Copilot, Muse, Gemini, Antigravity and Amp tabs that have a saved `session`. Everything else starts fresh either way.
 - A clone's entry also gets `[[agent.inherited]]` tables: what its conversation had already cost when it was cloned. With `--resume`, its pane counts only what it spent itself, as it did before, since the original already counted the rest.
