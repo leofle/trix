@@ -25,7 +25,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 6 | Capability matrix and the shared checker | 81d1bc5 | pass |
 | 7 | Matrix probes | 77e9fd5 (with 8) | pass |
 | 8 | Generic nodes and prompting | 77e9fd5 (with 7) | pass |
-| 9 | Workspaces and landing | (this) | pass |
+| 9 | Workspaces and landing | 871528d | pass |
+| 10 | Composition | (this) | pass |
 
 ## Step 1: baseline
 
@@ -571,6 +572,65 @@ floors, the hooks fingerprint, rule approvals and the agent-start policy
   trix has verified it has no commit that isn't on the run's branch.
 
 Tests added: 3, and one checker case. Suite: 793 passed. Deferred: nothing.
+
+## Step 10: composition
+
+**Built**
+
+- `src/workflow/compose.rs`:
+  - **`for_each`**: a fan-out declared in the workflow and checked before
+    the run. At run time it's one agent visit per item of the list another
+    node handed in, each in a worktree of its own, at most `parallel` at
+    once. An item that fails (a verdict, or a runtime event past its
+    restarts) is a failed item, never a failed run.
+  - **`join`**: waits for what leads into it by its rule (`all`, `any`, a
+    number, or triage's `both_or_ask`), then gives its first verdict if
+    enough succeeded and its second if not. `both_or_ask` asks you when
+    only some parts came.
+  - **`workflow`**: a workflow as a node. Its run is a run of its own
+    (`<parent>.<node>`), one level deeper, started with the parent's
+    inputs; the parent waits and takes its outcome as the verdict
+    (`succeeded` or `failed`). The sub-workflow is checked and snapshotted
+    when the parent starts.
+- **Blackboard:** a report's `board` object is merged into the run's
+  shared state, and any later prompt can read `{{board.key}}`.
+- **Triggers** (`src/workflow/trigger.rs`, and `triggers` in the model):
+  another workflow's run ending, an issue or PR on GitHub with a label
+  (polled through `gh`), files changed on the default branch. Each fires
+  once for each thing it sees; what fired is kept across restarts. The
+  scheduler that polls them is step 13.
+
+**Accept** (4 tests)
+
+- **Nested runs**, the **depth limit** and **spend roll-up**:
+  `a_workflow_node_runs_a_nested_run_rolls_its_spend_up_and_keeps_to_the_depth_limit`
+  (the inner run's live and closed spend shows in the outer's total; with
+  `max_depth = 2` a third level isn't started; a failed inner run fails
+  the outer's node; an inner workflow that doesn't check keeps the outer
+  from starting).
+- **Join partial failure**:
+  `a_fan_out_runs_an_agent_per_item_and_the_join_takes_partial_failure`
+  (three packages: one upgraded, one skipped, one exited three times; the
+  join says `some`, what upgraded lands and is tested; `parallel = 1`;
+  `none`; `both_or_ask`).
+- **Triggers that fire once**: `a_trigger_fires_once_for_each_thing_it_sees`.
+- The blackboard: `what_a_node_writes_on_the_blackboard_every_later_node_can_read`.
+
+**Decisions**
+
+- A fan-out's instances are added to the run's own copy of the workflow as
+  agent nodes (`upgrade-1`, `upgrade-2`, …) when the list is known. That's
+  the declared fan-out unfolding, not a graph an LLM rewrote: the instance
+  is the for_each node's agent, brief and profile, and nothing else can add
+  a node.
+- A fan-out's first declared verdict is the one that counts as success for
+  a join.
+- A nested run works on its own branch and, if it has a gate, opens its own
+  PR. The parent reads its outcome; it doesn't merge the child's branch
+  into its own. (Known limit.)
+
+Tests added: 4. Suite: 797 passed. Deferred: the polling loop for triggers
+(step 13).
 
 ## Decisions to review
 

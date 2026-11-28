@@ -58,6 +58,9 @@ pub struct Workflow {
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// What starts a run of it without you.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<Trigger>,
     /// Where the builder drew each node: column, row.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub layout: BTreeMap<String, [i32; 2]>,
@@ -585,6 +588,31 @@ impl Node {
             _ => Revisit::Fresh,
         })
     }
+}
+
+/// What starts a run without you: another workflow's run ending, an issue
+/// or PR on GitHub, files that changed. Each fires once for what it sees.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Trigger {
+    /// `workflow`, `github` or `files`.
+    pub on: String,
+    /// For `workflow`: whose run ending fires it, and in which state.
+    #[serde(default, skip_serializing_if = "none")]
+    pub workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub state: Option<String>,
+    /// For `github`: `issue` or `pr`, and the label it must carry.
+    #[serde(default, skip_serializing_if = "none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "none")]
+    pub label: Option<String>,
+    /// The input that gets the issue's or PR's number.
+    #[serde(default, skip_serializing_if = "none")]
+    pub input: Option<String>,
+    /// For `files`: the paths whose change on the default branch fires it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 /// One trigger, or several that lead the same way.

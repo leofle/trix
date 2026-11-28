@@ -126,6 +126,7 @@ pub fn opts(w: &Workflow, m: &Matrix, settings: &Settings, trusted: bool, repo_n
         notify_each: settings.approvals.notify_each,
         on_finish: settings.on_finish.clone(),
         repo_name: repo_name.into(),
+        max_depth: settings.agents.max_depth,
         state_from: m
             .0
             .iter()
@@ -142,6 +143,8 @@ pub fn opts(w: &Workflow, m: &Matrix, settings: &Settings, trusted: bool, repo_n
 
 /// What a start needs to know.
 pub struct Launch<'a> {
+    /// Where the workflows a workflow node names are found.
+    pub stores: &'a super::store::Stores,
     pub repo: &'a Path,
     pub m: &'a Matrix,
     pub ctx: &'a Ctx,
@@ -203,6 +206,28 @@ pub fn start(
         run.gate.ci_expected =
             crate::case::check_runs(l.repo, sha.trim(), &mut |r, a| env.gh(r, a))
                 .is_ok_and(|runs| !runs.is_empty());
+    }
+    // The workflows its workflow nodes name are checked and snapshotted
+    // with it: a sub-run reads the snapshot, like any run.
+    let mut subs: Vec<String> = w
+        .nodes
+        .values()
+        .filter_map(|n| n.workflow.clone().filter(|_| n.kind == "workflow"))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = subs.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let (sub, _) = l.stores.load(&name)?;
+        preflight(&sub, l.m, l.ctx)
+            .map_err(|e| format!("the workflow node's workflow doesn't check:\n{e}"))?;
+        subs.extend(
+            sub.nodes
+                .values()
+                .filter_map(|n| n.workflow.clone().filter(|_| n.kind == "workflow")),
+        );
+        super::store::snapshot(&engine::dir_of(root, &id).join("sub").join(&name), &sub)?;
     }
     super::store::snapshot(&engine::dir_of(root, &id), w)?;
     engine::store(root, &run)?;

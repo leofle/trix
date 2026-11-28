@@ -94,6 +94,8 @@ pub enum Ask {
     Floor,
     /// A node couldn't start: r tries again.
     Setup,
+    /// A join wanted every part and got some: c goes on with those.
+    Partial,
 }
 
 impl Ask {
@@ -108,6 +110,7 @@ impl Ask {
             Ask::Quota => &[('r', "try again now"), ('a', "abort")],
             Ask::Floor => &[('y', "let it through, for this run only"), ('a', "abort")],
             Ask::Setup => &[('r', "try again"), ('a', "abort")],
+            Ask::Partial => &[('c', "go on with what succeeded"), ('a', "abort")],
         }
     }
 }
@@ -182,6 +185,9 @@ pub struct NodeRun {
     /// A writer in a worktree of its own: its commits are on the run's branch.
     #[serde(default)]
     pub landed: bool,
+    /// The fan-out this is one item of.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 impl Default for NodeRun {
@@ -203,6 +209,7 @@ impl Default for NodeRun {
             backend: None,
             sent_back: false,
             landed: false,
+            parent: None,
         }
     }
 }
@@ -252,6 +259,9 @@ pub struct Opts {
     /// The kinds trix can price.
     #[serde(default)]
     pub priced: Vec<String>,
+    /// How deep a run started by a run may go.
+    #[serde(default)]
+    pub max_depth: u32,
 }
 
 /// A question an agent asked, waiting for the supervisor or for you.
@@ -331,6 +341,9 @@ pub struct WfRun {
     /// The agent pane that started it, if one did.
     #[serde(default)]
     pub started_by: Option<String>,
+    /// The blackboard: what nodes wrote for the rest of the run to read.
+    #[serde(default)]
+    pub board: BTreeMap<String, serde_json::Value>,
     /// The writers that work in worktrees of their own, in the order they
     /// handed in: the order they land in.
     #[serde(default)]
@@ -483,6 +496,7 @@ impl WfRun {
             parent: None,
             depth: 0,
             started_by: None,
+            board: BTreeMap::new(),
             finished: Vec::new(),
             log: Vec::new(),
             created: now,
@@ -731,6 +745,9 @@ impl WfRun {
                 v.insert(format!("{node}.verdict"), verdict.clone());
             }
         }
+        for (k, x) in &self.board {
+            v.insert(format!("board.{k}"), text(x));
+        }
         // The goal can name the inputs; everything else can name the goal.
         v.insert(
             "goal.text".into(),
@@ -774,10 +791,17 @@ impl WfRun {
     /// an agent on a kind trix can't price counts as unknown, never $0.
     pub fn spend(&self, seen: &[Seen]) -> (f64, bool) {
         let prefix = format!("{}-", self.id);
+        let sub = format!("{}.", self.id);
         let live: f64 = seen
             .iter()
-            .filter(|a| a.name.starts_with(&prefix))
+            .filter(|a| a.name.starts_with(&prefix) || a.name.starts_with(&sub))
             .map(|a| a.cost)
+            .sum();
+        // What a workflow node's run spent on panes it has closed rolls up.
+        let rolled: f64 = self
+            .nodes
+            .values()
+            .filter_map(|n| n.outputs.get("spent")?.as_f64())
             .sum();
         let unknown = self.workflow.nodes.iter().any(|(id, n)| {
             n.is_agent()
@@ -786,7 +810,7 @@ impl WfRun {
                     .as_ref()
                     .is_some_and(|k| !self.opts.priced.contains(k))
         });
-        (self.spent_closed + live, unknown)
+        (self.spent_closed + live + rolled, unknown)
     }
 
     /// Whether anything is pending: a node or check at work, CI or GitHub
@@ -803,6 +827,10 @@ impl WfRun {
     /// Follow the edges from `id` on a verdict or a runtime event: one, or
     /// several when the verdict fans out.
     pub(super) fn route(&mut self, env: &mut dyn Env, id: &str, trigger: &str) {
+        // One item of a fan-out: it's counted there, and never ends the run.
+        if let Some(parent) = self.nodes[id].parent.clone() {
+            return super::compose::child_done(self, env, &parent, id, trigger);
+        }
         self.active.retain(|a| a != id);
         let edges: Vec<super::model::Edge> = self
             .workflow
@@ -1170,6 +1198,11 @@ impl WfRun {
             .filter(|(k, _)| k != "verdict")
             .collect();
         st.outputs.insert("head".into(), head.clone().into());
+        // What it wrote on the blackboard is there for every node after.
+        for (k, x) in report["board"].as_object().into_iter().flatten() {
+            self.board.insert(k.clone(), x.clone());
+        }
+        let st = self.nodes.get_mut(id).unwrap();
         // What a reader judged is the commit it was given.
         let judged = if n.writes() {
             head
@@ -2193,6 +2226,12 @@ impl Run for WfRun {
                         format!("past the floor {floor}, as you said: for this run only"),
                     );
                     self.gate.let_through.push(floor);
+                }
+            }
+            Ask::Partial => {
+                if let Some(part) = self.limit.take() {
+                    self.note(env, "going on with what succeeded, as you said");
+                    self.gate.let_through.push(part);
                 }
             }
             Ask::Setup => {

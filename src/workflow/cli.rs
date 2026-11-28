@@ -376,10 +376,12 @@ pub fn run(args: &[String]) -> i32 {
             let Some(repo) = main_checkout() else {
                 return fail("not in a git repository");
             };
-            let started = Stores::of(Some(&repo)).load(&name).and_then(|(w, _)| {
+            let stores = Stores::of(Some(&repo));
+            let started = stores.load(&name).and_then(|(w, _)| {
                 let (m, ctx, settings) = live()?;
                 let mut env = Live::looking("workflow");
                 let l = super::launch::Launch {
+                    stores: &stores,
                     repo: &repo,
                     m: &m,
                     ctx: &ctx,

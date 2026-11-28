@@ -23,6 +23,7 @@ pub mod settings;
 pub mod store;
 pub mod summary;
 pub mod triage;
+pub mod trigger;
 pub mod view;
 
 #[cfg(test)]

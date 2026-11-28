@@ -21,6 +21,7 @@ pub fn opts() -> Opts {
         notify_each: true,
         on_finish: Vec::new(),
         repo_name: "acme/app".into(),
+        max_depth: 2,
         state_from: [
             ("claude", "hooks"),
             ("codex", "hooks"),
@@ -1194,7 +1195,12 @@ fn a_run_starts_checked_with_its_inputs_resolved_and_its_snapshot_taken() {
     let ctx = super::check::Ctx::ideal(&m);
     let settings = super::settings::Settings::default();
     let (repo, runs_dir) = (w.repo.clone(), root(&w));
+    let stores = super::store::Stores {
+        team: None,
+        personal: w.base.join("workflows"),
+    };
     let l = Launch {
+        stores: &stores,
         repo: &repo,
         m: &m,
         ctx: &ctx,
@@ -1245,14 +1251,12 @@ fn a_run_starts_checked_with_its_inputs_resolved_and_its_snapshot_taken() {
         ..ctx.clone()
     };
     let lu = Launch {
+        stores: &stores,
+        repo: &repo,
+        m: &m,
         ctx: &untrusted,
-        ..Launch {
-            repo: &repo,
-            m: &m,
-            ctx: &ctx,
-            settings: &settings,
-            trusted: false,
-        }
+        settings: &settings,
+        trusted: false,
     };
     assert!(
         launch(
@@ -1318,6 +1322,7 @@ fn a_run_starts_checked_with_its_inputs_resolved_and_its_snapshot_taken() {
     issue_api(&mut w2, "NONE");
     let (repo2, runs2) = (w2.repo.clone(), root(&w2));
     let l2 = Launch {
+        stores: &stores,
         repo: &repo2,
         m: &m,
         ctx: &ctx,
@@ -1907,4 +1912,356 @@ fn a_land_conflict_goes_back_to_its_author() {
     assert!(r2.nodes["ui"].cwd.clone().unwrap().is_dir());
     done(w);
     done(w2);
+}
+
+// ── composition ──
+
+/// nightly-deps on the fixture repository: its check is green once any
+/// upgrade landed.
+fn nightly() -> Workflow {
+    let mut w = builtin("nightly-deps").unwrap();
+    w.nodes.get_mut("tests").unwrap().run =
+        vec!["sh".into(), "-c".into(), "ls upgraded-* >/dev/null".into()];
+    w.limits.deadline = None;
+    w.nodes
+        .get_mut("upgrade")
+        .unwrap()
+        .brief
+        .as_mut()
+        .unwrap()
+        .owns = vec!["upgraded-*".into(), "package.json".into()];
+    w
+}
+
+#[test]
+fn a_fan_out_runs_an_agent_per_item_and_the_join_takes_partial_failure() {
+    let mut w = World::new("wf-foreach");
+    let mut r = start(&mut w, nightly(), opts());
+    tick(&mut w, &mut r);
+    submit(
+        &mut w,
+        &r,
+        "scan",
+        r#"{"verdict": "found", "packages": ["left-pad", "lodash", "react"]}"#,
+    )
+    .unwrap();
+    ticks(&mut w, &mut r, 3);
+    // One upgrader per package, at most three... here two at once (parallel).
+    assert_eq!(
+        r.nodes["upgrade"].outputs["instances"],
+        serde_json::json!(["upgrade-1", "upgrade-2", "upgrade-3"])
+    );
+    let started: Vec<&str> = w.spawned.iter().skip(1).map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        started,
+        [
+            "nightly-deps-42-upgrade-1",
+            "nightly-deps-42-upgrade-2",
+            "nightly-deps-42-upgrade-3"
+        ]
+    );
+    // Each is told its own item, in a worktree and on a branch of its own.
+    let p = &w.spawned[1].prompt;
+    assert!(
+        p.starts_with("Upgrade the dependency left-pad to its newest release")
+            && p.contains("trix wf submit upgrade-1"),
+        "{p}"
+    );
+    let trees: Vec<_> = (1..=3)
+        .map(|i| r.nodes[&format!("upgrade-{i}")].cwd.clone().unwrap())
+        .collect();
+    assert!(trees[0] != trees[1] && trees[1] != trees[2] && trees.iter().all(|t| *t != r.tree()));
+    assert_eq!(
+        w.sh(&trees[1], &["branch", "--show-current"]).trim(),
+        "trix/wf-nightly-deps-42-upgrade-2"
+    );
+    // One upgrades, one is skipped, one exits past its restarts: a failed
+    // item, not a failed run.
+    edit(&mut w, &r, "upgrade-1", "upgraded-left-pad", "1.3.0\n");
+    submit(&mut w, &r, "upgrade-1", r#"{"verdict": "upgraded"}"#).unwrap();
+    submit(
+        &mut w,
+        &r,
+        "upgrade-2",
+        r#"{"verdict": "skipped", "summary": "its tests need node 22"}"#,
+    )
+    .unwrap();
+    tick(&mut w, &mut r);
+    assert_eq!(
+        r.nodes["collect"].visits, 0,
+        "the join waits for every item"
+    );
+    for _ in 0..3 {
+        w.state(&r.nodes["upgrade-3"].agent.clone().unwrap(), "exited");
+        ticks(&mut w, &mut r, 2);
+    }
+    assert_eq!(
+        (r.state, r.nodes["upgrade-3"].state),
+        (RunState::Running, NodeState::Failed),
+        "{:?}",
+        r.log
+    );
+    ticks(&mut w, &mut r, 2);
+    // The join: some succeeded, so the run goes on with those.
+    assert_eq!(
+        r.nodes["collect"].verdict.as_deref(),
+        Some("some"),
+        "{:?}",
+        r.log
+    );
+    assert!(
+        r.log
+            .iter()
+            .any(|(_, l)| l == "collect: 1 of 3 succeeded: some"),
+        "{:?}",
+        r.log
+    );
+    ticks(&mut w, &mut r, 3);
+    // What upgraded landed; the check ran on the landed commit.
+    assert!(r.tree().join("upgraded-left-pad").is_file());
+    assert_eq!(
+        r.nodes["tests"].verdict.as_deref(),
+        Some("pass"),
+        "{:?}",
+        r.log
+    );
+    // With parallel = 1 they run one after another.
+    let mut one = nightly();
+    one.nodes.get_mut("upgrade").unwrap().parallel = Some(1);
+    let mut w2 = World::new("wf-foreach-one");
+    let mut r2 = start(&mut w2, one, opts());
+    tick(&mut w2, &mut r2);
+    submit(
+        &mut w2,
+        &r2,
+        "scan",
+        r#"{"verdict": "found", "packages": ["a", "b"]}"#,
+    )
+    .unwrap();
+    ticks(&mut w2, &mut r2, 3);
+    assert_eq!(w2.spawned.len(), 2, "scan, then the first upgrader only");
+    submit(&mut w2, &r2, "upgrade-1", r#"{"verdict": "skipped"}"#).unwrap();
+    ticks(&mut w2, &mut r2, 3);
+    assert_eq!(w2.spawned.last().unwrap().name, "nightly-deps-42-upgrade-2");
+    // None succeeded: the join says none, and the template ends there.
+    submit(&mut w2, &r2, "upgrade-2", r#"{"verdict": "skipped"}"#).unwrap();
+    ticks(&mut w2, &mut r2, 3);
+    assert_eq!(
+        r2.nodes["collect"].verdict.as_deref(),
+        Some("none"),
+        "{:?}",
+        r2.log
+    );
+    // both_or_ask: every part was wanted, some came: yours to say.
+    let mut both = nightly();
+    both.nodes.get_mut("collect").unwrap().wait = Some("both_or_ask".into());
+    let mut w3 = World::new("wf-foreach-both");
+    let mut r3 = start(&mut w3, both, opts());
+    tick(&mut w3, &mut r3);
+    submit(
+        &mut w3,
+        &r3,
+        "scan",
+        r#"{"verdict": "found", "packages": ["a", "b"]}"#,
+    )
+    .unwrap();
+    ticks(&mut w3, &mut r3, 3);
+    edit(&mut w3, &r3, "upgrade-1", "upgraded-a", "2\n");
+    submit(&mut w3, &r3, "upgrade-1", r#"{"verdict": "upgraded"}"#).unwrap();
+    submit(&mut w3, &r3, "upgrade-2", r#"{"verdict": "skipped"}"#).unwrap();
+    ticks(&mut w3, &mut r3, 3);
+    assert_eq!(
+        (r3.ask, r3.why.as_str()),
+        (
+            Some(Ask::Partial),
+            "1 of 2 parts of collect succeeded: go on with those?"
+        )
+    );
+    op(&mut w3, None, Some(&r3.id), Op::Answer { key: 'c' }).unwrap();
+    ticks(&mut w3, &mut r3, 2);
+    assert_eq!(r3.nodes["collect"].verdict.as_deref(), Some("some"));
+    done(w);
+    done(w2);
+    done(w3);
+}
+
+const OUTER: &str = r#"
+schema = 1
+name = "outer"
+[goal]
+text = "The inner workflow ran."
+[goal.done_when]
+mechanical = [{ check = "ok" }]
+[limits]
+wall_clock = "1h"
+[nodes.inner]
+kind = "workflow"
+workflow = "INNER"
+[nodes.ok]
+kind = "check"
+run = ["true"]
+[[edges]]
+from = "inner"
+to = "ok"
+on = "succeeded"
+[[edges]]
+from = "inner"
+to = "@fail"
+on = "failed"
+[[edges]]
+from = "ok"
+to = "@done"
+on = "pass"
+[[edges]]
+from = "ok"
+to = "@fail"
+on = "fail"
+"#;
+
+#[test]
+fn a_workflow_node_runs_a_nested_run_rolls_its_spend_up_and_keeps_to_the_depth_limit() {
+    use super::launch::{Launch, start as launch};
+    let mut w = World::new("wf-nested");
+    let stores = super::store::Stores {
+        team: None,
+        personal: w.base.join("workflows"),
+    };
+    let mut linear = Workflow::from_toml(LINEAR).unwrap();
+    linear.name = "inner".into();
+    stores
+        .save(&linear, super::store::Origin::Personal)
+        .unwrap();
+    let outer = Workflow::from_toml(&OUTER.replace("INNER", "inner")).unwrap();
+    // An outer that names itself inside: as deep as you let it.
+    let mut deep = Workflow::from_toml(&OUTER.replace("INNER", "deep")).unwrap();
+    deep.name = "deep".into();
+    stores.save(&deep, super::store::Origin::Personal).unwrap();
+    let m = super::caps::Matrix::shipped();
+    let ctx = super::check::Ctx::ideal(&m);
+    let settings = super::settings::Settings::default();
+    let (repo, runs_dir) = (w.repo.clone(), root(&w));
+    let l = Launch {
+        stores: &stores,
+        repo: &repo,
+        m: &m,
+        ctx: &ctx,
+        settings: &settings,
+        trusted: true,
+    };
+    let mut r = launch(&mut w, &runs_dir, &l, &outer, &BTreeMap::new()).unwrap();
+    // The inner workflow was checked and snapshotted with the outer one.
+    assert_eq!(
+        super::store::snapshot_of(&engine::dir_of(&runs_dir, &r.id).join("sub/inner")).unwrap(),
+        linear
+    );
+    tick(&mut w, &mut r);
+    // A run of its own, one level deeper, in a pane of its own.
+    assert_eq!(w.opened, ["outer-1.inner"]);
+    let mut sub = engine::load(&runs_dir, "outer-1.inner").unwrap();
+    assert_eq!(
+        (sub.depth, sub.parent.as_deref(), sub.workflow.name.as_str()),
+        (1, Some("outer-1"), "inner")
+    );
+    assert_eq!(r.nodes["inner"].state, NodeState::Working);
+    // The outer waits while the inner works.
+    tick(&mut w, &mut sub);
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(r.active, ["inner"]);
+    // What the inner's agents spend shows in the outer's total, live and closed.
+    assert_eq!(sub.spend(&w.seen).0, 1.0);
+    assert_eq!(r.spend(&w.seen).0, 1.0, "its live agent's spend rolls up");
+    edit(&mut w, &sub, "writer", "src/file", "x\n");
+    submit(&mut w, &sub, "writer", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut sub, 2);
+    assert_eq!(sub.state, RunState::Succeeded, "{:?}", sub.log);
+    // The inner's outcome is the node's verdict, and the outer goes on.
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(
+        (r.state, r.nodes["inner"].verdict.as_deref()),
+        (RunState::Succeeded, Some("succeeded")),
+        "{:?}",
+        r.log
+    );
+    assert_eq!(
+        r.spend(&w.seen).0,
+        1.0,
+        "and what it spent on panes it closed"
+    );
+    // The depth limit: max_depth 2 lets a run start a run that starts a
+    // run, and no deeper.
+    let mut d0 = launch(&mut w, &runs_dir, &l, &deep, &BTreeMap::new()).unwrap();
+    assert_eq!(d0.opts.max_depth, 2);
+    tick(&mut w, &mut d0);
+    let mut d1 = engine::load(&runs_dir, "deep-1.inner").unwrap();
+    tick(&mut w, &mut d1);
+    let mut d2 = engine::load(&runs_dir, "deep-1.inner.inner").unwrap();
+    assert_eq!((d1.depth, d2.depth), (1, 2));
+    tick(&mut w, &mut d2);
+    assert!(
+        engine::load(&runs_dir, "deep-1.inner.inner.inner").is_err(),
+        "a third level isn't started"
+    );
+    assert_eq!(d2.state, RunState::Failed);
+    assert!(
+        d2.log
+            .iter()
+            .any(|(_, l)| l.contains("3 levels deep, and max_depth is 2: not started")),
+        "{:?}",
+        d2.log
+    );
+    // A failed inner run fails the outer's node, and so on up.
+    ticks(&mut w, &mut d1, 2);
+    ticks(&mut w, &mut d0, 2);
+    assert_eq!((d1.state, d0.state), (RunState::Failed, RunState::Failed));
+    // A workflow node whose workflow doesn't check keeps the outer from starting.
+    let mut bad = linear.clone();
+    bad.limits.wall_clock = None;
+    stores.save(&bad, super::store::Origin::Personal).unwrap();
+    let e = launch(&mut w, &runs_dir, &l, &outer, &BTreeMap::new()).unwrap_err();
+    assert!(
+        e.starts_with("the workflow node's workflow doesn't check:\ninner: 1 error"),
+        "{e}"
+    );
+    done(w);
+}
+
+#[test]
+fn what_a_node_writes_on_the_blackboard_every_later_node_can_read() {
+    let mut wf = issue_to_pr();
+    wf.nodes.get_mut("judge").unwrap().prompt =
+        Some("The plan was: {{board.plan}}. Does {{tests.commit}} meet it?".into());
+    let m = super::caps::Matrix::shipped();
+    assert_eq!(
+        super::check::check(&wf, &m, &super::check::Ctx::ideal(&m)).errors(),
+        0
+    );
+    let mut w = World::new("wf-board");
+    let mut r = start(&mut w, wf, opts());
+    tick(&mut w, &mut r);
+    edit(&mut w, &r, "implementer", "src/done", "ok\n");
+    submit(
+        &mut w,
+        &r,
+        "implementer",
+        r#"{"verdict": "ready", "board": {"plan": "reset the window at 60s"}}"#,
+    )
+    .unwrap();
+    ticks(&mut w, &mut r, 3);
+    assert_eq!(r.board["plan"], "reset the window at 60s");
+    submit(
+        &mut w,
+        &r,
+        "reviewer",
+        r#"{"verdict": "pass", "findings": []}"#,
+    )
+    .unwrap();
+    ticks(&mut w, &mut r, 2);
+    assert!(
+        w.spawned
+            .last()
+            .unwrap()
+            .prompt
+            .starts_with("The plan was: reset the window at 60s. Does ")
+    );
+    done(w);
 }

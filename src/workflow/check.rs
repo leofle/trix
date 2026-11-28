@@ -460,7 +460,7 @@ fn known(w: &Workflow, name: &str) -> Result<(), String> {
         ("goal", Some("text"))
         | ("run", Some("id" | "state"))
         | ("inbox" | "item" | "node" | "worktree" | "repo", None) => Ok(()),
-        ("config", Some(_)) => Ok(()),
+        ("config" | "board", Some(_)) => Ok(()),
         ("inputs", Some(i)) if w.inputs.contains_key(i) => Ok(()),
         ("inputs", Some(i)) => Err(format!("there's no input '{i}'")),
         (node, Some(f)) if w.nodes.contains_key(node) => {
