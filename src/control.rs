@@ -354,6 +354,10 @@ pub fn reply(stream: &mut UnixStream, r: &Reply) {
 }
 
 pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Request, sandboxed: bool) {
+    // `[approvals] allow_sandboxed = true` lets a sandboxed agent start and
+    // stop runs, as `[workflows.agents]` allows any agent. Never approve.
+    let run_ops = matches!(&req, Request::Wf { op: crate::workflow::engine::Op::Start | crate::workflow::engine::Op::Abort | crate::workflow::engine::Op::Pause | crate::workflow::engine::Op::Resume, .. });
+    let sandboxed = sandboxed && !(run_ops && app.config.workflows.approvals.allow_sandboxed);
     if sandboxed && let Some(what) = outside_the_sandbox(&req) {
         let err = format!("a command in a sandbox can't {what}: that would run outside the sandbox. Ask the user to do it, or run it outside the sandbox");
         return reply(&mut stream, &Reply::fail(err));
@@ -1413,6 +1417,46 @@ mod tests {
         for a in &app.agents {
             a.shutdown();
         }
+    }
+
+    #[test]
+    fn a_check_and_what_it_starts_are_nobodys_whatever_pane_runs_them() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        // The run's pane is this process's own parent, as the kernel has it:
+        // without the registry, a process under here would be the run's.
+        let me = std::process::id();
+        let mut pane = crate::agent::test_agent(Kind::Custom);
+        pane.name = "issue-to-pr-42".into();
+        pane.pid = crate::platform::parent_of(me).unwrap();
+        app.agents.push(pane);
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 5"]).spawn().unwrap();
+        assert_eq!(pane_of(&app, Some(child.id())), Pane::Agent("issue-to-pr-42".into()));
+        // The run registers this process as one of its checks: now anything
+        // under it is found as the check first, before the pane.
+        app.checks.push((me, "issue-to-pr-42".into()));
+        assert_eq!(pane_of(&app, Some(child.id())), Pane::Check("issue-to-pr-42".into()));
+        assert_eq!(pane_of(&app, Some(me)), Pane::Check("issue-to-pr-42".into()));
+        assert_eq!(who_asks(&app, Some(child.id()), None), Pane::Check("issue-to-pr-42".into()));
+        // Naming a pane in the request doesn't make it that pane's.
+        assert_eq!(who_asks(&app, Some(child.id()), Some(app.agents[0].id)), Pane::Check("issue-to-pr-42".into()));
+        // And a check can't drive a run: every request there is is refused.
+        let check = Asker::Check("a check of issue-to-pr-42".into());
+        let root = std::env::temp_dir().join(format!("trix-control-check-{me}"));
+        for op in [crate::workflow::engine::Op::Approve, crate::workflow::engine::Op::Start, crate::workflow::engine::Op::Submit { node: "judge".into(), report: "{}".into() }] {
+            let e = crate::workflow::engine::handle(&root, Some(&check), Some("issue-to-pr-42"), op, &app.config.workflows.agents).unwrap_err();
+            assert!(e.contains("a check runs code the agents wrote"), "{e}");
+        }
+        // A sandboxed agent hands in and asks, and runs nothing.
+        let wf = |op| Request::Wf { run: Some("issue-to-pr-42".into()), op };
+        assert!(outside_the_sandbox(&wf(crate::workflow::engine::Op::Submit { node: "judge".into(), report: "{}".into() })).is_none());
+        assert!(outside_the_sandbox(&wf(crate::workflow::engine::Op::Ask { text: "?".into() })).is_none());
+        for op in [crate::workflow::engine::Op::Approve, crate::workflow::engine::Op::Start, crate::workflow::engine::Op::Abort, crate::workflow::engine::Op::Revoke] {
+            assert!(outside_the_sandbox(&wf(op)).is_some());
+        }
+        assert!(outside_the_sandbox(&Request::CheckPid { pid: 1 }).is_some());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

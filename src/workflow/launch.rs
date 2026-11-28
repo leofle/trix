@@ -115,7 +115,14 @@ fn resolve(
 }
 
 /// What your config and the matrix say now: a run keeps to it.
-pub fn opts(w: &Workflow, m: &Matrix, settings: &Settings, trusted: bool, repo_name: &str) -> Opts {
+pub fn opts(
+    w: &Workflow,
+    m: &Matrix,
+    ctx: &Ctx,
+    settings: &Settings,
+    trusted: bool,
+    repo_name: &str,
+) -> Opts {
     Opts {
         approvals: trusted && settings.approvals.allow.contains(&w.name),
         ci_paths: settings.ci_paths.clone(),
@@ -127,6 +134,12 @@ pub fn opts(w: &Workflow, m: &Matrix, settings: &Settings, trusted: bool, repo_n
         on_finish: settings.on_finish.clone(),
         repo_name: repo_name.into(),
         max_depth: settings.agents.max_depth,
+        decision: m
+            .0
+            .keys()
+            .filter(|k| m.decision(k, &ctx.installed) == super::caps::Level::Verified)
+            .cloned()
+            .collect(),
         state_from: m
             .0
             .iter()
@@ -192,7 +205,7 @@ pub fn start(
         l.repo.to_path_buf(),
         &base,
         inputs,
-        opts(w, l.m, l.settings, l.trusted, &repo_name),
+        opts(w, l.m, l.ctx, l.settings, l.trusted, &repo_name),
         env.now(),
     );
     // Whether checks will come for a commit: they're on the base's head.

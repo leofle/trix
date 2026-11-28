@@ -22,6 +22,7 @@ pub fn opts() -> Opts {
         on_finish: Vec::new(),
         repo_name: "acme/app".into(),
         max_depth: 2,
+        decision: vec!["claude".into()],
         state_from: [
             ("claude", "hooks"),
             ("codex", "hooks"),
@@ -119,10 +120,10 @@ pub fn edit(w: &mut World, r: &WfRun, node: &str, file: &str, text: &str) -> Str
     w.commit(&dir, &format!("{node}: {file}"))
 }
 
-const READY: &str = r#"{"verdict": "ready", "summary": "added the reset"}"#;
+pub const READY: &str = r#"{"verdict": "ready", "summary": "added the reset"}"#;
 
 /// To the implementer at work on its first visit.
-fn begun(name: &str, o: Opts) -> (World, WfRun) {
+pub fn begun(name: &str, o: Opts) -> (World, WfRun) {
     let mut w = World::new(name);
     let mut r = start(&mut w, issue_to_pr(), o);
     tick(&mut w, &mut r);
@@ -136,7 +137,7 @@ fn begun(name: &str, o: Opts) -> (World, WfRun) {
 }
 
 /// From there to the gate's turn: a green check, the reviewer's and the judge's pass.
-fn to_gate(w: &mut World, r: &mut WfRun) {
+pub fn to_gate(w: &mut World, r: &mut WfRun) {
     edit(w, r, "implementer", "src/done", "ok\n");
     submit(w, r, "implementer", READY).unwrap();
     ticks(w, r, 3);
@@ -154,7 +155,7 @@ fn to_gate(w: &mut World, r: &mut WfRun) {
     assert_eq!(r.active, ["gate"], "{:?}", r.log);
 }
 
-fn done(w: World) {
+pub fn done(w: World) {
     let _ = std::fs::remove_dir_all(&w.base);
 }
 
@@ -1355,9 +1356,9 @@ fn a_run_starts_checked_with_its_inputs_resolved_and_its_snapshot_taken() {
         },
         ..Default::default()
     };
-    assert!(super::launch::opts(&issue_to_pr(), &m, &on, true, "acme/app").approvals);
+    assert!(super::launch::opts(&issue_to_pr(), &m, &ctx, &on, true, "acme/app").approvals);
     assert!(
-        !super::launch::opts(&issue_to_pr(), &m, &on, false, "acme/app").approvals,
+        !super::launch::opts(&issue_to_pr(), &m, &ctx, &on, false, "acme/app").approvals,
         "not when it isn't trusted"
     );
     done(w);

@@ -19,6 +19,7 @@ pub mod policy;
 pub mod probe;
 pub mod prompt;
 pub mod runner;
+pub mod sched;
 pub mod settings;
 pub mod store;
 pub mod summary;
@@ -30,6 +31,8 @@ pub mod view;
 mod check_tests;
 #[cfg(test)]
 pub mod engine_tests;
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 pub mod replay;
 

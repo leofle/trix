@@ -96,6 +96,8 @@ pub enum Ask {
     Setup,
     /// A join wanted every part and got some: c goes on with those.
     Partial,
+    /// An agent pane started the run, and `[workflows.agents] run` is ask: y starts it.
+    Launch,
 }
 
 impl Ask {
@@ -111,6 +113,7 @@ impl Ask {
             Ask::Floor => &[('y', "let it through, for this run only"), ('a', "abort")],
             Ask::Setup => &[('r', "try again"), ('a', "abort")],
             Ask::Partial => &[('c', "go on with what succeeded"), ('a', "abort")],
+            Ask::Launch => &[('y', "start it"), ('a', "abort")],
         }
     }
 }
@@ -262,6 +265,10 @@ pub struct Opts {
     /// How deep a run started by a run may go.
     #[serde(default)]
     pub max_depth: u32,
+    /// The kinds whose hook decision is verified for the installed
+    /// version: only there may a rule answer a permission prompt.
+    #[serde(default)]
+    pub decision: Vec<String>,
 }
 
 /// A question an agent asked, waiting for the supervisor or for you.
@@ -341,6 +348,10 @@ pub struct WfRun {
     /// The agent pane that started it, if one did.
     #[serde(default)]
     pub started_by: Option<String>,
+    /// The hooks and the git settings that run commands, as they were when
+    /// the run began (`policy::fingerprint`).
+    #[serde(default)]
+    pub fingerprint: Option<BTreeMap<String, String>>,
     /// The blackboard: what nodes wrote for the rest of the run to read.
     #[serde(default)]
     pub board: BTreeMap<String, serde_json::Value>,
@@ -496,6 +507,7 @@ impl WfRun {
             parent: None,
             depth: 0,
             started_by: None,
+            fingerprint: None,
             board: BTreeMap::new(),
             finished: Vec::new(),
             log: Vec::new(),
@@ -2228,6 +2240,7 @@ impl Run for WfRun {
                     self.gate.let_through.push(floor);
                 }
             }
+            Ask::Launch => self.note(env, "started, as you said"),
             Ask::Partial => {
                 if let Some(part) = self.limit.take() {
                     self.note(env, "going on with what succeeded, as you said");
@@ -2314,6 +2327,10 @@ impl Run for WfRun {
     }
 
     fn visit(&mut self, root: &Path, env: &mut dyn Env, seen: &[Seen]) -> bool {
+        // What could make git run a command behind trix's back, as it is now.
+        if self.fingerprint.is_none() && self.workflow.policy.push != Push::Allow {
+            self.fingerprint = Some(super::policy::fingerprint(env, &self.repo));
+        }
         // Text from outside the project: you read it first, once.
         if !self.trusted_input
             && let Some(who) = self.outsiders()
@@ -2517,6 +2534,19 @@ pub enum Op {
     Pause,
     Resume,
     Revoke,
+    /// A PermissionRequest hook asks whether a rule covers this one request.
+    Decide {
+        tool: String,
+        command: String,
+        cwd: String,
+    },
+    /// The run's pane is about to start: an agent pane may only as `[workflows.agents]` says.
+    Start,
+    /// Trust a workflow as it is now: yours only.
+    Trust {
+        name: String,
+        hash: String,
+    },
 }
 
 /// The run an agent's pane belongs to: its panes are named after it.
@@ -2617,6 +2647,16 @@ pub fn handle(
             "{what} can't submit, ask, approve, send or start runs: a check runs code the agents wrote"
         ));
     }
+    if let Op::Trust { name, hash } = &op {
+        if let Some(who) = asker {
+            return Err(format!(
+                "{} can't trust a workflow: only the user does",
+                who.said()
+            ));
+        }
+        super::policy::trust(&super::policy::trust_file(), name, hash)?;
+        return Ok((format!("trusted {name} as it is now\n"), None));
+    }
     let pane = asker.map(crate::control::Asker::name);
     let found = match (run, pane) {
         (Some(id), _) => load(root, id).map(|r| {
@@ -2698,6 +2738,30 @@ pub fn handle(
                 None,
             ))
         }
+        Op::Decide { tool, command, cwd } => {
+            if mine.is_empty() {
+                return Err("not a node's agent".into());
+            }
+            Ok(
+                match super::policy::decide(&r, &mine, &tool, &command, &cwd) {
+                    Ok(rule) => {
+                        let sha = r.nodes[&mine].start.clone().unwrap_or_default();
+                        let entry = serde_json::json!({"what": format!("{tool}: {command}"), "kind": "permission", "node": mine,
+                        "approver": "rule", "rule": format!("approvals.permissions[{rule}]"), "tool": tool, "command": command,
+                        "cwd": cwd, "sha": sha});
+                        super::policy::audit(root, &r, entry, crate::prices::now());
+                        ("allow\n".to_string(), None)
+                    }
+                    // Not allowed by a rule: the prompt is yours, as it always was.
+                    Err(why) => (format!("ask: {why}\n"), None),
+                },
+            )
+        }
+        Op::Start => {
+            super::policy::agent_start(policy, root, &r, asker)?;
+            Ok((format!("run {id}: starting\n"), None))
+        }
+        Op::Trust { .. } => unreachable!(),
         // Yours only, from every agent pane: a gate, and what a run asks.
         Op::Approve | Op::Answer { .. } | Op::Revoke if asker.is_some() => Err(format!(
             "{} can't approve, answer or revoke a run: the user does, in the run's pane, or with trix workflow approve from a terminal",

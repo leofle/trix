@@ -26,7 +26,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 7 | Matrix probes | 77e9fd5 (with 8) | pass |
 | 8 | Generic nodes and prompting | 77e9fd5 (with 7) | pass |
 | 9 | Workspaces and landing | 871528d | pass |
-| 10 | Composition | (this) | pass |
+| 10 | Composition | a899ab0 | pass |
+| 11 | Policy, approvals and autopilot | (this) | pass |
 
 ## Step 1: baseline
 
@@ -631,6 +632,109 @@ Tests added: 3, and one checker case. Suite: 793 passed. Deferred: nothing.
 
 Tests added: 4. Suite: 797 passed. Deferred: the polling loop for triggers
 (step 13).
+
+## Step 11: policy, approvals and autopilot
+
+**Built** (`src/workflow/policy.rs`, and the engine, server and hook client)
+
+- **Floors on trix's own actions** (on by default, not removable; a
+  workflow or your config can only add): trix's push is a plain one of the
+  checked commit, never forced; no merge into a protected branch without
+  green CI on the checked commit, whoever approved (a branch whose
+  protection can't be asked counts as protected); no push of a change to CI
+  configuration without you, released for that run only by `trix workflow
+  approve`. Two opt-in floors: `push_without_you`, `merge_without_you`.
+- **The hooks fingerprint**: the repository's hooks and `core.hooksPath`,
+  `core.fsmonitor`, `core.sshCommand`, `credential.helper`, taken when the
+  run begins (under `push: guarded` and `gate_only`) and held against
+  before trix's own push, land and merge. A change parks the run and says
+  what changed.
+- **The guard** on every agent pane (`Request::SpawnGuarded`, a new request
+  so an old server hangs up instead of starting the pane unguarded) and on
+  every check. A check runs in a process of its own with trix's variables
+  removed, and its pid is registered with the server (`Request::CheckPid`):
+  the server's ancestry walk finds a registered check before any pane, so a
+  request from it, or from anything it starts, is `Asker::Check`, refused
+  for every operation. `push: allow` gets no guard, as today.
+- **Rule approvers through the hook.** `trix hook claude` (and codex), on a
+  PermissionRequest, asks the server whether a rule of the run covers this
+  one request. Allow is printed for the backend; anything else (no rule, a
+  floor, revoked, approvals off, the hook not verified for the installed
+  version, a timeout, no server) prints nothing, and the prompt is yours as
+  before. Nothing is typed into a pane. A push or a merge is never a
+  rule's. **Codex's decision isn't verified** (step 7), so no rule fires on
+  Codex.
+- **Merge approver nodes** (from step 8) with the two switches: the
+  workflow's `approvals` block, and its name in `[approvals] allow` plus a
+  trusted file.
+- **Trust by hash** (`trix workflow trust`): a file runs only as you
+  trusted it; the hash covers the workflow, the workflows its nodes run and
+  the arguments its profiles resolve to. A built-in is trusted by where it
+  was found, never by what a file says of itself. Only you trust: the
+  server refuses it from agent panes and checks.
+- **`[workflows.agents]`**: an agent pane starts a run only as `run` says
+  (`ask`: the run asks you first, in its pane), stops or resumes only as
+  `stop` and `resume` say, only its own runs under `scope = "own"`, and no
+  deeper than `max_depth`. A gate is never an agent's.
+- **Audit** (`approvals.jsonl`): every approval with time, run, node, kind,
+  approver, rule, the exact tool and command, cwd, branch and SHA.
+  **Revoke** drops every approval back to ask at once.
+- **The autopilot preset** (`trix workflow autopilot <name> [--yes]`):
+  refused while the checker shows an error; shows what each node will do
+  unattended (covered by its profile, covered by rules, will park on
+  prompts); writes limits that park, the merge approver (a judge, else a
+  verifier, else a gatekeeper; yours when only an author could), and a
+  catch-all rule that asks. It writes no rule that allows a tool.
+
+**Accept** (`workflow::policy_tests`, 9 tests, and one in `control.rs`)
+
+- The decision is tied to the request (one synchronous request and reply
+  for one tool, command and place), and a hook timeout falls back to ask:
+  `a_rule_answers_one_request_through_the_hook_and_everything_else_asks`.
+- No code path types approval keys: an approver node's and a rule's
+  approvals return no key (asserted), and the end-to-end run types none.
+- Outside agent panes can't approve; self-approval and missing approvers
+  are refused (checker, and `approver()` at the gate).
+- **A planted test in a check** that runs `git push --force`, `gh pr merge`
+  and `trix workflow approve` fails on all three, with a fake `gh` on PATH
+  that succeeds only when it finds a login; the fixture remote and PR are
+  unchanged: `a_planted_test_cant_push_merge_or_approve`. The same test
+  under `push: allow` pushes and merges, which shows the guard is what
+  stopped it.
+- A planted pre-push hook makes the gate park before its push:
+  `a_planted_pre_push_hook_parks_the_gate_before_its_push`.
+- A commit that changes `.github/workflows/` parks the gate for you before
+  its push, an approver node can't release it, and `trix workflow approve`
+  releases it for that run only:
+  `a_ci_config_change_parks_the_gate_for_you_and_no_approver_can_release_it`.
+- A Claude profile with `Bash(npm test:*)` is labelled guarded and one with
+  only safe-list commands enforced (step 6's `only_a_safe_list_profile_is_enforced`).
+- `push: allow` panes get no guard (asserted in the planted test).
+- The preset on issue-to-pr passes check with zero errors and has no dead
+  rules: `the_autopilot_preset_passes_check_and_has_no_dead_rules`.
+- An audit entry exists for every approval: by the approver node, by you,
+  for a floor, for a permission rule (asserted in each test).
+
+**What the planted-test proof is, exactly.** In the test the check's
+`trix` is a stand-in on PATH that records the call and fails; the server's
+refusal is proven separately, on the real code: `engine::handle` refuses
+`Asker::Check` for every operation, and
+`control::tests::a_check_and_what_it_starts_are_nobodys_whatever_pane_runs_them`
+shows with real process ancestry that a registered check's child resolves
+to the check before the pane above it. There is no end-to-end test with a
+live server and a real `trix` binary in a check.
+
+**Decisions**
+
+- A sandboxed agent can hand in and ask. Starting and stopping runs is
+  refused for it unless `[approvals] allow_sandboxed = true`; approving is
+  refused always.
+- The CI-config floor compares the checked commit with the base as origin
+  has it (`origin/<base>...<sha>`).
+- The preset writes no tool-allowing rule (the PRD's `npm install` example
+  is one a user adds): a rule trix invents would be an approval nobody chose.
+
+Tests added: 10. Suite: 807 passed. Deferred: nothing.
 
 ## Decisions to review
 

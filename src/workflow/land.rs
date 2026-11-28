@@ -176,6 +176,12 @@ pub fn land_node(run: &mut WfRun, env: &mut dyn Env, id: &str) {
     if writers.iter().any(|w| run.active.contains(w)) {
         return;
     }
+    // Trix's own git work: not past a hook or a setting that changed mid-run.
+    if run.workflow.policy.push != super::model::Push::Allow
+        && let Some(why) = super::policy::fingerprint_changed(run, env)
+    {
+        return run.park(env, why);
+    }
     let order: Vec<String> = run
         .finished
         .iter()

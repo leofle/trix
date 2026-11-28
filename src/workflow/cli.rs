@@ -27,6 +27,9 @@ usage:
   trix workflow approve <run>               yours only: refused from every agent pane and check
   trix workflow answer <run> <key>          answer what a run asks, as in its pane
   trix workflow revoke <run>                mid-run: every approval drops back to ask
+  trix workflow trust <name>                yours only: trust a workflow file as it is now
+  trix workflow autopilot <name> [--yes]    show what each node will do unattended, then (with
+                                            --yes) switch the workflow to autopilot
   trix wf submit <node> [--file F]          for the agents: hand in a report, JSON on stdin
   trix wf ask [--file F]                    for the agents: a question for the supervisor node;
                                             @node queues it to that node's inbox
@@ -61,6 +64,11 @@ pub enum Cmd {
     Pause(String),
     Resume(String),
     Revoke(String),
+    Trust(String),
+    Autopilot {
+        name: String,
+        yes: bool,
+    },
     Answer {
         id: String,
         key: char,
@@ -134,6 +142,15 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         ["pause", x] => Ok(Cmd::Pause(id(x))),
         ["resume", x] => Ok(Cmd::Resume(id(x))),
         ["revoke", x] => Ok(Cmd::Revoke(id(x))),
+        ["trust", x] => Ok(Cmd::Trust(id(x))),
+        ["autopilot", x] => Ok(Cmd::Autopilot {
+            name: id(x),
+            yes: false,
+        }),
+        ["autopilot", x, "--yes"] | ["autopilot", "--yes", x] => Ok(Cmd::Autopilot {
+            name: id(x),
+            yes: true,
+        }),
         ["answer", x, key] if key.chars().count() == 1 => Ok(Cmd::Answer {
             id: id(x),
             key: key.chars().next().unwrap_or(' ').to_ascii_lowercase(),
@@ -270,6 +287,41 @@ pub fn as_case(cmd: &Cmd, is_case: impl Fn(&str) -> bool) -> Option<Vec<String>>
     }
 }
 
+/// The workflows a workflow's workflow nodes name, all the way down.
+pub fn subs(stores: &Stores, w: &Workflow) -> Result<Vec<Workflow>, String> {
+    let mut names: Vec<String> = w
+        .nodes
+        .values()
+        .filter_map(|n| n.workflow.clone().filter(|_| n.kind == "workflow"))
+        .collect();
+    let (mut seen, mut out) = (std::collections::BTreeSet::new(), Vec::new());
+    while let Some(name) = names.pop() {
+        if seen.insert(name.clone()) {
+            let (sub, _) = stores.load(&name)?;
+            names.extend(
+                sub.nodes
+                    .values()
+                    .filter_map(|n| n.workflow.clone().filter(|_| n.kind == "workflow")),
+            );
+            out.push(sub);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Whether a workflow is trusted as it is now: a built-in is, a file is
+/// when its content is what you trusted.
+pub fn trusted(stores: &Stores, w: &Workflow, builtin: bool) -> Result<bool, String> {
+    let hash = super::policy::content_hash(w, &subs(stores, w)?);
+    Ok(super::policy::is_trusted(
+        &super::policy::trust_file(),
+        w,
+        &hash,
+        builtin,
+    ))
+}
+
 fn fail(e: impl std::fmt::Display) -> i32 {
     eprintln!("trix: workflow: {e}");
     1
@@ -377,8 +429,11 @@ pub fn run(args: &[String]) -> i32 {
                 return fail("not in a git repository");
             };
             let stores = Stores::of(Some(&repo));
-            let started = stores.load(&name).and_then(|(w, _)| {
-                let (m, ctx, settings) = live()?;
+            let started = stores.load(&name).and_then(|(w, origin)| {
+                let (m, mut ctx, settings) = live()?;
+                // A file runs only as you trusted it: a change since then needs your trust again.
+                let trusted = trusted(&stores, &w, origin == super::store::Origin::Builtin)?;
+                ctx.trusted = Some(trusted);
                 let mut env = Live::looking("workflow");
                 let l = super::launch::Launch {
                     stores: &stores,
@@ -386,10 +441,16 @@ pub fn run(args: &[String]) -> i32 {
                     m: &m,
                     ctx: &ctx,
                     settings: &settings,
-                    trusted: true,
+                    trusted,
                 };
                 let run = super::launch::start(&mut env, &root, &l, &w, &inputs)?;
-                if let Err(e) = env.open_run(&run.id, &repo) {
+                // The server says whether this pane may start it: an agent's only as
+                // [workflows.agents] allows.
+                let allowed = control(Request::Wf {
+                    run: Some(run.id.clone()),
+                    op: Op::Start,
+                });
+                if let Err(e) = allowed.and_then(|_| env.open_run(&run.id, &repo)) {
                     let _ = std::fs::remove_dir_all(engine::dir_of(&root, &run.id));
                     return Err(e);
                 }
@@ -493,6 +554,39 @@ pub fn run(args: &[String]) -> i32 {
         Cmd::Resume(id) => wf(id, Op::Resume),
         Cmd::Revoke(id) => wf(id, Op::Revoke),
         Cmd::Answer { id, key } => wf(id, Op::Answer { key }),
+        Cmd::Trust(name) => {
+            let stores = Stores::of(main_checkout().as_deref());
+            say(stores.load(&name).and_then(|(w, _)| {
+                let hash = super::policy::content_hash(&w, &subs(&stores, &w)?);
+                control(Request::Wf {
+                    run: None,
+                    op: Op::Trust { name, hash },
+                })
+            }))
+        }
+        Cmd::Autopilot { name, yes } => {
+            let stores = Stores::of(main_checkout().as_deref());
+            say(stores.load(&name).and_then(|(mut w, origin)| {
+                let (m, ctx, _) = live()?;
+                let before = check::check(&w, &m, &ctx);
+                // Autopilot can't be switched on while the checker shows an error.
+                if before.errors() > 0 {
+                    return Err(format!("fix these first:\n{}", before.render()));
+                }
+                let nodes = super::policy::autopilot(&mut w, &m, &ctx, "", "main");
+                let mut out = super::policy::preview_text(&w, &nodes);
+                out.push_str(&check::check(&w, &m, &ctx).render());
+                if yes {
+                    let path = stores.save(&w, origin)?;
+                    let hash = super::policy::content_hash(&w, &subs(&stores, &w)?);
+                    control(Request::Wf { run: None, op: Op::Trust { name: w.name.clone(), hash } })?;
+                    out.push_str(&format!("saved {}: add \"{}\" to [approvals] allow in your config to switch its approvals on\n", crate::app::tilde(&path), w.name));
+                } else {
+                    out.push_str("nothing was changed: --yes switches it on\n");
+                }
+                Ok(out)
+            }))
+        }
     }
 }
 
