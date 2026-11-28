@@ -7,10 +7,6 @@
 //! and saying what the pane is doing. What a node does is the run's own
 //! (`visit`): triage's built-in kinds, or a workflow's generic nodes.
 
-// Beside triage's own runner until its tests are ported and it's switched
-// over (the next two commits): only the replay drives this one yet.
-#![allow(dead_code)]
-
 use super::env::{Env, Live, Seen};
 use std::path::Path;
 

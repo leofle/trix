@@ -18,7 +18,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | Step | What | Commit | Result |
 |---|---|---|---|
 | 1 | Baseline | 5843b50 | pass |
-| 2 | Seeded replay and goldens of today's triage | (next) | pass |
+| 2 | Seeded replay and goldens of today's triage | a39b7a0 | pass |
+| 3 | Generic runner extracted, the triage tests ported (three green commits) | 1d928ee, aba1465, (this) | pass |
 
 ## Step 1: baseline
 
@@ -132,6 +133,42 @@ Tests added: none. Deferred: nothing.
   commit> -- tests/goldens/triage` must stay empty.
 - Tests added: 14 replay scenarios. Suite: 723 passed. Deferred: nothing.
 
+## Step 3: the generic runner, and the triage tests ported
+
+Three commits, each green (suite, clippy, new code rustfmt-clean):
+
+- **A (`1d928ee`): the generic runner, beside triage's own.**
+  - `src/workflow/env.rs`: the `Env` trait (unchanged: `now`, `git`, `gh`,
+    `spawn`, `open_case`, `send`, `close`, `agents`, `answer`, `say`,
+    `print`), `Seen`, `AgentSpec` (triage's `RoleAgent` is this type), and
+    `Live`, the real world.
+  - `src/workflow/runner.rs`: the `Run` trait and the generic `step` and
+    `run_pane`. The runner owns what every run shares: looking at the
+    agents, closing the panes whose node handed in (pane lifetime), taking
+    your answers and `a` to abort, the limits, and saying what the pane is
+    doing. What the nodes do is the run's own `visit`.
+  - `src/case.rs`: triage's `step` was first split into its parts
+    (`meanwhile`, `answered`, `over_budget`, `visit`) with no change in
+    behaviour, then `impl Run for Case` puts the case on the generic
+    runner. Triage's own `step` still drove `trix case run` in this commit.
+  - Every replay scenario ran on **both** runners against the one golden
+    (28 replays), so the two were shown equal before anything switched.
+- **B (`aba1465`): the 45 tests ported.** They drive the case through
+  `workflow::runner::step` and no longer through triage's own. Same names,
+  every assertion kept: `docs/workflows/assert-counts.sh src/case.rs` gives
+  the same 45 lines as at baseline, 375 assertions. The port is its own
+  commit and it's small, because the generic `step` takes the same three
+  arguments: the diff is the import.
+- **C (this commit): switched over, the old runner deleted.** `trix case
+  run <id>` is `runner::run_pane::<Case>`. Triage's own `step` and
+  `run_pane` are gone: no second runner remains. The replay runs on the
+  generic runner only.
+- **Accept:** every commit green; assertion counts equal (45 tests, 375
+  assertions, before and after); the port is its own commit; replay is
+  identical after C (`git diff a39b7a0 -- tests/goldens/triage` is empty).
+- Tests added: none (14 replays temporarily doubled in A). Suite: 723.
+  Deferred: nothing.
+
 ## Decisions to review
 
 - **D1. BUILD.md is at the repository root.** The PRD says
@@ -154,3 +191,7 @@ Tests added: none. Deferred: nothing.
   `init.templateDir` to a template without `info/`. It passes with the
   personal config out of the way, and in CI. The test wasn't changed.
 - **D4. The triage tests number 45, not 46** (see step 1).
+- **D5. `Env::open_case` still takes a triage `Case`.** It's what triage's
+  "a builder starts a fresh PR" uses, and the PRD lists it as part of the
+  existing seam. Workflow runs start their sub-runs through `Env::open_run`
+  (step 10), added beside it.

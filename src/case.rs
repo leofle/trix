@@ -1691,62 +1691,6 @@ fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<Strin
     }
 }
 
-/// One look at the case: take what came in, start what's next, ask you
-/// what only you decide. Called every couple of seconds; returns whether
-/// the case changed.
-pub fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
-    let before = c.clone();
-    let mut seen = env.agents().unwrap_or_default();
-    // Close those done with their part, once they've stopped working.
-    let mut closed = Vec::new();
-    for name in c.closing.clone() {
-        match seen.iter().find(|a| a.name == name) {
-            None => closed.push(name),
-            Some(a) if a.state != "working" && a.state != "starting" => {
-                if env.close(&name, false).is_ok() {
-                    c.spent_closed += a.cost;
-                    closed.push(name);
-                }
-            }
-            Some(_) => {}
-        }
-    }
-    c.closing.retain(|n| !closed.contains(n));
-    // Their cost is in spent_closed now, not to be counted again.
-    seen.retain(|a| !closed.contains(&a.name));
-    if c.stage.over() {
-        return *c != before;
-    }
-
-    if meanwhile(c, root, env, &seen) {
-        return true;
-    }
-    if let Some(a) = c.ask {
-        let Some(key) = env.answer() else { return *c != before };
-        if key == 'a' {
-            abort(c, env, &seen);
-            return true;
-        }
-        if !c.keys(a).iter().any(|(k, _)| *k == key) {
-            return *c != before;
-        }
-        answered(c, root, env, &seen, a, key);
-        return true;
-    }
-
-    if over_budget(c, env, &seen) {
-        return true;
-    }
-    if visit(c, root, env, &seen) {
-        return true;
-    }
-    // At the gate, it says what it waits for itself.
-    if c.ask.is_none() && !c.stage.over() && c.stage != Stage::Gate {
-        env.say("Working", &format!("{} · {}", c.id, c.status()));
-    }
-    *c != before
-}
-
 /// What came in while the case asks you something: a report after all,
 /// the other reviewer going on, a PR that merged on GitHub. True: the case
 /// finished here.
@@ -2850,7 +2794,6 @@ impl Run for Case {
 
 /// What the case's pane shows as it starts: the case, its log so far, and
 /// what it asks.
-#[allow(dead_code)] // the generic runner's pane: not switched over yet
 fn banner(c: &Case) -> String {
     let url = c.pr.as_ref().map(|p| p.url.clone()).or(c.issue.as_ref().map(|i| i.url.clone())).unwrap_or_default();
     let builder = if c.pr.is_none() && c.issue.is_some() { format!("Builder {}, reviewer", c.builder.agent) } else { "Reviewer".into() };
@@ -2868,60 +2811,6 @@ fn banner(c: &Case) -> String {
         s.push_str(&format!("needs you: {}  [{}]  (type the key, then enter)\n", c.why, keys.join(" · ")));
     }
     s
-}
-
-// ───────────────────────────── the real world ─────────────────────────────
-
-/// `trix case run <id>`: the case's pane. Runs until the case is over, then
-/// stays, so its log is there to read.
-pub fn run_pane(id: &str) -> i32 {
-    let root = root();
-    let mut c = match load(&root, id) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("trix: {e}");
-            return 1;
-        }
-    };
-    let mut env = Live::in_pane("triage");
-    let url = c.pr.as_ref().map(|p| p.url.clone()).or(c.issue.as_ref().map(|i| i.url.clone())).unwrap_or_default();
-    let builder = if c.pr.is_none() && c.issue.is_some() { format!("Builder {}, reviewer", c.builder.agent) } else { "Reviewer".into() };
-    let reviewers = match &c.reviewer2 {
-        Some(r2) => format!("{builder}s {} and {}", c.reviewer.agent, r2.agent),
-        None => format!("{builder} {}", c.reviewer.agent),
-    };
-    println!("trix triage · {} · {} {}\n{}\n{reviewers}, fixer {}, gatekeeper {} · budget {} · up to {}\n", c.id, c.subject(), c.title(), clean(&url), c.fixer.agent, c.gatekeeper.agent, crate::cost::usd(c.budget), plural(c.max_rounds as usize, "round"));
-    for (at, text) in &c.log {
-        let (_, _, secs) = crate::ledger::local(*at);
-        println!("{:02}:{:02}  {text}", secs / 3600, secs / 60 % 60);
-    }
-    if let Some(a) = c.ask {
-        env.say("Question", &format!("{} · {}", c.id, c.why));
-        let keys: Vec<String> = c.keys(a).iter().map(|(k, w)| format!("{k}: {w}")).collect();
-        println!("needs you: {}  [{}]  (type the key, then enter)", c.why, keys.join(" · "));
-    }
-    // Restored with the workspace: let restore bring the case's agents
-    // back before looking for them, or they'd be started twice.
-    if !c.log.is_empty() && !c.stage.over() {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
-    let mut said_over = false;
-    loop {
-        if step(&mut c, &root, &mut env) {
-            if let Err(e) = store(&root, &c) {
-                eprintln!("trix: {e}");
-            }
-            if c.ask.is_some() {
-                println!("(type the key, then enter)");
-            }
-        }
-        if c.stage.over() && c.closing.is_empty() && !said_over {
-            said_over = true;
-            println!("\nCase {} is {}. Its log stays here; close the pane when you're done with it.", c.id, c.stage.label());
-            env.say("Finished", &format!("{} · {}", c.id, c.stage.label()));
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
 }
 
 // ───────────────────────────── the command line ─────────────────────────────
@@ -3258,7 +3147,8 @@ pub fn run(args: &[String]) -> i32 {
             let live = Live::looking("triage").agents().unwrap_or_default();
             show(&c).replacen('\n', &format!("\n{}\n", spent_line(&c, &live)), 1)
         })),
-        ["run", id] => run_pane(id),
+        // The case's pane: the generic runner, driving the case.
+        ["run", id] => crate::workflow::runner::run_pane::<Case>(&root, id),
         ["approve", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Approve })),
         ["abort", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Abort })),
         ["answer", id, key] if key.chars().count() == 1 => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Answer { key: key.chars().next().unwrap_or(' ').to_ascii_lowercase() } })),
@@ -3392,7 +3282,6 @@ fn show(c: &Case) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The generic runner drives the case in every test here.
     use crate::workflow::runner::step;
 
     #[derive(Default)]

@@ -6,8 +6,8 @@
 //! the case folder (`case.json` and the report files) and the repository
 //! (worktrees, branches and refs, here and on origin). The goldens were
 //! recorded against the triage runner of 1.7.8, before any of it moved,
-//! and are never recorded again: every later runner must replay them
-//! identically. `TRIX_BLESS=1` writes a golden that doesn't exist yet, and
+//! and are never recorded again: the generic runner that drives triage
+//! now must replay them identically. `TRIX_BLESS=1` writes a golden that doesn't exist yet, and
 //! refuses to overwrite one that does.
 
 use crate::case::{self, Ask, Case, Env, Op, Pr, Role, RoleAgent, Seen, Stage};
@@ -18,34 +18,9 @@ use std::path::{Path, PathBuf};
 /// When every scenario starts.
 pub const T0: u64 = 1_795_000_000;
 
-thread_local! {
-    /// This thread's scenario runs on the generic runner, not triage's own.
-    static GENERIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// The runner under replay: one look at the case.
 fn step(c: &mut Case, root: &Path, env: &mut dyn Env) -> bool {
-    if GENERIC.get() {
-        super::runner::step(c, root, env)
-    } else {
-        case::step(c, root, env)
-    }
-}
-
-/// A scenario, replayed on triage's own runner and on the generic one:
-/// both against the one golden.
-macro_rules! replay {
-    ($old:ident, $new:ident, $scenario:ident) => {
-        #[test]
-        fn $old() {
-            $scenario();
-        }
-        #[test]
-        fn $new() {
-            GENERIC.set(true);
-            $scenario();
-        }
-    };
+    super::runner::step(c, root, env)
 }
 
 /// A pull request as the fake GitHub has it.
@@ -148,10 +123,7 @@ impl World {
     /// A repository with an origin, `main`, and a PR branch `rate-limits`
     /// (PR #12) one commit ahead.
     pub fn new(name: &str) -> World {
-        // Each runner replays the scenario in a world of its own.
-        let which = if GENERIC.get() { "generic" } else { "own" };
-        let base =
-            std::env::temp_dir().join(format!("trix-replay-{name}-{which}-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("trix-replay-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let base = base.canonicalize().unwrap();
@@ -849,12 +821,8 @@ fn to_gate(w: &mut World, c: &mut Case) {
     assert_eq!(c.ask, Some(Ask::Merge), "{}", c.why);
 }
 
-replay!(
-    replay_a_pr_through_two_rounds_to_a_merge,
-    generic_replay_a_pr_through_two_rounds_to_a_merge,
-    a_pr_through_two_rounds_to_a_merge
-);
-fn a_pr_through_two_rounds_to_a_merge() {
+#[test]
+fn replay_a_pr_through_two_rounds_to_a_merge() {
     let mut w = World::new("two-rounds");
     let mut c = w.case(&one());
     to_fixing(&mut w, &mut c);
@@ -892,12 +860,8 @@ fn a_pr_through_two_rounds_to_a_merge() {
     w.finish(&c);
 }
 
-replay!(
-    replay_two_reviewers_side_by_side,
-    generic_replay_two_reviewers_side_by_side,
-    two_reviewers_side_by_side
-);
-fn two_reviewers_side_by_side() {
+#[test]
+fn replay_two_reviewers_side_by_side() {
     let mut w = World::new("two-reviewers");
     let mut c = w.case(&TriageOpts::default());
     w.tick(&mut c);
@@ -932,12 +896,8 @@ fn two_reviewers_side_by_side() {
     w.finish(&c);
 }
 
-replay!(
-    replay_nothing_found_then_the_gate,
-    generic_replay_nothing_found_then_the_gate,
-    nothing_found_then_the_gate
-);
-fn nothing_found_then_the_gate() {
+#[test]
+fn replay_nothing_found_then_the_gate() {
     let mut w = World::new("nothing-found");
     let mut c = w.case(&one());
     w.tick(&mut c);
@@ -956,12 +916,8 @@ fn nothing_found_then_the_gate() {
     w.finish(&c);
 }
 
-replay!(
-    replay_the_round_limit_asks_for_one_more,
-    generic_replay_the_round_limit_asks_for_one_more,
-    the_round_limit_asks_for_one_more
-);
-fn the_round_limit_asks_for_one_more() {
+#[test]
+fn replay_the_round_limit_asks_for_one_more() {
     let mut w = World::new("round-limit");
     let mut c = w.case(&TriageOpts {
         max_rounds: 1,
@@ -999,12 +955,8 @@ fn the_round_limit_asks_for_one_more() {
     w.finish(&c);
 }
 
-replay!(
-    replay_red_ci_at_the_gate,
-    generic_replay_red_ci_at_the_gate,
-    red_ci_at_the_gate
-);
-fn red_ci_at_the_gate() {
+#[test]
+fn replay_red_ci_at_the_gate() {
     let mut w = World::new("ci-failed");
     let mut c = w.case(&one());
     to_fixing(&mut w, &mut c);
@@ -1039,12 +991,8 @@ fn red_ci_at_the_gate() {
     w.finish(&c);
 }
 
-replay!(
-    replay_the_budget_and_an_agent_without_its_report,
-    generic_replay_the_budget_and_an_agent_without_its_report,
-    the_budget_and_an_agent_without_its_report
-);
-fn the_budget_and_an_agent_without_its_report() {
+#[test]
+fn replay_the_budget_and_an_agent_without_its_report() {
     let mut w = World::new("budget-no-report");
     let mut c = w.case(&one());
     w.tick(&mut c);
@@ -1088,12 +1036,8 @@ fn the_budget_and_an_agent_without_its_report() {
     w.finish(&c);
 }
 
-replay!(
-    replay_a_failed_merge_and_a_base_that_moved,
-    generic_replay_a_failed_merge_and_a_base_that_moved,
-    a_failed_merge_and_a_base_that_moved
-);
-fn a_failed_merge_and_a_base_that_moved() {
+#[test]
+fn replay_a_failed_merge_and_a_base_that_moved() {
     let mut w = World::new("merge-failed");
     let mut c = w.case(&one());
     to_gate(&mut w, &mut c);
@@ -1115,12 +1059,8 @@ fn a_failed_merge_and_a_base_that_moved() {
     w.finish(&c);
 }
 
-replay!(
-    replay_a_conflict_with_the_base,
-    generic_replay_a_conflict_with_the_base,
-    a_conflict_with_the_base
-);
-fn a_conflict_with_the_base() {
+#[test]
+fn replay_a_conflict_with_the_base() {
     let mut w = World::new("conflict");
     let mut c = w.case(&TriageOpts {
         max_rounds: 1,
@@ -1154,12 +1094,8 @@ fn a_conflict_with_the_base() {
     w.finish(&c);
 }
 
-replay!(
-    replay_an_agent_that_cant_start,
-    generic_replay_an_agent_that_cant_start,
-    an_agent_that_cant_start
-);
-fn an_agent_that_cant_start() {
+#[test]
+fn replay_an_agent_that_cant_start() {
     let mut w = World::new("setup");
     let mut c = w.case(&one());
     w.refuse.push("triage-12-review".into());
@@ -1174,12 +1110,8 @@ fn an_agent_that_cant_start() {
     w.finish(&c);
 }
 
-replay!(
-    replay_branch_rules_auto_merge_and_admin,
-    generic_replay_branch_rules_auto_merge_and_admin,
-    branch_rules_auto_merge_and_admin
-);
-fn branch_rules_auto_merge_and_admin() {
+#[test]
+fn replay_branch_rules_auto_merge_and_admin() {
     let mut w = World::new("approval");
     let mut c = w.case(&one());
     to_gate(&mut w, &mut c);
@@ -1214,12 +1146,8 @@ fn branch_rules_auto_merge_and_admin() {
     w.finish(&c);
 }
 
-replay!(
-    replay_a_restart_mid_case,
-    generic_replay_a_restart_mid_case,
-    a_restart_mid_case
-);
-fn a_restart_mid_case() {
+#[test]
+fn replay_a_restart_mid_case() {
     let mut w = World::new("restore");
     let mut c = w.case(&TriageOpts::default());
     w.tick(&mut c);
@@ -1299,12 +1227,8 @@ fn start(w: &mut World, input: &str, opts: &TriageOpts) -> Result<Case, String> 
     made
 }
 
-replay!(
-    replay_an_issue_with_several_prs_and_a_fork,
-    generic_replay_an_issue_with_several_prs_and_a_fork,
-    an_issue_with_several_prs_and_a_fork
-);
-fn an_issue_with_several_prs_and_a_fork() {
+#[test]
+fn replay_an_issue_with_several_prs_and_a_fork() {
     let mut w = World::new("choose");
     w.note("a second PR for the issue, on a branch of its own");
     let (repo, sha) = (w.repo.clone(), w.head("rate-limits"));
@@ -1354,12 +1278,8 @@ fn an_issue_with_several_prs_and_a_fork() {
     w.finish(&c);
 }
 
-replay!(
-    replay_an_issue_built_from_nothing,
-    generic_replay_an_issue_built_from_nothing,
-    an_issue_built_from_nothing
-);
-fn an_issue_built_from_nothing() {
+#[test]
+fn replay_an_issue_built_from_nothing() {
     let mut w = World::new("build");
     w.hub.answers = issue_answers(31, "NONE", &[], "MEMBER");
     let mut c = start(&mut w, "#31", &one()).unwrap();
@@ -1418,12 +1338,8 @@ fn an_issue_built_from_nothing() {
     w.finish(&c);
 }
 
-replay!(
-    replay_an_unsolved_issue_handed_to_a_fresh_case,
-    generic_replay_an_unsolved_issue_handed_to_a_fresh_case,
-    an_unsolved_issue_handed_to_a_fresh_case
-);
-fn an_unsolved_issue_handed_to_a_fresh_case() {
+#[test]
+fn replay_an_unsolved_issue_handed_to_a_fresh_case() {
     let mut w = World::new("rebuild");
     w.hub.answers = issue_answers(31, "OWNER", &[12], "MEMBER");
     let mut c = start(&mut w, "31", &one()).unwrap();
