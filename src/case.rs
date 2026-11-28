@@ -483,7 +483,7 @@ impl Case {
         let role = |r: &crate::config::Role| RoleAgent { agent: r.agent.clone(), args: r.args.clone() };
         Case {
             id: id.into(),
-            stage: if pr.is_some() { Stage::Reviewing } else { Stage::Building },
+            stage: entry(pr.is_some()),
             pr,
             issue,
             choices: Vec::new(),
@@ -1601,6 +1601,73 @@ fn ensure_agent(c: &mut Case, role: Role, seen: &[Seen], env: &mut dyn Env) -> b
     }
 }
 
+// ───────────────────────────── the case on its workflow ─────────────────────────────
+
+/// The node of the triage workflow a stage is, by its kind. A case that's
+/// over is at none.
+pub(crate) fn node_of(stage: Stage) -> Option<&'static str> {
+    match stage {
+        Stage::Choosing => Some("gh.resolve_target"),
+        Stage::Building => Some("triage.build"),
+        Stage::Reviewing => Some("triage.review"),
+        Stage::Fixing => Some("triage.fix"),
+        Stage::Verifying => Some("triage.gatekeep"),
+        Stage::Gate => Some("gh.gate"),
+        Stage::Merged | Stage::Aborted => None,
+    }
+}
+
+fn stage_of(kind: &str) -> Option<Stage> {
+    [Stage::Choosing, Stage::Building, Stage::Reviewing, Stage::Fixing, Stage::Verifying, Stage::Gate].into_iter().find(|s| node_of(*s) == Some(kind)).or((kind == crate::workflow::model::DONE).then_some(Stage::Merged))
+}
+
+fn node_kind(role: Role) -> &'static str {
+    match role {
+        Role::Builder => "triage.build",
+        Role::Reviewer | Role::Reviewer2 => "triage.review",
+        Role::Fixer => "triage.fix",
+        Role::Gatekeeper => "triage.gatekeep",
+    }
+}
+
+/// Where the workflow's edge leads from a stage's node on `verdict`.
+pub(crate) fn next_stage(from: Stage, verdict: &str) -> Option<Stage> {
+    crate::workflow::triage::next(node_of(from)?, verdict).and_then(stage_of)
+}
+
+/// Where a case starts: the target's node says `pr` or `issue`, and the
+/// workflow's edge says what follows.
+fn entry(has_pr: bool) -> Stage {
+    next_stage(Stage::Choosing, if has_pr { "pr" } else { "issue" }).expect("the triage template routes its target")
+}
+
+/// The stage's node gave `verdict`: the case goes where the workflow's edge
+/// leads. Nothing in the built-ins says what's next but this. False (and
+/// the case asks) when the workflow has no such edge.
+pub(crate) fn go(c: &mut Case, env: &mut dyn Env, verdict: &str) -> bool {
+    match next_stage(c.stage, verdict) {
+        Some(s) => {
+            c.stage = s;
+            true
+        }
+        None => {
+            ask(c, env, Ask::Setup, format!("the triage workflow has no edge from {} on {verdict}", node_of(c.stage).unwrap_or("a case that's over")));
+            false
+        }
+    }
+}
+
+/// The role's report is in. A node that starts fresh on every visit is done
+/// with its pane, which closes once it stops; one that's reused keeps it,
+/// and its next round is sent there. That's the node's `revisit`: fresh for
+/// the builder, the reviewers and the gatekeeper, reuse for the fixer.
+fn release(c: &mut Case, role: Role, name: &str) {
+    match crate::workflow::triage::revisit(node_kind(role)) {
+        crate::workflow::model::Revisit::Fresh => done_with(c, role, name),
+        crate::workflow::model::Revisit::Reuse => c.watch_mut(role).agent = None,
+    }
+}
+
 /// The role's agent's work is in: close it once it stops, and go on.
 fn done_with(c: &mut Case, role: Role, name: &str) {
     c.watch_mut(role).agent = None;
@@ -1647,7 +1714,7 @@ fn ci(c: &Case, env: &mut dyn Env) -> (Ci, Vec<String>) {
 /// that answers the PR conflicting with its base, however it came (the
 /// gate, the gatekeeper's changes, your r), gets the steps for that, and
 /// the base as origin has it now.
-fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<String>) {
+fn next_round(c: &mut Case, env: &mut dyn Env, verdict: &str, mut what: String, open: Vec<String>) {
     c.round += 1;
     c.open = open;
     if conflicts(c) {
@@ -1661,7 +1728,9 @@ fn next_round(c: &mut Case, env: &mut dyn Env, mut what: String, open: Vec<Strin
             what = format!("{what}\n\n{steps}");
         }
     }
-    c.stage = Stage::Fixing;
+    if !go(c, env, verdict) {
+        return;
+    }
     c.fix = None;
     c.w.nudged = false;
     // Your y was for a commit that's being replaced.
@@ -1725,19 +1794,19 @@ fn answered(c: &mut Case, root: &Path, env: &mut dyn Env, seen: &[Seen], a: Ask,
         Ask::Choose if key == 'n' => {
             note(c, env, "none of those PRs: a builder makes one, as you said");
             c.choices.clear();
-            c.stage = Stage::Building;
+            go(c, env, "issue");
         }
         Ask::Choose => {
             let pr = c.choices[key as usize - '1' as usize].pr.clone();
             note(c, env, format!("triaging PR #{}, as you chose", pr.number));
             c.ci_expected = expects_ci(c, env, &pr.sha);
             c.pr = Some(pr);
-            c.stage = Stage::Reviewing;
+            go(c, env, "pr");
         }
         Ask::Unsolved if key == 'b' => rebuild(c, root, env),
         Ask::Unsolved => {
             note(c, env, "fixing it in place, as you said");
-            c.stage = Stage::Fixing;
+            go(c, env, "unsolved");
         }
         Ask::Outsider => {
             c.trusted = true;
@@ -1747,7 +1816,7 @@ fn answered(c: &mut Case, root: &Path, env: &mut dyn Env, seen: &[Seen], a: Ask,
             note(c, env, "nothing to fix: to the merge gate, as you said");
             // What the reviewer read: nothing pushed since is merged.
             c.checked = Some(c.pr().sha.clone());
-            c.stage = Stage::Gate;
+            go(c, env, "nothing_found");
         }
         Ask::RoundLimit | Ask::CiFailed => {
             c.max_rounds = c.max_rounds.max(c.round + 1);
@@ -1756,7 +1825,7 @@ fn answered(c: &mut Case, root: &Path, env: &mut dyn Env, seen: &[Seen], a: Ask,
                 (Ask::RoundLimit, Some(v)) => verdict_text(v),
                 _ => format!("CI fails on the PR: see gh pr checks {}.", c.pr().number),
             };
-            next_round(c, env, why, open);
+            next_round(c, env, if a == Ask::RoundLimit { "changes" } else { "ci_failed" }, why, open);
         }
         Ask::Budget => {
             c.budget += c.budget_step;
@@ -1901,8 +1970,8 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                     c.ci_expected = fetch(c, env, &base).map_or(true, |sha| expects_ci(c, env, &sha));
                     c.pr = Some(pr);
                     c.build = Some(r);
-                    done_with(c, role, &name);
-                    c.stage = Stage::Reviewing;
+                    release(c, role, &name);
+                    go(c, env, "pushed");
                     c.w.nudged = false;
                 }
                 Err(e) => ask(c, env, Ask::Setup, format!("couldn't open the PR: {}", e.lines().next().unwrap_or("").trim())),
@@ -1937,13 +2006,13 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
                 }
             }
             c.fix = Some(r);
-            c.w.agent = None;
-            c.stage = Stage::Verifying;
+            release(c, role, &name);
+            go(c, env, "pushed");
             c.w.nudged = false;
         }
         Role::Gatekeeper => {
             let Ok(v) = serde_json::from_str::<Verdict>(text) else { return };
-            done_with(c, role, &name);
+            release(c, role, &name);
             c.findings.extend(v.new.iter().cloned().map(|f| Finding { by: vec![format!("gatekeeper {}", f.id)], also: None, ..f }));
             c.optional.extend(v.optional.iter().cloned().map(|o| Optional { by: Some(format!("gatekeeper {}", c.round)), ..o }));
             if v.solves.is_some() {
@@ -1955,9 +2024,9 @@ fn take(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, text: &str) {
             let what = verdict_text(&v);
             c.verdict = Some(v);
             if pass {
-                c.stage = Stage::Gate;
+                go(c, env, "pass");
             } else if c.round < c.max_rounds {
-                next_round(c, env, what, failing);
+                next_round(c, env, "changes", what, failing);
             } else {
                 c.open = failing;
                 ask(c, env, Ask::RoundLimit, format!("{} done and the gatekeeper still asks for changes", plural(c.round as usize, "round")));
@@ -1995,7 +2064,7 @@ fn take_review(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, name: &
         let opt = if optional > 0 { format!(" ({optional} optional)") } else { String::new() };
         if n == 0 && c.issue.is_none() {
             c.review_mut(role).unwrap().done = true;
-            done_with(c, role, name);
+            release(c, role, name);
             note(c, env, format!("the {label} found nothing must-fix{opt}"));
             return reviews_in(c, env);
         }
@@ -2016,7 +2085,7 @@ fn take_review(c: &mut Case, root: &Path, env: &mut dyn Env, role: Role, name: &
         return;
     }
     let Ok(r) = serde_json::from_str::<Verified>(text) else { return };
-    done_with(c, role, name);
+    release(c, role, name);
     let rv = c.review_mut(role).unwrap();
     rv.verifying = false;
     rv.done = true;
@@ -2136,7 +2205,7 @@ fn reviews_in(c: &mut Case, env: &mut dyn Env) {
     } else if c.findings.is_empty() {
         ask(c, env, Ask::NothingFound, format!("{who} found nothing to fix"));
     } else {
-        c.stage = Stage::Fixing;
+        go(c, env, "findings");
         c.w.nudged = false;
     }
 }
@@ -2282,7 +2351,7 @@ fn gate(c: &mut Case, env: &mut dyn Env) {
                 c.findings.push(Finding { id: id.clone(), file: "CI".into(), line: None, severity: Severity::Important, summary: what.clone(), failure: format!("gh pr checks {} shows them failing", c.pr().number), evidence: None, proof: None, by: Vec::new(), also: None });
             }
             if c.round < c.max_rounds {
-                next_round(c, env, format!("{what}. See gh pr checks {}.", c.pr().number), vec![id]);
+                next_round(c, env, "ci_failed", format!("{what}. See gh pr checks {}.", c.pr().number), vec![id]);
             } else {
                 c.open = vec![id];
                 ask(c, env, Ask::CiFailed, format!("CI failed ({}) and the rounds are used up", failed.join(", ")));
@@ -2355,7 +2424,7 @@ fn conflict(c: &mut Case, env: &mut dyn Env, more: bool) {
     }
     if c.round < c.max_rounds {
         let what = conflict_steps(c);
-        next_round(c, env, what, vec![id]);
+        next_round(c, env, "conflict", what, vec![id]);
     } else {
         c.open = vec![id];
         ask(c, env, Ask::Conflict, format!("PR #{n} conflicts with {base} and the rounds are used up"));
@@ -2506,7 +2575,7 @@ fn finished(c: &mut Case, env: &mut dyn Env, after: Option<(u64, AfterMerge)>, w
     c.ask = None;
     c.why.clear();
     c.blocked = None;
-    c.stage = Stage::Merged;
+    go(c, env, "merged");
     note(c, env, what);
     close_issue(c, env, after);
     close_all(c, env, true);
@@ -3106,7 +3175,9 @@ fn start(input: &str) -> Result<String, String> {
     let target = resolve(&repo, input, &mut gh)?;
     let config = crate::config::load().unwrap_or_default();
     let root = root();
-    let c = open_case(&root, &repo, target, &config.triage, crate::prices::now(), &mut gh)?;
+    // The triage workflow with your [triage] settings in: what the case runs.
+    let opts = crate::workflow::triage::opts_of(&crate::workflow::triage::bound(&config.triage))?;
+    let c = open_case(&root, &repo, target, &opts, crate::prices::now(), &mut gh)?;
     store(&root, &c)?;
     case_pane(&root, &c.id, &repo)?;
     Ok(c.id)
@@ -3123,11 +3194,39 @@ pub(crate) fn case_pane(root: &Path, id: &str, repo: &Path) -> Result<(), String
     Ok(())
 }
 
+/// A `trix case …` command line, read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Cmd {
+    Ls { json: bool },
+    Show { id: String, json: bool },
+    /// The case's pane: what a saved layout starts again.
+    Run(String),
+    Approve(String),
+    Abort(String),
+    Answer { id: String, key: char },
+    Submit { id: String, role: String, file: Option<PathBuf> },
+}
+
+/// What `trix case <args>` asks for. None: not a command, and the help is shown.
+pub(crate) fn parse(args: &[String]) -> Option<Cmd> {
+    let json = args.iter().any(|a| a == "--json");
+    let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
+    Some(match words.as_slice() {
+        ["ls"] => Cmd::Ls { json },
+        ["show", id] => Cmd::Show { id: id.to_string(), json },
+        ["run", id] => Cmd::Run(id.to_string()),
+        ["approve", id] => Cmd::Approve(id.to_string()),
+        ["abort", id] => Cmd::Abort(id.to_string()),
+        ["answer", id, key] if key.chars().count() == 1 => Cmd::Answer { id: id.to_string(), key: key.chars().next().unwrap_or(' ').to_ascii_lowercase() },
+        ["submit", id, role] => Cmd::Submit { id: id.to_string(), role: role.to_string(), file: None },
+        ["submit", id, role, "--file", f] => Cmd::Submit { id: id.to_string(), role: role.to_string(), file: Some(PathBuf::from(f)) },
+        _ => return None,
+    })
+}
+
 /// `trix case …`.
 pub fn run(args: &[String]) -> i32 {
     let root = root();
-    let json = args.iter().any(|a| a == "--json");
-    let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
     let say = |r: Result<String, String>| match r {
         Ok(out) => {
             print!("{out}");
@@ -3138,25 +3237,29 @@ pub fn run(args: &[String]) -> i32 {
             1
         }
     };
-    match words.as_slice() {
-        ["ls"] if json => say(serde_json::to_string_pretty(&all(&root).iter().map(summary).collect::<Vec<_>>()).map(|s| s + "\n").map_err(|e| e.to_string())),
-        ["ls"] => say(Ok(listing(&all(&root)))),
-        ["show", id] if json => say(load(&root, id).and_then(|c| serde_json::to_string_pretty(&c).map(|s| s + "\n").map_err(|e| e.to_string()))),
-        ["show", id] => say(load(&root, id).map(|c| {
+    let Some(cmd) = parse(args) else {
+        eprint!("{HELP}");
+        return 2;
+    };
+    match cmd {
+        Cmd::Ls { json: true } => say(serde_json::to_string_pretty(&all(&root).iter().map(summary).collect::<Vec<_>>()).map(|s| s + "\n").map_err(|e| e.to_string())),
+        Cmd::Ls { json: false } => say(Ok(listing(&all(&root)))),
+        Cmd::Show { id, json: true } => say(load(&root, &id).and_then(|c| serde_json::to_string_pretty(&c).map(|s| s + "\n").map_err(|e| e.to_string()))),
+        Cmd::Show { id, json: false } => say(load(&root, &id).map(|c| {
             // What its agents spend now, as the workspace has it: none if it isn't running.
             let live = Live::looking("triage").agents().unwrap_or_default();
             show(&c).replacen('\n', &format!("\n{}\n", spent_line(&c, &live)), 1)
         })),
         // The case's pane: the generic runner, driving the case.
-        ["run", id] => crate::workflow::runner::run_pane::<Case>(&root, id),
-        ["approve", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Approve })),
-        ["abort", id] => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Abort })),
-        ["answer", id, key] if key.chars().count() == 1 => say(control(crate::control::Request::Case { id: id.to_string(), op: Op::Answer { key: key.chars().next().unwrap_or(' ').to_ascii_lowercase() } })),
-        ["submit", id, role] | ["submit", id, role, "--file", _] => {
-            let Some(role) = Role::parse(role) else {
+        Cmd::Run(id) => crate::workflow::runner::run_pane::<Case>(&root, &id),
+        Cmd::Approve(id) => say(control(crate::control::Request::Case { id, op: Op::Approve })),
+        Cmd::Abort(id) => say(control(crate::control::Request::Case { id, op: Op::Abort })),
+        Cmd::Answer { id, key } => say(control(crate::control::Request::Case { id, op: Op::Answer { key } })),
+        Cmd::Submit { id, role, file } => {
+            let Some(role) = Role::parse(&role) else {
                 return say(Err(format!("'{role}' isn't a role (builder, reviewer, reviewer2, fixer, gatekeeper)")));
             };
-            let file = words.get(4).map(Path::new);
+            let file = file.as_deref();
             let mut report = String::new();
             match file {
                 // For an agent whose permissions refuse a heredoc.
@@ -3171,7 +3274,7 @@ pub fn run(args: &[String]) -> i32 {
             if report.trim().is_empty() {
                 return say(Err("submit: pipe the report's JSON in on stdin, or name a file with --file".into()));
             }
-            let r = control(crate::control::Request::Case { id: id.to_string(), op: Op::Submit { role, report } });
+            let r = control(crate::control::Request::Case { id, op: Op::Submit { role, report } });
             // Taken: the file is gone, so it can't be committed. A report
             // sent back stays, to be fixed and handed in again.
             if let (Ok(_), Some(f)) = (&r, file) {
@@ -3179,9 +3282,82 @@ pub fn run(args: &[String]) -> i32 {
             }
             say(r)
         }
-        _ => {
-            eprint!("{HELP}");
-            2
+    }
+}
+
+// ───────────────────────────── the case as a workflow run ─────────────────────────────
+
+impl Case {
+    /// The case as a workflow run: what the overview and `trix workflow
+    /// ls` show. Any `case.json` converts, one from before workflows too,
+    /// so a case in flight when trix was upgraded shows up like any run.
+    pub fn view(&self) -> crate::workflow::view::RunView {
+        use crate::workflow::view::{NodeState, NodeView, RunState, RunView};
+        let w = crate::workflow::triage::template();
+        let state = match (self.stage, self.ask) {
+            (Stage::Merged, _) => RunState::Succeeded,
+            (Stage::Aborted, _) => RunState::Aborted,
+            // Waiting on GitHub's branch rules, not on an answer only you can give.
+            (_, Some(Ask::Approval)) => RunState::Parked,
+            (_, Some(_)) => RunState::NeedsYou,
+            _ => RunState::Running,
+        };
+        // How far the case got: a node before that is done, the one there
+        // is at work, one after waits. A case that's over stopped somewhere.
+        let order = [Stage::Choosing, Stage::Building, Stage::Reviewing, Stage::Fixing, Stage::Verifying, Stage::Gate];
+        let at = order.iter().position(|s| *s == self.stage);
+        let fixed = self.fix.is_some();
+        let mut nodes = Vec::new();
+        for (i, stage) in order.iter().enumerate() {
+            let kind = node_of(*stage).unwrap_or_default();
+            let Some((id, node)) = w.of_kind(kind) else { continue };
+            // A case for a PR never chose or built one.
+            if (*stage == Stage::Choosing && self.choices.is_empty()) || (*stage == Stage::Building && self.build.is_none() && self.stage != Stage::Building) {
+                continue;
+            }
+            let reached = match *stage {
+                Stage::Choosing | Stage::Building | Stage::Reviewing => true,
+                Stage::Fixing => fixed || matches!(self.stage, Stage::Fixing),
+                Stage::Verifying => self.verdict.is_some() || matches!(self.stage, Stage::Verifying),
+                _ => matches!(self.stage, Stage::Gate | Stage::Merged),
+            };
+            let node_state = match at {
+                _ if self.stage == Stage::Merged => if reached || *stage == Stage::Gate { NodeState::Done } else { NodeState::Waiting },
+                Some(now) if now == i && self.ask.is_some() => NodeState::Blocked,
+                Some(now) if now == i => NodeState::Working,
+                // The fixer's work is with the gatekeeper.
+                Some(now) if *stage == Stage::Fixing && order[now] == Stage::Verifying => NodeState::InReview,
+                Some(now) if i < now && reached => NodeState::Done,
+                // Aborted: what had finished is done.
+                None if reached && *stage != Stage::Gate => NodeState::Done,
+                _ => NodeState::Waiting,
+            };
+            let (backend, visits, last) = match *stage {
+                Stage::Choosing => ("trix".to_string(), 1, format!("{} to choose from", plural(self.choices.len(), "PR"))),
+                Stage::Building => (self.builder.agent.clone(), 1, self.build.as_ref().map_or(String::new(), |b| format!("pushed · {}", plural(b.commits.len(), "commit")))),
+                Stage::Reviewing => {
+                    let agents = self.reviewers().iter().map(|r| self.role_agent(*r).agent.clone()).collect::<Vec<_>>().join(" + ");
+                    let done = self.reviews.iter().all(|r| r.done) && !self.reviews.is_empty();
+                    (agents, 1, if done { plural(self.findings.iter().filter(|f| !f.by.is_empty()).count(), "finding") } else { String::new() })
+                }
+                Stage::Fixing => (self.fixer.agent.clone(), if reached { self.round } else { 0 }, self.fix.as_ref().map_or(String::new(), |f| format!("pushed · {}", plural(f.commits.len(), "commit")))),
+                Stage::Verifying => (self.gatekeeper.agent.clone(), if self.verdict.is_some() || self.stage == Stage::Verifying { self.round } else { 0 }, self.verdict.as_ref().map_or(String::new(), |v| snake(&v.verdict))),
+                _ => ("trix".to_string(), u32::from(reached), if self.stage == Stage::Merged { "merged".to_string() } else { String::new() }),
+            };
+            nodes.push(NodeView { id: id.to_string(), kind: kind.to_string(), state: node_state, backend, owns: node.brief.as_ref().map(|b| b.owns.clone()).unwrap_or_default(), visits, last });
+        }
+        RunView {
+            id: self.id.clone(),
+            workflow: w.name.clone(),
+            state,
+            goal: format!("{} {}", self.subject(), self.title()).trim().to_string(),
+            nodes,
+            // A round is a cycle: cost, never progress.
+            cycles: self.round,
+            wasted: 0,
+            spent_usd: self.spent_closed,
+            unpriced: false,
+            why: self.why.clone(),
         }
     }
 }

@@ -528,6 +528,7 @@ fn main() -> anyhow::Result<()> {
         Some("spend") => std::process::exit(ledger::run(&args[1..])),
         Some("triage") => std::process::exit(case::triage(&args[1..])),
         Some("case") => std::process::exit(case::run(&args[1..])),
+        Some("workflow") => std::process::exit(workflow::cli::run(&args[1..])),
         Some("forget") => {
             let yes = args.iter().skip(1).any(|a| a == "--yes" || a == "-y");
             if !flagged || args.iter().skip(1).any(|a| a != "--yes" && a != "-y") {

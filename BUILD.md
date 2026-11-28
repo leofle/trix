@@ -19,7 +19,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 |---|---|---|---|
 | 1 | Baseline | 5843b50 | pass |
 | 2 | Seeded replay and goldens of today's triage | a39b7a0 | pass |
-| 3 | Generic runner extracted, the triage tests ported (three green commits) | 1d928ee, aba1465, (this) | pass |
+| 3 | Generic runner extracted, the triage tests ported (three green commits) | 1d928ee, aba1465, 8277530 | pass |
+| 4 | Built-ins and the triage template (**hard parity gate**) | (this) | **pass** |
 
 ## Step 1: baseline
 
@@ -169,6 +170,77 @@ Three commits, each green (suite, clippy, new code rustfmt-clean):
 - Tests added: none (14 replays temporarily doubled in A). Suite: 723.
   Deferred: nothing.
 
+## Step 4: built-ins and the triage template (hard parity gate)
+
+**Built**
+
+- `src/workflow/model.rs`: the workflow model (inputs, goal and
+  `done_when`, limits, policy, approvals, profiles, nodes, edges, layout),
+  read from native TOML with a schema version. Step 5 completes its
+  storage, round trip and snapshot.
+- `src/workflow/templates/triage.toml`: the built-in triage template,
+  compiled into the binary and read-only. `push = "allow"`, `merge =
+  "you"`, `no_progress = "off"`, `wall_clock = "12h"` (in-flight),
+  `max_iterations` and `budget_usd` from `[triage]`, a brief on every agent
+  node (`owns = ["**"]` for build and fix, nothing for review and gatekeep).
+- **The `triage.*` and `gh.*` kinds are `src/case.rs`**: `triage.build`,
+  `triage.review`, `triage.fix`, `triage.gatekeep`, `gh.resolve_target`
+  (the Choosing stage) and `gh.gate` (which also merges). They keep today's
+  prompts, report schemas and validators word for word, and run no scope
+  check. What changed is who decides:
+  - **What's next is the template's edges.** Every stage change in
+    `case.rs` now goes through `go(case, verdict)`, which follows the
+    template's edge from the stage's node. No built-in names its successor
+    any more (the only `c.stage = …` left outside `go` are abort and the
+    hand-off to a fresh case, which are your actions, not verdicts).
+    A verdict with no edge asks you instead of guessing.
+  - **Pane lifetime is the node's `revisit`.** `release()` closes a
+    role's pane after its report when its node is `fresh` (builder,
+    reviewers, gatekeeper) and keeps it when it's `reuse` (the fixer, whose
+    next round is sent to the kept pane).
+  - **Who a role's agent is, and the limits, come from the bound
+    template.** `trix triage` binds `[triage]` into the template
+    (`{{config.triage.…}}`) and makes the case from the result.
+- **Aliases:** `trix workflow run triage --input target=<n>` is `trix
+  triage <n>`; `trix workflow approve|abort <id>` is `trix case
+  approve|abort <id>` for a triage run; `trix workflow ls` lists cases as
+  runs. Every `trix case` subcommand and flag is kept (`ls`, `show`, `run`,
+  `approve`, `abort`, `answer`, `submit`, `--json`, `--file`), and so is
+  every `[triage]` key.
+- **The `case.json` converter:** `Case::view()` turns any case, one written
+  by an older trix too, into the run view the overview and `trix workflow
+  ls` use. `case.json` itself keeps its format, so a case in flight across
+  the upgrade just goes on.
+
+**Accept (all pass)**
+
+- **Replay is identical on the template path.** The replay now makes its
+  cases from the bound template and runs them through the generic runner
+  with graph routing and `revisit` lifetimes. All 14 goldens match, byte
+  for byte: `git diff a39b7a0 -- tests/goldens/triage` is empty. That
+  covers the prompts and messages word for word, the pane lifetimes (the
+  `close` calls: fixer kept between rounds, builder, reviewers and
+  gatekeeper closed after their report) and the pushes (origin's refs).
+- **Every alias and flag is tested**
+  (`every_trix_case_command_and_flag_still_reads_the_same`,
+  `the_workflow_commands_are_the_case_commands_under_another_name`), and
+  the `[triage]` mapping both ways
+  (`the_triage_config_maps_onto_the_template_and_back`).
+- **A converter test per stage**
+  (`a_case_converts_to_a_run_at_every_stage`: Choosing, Building,
+  Reviewing, Fixing, Verifying, Gate, Merged, Aborted, plus a `case.json`
+  from before workflows).
+- **A saved layout with `trix case run <id>` restores**
+  (`a_saved_layouts_case_pane_restores_and_goes_on`).
+- The 45 triage tests still pass with their 375 assertions.
+
+Tests added: 8 (`workflow::triage`). Suite: 731 passed.
+
+**Deferred to step 13:** enforcing the template's `wall_clock = "12h"` on a
+triage run. Today's triage has no time limit; the in-flight clock needs
+state that can't go into `case.json` without changing the folder the
+goldens freeze, so it's kept in the run's own folder, which step 13 adds.
+
 ## Decisions to review
 
 - **D1. BUILD.md is at the repository root.** The PRD says
@@ -191,6 +263,14 @@ Three commits, each green (suite, clippy, new code rustfmt-clean):
   `init.templateDir` to a template without `info/`. It passes with the
   personal config out of the way, and in CI. The test wasn't changed.
 - **D4. The triage tests number 45, not 46** (see step 1).
+- **D6. The built-in kinds stay in `src/case.rs`.** The PRD asks for
+  "`triage.*` and `gh.*` kinds"; they are the functions of `case.rs`,
+  driven by the generic runner and routed by the template, not a rewrite
+  into new files. Moving 2,000 lines would have made the parity diff
+  unreadable and bought nothing. `gh.merge` is part of `gh.gate` here, as
+  the merge is today. A triage **fork** (your own copy with other edges or
+  an approver node) runs on the generic engine's `gh.gate`, not on these
+  built-ins: see the known limits.
 - **D5. `Env::open_case` still takes a triage `Case`.** It's what triage's
   "a builder starts a fresh PR" uses, and the PRD lists it as part of the
   existing seam. Workflow runs start their sub-runs through `Env::open_run`

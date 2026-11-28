@@ -228,6 +228,9 @@ impl World {
             base: "main".into(),
             sha,
         };
+        // The template path: the built-in triage workflow, bound to these
+        // settings, is what the case is made from.
+        let opts = &super::triage::opts_of(&super::triage::bound(opts)).unwrap();
         let c = Case::new("triage-12", Some(pr), None, self.repo.clone(), opts, T0);
         case::store(&self.root, &c).unwrap();
         c
@@ -1213,6 +1216,7 @@ fn start(w: &mut World, input: &str, opts: &TriageOpts) -> Result<Case, String> 
     let (root, repo) = (w.root.clone(), w.repo.clone());
     w.note(&format!("trix triage {input}"));
     let made = {
+        let opts = &super::triage::opts_of(&super::triage::bound(opts)).unwrap();
         let mut gh = w.gh_fn();
         case::resolve(&repo, input, &mut gh)
             .and_then(|t| case::open_case(&root, &repo, t, opts, T0, &mut gh))
