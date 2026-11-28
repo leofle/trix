@@ -30,7 +30,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 11 | Policy, approvals and autopilot | 7e1cc86 | pass |
 | 12 | Dry run and rehearsal | 4d823e5 | pass |
 | 13 | Run log, overview, scheduling and notifications | 73cfaf3 | pass |
-| 14 | Terminal builder | (this) | pass |
+| 14 | Terminal builder | 999de55 | pass |
+| 15 | YAML import and export | (this) | pass |
 
 ## Step 1: baseline
 
@@ -934,6 +935,47 @@ and `thiserror` into `Cargo.lock`.
 
 Tests added: 4. Suite: 823 passed.
 
+## Step 15: YAML import and export
+
+`src/workflow/yaml.rs`. YAML is for sharing, not for writing: the builder
+owns the native TOML, and import converts.
+
+- **Export** (`trix workflow export <name> > wf.yaml`): one self-contained
+  file. A header says what it is (`Format trix-workflow/1`, edit in the
+  builder), how it checked on the machine that exported it (errors and
+  warnings, each warning on a `# ⚠` line), then the workflow with
+  `format: trix-workflow/1` first and its keys in the native file's order.
+  `schema` and `builtin` aren't exported: an exported built-in is a file of
+  your own.
+- **Import** (`trix workflow import <file>`): reads the YAML, refuses a
+  format it doesn't know, goes through the native format (so names and
+  unknown keys are held to the same rules as any workflow file), runs the
+  one checker, and saves native TOML in your own workflows. It prints the
+  report before it asks anything.
+  - It's **never trusted by being imported**: the report carries the
+    untrusted line whatever the importer's config says, and trust is asked
+    for (`trust <name> as it is now? [y/N]`, default no) or given later
+    with `trix workflow trust`.
+  - A file with errors imports as a **draft that can't run**, and says so.
+  - A file that says `builtin: true` is still a file.
+  - It **never replaces** a workflow that's already here, built-in, team or
+    yours: the import is refused and says to rename it (D8).
+- Import is the checker's fifth way in: `SURFACES` is 5, and the test that
+  the surfaces agree covers it (import adds only its untrusted line).
+
+Accept: native to YAML to native is identical for every template, as the
+same workflow and as the same native file, and exporting what was imported
+gives the same YAML. Import runs the checker and asks for trust.
+
+Dependency added: `serde_norway` 0.9 (and its `unsafe-libyaml-norway`),
+see D7.
+
+Tests added: 4 (round trip of every template; the export's header, order
+and contents; import checks, never trusts, drafts, hand-edited YAML and
+what isn't a workflow; an import lands in your own workflows and replaces
+nothing). Suite: 827 passed. Tried by hand against a throwaway home
+directory: export, rename, import, check.
+
 ## Decisions to review
 
 - **D1. BUILD.md is at the repository root.** The PRD says
@@ -968,3 +1010,11 @@ Tests added: 4. Suite: 823 passed.
   "a builder starts a fresh PR" uses, and the PRD lists it as part of the
   existing seam. Workflow runs start their sub-runs through `Env::open_run`
   (step 10), added beside it.
+- **D7. YAML is read and written with `serde_norway`.** The PRD names the
+  YAML format but no crate. `serde_yaml` is archived and unmaintained;
+  `serde_norway` is its maintained fork with the same API. It's the one
+  dependency this branch adds besides `rataflow` (step 14).
+- **D8. Import never replaces a workflow that's already here.** The PRD
+  says import "runs the checker and asks for trust" and is silent on a name
+  that's taken. Replacing a file you had trusted with one from elsewhere is
+  the less safe reading, so the import is refused and says to rename it.

@@ -31,6 +31,7 @@ pub mod summary;
 pub mod triage;
 pub mod trigger;
 pub mod view;
+pub mod yaml;
 
 #[cfg(test)]
 mod builder_tests;
@@ -49,7 +50,7 @@ pub mod replay;
 
 /// How many ways a workflow gets checked, each through the one checker.
 #[cfg(test)]
-pub const SURFACES: usize = 4;
+pub const SURFACES: usize = 5;
 
 /// What each of those ways says of a workflow: its name, and the text.
 #[cfg(test)]
@@ -80,5 +81,18 @@ pub fn surfaces(
                 .problems()
                 .render(),
         ),
+        // Import adds one line of its own: imported, it isn't trusted yet.
+        ("import", {
+            let yaml = yaml::export(w, m, ctx).unwrap_or_default();
+            let said = yaml::import(&yaml, m, ctx)
+                .map(|(_, r)| r.render())
+                .unwrap_or_default();
+            let (first, rest) = said.split_once('\n').unwrap_or_default();
+            let rest: Vec<&str> = rest
+                .lines()
+                .filter(|l| !l.contains("untrusted, or changed since trust was given"))
+                .collect();
+            format!("{first}\n{}\n", rest.join("\n"))
+        }),
     ]
 }

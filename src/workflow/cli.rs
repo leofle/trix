@@ -47,6 +47,8 @@ usage:  trix workflow new                         the wizard: a template, the go
   trix workflow approve <run>               yours only: refused from every agent pane and check
   trix workflow answer <run> <key>          answer what a run asks, as in its pane
   trix workflow revoke <run>                mid-run: every approval drops back to ask
+  trix workflow export <name> > wf.yaml     a self-contained YAML file, to share
+  trix workflow import <file>               runs check, converts to native, asks for trust
   trix workflow trust <name>                yours only: trust a workflow file as it is now
   trix workflow autopilot <name> [--yes]    show what each node will do unattended, then (with
                                             --yes) switch the workflow to autopilot
@@ -117,6 +119,8 @@ pub enum Cmd {
     Pause(String),
     Resume(String),
     Revoke(String),
+    Export(String),
+    Import(String),
     Trust(String),
     Autopilot {
         name: String,
@@ -292,6 +296,8 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         ["pause", x] => Ok(Cmd::Pause(id(x))),
         ["resume", x] => Ok(Cmd::Resume(id(x))),
         ["revoke", x] => Ok(Cmd::Revoke(id(x))),
+        ["export", x] => Ok(Cmd::Export(id(x))),
+        ["import", x] => Ok(Cmd::Import(id(x))),
         ["trust", x] => Ok(Cmd::Trust(id(x))),
         ["autopilot", x] => Ok(Cmd::Autopilot {
             name: id(x),
@@ -1230,6 +1236,41 @@ pub fn run(args: &[String]) -> i32 {
                         .and_then(|name| edit(name.split_whitespace().next().unwrap_or_default())))
                 }
             }
+        }
+        Cmd::Export(name) => {
+            let stores = Stores::of(main_checkout().as_deref());
+            say(stores.load(&name).and_then(|(w, _)| {
+                live().and_then(|(m, ctx, _)| super::yaml::export(&w, &m, &ctx))
+            }))
+        }
+        Cmd::Import(file) => {
+            let stores = Stores::of(main_checkout().as_deref());
+            say(std::fs::read_to_string(&file)
+                .map_err(|e| format!("{file}: {e}"))
+                .and_then(|text| {
+                    let (m, ctx, _) = live()?;
+                    let (w, report, path) = super::yaml::import_into(&stores, &text, &m, &ctx)?;
+                    // What it is, before you're asked anything about it.
+                    println!(
+                        "{}saved {}",
+                        super::yaml::import_text(&report),
+                        crate::app::tilde(&path)
+                    );
+                    // Trust is yours to give, and asked for: never taken.
+                    if ask(&format!("trust {} as it is now? [y/N]", w.name))?
+                        .eq_ignore_ascii_case("y")
+                    {
+                        let hash = super::policy::content_hash(&w, &subs(&stores, &w)?);
+                        return control(Request::Wf {
+                            run: None,
+                            op: Op::Trust {
+                                name: w.name.clone(),
+                                hash,
+                            },
+                        });
+                    }
+                    Ok(String::new())
+                }))
         }
         Cmd::Approve(id) => wf(id, Op::Approve),
         Cmd::Abort(id) => wf(id, Op::Abort),
