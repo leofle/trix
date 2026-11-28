@@ -51,6 +51,8 @@ pub struct Hub {
     pub repo_info: Option<String>,
     pub review: &'static str,
     pub next_pr: u64,
+    /// The body of every PR opened.
+    pub pr_bodies: Vec<String>,
 }
 
 /// An agent as it was started.
@@ -530,6 +532,11 @@ impl World {
                 title,
                 ..,
             ] => {
+                if let Some(i) = args.iter().position(|a| *a == "--body") {
+                    self.hub
+                        .pr_bodies
+                        .push(args.get(i + 1).map(|b| b.to_string()).unwrap_or_default());
+                }
                 let n = self.hub.next_pr;
                 self.hub.next_pr += 1;
                 self.hub.prs.push(HubPr {

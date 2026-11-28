@@ -1469,3 +1469,442 @@ fn the_run_and_wf_commands_read_their_arguments() {
     assert!(cli::show(&r, &w.seen).contains("· $3.00 + ? ·"));
     done(w);
 }
+
+// ── workspaces and landing ──
+
+/// Two writers no edge puts in order, a land step, a check on what landed,
+/// a verifier on a third backend, and the gate. `prep` runs before both.
+pub fn pair(api_owns: &str, ui_owns: &str) -> Workflow {
+    let text = format!(
+        r#"
+schema = 1
+name = "pair"
+entry = ["prep"]
+[goal]
+text = "Both halves are in."
+[goal.done_when]
+mechanical = [{{ check = "tests" }}]
+attested = [{{ judge = "verifier" }}]
+[limits]
+wall_clock = "1h"
+max_iterations = 4
+[policy]
+push = "guarded"
+merge = "you"
+[nodes.prep]
+kind = "agent"
+agent = "claude"
+profile = "edit-only"
+verdicts = ["ready"]
+brief = {{ owns = ["notes/**", "src/**"], done = "The ground is laid." }}
+[nodes.api]
+kind = "agent"
+agent = "claude"
+profile = "edit-only"
+verdicts = ["ready"]
+brief = {{ owns = ["{api_owns}"], done = "The API half is committed." }}
+[nodes.ui]
+kind = "agent"
+agent = "codex"
+profile = "edit-and-test"
+verdicts = ["ready"]
+brief = {{ owns = ["{ui_owns}"], done = "The UI half is committed." }}
+[nodes.land]
+kind = "land"
+on_conflict = "author"
+[nodes.tests]
+kind = "check"
+run = ["sh", "-c", "test -f src/api/a && test -f src/ui/b"]
+commit = "land.head"
+[nodes.verifier]
+kind = "agent"
+preset = "verifier"
+agent = "gemini"
+profile = "instruct-read-only"
+verdicts = ["pass", "changes"]
+brief = {{ owns = [], done = "Both halves are what was asked." }}
+[nodes.gate]
+kind = "gh.gate"
+[[edges]]
+from = "prep"
+to = "api"
+on = "ready"
+[[edges]]
+from = "prep"
+to = "ui"
+on = "ready"
+[[edges]]
+from = "api"
+to = "land"
+on = "ready"
+[[edges]]
+from = "ui"
+to = "land"
+on = "ready"
+[[edges]]
+from = "land"
+to = "tests"
+on = "landed"
+[[edges]]
+from = "tests"
+to = "verifier"
+on = "pass"
+[[edges]]
+from = "tests"
+to = "@fail"
+on = "fail"
+[[edges]]
+from = "verifier"
+to = "gate"
+on = "pass"
+[[edges]]
+from = "verifier"
+to = "@fail"
+on = "changes"
+"#
+    );
+    Workflow::from_toml(&text).unwrap()
+}
+
+/// prep hands in, leaving a staged and an untracked file behind, and both
+/// halves start.
+fn halves(name: &str, wf: Workflow) -> (World, WfRun) {
+    let mut w = World::new(name);
+    let mut r = start(&mut w, wf, opts());
+    tick(&mut w, &mut r);
+    let tree = r.tree();
+    edit(&mut w, &r, "prep", "notes/plan.md", "the plan\n");
+    std::fs::write(tree.join("notes/staged.md"), "staged, not committed\n").unwrap();
+    w.sh(&tree, &["add", "notes/staged.md"]);
+    std::fs::write(tree.join("notes/untracked.md"), "untracked\n").unwrap();
+    submit(&mut w, &r, "prep", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(r.active, ["api", "ui"], "{:?}", r.log);
+    assert_eq!(
+        (r.nodes["api"].state, r.nodes["ui"].state),
+        (NodeState::Working, NodeState::Working)
+    );
+    (w, r)
+}
+
+#[test]
+fn writers_in_order_share_one_worktree() {
+    let mut wf = issue_to_pr();
+    let docs = Node {
+        kind: "agent".into(),
+        agent: Some("claude".into()),
+        profile: Some("edit-only".into()),
+        verdicts: vec!["ready".into()],
+        brief: Some(Brief {
+            owns: vec!["test/**".into()],
+            must_not_touch: vec![],
+            done: "The tests are documented.".into(),
+        }),
+        ..Node::default()
+    };
+    wf.nodes.insert("docs".into(), docs);
+    for e in wf
+        .edges
+        .iter_mut()
+        .filter(|e| e.from == "implementer" && e.to == "tests")
+    {
+        e.to = "docs".into();
+    }
+    let on = |from: &str, to: &str| Edge {
+        from: from.into(),
+        to: to.into(),
+        on: Triggers::One("ready".into()),
+        guard: None,
+        pass: BTreeMap::new(),
+        ask: None,
+    };
+    wf.edges.push(on("docs", "tests"));
+    assert!(!super::check::isolated(&wf, "implementer") && !super::check::isolated(&wf, "docs"));
+    let mut w = World::new("wf-shared");
+    let mut r = start(&mut w, wf, opts());
+    tick(&mut w, &mut r);
+    edit(&mut w, &r, "implementer", "src/done", "ok\n");
+    submit(&mut w, &r, "implementer", READY).unwrap();
+    ticks(&mut w, &mut r, 2);
+    // One after another, in the run's worktree: the second sees the first's work.
+    assert_eq!(
+        (
+            r.nodes["implementer"].cwd.clone(),
+            r.nodes["docs"].cwd.clone()
+        ),
+        (Some(r.tree()), Some(r.tree()))
+    );
+    assert!(r.tree().join("src/done").is_file() && r.finished.is_empty());
+    // Each one's changes are what changed during its own visit.
+    edit(&mut w, &r, "docs", "test/README.md", "how to run\n");
+    submit(&mut w, &r, "docs", READY).unwrap();
+    tick(&mut w, &mut r);
+    assert!(
+        r.log
+            .iter()
+            .any(|(_, l)| l == "docs handed in ready: 1 file"),
+        "{:?}",
+        r.log
+    );
+    done(w);
+}
+
+#[test]
+fn writers_that_can_run_at_the_same_time_get_their_own_worktrees_and_land() {
+    // Scopes that don't overlap: they're isolated all the same.
+    let wf = pair("src/api/**", "src/ui/**");
+    let m = super::caps::Matrix::shipped();
+    let report = super::check::check(&wf, &m, &super::check::Ctx::ideal(&m));
+    assert_eq!(
+        (report.errors(), report.has("scope-overlap")),
+        (0, false),
+        "{}",
+        report.render()
+    );
+    assert!(
+        super::check::isolated(&wf, "api")
+            && super::check::isolated(&wf, "ui")
+            && !super::check::isolated(&wf, "prep")
+    );
+    let (mut w, mut r) = halves("wf-pair", wf);
+    let (api, ui) = (
+        r.nodes["api"].cwd.clone().unwrap(),
+        r.nodes["ui"].cwd.clone().unwrap(),
+    );
+    assert!(api != ui && api != r.tree() && ui != r.tree());
+    // Each on a branch of its own from the run's branch, with an index of its own.
+    assert_eq!(
+        w.sh(&api, &["branch", "--show-current"]).trim(),
+        "trix/wf-pair-42-api"
+    );
+    assert_eq!(
+        w.sh(&ui, &["branch", "--show-current"]).trim(),
+        "trix/wf-pair-42-ui"
+    );
+    let index = |w: &mut World, d: &std::path::Path| {
+        w.sh(
+            d,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+    };
+    let (ia, iu, ir) = (
+        index(&mut w, &api),
+        index(&mut w, &ui),
+        index(&mut w, &r.tree()),
+    );
+    assert!(
+        ia != iu && ia != ir && iu != ir,
+        "no two agents share an index"
+    );
+    // What was uncommitted in the run's worktree came along: staged stays
+    // staged, untracked comes too, and what prep committed is there.
+    for tree in [&api, &ui] {
+        assert_eq!(
+            std::fs::read_to_string(tree.join("notes/plan.md")).unwrap(),
+            "the plan\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("notes/untracked.md")).unwrap(),
+            "untracked\n"
+        );
+        let status = w.sh(tree, &["status", "--porcelain"]);
+        assert!(
+            status.contains("A  notes/staged.md") && status.contains("?? notes/untracked.md"),
+            "{status}"
+        );
+    }
+    // The UI half hands in first; the landing waits for the API half.
+    for tree in [&api, &ui] {
+        w.sh(tree, &["rm", "-q", "--cached", "notes/staged.md"]);
+        std::fs::remove_file(tree.join("notes/staged.md")).unwrap();
+        std::fs::remove_file(tree.join("notes/untracked.md")).unwrap();
+    }
+    edit(&mut w, &r, "ui", "src/ui/b", "b\n");
+    submit(&mut w, &r, "ui", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(
+        (r.active.clone(), r.nodes["land"].visits),
+        (vec!["api".to_string(), "land".to_string()], 0)
+    );
+    // Nothing is removed before it has landed: an attempt is refused.
+    let e = super::land::remove_tree(&mut r, &mut w, "ui").unwrap_err();
+    assert_eq!(
+        e,
+        "ui's worktree isn't removed: 1 commit on trix/wf-pair-42-ui hasn't landed on trix/wf-pair-42"
+    );
+    assert!(ui.is_dir());
+    edit(&mut w, &r, "api", "src/api/a", "a\n");
+    submit(&mut w, &r, "api", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut r, 2);
+    // Landed in the order they finished, onto the run's branch.
+    assert_eq!(r.finished, ["ui", "api"]);
+    let landed: Vec<&str> = r
+        .log
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .filter(|l| l.starts_with("landed "))
+        .collect();
+    assert_eq!(
+        landed,
+        [
+            "landed ui: 1 commit onto trix/wf-pair-42",
+            "landed api: 1 commit onto trix/wf-pair-42"
+        ]
+    );
+    assert!(r.tree().join("src/api/a").is_file() && r.tree().join("src/ui/b").is_file());
+    // The check runs on the landed commit, which trix pins; the verifier
+    // (a third backend, never an author) judges that commit.
+    tick(&mut w, &mut r);
+    let head = w.sh(&r.tree(), &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(
+        (r.pinned.as_deref(), r.nodes["tests"].verdict.as_deref()),
+        (Some(head.as_str()), Some("pass"))
+    );
+    assert_eq!(
+        r.nodes["land"].outputs["head"].as_str(),
+        Some(head.as_str())
+    );
+    tick(&mut w, &mut r);
+    let v = w.spawned.last().unwrap().clone();
+    assert_eq!(
+        (
+            v.kind.as_str(),
+            w.sh(&v.cwd, &["rev-parse", "HEAD"]).trim().to_string()
+        ),
+        ("gemini", head.clone())
+    );
+    submit(&mut w, &r, "verifier", r#"{"verdict": "pass"}"#).unwrap();
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(r.ask, Some(Ask::Merge), "{:?}", r.log);
+    // The PR's body is the outcome summary: nodes, verdicts, the check, the landing.
+    let body = w.hub.pr_bodies.last().unwrap().clone();
+    assert!(
+        body.contains("| land | land | trix | 1 | landed |")
+            && body.contains("| tests | check | check | 1 | pass (exit 0) on"),
+        "{body}"
+    );
+    assert!(
+        body.contains("| ui | agent | codex | 1 | ready |")
+            && body.contains("Cycles: 1 (0 wasted)"),
+        "{body}"
+    );
+    op(&mut w, None, Some(&r.id), Op::Approve).unwrap();
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(r.state, RunState::Succeeded, "{:?}", r.log);
+    // Landed, their worktrees and branches are gone; the run's stays.
+    assert!(!api.is_dir() && !ui.is_dir() && r.tree().is_dir());
+    assert!(
+        !w.sh(&r.repo.clone(), &["branch", "--list", "trix/wf-pair-42-*"])
+            .contains("trix/wf-pair-42-api")
+    );
+    done(w);
+}
+
+#[test]
+fn a_land_conflict_goes_back_to_its_author() {
+    // Overlapping scopes: flagged while it's built, isolated all the same.
+    let wf = pair("src/**", "src/**");
+    let m = super::caps::Matrix::shipped();
+    let report = super::check::check(&wf, &m, &super::check::Ctx::ideal(&m));
+    assert_eq!(report.errors(), 0, "{}", report.render());
+    assert!(
+        report
+            .find("scope-overlap")
+            .unwrap()
+            .text
+            .contains("api and ui can run at the same time")
+    );
+    let (mut w, mut r) = halves("wf-conflict", wf);
+    for node in ["api", "ui"] {
+        let tree = r.nodes[node].cwd.clone().unwrap();
+        w.sh(&tree, &["rm", "-q", "--cached", "notes/staged.md"]);
+        std::fs::remove_file(tree.join("notes/staged.md")).unwrap();
+        std::fs::remove_file(tree.join("notes/untracked.md")).unwrap();
+    }
+    // Both change the same file, each its own way.
+    edit(&mut w, &r, "api", "src/shared.txt", "the API's way\n");
+    edit(&mut w, &r, "api", "src/api/a", "a\n");
+    submit(&mut w, &r, "api", r#"{"verdict": "ready"}"#).unwrap();
+    edit(&mut w, &r, "ui", "src/shared.txt", "the UI's way\n");
+    edit(&mut w, &r, "ui", "src/ui/b", "b\n");
+    submit(&mut w, &r, "ui", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut r, 2);
+    // The first lands. The second conflicts and goes back to its author,
+    // with the files that conflict: a cycle of cost.
+    assert_eq!(
+        (r.nodes["api"].landed, r.nodes["ui"].landed, r.cycles),
+        (true, false, 2),
+        "{:?}",
+        r.log
+    );
+    assert_eq!(
+        (r.active.clone(), r.nodes["ui"].state),
+        (vec!["ui".to_string()], NodeState::Waiting)
+    );
+    tick(&mut w, &mut r);
+    let (to, text) = w
+        .sent
+        .last()
+        .unwrap_or_else(|| panic!("{:?} {:?}", r.log, r.ask))
+        .clone();
+    assert_eq!(to, "pair-42-ui");
+    assert!(
+        text.contains("these files conflict: src/shared.txt")
+            && text.contains("git rebase trix/wf-pair-42"),
+        "{text}"
+    );
+    // Its worktree is as it left it: the rebase was taken back.
+    let ui = r.nodes["ui"].cwd.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ui.join("src/shared.txt")).unwrap(),
+        "the UI's way\n"
+    );
+    assert!(w.sh(&ui, &["status", "--porcelain"]).trim().is_empty());
+    // It brings the run's branch in, keeps what both meant, and hands in again.
+    w.sh(&ui, &["reset", "--quiet", "--hard", "trix/wf-pair-42"]);
+    edit(
+        &mut w,
+        &r,
+        "ui",
+        "src/shared.txt",
+        "the API's way\nand the UI's\n",
+    );
+    edit(&mut w, &r, "ui", "src/ui/b", "b\n");
+    submit(&mut w, &r, "ui", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut r, 3);
+    assert_eq!(
+        (r.nodes["ui"].landed, r.nodes["tests"].verdict.as_deref()),
+        (true, Some("pass")),
+        "{:?}",
+        r.log
+    );
+    assert_eq!(
+        std::fs::read_to_string(r.tree().join("src/shared.txt")).unwrap(),
+        "the API's way\nand the UI's\n"
+    );
+    // on_conflict: fail ends the run instead.
+    let mut wf = pair("src/**", "src/**");
+    wf.nodes.get_mut("land").unwrap().on_conflict = Some("fail".into());
+    let (mut w2, mut r2) = halves("wf-conflict-fail", wf);
+    for (node, text) in [("api", "one\n"), ("ui", "two\n")] {
+        let tree = r2.nodes[node].cwd.clone().unwrap();
+        w2.sh(&tree, &["rm", "-q", "--cached", "notes/staged.md"]);
+        std::fs::remove_file(tree.join("notes/staged.md")).unwrap();
+        std::fs::remove_file(tree.join("notes/untracked.md")).unwrap();
+        edit(&mut w2, &r2, node, "src/shared.txt", text);
+        submit(&mut w2, &r2, node, r#"{"verdict": "ready"}"#).unwrap();
+    }
+    ticks(&mut w2, &mut r2, 2);
+    assert_eq!(r2.state, RunState::Failed);
+    assert!(
+        r2.why.starts_with(
+            "landing ui onto trix/wf-pair-42 conflicted: these files conflict: src/shared.txt"
+        ),
+        "{}",
+        r2.why
+    );
+    // What didn't land is still there: nothing was removed.
+    assert!(r2.nodes["ui"].cwd.clone().unwrap().is_dir());
+    done(w);
+    done(w2);
+}

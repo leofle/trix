@@ -179,6 +179,9 @@ pub struct NodeRun {
     /// the same starting point, so undoing the change clears it.
     #[serde(default)]
     pub sent_back: bool,
+    /// A writer in a worktree of its own: its commits are on the run's branch.
+    #[serde(default)]
+    pub landed: bool,
 }
 
 impl Default for NodeRun {
@@ -199,6 +202,7 @@ impl Default for NodeRun {
             cwd: None,
             backend: None,
             sent_back: false,
+            landed: false,
         }
     }
 }
@@ -327,6 +331,10 @@ pub struct WfRun {
     /// The agent pane that started it, if one did.
     #[serde(default)]
     pub started_by: Option<String>,
+    /// The writers that work in worktrees of their own, in the order they
+    /// handed in: the order they land in.
+    #[serde(default)]
+    pub finished: Vec<String>,
     #[serde(default)]
     pub log: Vec<(u64, String)>,
     pub created: u64,
@@ -396,18 +404,18 @@ fn report_file(root: &Path, id: &str, node: &str) -> PathBuf {
         .join(format!("{node}.json"))
 }
 
-fn plural(n: usize, what: &str) -> String {
+pub(super) fn plural(n: usize, what: &str) -> String {
     format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
-fn first_line(e: &str) -> &str {
+pub(super) fn first_line(e: &str) -> &str {
     e.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("")
 }
 
-fn short(sha: &str) -> &str {
+pub(super) fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
 
@@ -428,7 +436,6 @@ impl WfRun {
             .map(|k| (k.clone(), NodeRun::default()))
             .collect();
         let active = w.entries().into_iter().map(String::from).collect();
-        let back = !check::back_edges(&w).is_empty();
         WfRun {
             v: STATE,
             id: id.into(),
@@ -441,16 +448,16 @@ impl WfRun {
                 .as_deref()
                 .and_then(|t| duration(t).ok())
                 .unwrap_or(3 * 3600),
-            ceiling: if back {
-                w.limits
-                    .max_iterations
-                    .as_ref()
-                    .and_then(Count::get)
-                    .unwrap_or(1)
-                    .max(1)
-            } else {
-                1
-            },
+            // A ceiling, never a target: 1 unless the workflow sets one. It
+            // bounds every way work goes back: an edge, a scope send-back, a
+            // land conflict.
+            ceiling: w
+                .limits
+                .max_iterations
+                .as_ref()
+                .and_then(Count::get)
+                .unwrap_or(1)
+                .max(1),
             budget: w.limits.budget_usd.as_ref().and_then(|b| b.get()),
             workflow: w,
             inputs,
@@ -476,6 +483,7 @@ impl WfRun {
             parent: None,
             depth: 0,
             started_by: None,
+            finished: Vec::new(),
             log: Vec::new(),
             created: now,
         }
@@ -502,7 +510,7 @@ impl WfRun {
         self.repo.join(".trix/worktrees").join(&self.id)
     }
 
-    fn note(&mut self, env: &mut dyn Env, text: impl Into<String>) {
+    pub(super) fn note(&mut self, env: &mut dyn Env, text: impl Into<String>) {
         let text = text.into();
         let at = env.now();
         let (_, _, secs) = crate::ledger::local(at);
@@ -510,7 +518,13 @@ impl WfRun {
         self.log.push((at, text));
     }
 
-    fn ask(&mut self, env: &mut dyn Env, a: Ask, about: Option<&str>, why: impl Into<String>) {
+    pub(super) fn ask(
+        &mut self,
+        env: &mut dyn Env,
+        a: Ask,
+        about: Option<&str>,
+        why: impl Into<String>,
+    ) {
         self.ask = Some(a);
         self.about = about.map(String::from);
         self.why = why.into();
@@ -524,7 +538,7 @@ impl WfRun {
     }
 
     /// Stop here until you resume it: nothing is lost, nothing runs.
-    fn park(&mut self, env: &mut dyn Env, why: impl Into<String>) {
+    pub(super) fn park(&mut self, env: &mut dyn Env, why: impl Into<String>) {
         self.why = why.into();
         self.state = RunState::Parked;
         self.note(
@@ -535,7 +549,7 @@ impl WfRun {
         env.notify(&format!("{} is parked", self.id), &self.why.clone());
     }
 
-    fn fail(&mut self, env: &mut dyn Env, why: impl Into<String>) {
+    pub(super) fn fail(&mut self, env: &mut dyn Env, why: impl Into<String>) {
         self.why = why.into();
         self.state = RunState::Failed;
         self.ask = None;
@@ -545,7 +559,7 @@ impl WfRun {
         env.notify(&format!("{} failed", self.id), &self.why.clone());
     }
 
-    fn succeed(&mut self, env: &mut dyn Env, what: impl Into<String>) {
+    pub(super) fn succeed(&mut self, env: &mut dyn Env, what: impl Into<String>) {
         self.state = RunState::Succeeded;
         self.ask = None;
         self.why.clear();
@@ -560,7 +574,7 @@ impl WfRun {
 
     /// A limit was hit: ask, park or fail, as the workflow says. Autopilot
     /// parks: a human is needed only when a run is really stuck.
-    fn limit(&mut self, env: &mut dyn Env, which: &str, what: String) {
+    pub(super) fn limit(&mut self, env: &mut dyn Env, which: &str, what: String) {
         self.limit = Some(which.into());
         let on = self
             .workflow
@@ -578,7 +592,7 @@ impl WfRun {
         }
     }
 
-    fn close_all(&mut self, env: &mut dyn Env, clean: bool) {
+    pub(super) fn close_all(&mut self, env: &mut dyn Env, clean: bool) {
         let prefix = format!("{}-", self.id);
         let seen = env.agents().unwrap_or_default();
         for a in seen.iter().filter(|a| a.name.starts_with(&prefix)) {
@@ -592,20 +606,29 @@ impl WfRun {
         }
     }
 
-    /// The detached checkouts readers and checks used: nothing in them is
-    /// kept. Removed without force, so one that changed stays.
+    /// What the run leaves behind once it's done: the detached checkouts
+    /// readers used (nothing in them is kept) and the worktrees of writers
+    /// whose commits have landed. Removed without force, so one that
+    /// changed stays; a writer's worktree that hasn't landed is never removed.
     fn remove_checkouts(&mut self, env: &mut dyn Env) {
-        let paths: Vec<PathBuf> = self
+        let own: Vec<(String, PathBuf)> = self
             .nodes
-            .values()
-            .filter_map(|n| n.cwd.clone())
-            .filter(|p| *p != self.tree() && p.is_dir())
+            .iter()
+            .filter_map(|(id, n)| Some((id.clone(), n.cwd.clone()?)))
+            .filter(|(_, p)| *p != self.tree() && p.is_dir())
             .collect();
-        for p in paths {
-            if let Err(e) = env.git(
-                &self.repo,
-                &["worktree", "remove", &p.display().to_string()],
-            ) {
+        for (id, p) in own {
+            let removed = if self.workflow.nodes[&id].writes() {
+                super::land::remove_tree(self, env, &id)
+            } else {
+                super::land::unlock_ours(self, env, &p);
+                env.git(
+                    &self.repo,
+                    &["worktree", "remove", &p.display().to_string()],
+                )
+                .map(|_| ())
+            };
+            if let Err(e) = removed {
                 self.note(
                     env,
                     format!("kept {}: {}", crate::app::tilde(&p), first_line(&e)),
@@ -616,7 +639,7 @@ impl WfRun {
 
     /// The run's worktree, made if it isn't there: on its own branch, from
     /// the base as origin has it.
-    fn ensure_tree(&mut self, env: &mut dyn Env) -> Result<PathBuf, String> {
+    pub(super) fn ensure_tree(&mut self, env: &mut dyn Env) -> Result<PathBuf, String> {
         let path = self.tree();
         if path.is_dir() {
             return Ok(path);
@@ -652,13 +675,18 @@ impl WfRun {
     }
 
     /// The run branch's head, as trix reads it itself.
-    fn head(&mut self, env: &mut dyn Env) -> Result<String, String> {
+    pub(super) fn head(&mut self, env: &mut dyn Env) -> Result<String, String> {
         let tree = self.ensure_tree(env)?;
         Ok(env.git(&tree, &["rev-parse", "HEAD"])?.trim().to_string())
     }
 
     /// A clean, detached checkout of `sha` for a reader or a check.
-    fn checkout(&mut self, env: &mut dyn Env, name: &str, sha: &str) -> Result<PathBuf, String> {
+    pub(super) fn checkout(
+        &mut self,
+        env: &mut dyn Env,
+        name: &str,
+        sha: &str,
+    ) -> Result<PathBuf, String> {
         let path = self.repo.join(".trix/worktrees").join(name);
         if !path.is_dir() {
             env.git(
@@ -772,10 +800,17 @@ impl WfRun {
 // ───────────────────────────── the nodes ─────────────────────────────
 
 impl WfRun {
-    /// Follow the edge from `id` on a verdict or a runtime event.
-    fn route(&mut self, env: &mut dyn Env, id: &str, trigger: &str) {
+    /// Follow the edges from `id` on a verdict or a runtime event: one, or
+    /// several when the verdict fans out.
+    pub(super) fn route(&mut self, env: &mut dyn Env, id: &str, trigger: &str) {
         self.active.retain(|a| a != id);
-        let Some(edge) = self.workflow.follow(id, trigger).cloned() else {
+        let edges: Vec<super::model::Edge> = self
+            .workflow
+            .follow_all(id, trigger)
+            .into_iter()
+            .cloned()
+            .collect();
+        if edges.is_empty() {
             // The checker refuses a verdict with no edge; an event with none ends the run.
             let what = if EVENTS.contains(&trigger) {
                 "ended with"
@@ -786,73 +821,60 @@ impl WfRun {
                 env,
                 format!("{id} {what} {trigger}, and no edge says what follows"),
             );
-        };
+        }
         let vars = self.vars(id);
-        match edge.to.as_str() {
-            DONE => match self.done_when() {
-                Ok(()) => self.succeed(env, format!("done: {}", self.vars(id)["goal.text"])),
-                Err(why) => self.fail(
-                    env,
-                    format!(
-                        "{id} gave {trigger}, which ends the run, but done_when isn't met: {why}"
-                    ),
-                ),
-            },
-            FAIL => self.fail(
-                env,
-                format!(
-                    "{id} {} {trigger}",
-                    if EVENTS.contains(&trigger) {
-                        "ended with"
-                    } else {
-                        "gave"
-                    }
-                ),
-            ),
-            to => {
-                let payload: Vec<String> = edge
-                    .pass
-                    .values()
-                    .map(|t| prompt::render(t, &vars))
-                    .filter(|t| !t.trim().is_empty())
-                    .collect();
-                // An edge that leads back is a cycle of cost; going forward again isn't.
-                let at = self.workflow.edges.iter().position(|e| *e == edge);
-                let back = at.is_some_and(|i| check::back_edges(&self.workflow).contains(&i));
-                let target = self
-                    .nodes
-                    .get_mut(to)
-                    .expect("the checker refuses an edge to nowhere");
-                target.inbox = payload;
-                // Mentions queued for it arrive now, with what the edge passed.
-                target.inbox.append(&mut target.mentions);
-                target.state = NodeState::Waiting;
-                if !self.active.iter().any(|a| a == to) {
-                    self.active.push(to.to_string());
-                }
-                if back {
-                    self.cycles += 1;
-                    self.note(
+        let back_edges = check::back_edges(&self.workflow);
+        for edge in edges {
+            match edge.to.as_str() {
+                DONE => match self.done_when() {
+                    Ok(()) => self.succeed(env, format!("done: {}", vars["goal.text"])),
+                    Err(why) => self.fail(
                         env,
-                        format!(
-                            "{id} gave {trigger}: back to {to} (cycle {} of at most {})",
-                            self.cycles, self.ceiling
-                        ),
-                    );
-                    if self.cycles > self.ceiling {
-                        let ceiling = self.ceiling;
-                        self.limit(
-                            env,
-                            "cycles",
-                            format!(
-                                "the ceiling of {} is reached, and {id} still sends work back",
-                                plural(ceiling as usize, "cycle")
-                            ),
-                        );
-                    }
-                } else {
-                    self.note(env, format!("{id} gave {trigger}: on to {to}"));
+                        format!("{id} gave {trigger}, which ends the run, but done_when isn't met: {why}"),
+                    ),
+                },
+                FAIL => {
+                    let what = if EVENTS.contains(&trigger) { "ended with" } else { "gave" };
+                    self.fail(env, format!("{id} {what} {trigger}"))
                 }
+                to => {
+                    let payload: Vec<String> =
+                        edge.pass.values().map(|t| prompt::render(t, &vars)).filter(|t| !t.trim().is_empty()).collect();
+                    // An edge that leads back is a cycle of cost; going forward again isn't.
+                    let at = self.workflow.edges.iter().position(|e| *e == edge);
+                    let back = at.is_some_and(|i| back_edges.contains(&i));
+                    let target = self.nodes.get_mut(to).expect("the checker refuses an edge to nowhere");
+                    target.inbox = payload;
+                    // Mentions queued for it arrive now, with what the edge passed.
+                    target.inbox.append(&mut target.mentions);
+                    target.state = NodeState::Waiting;
+                    if !self.active.iter().any(|a| a == to) {
+                        self.active.push(to.to_string());
+                    }
+                    if back {
+                        self.cycles += 1;
+                        self.note(
+                            env,
+                            format!("{id} gave {trigger}: back to {to} (cycle {} of at most {})", self.cycles, self.ceiling),
+                        );
+                        if self.cycles > self.ceiling {
+                            let ceiling = self.ceiling;
+                            self.limit(
+                                env,
+                                "cycles",
+                                format!(
+                                    "the ceiling of {} is reached, and {id} still sends work back",
+                                    plural(ceiling as usize, "cycle")
+                                ),
+                            );
+                        }
+                    } else {
+                        self.note(env, format!("{id} gave {trigger}: on to {to}"));
+                    }
+                }
+            }
+            if self.over() {
+                return;
             }
         }
     }
@@ -860,7 +882,7 @@ impl WfRun {
     /// A revisit that changed nothing: the same head, the same failure, or
     /// the same verdict on the same commit. `no_progress: 1` stops at the
     /// first one.
-    fn wasted(&mut self, env: &mut dyn Env, id: &str, what: &str) -> bool {
+    pub(super) fn wasted(&mut self, env: &mut dyn Env, id: &str, what: &str) -> bool {
         self.wasted += 1;
         self.note(env, format!("a wasted cycle: {id} {what}"));
         let after = self
@@ -884,7 +906,7 @@ impl WfRun {
     }
 
     /// Start a node's visit: its checkout, its prompt, its pane.
-    fn begin(&mut self, env: &mut dyn Env, seen: &[Seen], id: &str) {
+    pub(super) fn begin(&mut self, env: &mut dyn Env, seen: &[Seen], id: &str) {
         let n = self.workflow.nodes[id].clone();
         if let Some(max) = n.max_visits.filter(|m| self.nodes[id].visits >= *m) {
             return self.limit(
@@ -899,7 +921,12 @@ impl WfRun {
         let writer = n.writes();
         let started = (|| -> Result<(PathBuf, Option<String>), String> {
             if writer {
-                let tree = self.ensure_tree(env)?;
+                // Writers that can run at the same time never share a worktree.
+                let tree = if check::isolated(&self.workflow, id) {
+                    super::land::own_tree(self, env, id)?
+                } else {
+                    self.ensure_tree(env)?
+                };
                 let head = env.git(&tree, &["rev-parse", "HEAD"])?.trim().to_string();
                 return Ok((tree, Some(head)));
             }
@@ -991,7 +1018,7 @@ impl WfRun {
     /// commits touched and is still different now (not what a merge of the
     /// base brought in, and not a change it undid), and what it left
     /// uncommitted.
-    fn changed(&mut self, env: &mut dyn Env, id: &str) -> Vec<String> {
+    pub(super) fn changed(&mut self, env: &mut dyn Env, id: &str) -> Vec<String> {
         let (Some(cwd), Some(start)) = (self.nodes[id].cwd.clone(), self.nodes[id].start.clone())
         else {
             return Vec::new();
@@ -1043,7 +1070,7 @@ impl WfRun {
 
     /// A report came in: check a writer's scope, tell a wasted cycle, let
     /// the pane go if the node starts fresh, and follow the verdict's edge.
-    fn take(&mut self, root: &Path, env: &mut dyn Env, id: &str, text: &str) {
+    pub(super) fn take(&mut self, root: &Path, env: &mut dyn Env, id: &str, text: &str) {
         let n = self.workflow.nodes[id].clone();
         let Ok(report) = serde_json::from_str::<serde_json::Value>(text) else {
             return;
@@ -1152,6 +1179,12 @@ impl WfRun {
         st.outputs.insert("commit".into(), judged.into());
         st.state = NodeState::Done;
         st.quota = None;
+        st.landed = false;
+        if n.writes() && check::isolated(&self.workflow, id) {
+            self.finished.retain(|f| f != id);
+            self.finished.push(id.to_string());
+        }
+        let st = self.nodes.get_mut(id).unwrap();
         if n.revisit() == Revisit::Fresh {
             st.agent = None;
             if !self.closing.contains(&name) {
@@ -1180,7 +1213,7 @@ impl WfRun {
     /// No report yet: a quota stop is said and waited out, a stopped agent
     /// is nudged once and then yours, one that exited is started again.
     /// An idle agent is never restarted.
-    fn watch(&mut self, env: &mut dyn Env, seen: &[Seen], id: &str) {
+    pub(super) fn watch(&mut self, env: &mut dyn Env, seen: &[Seen], id: &str) {
         let n = self.workflow.nodes[id].clone();
         let Some(name) = self.nodes[id].agent.clone() else {
             return;

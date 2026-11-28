@@ -1095,6 +1095,18 @@ fn the_graph_rules_are_checked() {
         !run(&w).has("loop-no-ceiling"),
         "max_visits on every node of the loop is a ceiling too"
     );
+    // A land step that sends conflicts back to their author is a loop too.
+    let mut n = builtin("nightly-deps").unwrap();
+    n.limits.max_iterations = None;
+    let r = run(&n);
+    assert_eq!(
+        r.find("loop-no-ceiling").map(|p| p.at.clone()),
+        Some(At::Node("land".into())),
+        "{}",
+        r.render()
+    );
+    n.nodes.get_mut("land").unwrap().on_conflict = Some("fail".into());
+    assert!(!run(&n).has("loop-no-ceiling"));
     // A linear flow needs neither.
     let mut l = wf();
     l.limits.max_iterations = None;

@@ -23,8 +23,9 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 4 | Built-ins and the triage template (**hard parity gate**) | f590813 | **pass** |
 | 5 | Workflow model and native TOML | 75e1cbc | pass |
 | 6 | Capability matrix and the shared checker | 81d1bc5 | pass |
-| 7 | Matrix probes | (this, with 8) | pass |
-| 8 | Generic nodes and prompting | (this, with 7) | pass |
+| 7 | Matrix probes | 77e9fd5 (with 8) | pass |
+| 8 | Generic nodes and prompting | 77e9fd5 (with 7) | pass |
+| 9 | Workspaces and landing | (this) | pass |
 
 ## Step 1: baseline
 
@@ -519,6 +520,57 @@ Tests added: 17 (14 engine, 3 prompt). Suite: 790 passed. Deferred to
 their own steps: `land`, `for_each`, `join` and `workflow` nodes (9, 10);
 floors, the hooks fingerprint, rule approvals and the agent-start policy
 (11); the run log (13).
+
+## Step 9: workspaces and landing
+
+**Built** (`src/workflow/land.rs`, and the engine's `begin`)
+
+- **Shared:** writers that edges put in order work one after another in
+  the run's worktree (`trix/wf-<run>`).
+- **Isolated:** a writer that can run at the same time as another (no edge
+  orders them), that fans out, or that asks for it gets a worktree of its
+  own on `trix/wf-<run>-<node>`, branched from the run's branch. What's
+  uncommitted in the run's worktree is copied in: staged files stay staged
+  (`git stash create`, applied with `--index`; nobody's stash is touched)
+  and untracked files come too.
+- **The land step:** once every isolated writer at work has handed in,
+  their commits are rebased onto the run's branch in the order they
+  finished, and the run's branch fast-forwards. A conflict takes the rebase
+  back, then goes to its author with the conflicting files in its inbox
+  (`on_conflict: author`, a cycle of cost) or ends the run (`fail`). After
+  landing, the check runs on the landed commit, which trix pins.
+- **Nothing is removed before it lands.** `land::remove_tree` refuses a
+  worktree whose branch has commits not on the run's branch, or that has
+  uncommitted changes, and never forces. At the end of a run, landed
+  worktrees and their branches go; the run's own stays.
+- A verdict can **fan out** to several nodes (two edges on the same
+  trigger).
+
+**Accept** (`workflow::engine_tests`, 3 tests)
+
+- Writers in order share one worktree (`writers_in_order_share_one_worktree`).
+- Writers that can run at the same time get their own, with scopes that
+  don't overlap too, and never share an index
+  (`writers_that_can_run_at_the_same_time_get_their_own_worktrees_and_land`:
+  three different index files, the dirty state copied, landing in finish
+  order, the check and a Gemini verifier on the landed commit, the gate,
+  the outcome summary as the PR's body).
+- A forced conflict goes back to its author with the conflicting file, and
+  lands once resolved; `on_conflict: fail` ends the run
+  (`a_land_conflict_goes_back_to_its_author`).
+- No worktree is removed before landing: the attempted removal is refused
+  in the test ("1 commit on trix/wf-pair-42-ui hasn't landed").
+
+**Decisions**
+
+- The cycle ceiling is `max_iterations` whenever it's set, 1 otherwise, and
+  it bounds every way work goes back: an edge, a scope send-back, a land
+  conflict. So the checker now also wants `max_iterations` when a land step
+  sends conflicts back to their author (`loop-no-ceiling` on the land node).
+- A landed writer's branch is deleted by name (`git branch -D`) only after
+  trix has verified it has no commit that isn't on the run's branch.
+
+Tests added: 3, and one checker case. Suite: 793 passed. Deferred: nothing.
 
 ## Decisions to review
 

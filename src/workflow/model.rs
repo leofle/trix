@@ -669,6 +669,26 @@ impl Workflow {
             .or_else(|| self.edges.iter().filter(|e| e.from == "*").find(on))
     }
 
+    /// Every edge `from` takes on `trigger`: one verdict can fan out to
+    /// several nodes. The node's own edges, else the `*` ones.
+    pub fn follow_all(&self, from: &str, trigger: &str) -> Vec<&Edge> {
+        let on = |e: &&Edge| e.on.list().contains(&trigger);
+        let own: Vec<&Edge> = self
+            .edges
+            .iter()
+            .filter(|e| e.from == from)
+            .filter(on)
+            .collect();
+        if !own.is_empty() {
+            return own;
+        }
+        self.edges
+            .iter()
+            .filter(|e| e.from == "*")
+            .filter(on)
+            .collect()
+    }
+
     /// The edges that leave `from`, `*` ones included.
     pub fn out(&self, from: &str) -> impl Iterator<Item = &Edge> {
         self.edges

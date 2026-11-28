@@ -1372,6 +1372,22 @@ pub fn check(w: &Workflow, m: &Matrix, ctx: &Ctx) -> Report {
             );
         }
     }
+    // A land conflict goes back to its author: a loop no edge draws.
+    for (id, _) in w
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.kind == "land" && n.on_conflict.as_deref() != Some("fail"))
+    {
+        if w.limits.max_iterations.is_none() {
+            add(
+                Error,
+                "loop-no-ceiling",
+                node(id),
+                "a land conflict goes back to its author, and nothing stops that loop: no max_iterations".into(),
+                vec![fix("set max_iterations: 3", FixOp::SetMaxIterations(3))],
+            );
+        }
+    }
     if w.goal.done_when.mechanical.is_empty() {
         add(
             Error,
