@@ -20,7 +20,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 1 | Baseline | 5843b50 | pass |
 | 2 | Seeded replay and goldens of today's triage | a39b7a0 | pass |
 | 3 | Generic runner extracted, the triage tests ported (three green commits) | 1d928ee, aba1465, 8277530 | pass |
-| 4 | Built-ins and the triage template (**hard parity gate**) | (this) | **pass** |
+| 4 | Built-ins and the triage template (**hard parity gate**) | f590813 | **pass** |
+| 5 | Workflow model and native TOML | (this) | pass |
 
 ## Step 1: baseline
 
@@ -240,6 +241,35 @@ Tests added: 8 (`workflow::triage`). Suite: 731 passed.
 triage run. Today's triage has no time limit; the in-flight clock needs
 state that can't go into `case.json` without changing the folder the
 goldens freeze, so it's kept in the run's own folder, which step 13 adds.
+
+## Step 5: the workflow model and native TOML
+
+- `src/workflow/model.rs` (from step 4) is the format: `schema = 1`,
+  inputs, goal and `done_when` (mechanical and attested), limits, policy
+  (`push`: `gate_only`, `guarded` or `allow`), approvals, profiles, notify,
+  nodes with briefs, edges, and the builder's layout positions. Every
+  struct refuses a key it doesn't know (`deny_unknown_fields`), and nothing
+  unset is written out.
+- `src/workflow/store.rs`: where workflows live. Built-ins are compiled in
+  and read-only; `.trix/workflows/<name>.toml` in the main checkout is the
+  team's and shadows `~/.config/trix/workflows/<name>.toml`, yours. A
+  built-in's name can't be saved over: a fork gets its own.
+- **Snapshot at start:** `store::snapshot` writes the workflow into the
+  run's folder (`<state>/runs/<id>/workflow.toml`), and a run reads only
+  that.
+- Templates: `triage`, `issue-to-pr`, `bug-repro`, `nightly-deps`
+  (`src/workflow/templates/`).
+- **Accept:** round-trip and schema tests pass
+  (`every_template_round_trips_through_the_native_format`,
+  `the_schema_version_and_the_keys_are_checked`,
+  `the_teams_workflow_shadows_yours_and_built_ins_are_read_only`,
+  `a_run_works_from_the_snapshot_taken_at_its_start`).
+- **Decisions:** `{{config.…}}` settings (triage's round ceiling, budget and
+  agents) are kept as text in the file and bound when a run starts, so the
+  shipped template round-trips unchanged. Durations are text (`3h`,
+  `1h30m`). The content hash that trust is pinned to is FNV-1a over the
+  workflow's canonical JSON: it detects edits, it isn't a signature.
+- Tests added: 4. Suite: 735 passed. Deferred: nothing.
 
 ## Decisions to review
 

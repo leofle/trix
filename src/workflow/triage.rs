@@ -11,12 +11,10 @@ use super::model::{Args, Count, Node, Revisit, Second, Workflow};
 use crate::config::{Role, TriageOpts};
 use std::sync::OnceLock;
 
-const TEMPLATE: &str = include_str!("templates/triage.toml");
-
 /// The built-in triage workflow, as shipped: its `{{config.…}}` not bound.
 pub fn template() -> &'static Workflow {
     static T: OnceLock<Workflow> = OnceLock::new();
-    T.get_or_init(|| Workflow::from_toml(TEMPLATE).expect("the built-in triage template parses"))
+    T.get_or_init(|| super::store::builtin("triage").expect("the built-in triage template"))
 }
 
 /// `[triage]` as the template's `{{config.triage.…}}` see it.

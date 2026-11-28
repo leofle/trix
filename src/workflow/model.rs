@@ -2,9 +2,6 @@
 //! edges. The builder owns this as a TOML file; YAML is for import and
 //! export only.
 
-// Built ahead of the steps that use each part: this comes off once they do.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

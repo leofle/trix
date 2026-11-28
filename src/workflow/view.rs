@@ -1,9 +1,6 @@
 //! A run as anyone looks at it: the overview, `trix workflow ls`, the
 //! summary. Every kind of run turns into this, triage cases included.
 
-// Built ahead of the steps that use each part: this comes off once they do.
-#![allow(dead_code)]
-
 use serde::Serialize;
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
