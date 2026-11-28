@@ -32,7 +32,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 13 | Run log, overview, scheduling and notifications | 73cfaf3 | pass |
 | 14 | Terminal builder | 999de55 | pass |
 | 15 | YAML import and export | 4b01abf | pass |
-| 16 | Docs, and the last honesty fixes | (this) | pass |
+| 16 | Docs, and the last honesty fixes | ac7e4b6 | pass |
+| 17 | Push and pull request | this commit, pushed with a plain push | pass |
 
 ## Step 1: baseline
 
@@ -1059,6 +1060,19 @@ triage, with unknown kinds and triage as a node; a gate needs something
 checked; with no check the gate merges what the judge passed; plus
 triage in the every-template dry run). The wizard's test no longer makes a
 copy of triage: it asserts the refusal instead.
+
+## Step 17: push and pull request
+
+- `trix/workflows` starts at `origin/main` (`fe0cbe3`, still its head when
+  this was pushed) and is 18 commits: one per checkpoint, three for step 3,
+  one for steps 7 and 8 together, and this one, which only completes this
+  file's checkpoint table.
+- Pushed with a plain `git push -u origin trix/workflows`: no force, nothing
+  rewritten after the push, nothing pushed to `main`.
+- A pull request against `main`, with the checkpoint table, the triage
+  parity evidence, the probe results, "Decisions to review" and the known
+  limits. Outcome summaries only: no prompts, local paths or secrets.
+- Not merged: that's the reviewer's.
 
 ## Decisions to review
 
