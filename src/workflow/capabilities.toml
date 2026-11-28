@@ -14,9 +14,13 @@
 # backend outside it drops to documented, with a warning.
 
 [claude]
-level = "documented"
-verified_with = ""
-verified_at = ""
+# Probed on the build machine (2026-11-28): hand-in under all four profiles,
+# a push to the disabled remote, the PermissionRequest decision and the
+# hook timeout all passed. Verified for that version only: any other
+# counts as documented until `trix workflow capabilities --verify` runs.
+level = "verified"
+verified_with = "2.1.332"
+verified_at = "1.7.8"
 versions = { min = "2.0.0", max = "2.99.99" }
 hand_in = true
 read_only_enforced = true            # with a profile whose commands are all on the safe list
@@ -24,12 +28,15 @@ push = "enforced"                    # with a safe-list profile; guarded with an
 state = "hooks"
 resume = "yes"
 quota_signal = "screen"
-permission_decision = "documented"   # PermissionRequest can return a decision; verified by the probe
+permission_decision = "verified"     # PermissionRequest returns a decision; a late one is ignored
 merge_approver = true
 priced = true
 hook_timeout_s = 5
 
 [codex]
+# Probed on the build machine (0.167.2, 2026-11-28): inconclusive. A managed
+# policy there refuses approval_policy = never, so headless Codex couldn't run
+# the probe's command. Nothing about Codex itself was shown either way.
 level = "documented"
 verified_with = ""
 verified_at = ""

@@ -1,0 +1,40 @@
+#!/bin/sh
+# A stand-in for Codex, for tests.
+#   codex --version
+#   codex exec <prompt> [-s read-only|workspace-write] [-a never] [-c hooks=…]
+# In read-only it can't reach trix's socket or the network: `trix` and
+# `git push` fail there. In workspace-write it runs what it's told. Its
+# PermissionRequest hook is called only with FAKE_MODE=decides.
+[ "$1" = "--version" ] && { echo "codex-cli ${FAKE_VERSION:-0.167.2}"; exit 0; }
+sandbox=workspace-write; prompt=""; hooks=""
+[ "$1" = "exec" ] && { prompt="$2"; shift 2; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s) sandbox="$2"; shift 2 ;;
+    -c) hooks="$2"; shift 2 ;;
+    -a) shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ "$FAKE_MODE" = "quota" ]; then
+  echo "■ You've hit your usage limit. Try again in 2h 5m."
+  exit 1
+fi
+cmd=$(printf '%s\n' "$prompt" | sed -n '/^RUN:$/,/^END$/p' | sed '1d;$d')
+[ -z "$cmd" ] && exit 0
+set -- $cmd
+if [ "$sandbox" = "read-only" ]; then
+  case "$1 $2" in
+    trix*|"git push"|touch*) echo "sandbox: operation not permitted"; exit 0 ;;
+  esac
+fi
+case "$1" in
+  touch)
+    # Not in its sandbox's allowances without asking: -a never refuses.
+    [ "$FAKE_MODE" = "decides" ] || { echo "approval required, and approvals are off: refused"; exit 0; }
+    hook=$(printf '%s' "$hooks" | sed -n 's/.*command="\([^"]*\)".*/\1/p')
+    decision=$(printf '{"hook_event_name":"PermissionRequest","request_id":"req-1"}' | sh -c "$hook")
+    case "$decision" in *'"behavior":"allow"'*) ;; *) echo "refused"; exit 0 ;; esac
+    ;;
+esac
+sh -c "$cmd" 2>&1

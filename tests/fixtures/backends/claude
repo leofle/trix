@@ -1,0 +1,63 @@
+#!/bin/sh
+# A stand-in for Claude Code, for tests: it makes Claude's hook calls and
+# prints its screens. No model, no network, no login.
+#   claude --version
+#   claude -p <prompt> [--permission-mode M] [--allowedTools T] [--settings F]
+# The prompt names one command between a RUN: line and an END line. Whether
+# it runs is decided as Claude would: by the tool list, else (in a prompting
+# mode) by the PermissionRequest hook in the settings file.
+# FAKE_MODE changes what it does: cant-submit, no-hook-event,
+# ignores-decision, late-allow-taken, unsets-guard, quota.
+[ "$1" = "--version" ] && { echo "${FAKE_VERSION:-2.3.1} (Claude Code)"; exit 0; }
+mode=default; tools=""; settings=""; prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt="$2"; shift 2 ;;
+    --permission-mode) mode="$2"; shift 2 ;;
+    --allowedTools) tools="$2"; shift 2 ;;
+    --settings) settings="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ "$FAKE_MODE" = "quota" ]; then
+  echo "You've hit your usage limit. Your limit resets at 3am."
+  exit 1
+fi
+cmd=$(printf '%s\n' "$prompt" | sed -n '/^RUN:$/,/^END$/p' | sed '1d;$d')
+[ -z "$cmd" ] && { echo "Nothing to run."; exit 0; }
+set -- $cmd
+allowed=no
+for pat in "Bash" "Bash($1:*)" "Bash($1 $2:*)" "Bash($1 $2 $3:*)"; do
+  case ",$tools," in *",$pat,"*) allowed=yes ;; esac
+done
+case "$FAKE_MODE:$1" in cant-submit:trix) echo "Bash failed: command not found"; exit 0 ;; esac
+if [ "$allowed" = no ]; then
+  if [ "$mode" = "dontAsk" ]; then
+    echo "Permission to use Bash was denied."
+    exit 0
+  fi
+  [ "$FAKE_MODE" = "no-hook-event" ] && { echo "Do you want to run: $cmd ?"; exit 0; }
+  hook=$(sed -n 's/^ *"command": "\(.*\)",*$/\1/p' "$settings" | head -1)
+  wait_s=$(sed -n 's/^ *"timeout": \([0-9]*\).*/\1/p' "$settings" | head -1)
+  out="$(mktemp)"
+  ( printf '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"%s"},"request_id":"req-1"}' "$cmd" | sh -c "$hook" > "$out" ) &
+  hook_pid=$!
+  if [ "$FAKE_MODE" = "late-allow-taken" ]; then
+    wait $hook_pid
+  else
+    ( sleep "${wait_s:-5}"; kill $hook_pid 2>/dev/null ) &
+    killer=$!
+    wait $hook_pid 2>/dev/null
+    kill $killer 2>/dev/null
+  fi
+  decision=$(cat "$out"); rm -f "$out"
+  case "$decision" in
+    *'"behavior":"allow"'*) [ "$FAKE_MODE" = "ignores-decision" ] && { echo "Do you want to run: $cmd ?"; exit 0; } ;;
+    *) echo "Do you want to run: $cmd ?"; exit 0 ;;
+  esac
+fi
+if [ "$FAKE_MODE" = "unsets-guard" ]; then
+  unset GIT_CONFIG_COUNT
+fi
+sh -c "$cmd" 2>&1
+echo "Done."

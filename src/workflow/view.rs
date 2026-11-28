@@ -1,9 +1,9 @@
 //! A run as anyone looks at it: the overview, `trix workflow ls`, the
 //! summary. Every kind of run turns into this, triage cases included.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     /// Waiting on a cron start, a trigger or another workflow.
@@ -44,7 +44,7 @@ impl RunState {
     }
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
     Waiting,

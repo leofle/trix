@@ -36,6 +36,7 @@ fn verified() -> (Matrix, Ctx) {
         Local {
             version: "2.3.1".into(),
             trix: "1.8.0".into(),
+            verified: true,
             permission_decision: Some("verified".into()),
             results: BTreeMap::new(),
         },

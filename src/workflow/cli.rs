@@ -2,9 +2,12 @@
 
 use super::caps::{HandIn, Installed, Matrix};
 use super::check::{self, Ctx};
+use super::engine::{self, Op, WfRun};
+use super::env::{Env, Live, control};
 use super::model::Workflow;
 use super::settings::Settings;
-use super::store::Stores;
+use super::store::{Stores, runs_root};
+use crate::control::Request;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -13,14 +16,20 @@ usage:
   trix workflow run <name> [--input k=v]…   start a run of a workflow
                                             (triage: --input target=<PR or issue>)
   trix workflow ls [--json]                 every run and where it is
+  trix workflow show <run> [--json]         one run: its nodes, its log
   trix workflow check <name> [--fix]        the one checker: the builder, import, dry run and
                                             run start use it too. --fix applies what it can
   trix workflow capabilities [--kind k] [--verify]
                                             what each backend can do, and how well trix knows
                                             it. --verify runs real probes (opt-in: it spends a
                                             little quota)
-  trix workflow approve <run>               yours only: let a run's gate through
-  trix workflow abort <run>                 stop a run
+  trix workflow pause|resume|abort <run>    from an agent pane: as [workflows.agents] allows
+  trix workflow approve <run>               yours only: refused from every agent pane and check
+  trix workflow answer <run> <key>          answer what a run asks, as in its pane
+  trix workflow revoke <run>                mid-run: every approval drops back to ask
+  trix wf submit <node> [--file F]          for the agents: hand in a report, JSON on stdin
+  trix wf ask [--file F]                    for the agents: a question for the supervisor node;
+                                            @node queues it to that node's inbox
 ";
 
 /// A `trix workflow …` command line, read.
@@ -30,7 +39,13 @@ pub enum Cmd {
         name: String,
         inputs: BTreeMap<String, String>,
     },
+    /// The run's pane: what a saved layout starts again.
+    Pane(String),
     Ls {
+        json: bool,
+    },
+    Show {
+        id: String,
         json: bool,
     },
     Check {
@@ -43,6 +58,13 @@ pub enum Cmd {
     },
     Approve(String),
     Abort(String),
+    Pause(String),
+    Resume(String),
+    Revoke(String),
+    Answer {
+        id: String,
+        key: char,
+    },
 }
 
 /// What `trix workflow <args>` asks for, or why it isn't a command.
@@ -53,6 +75,7 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
         .map(String::as_str)
         .filter(|a| *a != "--json")
         .collect();
+    let id = |s: &&str| s.to_string();
     match words.as_slice() {
         ["run", name, rest @ ..] => {
             let mut inputs = BTreeMap::new();
@@ -77,7 +100,9 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 inputs,
             })
         }
+        ["pane", x] => Ok(Cmd::Pane(id(x))),
         ["ls"] => Ok(Cmd::Ls { json }),
+        ["show", x] => Ok(Cmd::Show { id: id(x), json }),
         ["check", name] => Ok(Cmd::Check {
             name: name.to_string(),
             fix: false,
@@ -104,9 +129,42 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             }
             Ok(Cmd::Capabilities { kind, verify })
         }
-        ["approve", id] => Ok(Cmd::Approve(id.to_string())),
-        ["abort", id] => Ok(Cmd::Abort(id.to_string())),
+        ["approve", x] => Ok(Cmd::Approve(id(x))),
+        ["abort", x] => Ok(Cmd::Abort(id(x))),
+        ["pause", x] => Ok(Cmd::Pause(id(x))),
+        ["resume", x] => Ok(Cmd::Resume(id(x))),
+        ["revoke", x] => Ok(Cmd::Revoke(id(x))),
+        ["answer", x, key] if key.chars().count() == 1 => Ok(Cmd::Answer {
+            id: id(x),
+            key: key.chars().next().unwrap_or(' ').to_ascii_lowercase(),
+        }),
         _ => Err(HELP.to_string()),
+    }
+}
+
+/// A `trix wf …` command line: what an agent hands in or asks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WfCmd {
+    Submit { node: String, file: Option<PathBuf> },
+    Ask { file: Option<PathBuf> },
+}
+
+pub fn parse_wf(args: &[String]) -> Result<WfCmd, String> {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["submit", node] => Ok(WfCmd::Submit {
+            node: node.to_string(),
+            file: None,
+        }),
+        ["submit", node, "--file", f] => Ok(WfCmd::Submit {
+            node: node.to_string(),
+            file: Some(PathBuf::from(f)),
+        }),
+        ["ask"] => Ok(WfCmd::Ask { file: None }),
+        ["ask", "--file", f] => Ok(WfCmd::Ask {
+            file: Some(PathBuf::from(f)),
+        }),
+        _ => Err("usage: trix wf submit <node> [--file F] | trix wf ask [--file F]".into()),
     }
 }
 
@@ -205,6 +263,9 @@ pub fn as_case(cmd: &Cmd, is_case: impl Fn(&str) -> bool) -> Option<Vec<String>>
     match cmd {
         Cmd::Approve(id) if is_case(id) => words(&["approve", id]),
         Cmd::Abort(id) if is_case(id) => words(&["abort", id]),
+        Cmd::Show { id, json: false } if is_case(id) => words(&["show", id]),
+        Cmd::Show { id, json: true } if is_case(id) => words(&["show", id, "--json"]),
+        Cmd::Answer { id, key } if is_case(id) => words(&["answer", id, &key.to_string()]),
         _ => None,
     }
 }
@@ -212,6 +273,72 @@ pub fn as_case(cmd: &Cmd, is_case: impl Fn(&str) -> bool) -> Option<Vec<String>>
 fn fail(e: impl std::fmt::Display) -> i32 {
     eprintln!("trix: workflow: {e}");
     1
+}
+
+fn say(r: Result<String, String>) -> i32 {
+    match r {
+        Ok(out) => {
+            print!("{out}");
+            0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// One run, for you to read: its nodes and its log.
+pub fn show(r: &WfRun, seen: &[super::env::Seen]) -> String {
+    let v = r.view(seen);
+    let spent = if v.unpriced {
+        format!("{} + ?", crate::cost::usd(v.spent_usd))
+    } else {
+        crate::cost::usd(v.spent_usd)
+    };
+    let mut s = format!(
+        "{} · {} · {}\n{}\n{} of {} done · {} blocked · cycles {} ({} wasted) of at most {} · {spent} · {}m of {}m\n",
+        v.id,
+        v.workflow,
+        v.state.label(),
+        v.goal,
+        v.done(),
+        v.nodes.len(),
+        v.blocked(),
+        v.cycles,
+        v.wasted,
+        r.ceiling,
+        r.inflight / 60,
+        r.wall_clock / 60
+    );
+    if !v.why.is_empty() {
+        s.push_str(&format!("{}: {}\n", v.state.label(), v.why));
+    }
+    s.push('\n');
+    for n in &v.nodes {
+        let owns = if n.owns.is_empty() {
+            "–".to_string()
+        } else {
+            n.owns.join(",")
+        };
+        s.push_str(&format!(
+            "  {:<14} {:<10} {:<9} {:<18} {}\n",
+            n.id,
+            n.state.label(),
+            n.backend,
+            owns,
+            n.last
+        ));
+    }
+    if !r.log.is_empty() {
+        s.push_str("\nlog:\n");
+        for (at, text) in &r.log {
+            let (_, day, secs) = crate::ledger::local(*at);
+            s.push_str(&format!(
+                "  {day:>2}d {:02}:{:02}  {text}\n",
+                secs / 3600,
+                secs / 60 % 60
+            ));
+        }
+    }
+    s
 }
 
 /// `trix workflow …`.
@@ -230,10 +357,12 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let root = crate::case::root();
-    if let Some(case) = as_case(&cmd, |id| crate::case::load(&root, id).is_ok()) {
+    let cases = crate::case::root();
+    if let Some(case) = as_case(&cmd, |id| crate::case::load(&cases, id).is_ok()) {
         return crate::case::run(&case);
     }
+    let root = runs_root();
+    let wf = |run: String, op: Op| say(control(Request::Wf { run: Some(run), op }));
     match cmd {
         // `trix triage 123` is this, under its older name.
         Cmd::Run { name, inputs } if name == "triage" => match inputs.get("target") {
@@ -243,11 +372,45 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        Cmd::Run { name, inputs } => {
+            let Some(repo) = main_checkout() else {
+                return fail("not in a git repository");
+            };
+            let started = Stores::of(Some(&repo)).load(&name).and_then(|(w, _)| {
+                let (m, ctx, settings) = live()?;
+                let mut env = Live::looking("workflow");
+                let l = super::launch::Launch {
+                    repo: &repo,
+                    m: &m,
+                    ctx: &ctx,
+                    settings: &settings,
+                    trusted: true,
+                };
+                let run = super::launch::start(&mut env, &root, &l, &w, &inputs)?;
+                if let Err(e) = env.open_run(&run.id, &repo) {
+                    let _ = std::fs::remove_dir_all(engine::dir_of(&root, &run.id));
+                    return Err(e);
+                }
+                Ok(format!("{}\n", run.id))
+            });
+            // A refusal is the checker's own text: nothing to put before it.
+            match started {
+                Ok(out) => say(Ok(out)),
+                Err(e) if e.contains(" error") && e.contains(" warning") => {
+                    eprint!("{e}");
+                    1
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Cmd::Pane(id) => super::runner::run_pane::<WfRun>(&root, &id),
         Cmd::Ls { json } => {
-            let runs: Vec<_> = crate::case::all(&root)
+            let seen = Live::looking("workflow").agents().unwrap_or_default();
+            let mut runs: Vec<_> = crate::case::all(&cases)
                 .iter()
                 .map(crate::case::Case::view)
                 .collect();
+            runs.extend(engine::all(&root).iter().map(|r| r.view(&seen)));
             if json {
                 println!(
                     "{}",
@@ -264,7 +427,7 @@ pub fn run(args: &[String]) -> i32 {
                         format!(": {}", r.why)
                     };
                     println!(
-                        "{:<w$}  {:<8}  {}{why}  ·  {}",
+                        "{:<w$}  {:<12}  {}{why}  ·  {}",
                         r.id,
                         r.workflow,
                         r.state.label(),
@@ -274,6 +437,17 @@ pub fn run(args: &[String]) -> i32 {
             }
             0
         }
+        Cmd::Show { id, json } => say(engine::load(&root, &id).and_then(|r| {
+            if json {
+                return serde_json::to_string_pretty(&r)
+                    .map(|s| s + "\n")
+                    .map_err(|e| e.to_string());
+            }
+            Ok(show(
+                &r,
+                &Live::looking("workflow").agents().unwrap_or_default(),
+            ))
+        })),
         Cmd::Check { name, fix } => {
             let stores = Stores::of(main_checkout().as_deref());
             let found = stores
@@ -309,10 +483,76 @@ pub fn run(args: &[String]) -> i32 {
             }
             Err(e) => fail(e),
         },
-        Cmd::Capabilities { verify: true, .. } => fail("probes aren't built into this trix yet"),
-        Cmd::Run { name, .. } => fail(format!("no workflow named '{name}'")),
-        Cmd::Approve(id) | Cmd::Abort(id) => {
-            fail(format!("no run named '{id}' (trix workflow ls)"))
+        Cmd::Capabilities { kind, verify: true } => say(live()
+            .and_then(|(m, ctx, _)| super::probe::verify(&m, &ctx.installed, kind.as_deref()))),
+        Cmd::Approve(id) => wf(id, Op::Approve),
+        Cmd::Abort(id) => wf(id, Op::Abort),
+        Cmd::Pause(id) => wf(id, Op::Pause),
+        Cmd::Resume(id) => wf(id, Op::Resume),
+        Cmd::Revoke(id) => wf(id, Op::Revoke),
+        Cmd::Answer { id, key } => wf(id, Op::Answer { key }),
+    }
+}
+
+/// `trix wf …`: what an agent hands in or asks, from its pane. The server
+/// knows which run and which node by the pane it comes from.
+pub fn wf(args: &[String]) -> i32 {
+    let cmd = match parse_wf(args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let read = |file: &Option<PathBuf>| -> Result<String, String> {
+        let mut text = String::new();
+        match file {
+            // For an agent whose permissions refuse a heredoc.
+            Some(f) => {
+                text = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?
+            }
+            None => {
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text);
+            }
+        }
+        if text.trim().is_empty() {
+            return Err("pipe it in on stdin, or name a file with --file".into());
+        }
+        Ok(text)
+    };
+    let (file, sent) = match cmd {
+        WfCmd::Submit { node, file } => {
+            let r = read(&file).and_then(|report| {
+                control(Request::Wf {
+                    run: None,
+                    op: Op::Submit { node, report },
+                })
+            });
+            (file, r)
+        }
+        WfCmd::Ask { file } => {
+            let r = read(&file).and_then(|text| {
+                control(Request::Wf {
+                    run: None,
+                    op: Op::Ask { text },
+                })
+            });
+            (file, r)
+        }
+    };
+    // Taken: the file is gone, so it can't be committed. One sent back
+    // stays, to be fixed and handed in again.
+    if let (Ok(_), Some(f)) = (&sent, &file) {
+        let _ = std::fs::remove_file(f);
+    }
+    match sent {
+        Ok(out) => {
+            print!("{out}");
+            0
+        }
+        Err(e) => {
+            eprintln!("trix: wf: {e}");
+            1
         }
     }
 }

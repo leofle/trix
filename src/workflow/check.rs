@@ -1227,7 +1227,11 @@ pub fn check(w: &Workflow, m: &Matrix, ctx: &Ctx) -> Report {
         .iter()
         .flat_map(|e| reach(w, e).into_iter().chain([e.to_string()]))
         .collect();
-    for id in w.nodes.keys().filter(|id| !reached.contains(*id)) {
+    for id in w
+        .nodes
+        .keys()
+        .filter(|id| !reached.contains(*id) && w.nodes[*id].kind != "supervisor")
+    {
         add(
             Error,
             "unreachable",

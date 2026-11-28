@@ -184,11 +184,20 @@ impl Matrix {
         }
         for (kind, l) in local {
             if let Some(e) = m.0.get_mut(kind) {
-                e.level = Level::Verified;
-                e.verified_with = l.version.clone();
-                e.verified_at = l.trix.clone();
-                if let Some(d) = &l.permission_decision {
-                    e.permission_decision = d.clone();
+                // What shipped as verified was verified on one version: a
+                // local probe of another speaks for itself.
+                let shipped = e.verified_with.clone();
+                if l.verified {
+                    e.level = Level::Verified;
+                    e.verified_with = l.version.clone();
+                    e.verified_at = l.trix.clone();
+                }
+                match &l.permission_decision {
+                    Some(d) => e.permission_decision = d.clone(),
+                    None if l.version != shipped && e.permission_decision == "verified" => {
+                        e.permission_decision = "documented".into();
+                    }
+                    None => {}
                 }
             }
         }
@@ -247,6 +256,9 @@ impl Matrix {
 pub struct Local {
     pub version: String,
     pub trix: String,
+    /// Every core probe passed: the entry counts as verified.
+    #[serde(default)]
+    pub verified: bool,
     #[serde(default)]
     pub permission_decision: Option<String>,
     #[serde(default)]
@@ -560,6 +572,7 @@ mod tests {
             Local {
                 version: "2.3.1".into(),
                 trix: "1.8.0".into(),
+                verified: true,
                 permission_decision: Some("verified".into()),
                 results: BTreeMap::new(),
             },

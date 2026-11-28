@@ -760,6 +760,11 @@ impl Agent {
         if let Some(s) = &spec.runtime.setup {
             env.insert("TRIX_ROOT".into(), s.root.display().to_string());
         }
+        // A run's agent under push: guarded or gate_only: an accidental
+        // push or gh call fails in its pane.
+        if spec.runtime.guard {
+            env.extend(crate::workflow::guard::pane_env());
+        }
         if spec.kind == Kind::Codex
             && let Some(chain) = codex_user_notify()
         {

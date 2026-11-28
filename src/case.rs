@@ -2587,7 +2587,7 @@ fn finished(c: &mut Case, env: &mut dyn Env, after: Option<(u64, AfterMerge)>, w
 /// an approving review it needs, a code owner's, a protected branch. Not
 /// red or missing CI, a conflict, or a branch behind its base: those keep
 /// their own way.
-fn blocked_by_policy(err: &str) -> bool {
+pub(crate) fn blocked_by_policy(err: &str) -> bool {
     let e = err.to_lowercase();
     if e.contains("status check") || e.contains("not up to date") || e.contains("cannot be cleanly created") || e.contains("conflict") {
         return false;

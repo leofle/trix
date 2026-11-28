@@ -335,6 +335,10 @@ fn main() -> anyhow::Result<()> {
     }
     if args.first().map(String::as_str) == Some("hook") {
         let source = args.get(1).cloned().unwrap_or_else(|| "custom".into());
+        // A Codex hook ran: its hooks are trusted (`trix workflow check` asks).
+        if source == "codex" {
+            let _ = std::fs::write(worktree::state_dir().join("codex-hooks-seen"), "");
+        }
         hooks::run_client(&source, args.get(2).cloned());
         return Ok(());
     }
@@ -529,6 +533,7 @@ fn main() -> anyhow::Result<()> {
         Some("triage") => std::process::exit(case::triage(&args[1..])),
         Some("case") => std::process::exit(case::run(&args[1..])),
         Some("workflow") => std::process::exit(workflow::cli::run(&args[1..])),
+        Some("wf") => std::process::exit(workflow::cli::wf(&args[1..])),
         Some("forget") => {
             let yes = args.iter().skip(1).any(|a| a == "--yes" || a == "-y");
             if !flagged || args.iter().skip(1).any(|a| a != "--yes" && a != "-y") {

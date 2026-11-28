@@ -45,6 +45,9 @@ pub struct Runtime {
     pub ports: Option<Ports>,
     /// Runs once, in the pane, before the agent.
     pub setup: Option<Setup>,
+    /// The pane gets the guard (`workflow/guard.rs`): a run's agent under
+    /// `push: guarded` or `gate_only`.
+    pub guard: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1014,7 +1017,7 @@ pub struct Prepared {
 /// not to use the file this time.
 pub fn prepare(path: &Path, repo: Option<&RepoConfig>, reused: bool, skip: bool, opts: &WorktreeOpts) -> Prepared {
     let trusted = repo.filter(|r| !skip && r.trusted());
-    let mut out = Prepared { runtime: Runtime { ports: lease(path, opts, trusted.and_then(|r| r.ports)), setup: None }, ..Prepared::default() };
+    let mut out = Prepared { runtime: Runtime { ports: lease(path, opts, trusted.and_then(|r| r.ports)), setup: None, guard: false }, ..Prepared::default() };
     let mut notes = Vec::new();
     if !reused {
         if let Some(r) = trusted {

@@ -22,7 +22,9 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 3 | Generic runner extracted, the triage tests ported (three green commits) | 1d928ee, aba1465, 8277530 | pass |
 | 4 | Built-ins and the triage template (**hard parity gate**) | f590813 | **pass** |
 | 5 | Workflow model and native TOML | 75e1cbc | pass |
-| 6 | Capability matrix and the shared checker | (this) | pass |
+| 6 | Capability matrix and the shared checker | 81d1bc5 | pass |
+| 7 | Matrix probes | (this, with 8) | pass |
+| 8 | Generic nodes and prompting | (this, with 7) | pass |
 
 ## Step 1: baseline
 
@@ -357,6 +359,166 @@ goldens freeze, so it's kept in the run's own folder, which step 13 adds.
 
 Tests added: 31 (25 checker, 4 matrix, 2 settings). Suite: 766 passed.
 Deferred: nothing.
+
+## Step 7: matrix probes
+
+**Built**
+
+- `src/workflow/probe.rs`: the harness. Each probe runs the backend
+  headless in a scratch clone (a bare `origin` beside it, a `trix` on PATH
+  that only records a hand-in) and looks at what happened:
+  `hand-in:<profile>` for each shipped profile the kind has (and, for
+  Codex, the read-only sandbox the matrix says can't), `push-blocked` (a
+  push to a remote the guard disables), `permission-decision` (was the hook
+  asked, was its allow taken) and `hook-timeout` (an allow that comes after
+  the timeout must not be taken). Outcomes: `verified`, `failed`,
+  `inconclusive` (the event couldn't be triggered in 3 tries: doesn't
+  count), `skipped`.
+- `trix workflow capabilities --verify [--kind k]` runs them for the
+  installed backends and records `capabilities.json` in trix's state
+  folder. It's opt-in and spends a little quota.
+- `src/workflow/guard.rs`: the guard's environment (git config overrides
+  that send every push nowhere and turn repository hooks off, a `gh` with
+  no login), needed here for the blocked-push probe and used from step 8 on.
+- `tests/fixtures/backends/{claude,codex,gemini}`: shell stand-ins that
+  take each backend's headless command line, make its hook calls and print
+  its screens. `FAKE_MODE` makes them misbehave on purpose.
+
+**Accept**
+
+- **CI, fake backends only** (`workflow::probe::tests`, 6 tests): the
+  harness records `verified` (a backend that does what the matrix says),
+  `inconclusive` (the hook event never fires: "no permission request
+  reached the hook in 3 tries"), and `failed` (the hook's allow isn't
+  taken; a late allow is taken; it can't hand in; code that undoes the
+  guard pushes). Covered: hand-in per profile, the blocked push, the
+  PermissionRequest decision, the hook timeout. No test needs a real
+  backend or a login.
+- **Real probes on the build machine** (2026-11-28, macOS):
+
+| Backend | Version | Result |
+|---|---|---|
+| claude | 2.1.332 | **verified**: hand-in under edit-only, edit-and-test, read-only and review-and-test; push blocked; the PermissionRequest hook's decision is taken; an allow after the 5 s timeout is not. Ships as `verified` for 2.1.332, `permission_decision = "verified"`. |
+| codex | 0.167.2 | **inconclusive, ships as `documented`**: a managed policy on this machine refuses `approval_policy = never` ("falling back to required value UnlessTrusted"), so headless `codex exec` couldn't run the probe's command at all. Read-only not handing in matched the matrix. Nothing about Codex itself was shown either way. `permission_decision` stays `unverified`. |
+| gemini | not installed | not probed: `documented` |
+| amp, antigravity, copilot, cursor, grok, muse, opencode | installed | not probed: trix knows no headless mode for them. `documented` |
+
+- **Codex's decision result is recorded** (inconclusive), so it isn't
+  verified, and **Codex prompt approvals stay out**: a permission rule on a
+  Codex node is the check error `rule-no-decision`
+  (`codex_hands_in_from_workspace_write_only_and_its_decision_is_recorded`).
+- Claude's entry is `verified` for exactly 2.1.332. On any other version it
+  counts as `documented` (rules suspended, a warning) until the probe runs
+  there.
+
+**Decisions**
+
+- The first two real Codex runs said "failed: it didn't hand in" because of
+  the harness, not Codex: `codex exec` doesn't take `-a`. That was fixed
+  (the flag is dropped for headless Codex) and the probe rerun; the result
+  above is from the rerun plus a by-hand run that showed the managed policy.
+- The fake backends are POSIX shell, so tests need `sh`, `sed` and `git`,
+  nothing else.
+
+Tests added: 7 (6 probe, 1 guard). Deferred: nothing.
+
+## Step 8: generic nodes and prompting
+
+**Built**
+
+- `src/workflow/engine.rs`: `WfRun`, a run of any workflow, on the generic
+  runner (`impl Run`). Its state is `runs/<id>/run.json` (versioned), with
+  the snapshot, `reports/`, `asks/` and `approvals.jsonl` beside it.
+  - **Agent nodes** (agent, judge, supervisor): a writer works in the run's
+    worktree on `trix/wf-<id>`; a reader gets a detached checkout of the
+    checked commit, its own each visit. `revisit: reuse` keeps the pane and
+    sends the next visit to it; `fresh` closes it once the report is in.
+  - **Checks**: a clean, detached checkout of the run branch's head, which
+    trix resolves itself; the exit code decides; the commit it ran on is
+    **pinned**, and everything after judges that commit. A flaky rerun
+    isn't a cycle.
+  - **The gate** (`gh.gate`): `done_when` on the pinned commit, trix's own
+    plain push of exactly that commit, the PR (its body is the outcome
+    summary), CI on that commit ("no checks yet" is never green), the
+    approval (you, or the approver node when approvals are on for this
+    workflow and it voted pass on that commit and didn't write it), a fresh
+    CI look, then `gh pr merge --match-head-commit`.
+  - **Edges** pick what's next from the verdict. An edge that leads back is
+    a cycle of cost; the ceiling (`max_iterations`), `max_visits`, the
+    budget (priced kinds only: an unpriced agent's spend is unknown, never
+    $0) and the in-flight wall clock stop it, by `on_limit`.
+  - **Wasted cycles**: a writer that comes back and leaves the head where it
+    was, a check that fails the same way on the same commit, a reader that
+    gives the same verdict on the same commit. `no_progress: 1` fails the
+    run at the first.
+  - **Scope checks** at each hand-in of a generic writer: files its own
+    commits changed and that still differ, plus what it left uncommitted;
+    not what a merge of the base brought in. Outside `owns`, or inside
+    `must_not_touch`, goes back to the node as a cycle of cost.
+  - **Questions** (`trix wf ask`) go to the supervisor node, whose answer
+    comes back as the asker's next prompt, or to you (no supervisor, or
+    ESCALATE). **Mentions** are queued to an agent node's inbox and
+    delivered on its next visit along a declared edge; a mention of a
+    check, gate or unknown node is refused when it's submitted.
+  - **Watching**: a stopped agent is nudged once after its kind's settle
+    time, then it's yours (autopilot: parked). Only an agent that *exited*
+    is started again (twice by default), then the `exited` event fires.
+  - **Quota**: a stopped agent whose screen shows a shipped quota pattern
+    is `blocked: quota`, retried with backoff (5 min, doubling; 6 tries or
+    2 h), on `on_quota.fallback` if set, then escalated. Blocked time
+    isn't in-flight time.
+  - **The stall monitor**: when nothing is pending and the goal isn't met,
+    `on_stall` applies (ask when supervised, park and notify on autopilot).
+- `src/workflow/prompt.rs`: templates (`{{name}}`, `{{fence name}}`,
+  `{{#if}}`), the brief and how to hand in, in every generic prompt.
+- `src/workflow/launch.rs`: starting a run: the checker first (a refusal is
+  the checker's own text), input resolvers before any prompt (`gh.issue`),
+  the snapshot, the run's options from your config.
+- Server and CLI: `Request::Wf` (reports and questions are taken only from
+  the node's own pane; approve, answer and revoke only from you),
+  `Request::SpawnGuarded`, `trix wf submit|ask`, `trix workflow
+  run|pane|ls|show|approve|abort|pause|resume|revoke|answer`.
+
+**Accept** (`src/workflow/engine_tests.rs`, 14 tests, all on a real
+temporary repository with scripted agents and a fake GitHub through `Env`)
+
+- issue-to-pr runs end to end on a fixture repository: Codex implements,
+  the check fails then passes, Claude reviews, Gemini judges and approves,
+  trix pushes, opens the PR and merges the checked commit. Zero human
+  actions, 2 cycles, 0 wasted.
+- A linear flow finishes in one pass (1 cycle, ceiling 1).
+- The run stops at the first wasted cycle; with `no_progress: off` it goes on.
+- Reuse nodes keep their pane between visits; fresh nodes close theirs
+  after the hand-in.
+- A mention never wakes a node and arrives on its next edge visit; a
+  mention of a check or gate is refused.
+- An out-of-scope change goes back to its node; a base-branch merge
+  doesn't count against scope.
+- The stall monitor fires only when nothing is pending.
+- A simulated quota stop shows blocked, backs off without using the wall
+  clock, and escalates; a fallback backend takes over when set.
+- Idle agents are nudged, never restarted; exited ones are restarted.
+- Injected failures recover: an agent that can't start, a flaky check, a
+  failed push, red CI, a failed merge, pause and resume, abort.
+
+**Decisions**
+
+- A check blocks the run's pane while it runs. The pane is a process of its
+  own, so nothing else waits on it, but a run doesn't look at its other
+  nodes during a long check.
+- Quota is looked for only on an agent that has stopped without its report,
+  in the last 15 lines of its screen: an agent *talking about* quotas while
+  it works isn't taken for one that's out of them.
+- The gate parks on red CI unless the workflow has an edge for `ci_failed`.
+- A second run for the same issue is named `<name>-<n>-2`.
+- Steps 7 and 8 are one commit: the real probes (step 7) ran in the
+  background while step 8 was written, and both touch the same files.
+  Each was green on its own tests before the other was finished.
+
+Tests added: 17 (14 engine, 3 prompt). Suite: 790 passed. Deferred to
+their own steps: `land`, `for_each`, `join` and `workflow` nodes (9, 10);
+floors, the hooks fingerprint, rule approvals and the agent-start policy
+(11); the run log (13).
 
 ## Decisions to review
 

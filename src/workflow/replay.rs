@@ -53,6 +53,17 @@ pub struct Hub {
     pub next_pr: u64,
 }
 
+/// An agent as it was started.
+#[derive(Clone, Debug)]
+pub struct Spawned {
+    pub name: String,
+    pub kind: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub prompt: String,
+    pub guarded: bool,
+}
+
 /// The world a scenario runs in, and the record of what the runner did.
 pub struct World {
     name: String,
@@ -66,6 +77,17 @@ pub struct World {
     pub hub: Hub,
     /// Agents that fail to start.
     pub refuse: Vec<String>,
+    /// Every agent started, with its prompt and whether its pane got the guard.
+    pub spawned: Vec<Spawned>,
+    /// Every message sent to an open pane.
+    pub sent: Vec<(String, String)>,
+    /// What each agent's screen shows now.
+    pub screens: std::collections::BTreeMap<String, String>,
+    pub notified: Vec<(String, String)>,
+    /// Every check run: where, what, and whether the guard was on.
+    pub checks: Vec<(PathBuf, Vec<String>, bool)>,
+    pub opened: Vec<String>,
+    guard_next: bool,
     trace: Vec<String>,
     commits: u32,
     ticks: u32,
@@ -149,6 +171,13 @@ impl World {
                 ..Hub::default()
             },
             refuse: Vec::new(),
+            spawned: Vec::new(),
+            sent: Vec::new(),
+            screens: Default::default(),
+            notified: Vec::new(),
+            checks: Vec::new(),
+            opened: Vec::new(),
+            guard_next: false,
             trace: Vec::new(),
             commits: 0,
             ticks: 0,
@@ -203,7 +232,7 @@ impl World {
         output(c).unwrap_or_else(|e| panic!("git {}: {e}", args.join(" ")))
     }
 
-    fn commit(&mut self, dir: &Path, msg: &str) -> String {
+    pub fn commit(&mut self, dir: &Path, msg: &str) -> String {
         self.commits += 1;
         self.sh(dir, &["commit", "--quiet", "-m", msg]);
         self.sh(dir, &["rev-parse", "HEAD"]).trim().to_string()
@@ -276,6 +305,7 @@ impl World {
                 &format!("origin/{branch}"),
             ],
         );
+        std::fs::create_dir_all(tmp.join(file).parent().unwrap()).unwrap();
         std::fs::write(tmp.join(file), text).unwrap();
         self.sh(&tmp, &["add", "-A"]);
         let sha = self.commit(&tmp, "upstream work");
@@ -705,6 +735,14 @@ impl Env for World {
             state: "working".into(),
             cost: 1.0,
         });
+        self.spawned.push(Spawned {
+            name: name.into(),
+            kind: agent.agent.clone(),
+            args: agent.args.clone(),
+            cwd: cwd.to_path_buf(),
+            prompt: prompt.into(),
+            guarded: std::mem::take(&mut self.guard_next),
+        });
         Ok(())
     }
     fn open_case(&mut self, c: &Case) -> Result<(), String> {
@@ -721,6 +759,7 @@ impl Env for World {
         for l in text.lines() {
             self.trace.push(format!("  | {l}"));
         }
+        self.sent.push((name.into(), text.into()));
         if let Some(a) = self.seen.iter_mut().find(|a| a.name == name) {
             a.state = "working".into();
         }
@@ -745,6 +784,78 @@ impl Env for World {
     }
     fn print(&mut self, line: &str) {
         self.trace.push(format!("  print {}", untimed(line)));
+    }
+    fn spawn_in(
+        &mut self,
+        name: &str,
+        agent: &RoleAgent,
+        cwd: &Path,
+        prompt: &str,
+        guard: bool,
+    ) -> Result<(), String> {
+        self.guard_next = guard;
+        self.spawn(name, agent, cwd, prompt)
+    }
+    /// A check, run for real: a process of its own in `cwd`, trix's
+    /// variables removed, the guard on when asked, and `<base>/bin` first
+    /// on PATH so a scenario can plant a `gh` or a `trix` for it to find.
+    fn check(
+        &mut self,
+        cwd: &Path,
+        argv: &[String],
+        guard: bool,
+    ) -> Result<super::env::CheckOut, String> {
+        self.checks.push((cwd.to_path_buf(), argv.to_vec(), guard));
+        let Some((program, rest)) = argv.split_first() else {
+            return Err("no command".into());
+        };
+        let mut c = std::process::Command::new(program);
+        c.current_dir(cwd)
+            .args(rest)
+            .stdin(std::process::Stdio::null());
+        c.env("HOME", &self.base)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        c.env("GIT_AUTHOR_NAME", "Check")
+            .env("GIT_AUTHOR_EMAIL", "check@example.com");
+        c.env("GIT_COMMITTER_NAME", "Check")
+            .env("GIT_COMMITTER_EMAIL", "check@example.com");
+        c.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                self.base.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        for k in super::guard::TRIX_VARS {
+            c.env_remove(k);
+        }
+        if guard {
+            let empty = self.base.join("guard-empty");
+            let _ = std::fs::create_dir_all(&empty);
+            super::guard::apply(&mut c, &empty);
+        }
+        let o = c.output().map_err(|e| format!("{program}: {e}"))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        Ok(super::env::CheckOut {
+            exit_code: o.status.code().unwrap_or(-1),
+            log_tail: self.norm(&super::env::tail(&text)),
+        })
+    }
+    fn screen(&mut self, name: &str) -> Option<String> {
+        self.screens.get(name).cloned()
+    }
+    fn notify(&mut self, title: &str, body: &str) {
+        self.notified.push((title.into(), body.into()));
+    }
+    fn open_run(&mut self, id: &str, _repo: &Path) -> Result<(), String> {
+        self.opened.push(id.into());
+        Ok(())
     }
 }
 

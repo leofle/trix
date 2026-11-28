@@ -44,6 +44,60 @@ pub trait Env {
     /// The pane's state and activity: `Working`, `Question` or `Finished`.
     fn say(&mut self, event: &str, detail: &str);
     fn print(&mut self, line: &str);
+
+    /// Start an agent, with the guard on its pane when `guard` says so
+    /// (`push: guarded` and `gate_only`): an accidental push or `gh` call
+    /// fails there.
+    fn spawn_in(
+        &mut self,
+        name: &str,
+        agent: &AgentSpec,
+        cwd: &Path,
+        prompt: &str,
+        guard: bool,
+    ) -> Result<(), String> {
+        let _ = guard;
+        self.spawn(name, agent, cwd, prompt)
+    }
+    /// Run a check: a command in a process of its own, with trix's
+    /// variables removed, the guard on when `guard` says so, and its pid
+    /// registered with the server so nothing it starts can drive trix.
+    fn check(&mut self, cwd: &Path, argv: &[String], guard: bool) -> Result<CheckOut, String> {
+        let _ = (cwd, argv, guard);
+        Err("checks can't run here".into())
+    }
+    /// The last lines of an agent's screen: how a quota stop is told from
+    /// an idle agent.
+    fn screen(&mut self, name: &str) -> Option<String> {
+        let _ = name;
+        None
+    }
+    /// Tell you, on the desktop.
+    fn notify(&mut self, title: &str, body: &str) {
+        let _ = (title, body);
+    }
+    /// Store nothing, start a run's pane: the run is already in its folder.
+    fn open_run(&mut self, id: &str, repo: &Path) -> Result<(), String> {
+        let _ = (id, repo);
+        Err("runs can't be started here".into())
+    }
+}
+
+/// What a check came to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckOut {
+    pub exit_code: i32,
+    /// The end of what it printed.
+    pub log_tail: String,
+}
+
+/// The end of a command's output, for a prompt: its last lines, bounded.
+pub fn tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let from = lines.len().saturating_sub(40);
+    let t = lines[from..].join("\n");
+    let cut = t.len().saturating_sub(4000);
+    t[t.ceil_char_boundary(cut)..].to_string()
 }
 
 /// A command run in `repo`, never prompting: its output, or what it said
@@ -195,5 +249,90 @@ impl Env for Live {
     }
     fn print(&mut self, line: &str) {
         println!("{line}");
+    }
+    fn spawn_in(
+        &mut self,
+        name: &str,
+        agent: &AgentSpec,
+        cwd: &Path,
+        prompt: &str,
+        guard: bool,
+    ) -> Result<(), String> {
+        if !guard {
+            return self.spawn(name, agent, cwd, prompt);
+        }
+        let command = (!agent.args.is_empty()).then(|| shell_words::join(&agent.args));
+        control(crate::control::Request::SpawnGuarded {
+            kind: agent.agent.clone(),
+            name: Some(name.into()),
+            cwd: cwd.to_path_buf(),
+            command,
+            prompt: Some(prompt.into()),
+        })
+        .map(|_| ())
+    }
+    fn check(&mut self, cwd: &Path, argv: &[String], guard: bool) -> Result<CheckOut, String> {
+        let Some((program, rest)) = argv.split_first() else {
+            return Err("the check has no command".into());
+        };
+        let mut c = std::process::Command::new(program);
+        c.current_dir(cwd)
+            .args(rest)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        // No pane's: it finds no trix to talk to as one.
+        for k in super::guard::TRIX_VARS {
+            c.env_remove(k);
+        }
+        if guard {
+            super::guard::apply(&mut c, &super::guard::empty_dir());
+        }
+        let child = c.spawn().map_err(|e| format!("{program}: {e}"))?;
+        // The server is told whose this is before it can ask anything: a
+        // request from it, or from what it starts, is refused.
+        control(crate::control::Request::CheckPid { pid: child.id() })?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("{program}: {e}"))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(CheckOut {
+            exit_code: out.status.code().unwrap_or(-1),
+            log_tail: tail(&text),
+        })
+    }
+    fn screen(&mut self, name: &str) -> Option<String> {
+        control(crate::control::Request::Read {
+            target: name.into(),
+            lines: 15,
+        })
+        .ok()
+    }
+    fn notify(&mut self, title: &str, body: &str) {
+        crate::platform::notify(title, body, false);
+    }
+    fn open_run(&mut self, id: &str, repo: &Path) -> Result<(), String> {
+        let exe = crate::platform::trix_exe().map_err(|e| e.to_string())?;
+        let command = shell_words::join([
+            exe.display().to_string(),
+            "workflow".into(),
+            "pane".into(),
+            id.to_string(),
+        ]);
+        control(crate::control::Request::Spawn {
+            kind: "custom".into(),
+            name: Some(id.into()),
+            cwd: repo.to_path_buf(),
+            command: Some(command),
+            prompt: None,
+            worktree: false,
+        })
+        .map(|_| ())
     }
 }
