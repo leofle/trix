@@ -30,6 +30,7 @@ mod state;
 mod theme;
 mod ui;
 mod usage;
+mod workflow;
 mod worktree;
 mod worktrees;
 

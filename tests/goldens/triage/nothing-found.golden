@@ -1,0 +1,196 @@
+# scenario: nothing-found
+
+== trace ==
+tick 1 @+0
+  agents
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: f8f3dfda243f1a7c17b22a635f7eca026642019f
+  git [repo] worktree add --quiet --detach <tmp>/repo/.trix/worktrees/triage-12-review f8f3dfda243f1a7c17b22a635f7eca026642019f -> ok
+  spawn triage-12-review agent=claude args=[] cwd=<tmp>/repo/.trix/worktrees/triage-12-review
+  | You're the reviewer in trix triage case triage-12, for pull request #12 "Add rate limits" (https://example.com/pr/12): branch rate-limits into main.
+  | 
+  | Your folder is a detached checkout of the PR's head (f8f3dfda243f1a7c17b22a635f7eca026642019f). Find the must-fix defects this PR brings in or leaves. Read the diff (git diff origin/main...HEAD) and the code around it; build it and run the tests.
+  | 
+  | A finding is must-fix only if it's a real defect this PR brings in or leaves (wrong behaviour, a crash, a security hole, lost data, a broken build or tests, or it doesn't solve the issue) and you've proved it: a failing test, or you ran the code (a command, a repro) and saw the wrong output, crash or behaviour. Reading the code alone isn't proof. Style, naming, refactors, "could also", missing nice-to-have tests and guesses aren't must-fix: put them in a short optional list, or leave them out. One you think is a bug but can't show goes in optional with "unproven": true. Nothing in optional reaches the fixer. Don't pad the review: "no must-fix findings" is a good, expected answer.
+  | 
+  | Prefer a failing test as the proof, one the fixer can keep: write it in your checkout, run it and see it fail, then put it in proof.patch as a diff (git add -N for new files, then git diff), and put your checkout back as it was (git reset -q, git checkout -- ., and remove the files you added). Never commit or push anything: you only report. A repro (the exact command or steps, with what happened and what should have) proves it too.
+  | 
+  | Each must-fix finding: an id (F1, F2, …), the file, the line, a one-line summary, how it fails (the inputs or state, and the wrong result), and its proof. If nothing is must-fix, hand in {"findings": []}: that's a good answer, not a failure. Then you'll be asked to check each finding again before any of it reaches the fixer.
+  | 
+  | Hand it in by piping the JSON on stdin, with a heredoc, so no file lands in the checkout:
+  | trix case submit triage-12 reviewer <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-reviewer.json in your folder, and run: trix case submit triage-12 reviewer --file .trix-reviewer.json. trix deletes the file once it takes the report; never commit it.
+  | 
+  | The JSON: {"findings": [{"id": "F1", "file": "src/x.rs", "line": 12, "summary": "…", "failure": "…", "proof": {"test": "the test's name or path, and how to run it", "observed": "its failing output", "expected": "what it should show", "patch": "the test as a diff, if the PR doesn't have it"}}, {"id": "F2", "file": "src/y.rs", "line": 3, "summary": "…", "failure": "…", "proof": {"repro": "the exact command or steps", "observed": "what happened", "expected": "what should have"}}], "optional": [{"file": "src/z.rs", "line": 7, "summary": "…", "unproven": false}], "notes": "optional"}. optional may be empty, and stays short.
+  | 
+  | Follow the repository's own rules (CLAUDE.md, AGENTS.md). If the submit command says the report is wrong, fix it and submit again.
+  print started the reviewer (claude, triage-12-review) in <tmp>/repo/.trix/worktrees/triage-12-review
+  say Working: triage-12 · reviewing
+  => changed stage=Reviewing round=1 ask=-
+submit reviewer -> ok: reviewer report taken for case triage-12
+tick 2 @+0
+  agents
+  print the reviewer found nothing must-fix
+  print needs you: the reviewer found nothing to fix  [m: go to the merge gate anyway · a: abort]
+  say Question: triage-12 · the reviewer found nothing to fix
+  => changed stage=Reviewing round=1 ask=NothingFound
+Answer { key: 'y' } -> refused: a merge is only ever trix case approve, or y in the case's pane
+Answer { key: 'm' } -> ok: case triage-12: answered m key=Some('m')
+tick 3 @+0
+  agents
+  answer -> Some('m')
+  print nothing to fix: to the merge gate, as you said
+  => changed stage=Gate round=1 ask=-
+tick 4 @+0
+  agents
+  gh pr view 12 --json mergeable,mergeStateStatus -> ok
+  gh api repos/{owner}/{repo}/commits/f8f3dfda243f1a7c17b22a635f7eca026642019f/check-runs?per_page=100 -> ok
+  print needs you: ready to merge PR #12: CI green, the reviewer found nothing, and no gatekeeper ran  [y: merge · a: abort]
+  say Question: triage-12 · ready to merge PR #12: CI green, the reviewer found nothing, and no gatekeeper ran
+  => changed stage=Gate round=1 ask=Merge
+you type y
+tick 5 @+0
+  agents
+  answer -> Some('y')
+  gh pr view 12 --json mergeable,mergeStateStatus -> ok
+  gh api repos/{owner}/{repo}/commits/f8f3dfda243f1a7c17b22a635f7eca026642019f/check-runs?per_page=100 -> ok
+  gh pr merge 12 --squash --match-head-commit f8f3dfda243f1a7c17b22a635f7eca026642019f -> ok
+  print merged PR #12 (squash)
+  agents
+  close triage-12-review clean=true
+  agents
+  git [repo] -c core.quotePath=false worktree list --porcelain -> ok
+  git [repo] worktree remove <tmp>/repo/.trix/worktrees/triage-12-review -> ok
+  say Finished: triage-12 · merged #12
+  => changed stage=Merged round=1 ask=-
+
+== case folder ==
+--- case.json
+{
+  "id": "triage-12",
+  "pr": {
+    "number": 12,
+    "title": "Add rate limits",
+    "url": "https://example.com/pr/12",
+    "head": "rate-limits",
+    "base": "main",
+    "sha": "f8f3dfda243f1a7c17b22a635f7eca026642019f"
+  },
+  "issue": null,
+  "choices": [],
+  "trusted": false,
+  "reviews": [
+    {
+      "findings": [],
+      "optional": [],
+      "solves": null,
+      "retracted": [],
+      "verifying": false,
+      "done": true,
+      "agent": null,
+      "nudged": false,
+      "given": 1795000000,
+      "worked": false,
+      "stopped_at": null
+    }
+  ],
+  "optional": [],
+  "about": null,
+  "retracted": [],
+  "solves": null,
+  "needs_you": [],
+  "repo": "<tmp>/repo",
+  "stage": "merged",
+  "round": 1,
+  "max_rounds": 2,
+  "budget": 10.0,
+  "budget_step": 10.0,
+  "builder": {
+    "agent": "claude",
+    "args": []
+  },
+  "reviewer": {
+    "agent": "claude",
+    "args": []
+  },
+  "reviewer2": null,
+  "fixer": {
+    "agent": "claude",
+    "args": []
+  },
+  "gatekeeper": {
+    "agent": "claude",
+    "args": []
+  },
+  "findings": [],
+  "open": [],
+  "build": null,
+  "fix": null,
+  "verdict": null,
+  "checked": "f8f3dfda243f1a7c17b22a635f7eca026642019f",
+  "ci_expected": true,
+  "merge_when_ready": false,
+  "merge_tries": 0,
+  "merge_how": "now",
+  "blocked": null,
+  "review_solves": null,
+  "agent": null,
+  "nudged": false,
+  "given": 0,
+  "worked": false,
+  "stopped_at": null,
+  "closing": [],
+  "spent_closed": 1.0,
+  "ask": null,
+  "why": "",
+  "log": [
+    [
+      1795000000,
+      "started the reviewer (claude, triage-12-review) in <tmp>/repo/.trix/worktrees/triage-12-review"
+    ],
+    [
+      1795000000,
+      "the reviewer found nothing must-fix"
+    ],
+    [
+      1795000000,
+      "needs you: the reviewer found nothing to fix  [m: go to the merge gate anyway · a: abort]"
+    ],
+    [
+      1795000000,
+      "nothing to fix: to the merge gate, as you said"
+    ],
+    [
+      1795000000,
+      "needs you: ready to merge PR #12: CI green, the reviewer found nothing, and no gatekeeper ran  [y: merge · a: abort]"
+    ],
+    [
+      1795000000,
+      "merged PR #12 (squash)"
+    ]
+  ],
+  "created": 1795000000
+}
+--- reviewer-1.json
+{
+  "findings": [],
+  "optional": [],
+  "solves": null,
+  "notes": null
+}
+
+== repository ==
+worktree <tmp>/repo
+HEAD 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+branch refs/heads/main
+-- refs
+refs/heads/main 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+refs/remotes/origin/main 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+refs/remotes/origin/rate-limits f8f3dfda243f1a7c17b22a635f7eca026642019f
+
+== origin ==
+refs/heads/main 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+refs/heads/rate-limits f8f3dfda243f1a7c17b22a635f7eca026642019f

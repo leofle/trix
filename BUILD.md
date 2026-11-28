@@ -17,7 +17,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 
 | Step | What | Commit | Result |
 |---|---|---|---|
-| 1 | Baseline | (this commit) | pass |
+| 1 | Baseline | 5843b50 | pass |
+| 2 | Seeded replay and goldens of today's triage | (next) | pass |
 
 ## Step 1: baseline
 
@@ -79,6 +80,57 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | **Total: 45 tests** | **375** |
 
 Tests added: none. Deferred: nothing.
+
+## Step 2: seeded replay and goldens of today's triage
+
+- `src/workflow/replay.rs` (test-only): `World`, a recording `Env`.
+  - **git is real**, in a temporary repository with a bare `origin`, run
+    with no personal or system config, one author and dates that depend
+    only on how many commits came before, so every SHA is the same on every
+    machine. Worktrees, branches and pushes really happen.
+  - **GitHub is fake** (`Hub`): PRs, check runs, mergeability, merge
+    errors, branch rules, auto-merge, the issue API. No network, no login.
+  - **Agents are scripted**: the scenario sets their states, makes their
+    commits and pushes, and hands in their reports through the server's own
+    check (`case::handle`), as `trix case submit` does.
+- A golden (`tests/goldens/triage/*.golden`, 14 files, 311 KB) holds, in
+  order: every `Env` call (`agents`, `git`, `gh`, `spawn`, `send`, `close`,
+  `answer`, `say`, `print`, `open_case`), every prompt and message word for
+  word, the case folder (`case.json` and each report file), the
+  repository's worktrees and refs, and origin's refs.
+- Scenarios, and what each covers:
+
+| Golden | Covers |
+|---|---|
+| two-rounds | Reviewing, Fixing, Verifying, Gate, Merged; the gatekeeper's changes and a second round sent to the kept fixer; CI pending then green; Merge by `trix case approve` |
+| two-reviewers | reviewers 2: side by side, the same defect merged, a retraction, the comparison the gatekeeper gets |
+| nothing-found | NothingFound; `answer y` refused (a merge is only ever approve); the gate with no gatekeeper |
+| round-limit | RoundLimit, a key that isn't an answer, Aborted from the gate |
+| ci-failed | red CI as a finding with a round left; CiFailed with none |
+| budget-no-report | the reminder, NoReport (stopped, then exited and started again), Budget, `trix case abort` |
+| merge-failed | MergeFailed, a base that moved as it merged, mergeability unknown |
+| conflict | Conflict with the rounds used up, the base merged in, a real upstream commit |
+| setup | Setup: an agent that can't start, then can |
+| approval | branch rules: Approval, auto-merge (`w`), approved, merged on GitHub |
+| restore | reviewers 2, the case read back from its folder three times mid-run |
+| choose | Choosing and Choose; a PR from a fork refused, and an issue whose only PR is one |
+| build | Outsider, Building, commits not on origin sent back, the PR opened by trix, Unsolved (`f`), the issue closed after the merge |
+| rebuild | Unsolved (`b`): handed to a fresh case |
+
+  All 13 questions (NothingFound, RoundLimit, CiFailed, Budget, NoReport,
+  Merge, MergeFailed, Conflict, Setup, Choose, Unsolved, Outsider,
+  Approval) and all 8 stages appear in at least one golden.
+- **Accept:** goldens committed; replay against the current runner
+  (`case::step`, untouched) is identical, twice in a row and under another
+  timezone.
+- **Decisions:** what git prints on a failure isn't recorded (it differs
+  between git versions), only that it failed. The hour in a printed log
+  line isn't recorded (it's the machine's local time); the log's own
+  timestamps are, in `case.json`.
+- **Frozen:** the goldens are written once (`TRIX_BLESS=1` writes a missing
+  golden and refuses to overwrite one). From here on `git diff <step 2
+  commit> -- tests/goldens/triage` must stay empty.
+- Tests added: 14 replay scenarios. Suite: 723 passed. Deferred: nothing.
 
 ## Decisions to review
 

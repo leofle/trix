@@ -1,0 +1,672 @@
+# scenario: ci-failed
+
+== trace ==
+tick 1 @+0
+  agents
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: f8f3dfda243f1a7c17b22a635f7eca026642019f
+  git [repo] worktree add --quiet --detach <tmp>/repo/.trix/worktrees/triage-12-review f8f3dfda243f1a7c17b22a635f7eca026642019f -> ok
+  spawn triage-12-review agent=claude args=[] cwd=<tmp>/repo/.trix/worktrees/triage-12-review
+  | You're the reviewer in trix triage case triage-12, for pull request #12 "Add rate limits" (https://example.com/pr/12): branch rate-limits into main.
+  | 
+  | Your folder is a detached checkout of the PR's head (f8f3dfda243f1a7c17b22a635f7eca026642019f). Find the must-fix defects this PR brings in or leaves. Read the diff (git diff origin/main...HEAD) and the code around it; build it and run the tests.
+  | 
+  | A finding is must-fix only if it's a real defect this PR brings in or leaves (wrong behaviour, a crash, a security hole, lost data, a broken build or tests, or it doesn't solve the issue) and you've proved it: a failing test, or you ran the code (a command, a repro) and saw the wrong output, crash or behaviour. Reading the code alone isn't proof. Style, naming, refactors, "could also", missing nice-to-have tests and guesses aren't must-fix: put them in a short optional list, or leave them out. One you think is a bug but can't show goes in optional with "unproven": true. Nothing in optional reaches the fixer. Don't pad the review: "no must-fix findings" is a good, expected answer.
+  | 
+  | Prefer a failing test as the proof, one the fixer can keep: write it in your checkout, run it and see it fail, then put it in proof.patch as a diff (git add -N for new files, then git diff), and put your checkout back as it was (git reset -q, git checkout -- ., and remove the files you added). Never commit or push anything: you only report. A repro (the exact command or steps, with what happened and what should have) proves it too.
+  | 
+  | Each must-fix finding: an id (F1, F2, …), the file, the line, a one-line summary, how it fails (the inputs or state, and the wrong result), and its proof. If nothing is must-fix, hand in {"findings": []}: that's a good answer, not a failure. Then you'll be asked to check each finding again before any of it reaches the fixer.
+  | 
+  | Hand it in by piping the JSON on stdin, with a heredoc, so no file lands in the checkout:
+  | trix case submit triage-12 reviewer <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-reviewer.json in your folder, and run: trix case submit triage-12 reviewer --file .trix-reviewer.json. trix deletes the file once it takes the report; never commit it.
+  | 
+  | The JSON: {"findings": [{"id": "F1", "file": "src/x.rs", "line": 12, "summary": "…", "failure": "…", "proof": {"test": "the test's name or path, and how to run it", "observed": "its failing output", "expected": "what it should show", "patch": "the test as a diff, if the PR doesn't have it"}}, {"id": "F2", "file": "src/y.rs", "line": 3, "summary": "…", "failure": "…", "proof": {"repro": "the exact command or steps", "observed": "what happened", "expected": "what should have"}}], "optional": [{"file": "src/z.rs", "line": 7, "summary": "…", "unproven": false}], "notes": "optional"}. optional may be empty, and stays short.
+  | 
+  | Follow the repository's own rules (CLAUDE.md, AGENTS.md). If the submit command says the report is wrong, fix it and submit again.
+  print started the reviewer (claude, triage-12-review) in <tmp>/repo/.trix/worktrees/triage-12-review
+  say Working: triage-12 · reviewing
+  => changed stage=Reviewing round=1 ask=-
+submit reviewer -> ok: reviewer report taken for case triage-12
+tick 2 @+0
+  agents
+  print the reviewer found 1 must-fix finding: it checks them now
+  send triage-12-review
+  | Now check your own review, before any of it reaches the fixer. Your findings were:
+  | [
+  |   {
+  |     "id": "F1",
+  |     "file": "src/limit.rs",
+  |     "line": 1,
+  |     "severity": "important",
+  |     "summary": "the window never resets",
+  |     "failure": "after 60s a client is still refused",
+  |     "proof": {
+  |       "test": "limit_resets_after_60s",
+  |       "observed": "refused at t=61",
+  |       "expected": "allowed at t=61"
+  |     }
+  |   }
+  | ]
+  | 
+  | For each one (F1), run its proof again on the PR's head (f8f3dfda243f1a7c17b22a635f7eca026642019f, your folder: apply proof.patch first if it has one, then put the checkout back) and confirm it, with what the run showed as evidence, or retract it, saying why. Retract one whose proof doesn't hold up, and one that isn't must-fix after all (style, a refactor, a nice-to-have, a guess); either may go in optional instead, unproven if that's why.
+  | 
+  | Hand in this second report the same way:
+  | trix case submit triage-12 reviewer <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-reviewer.json in your folder, and run: trix case submit triage-12 reviewer --file .trix-reviewer.json. trix deletes the file once it takes the report; never commit it.
+  | 
+  | The JSON: {"findings": [{"id": "F1", "confirmed": true, "evidence": "the proof run again: what it showed"}, {"id": "F2", "confirmed": false, "why": "…"}], "optional": []}. Each finding gets one answer; only confirmed ones go to the fixer.
+  say Working: triage-12 · reviewing · checking its findings
+  => changed stage=Reviewing round=1 ask=-
+submit reviewer -> ok: reviewer report taken for case triage-12
+tick 3 @+0
+  agents
+  print the reviewer confirmed 1
+  say Working: triage-12 · fixing
+  => changed stage=Fixing round=1 ask=-
+agent triage-12-review is done
+tick 4 @+0
+  agents
+  close triage-12-review clean=false
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: f8f3dfda243f1a7c17b22a635f7eca026642019f
+  git [repo] worktree add --quiet -B trix/triage-12-fix <tmp>/repo/.trix/worktrees/triage-12-fix refs/remotes/origin/rate-limits -> ok
+  spawn triage-12-fix agent=claude args=[] cwd=<tmp>/repo/.trix/worktrees/triage-12-fix
+  | You're the fixer in trix triage case triage-12, for pull request #12 "Add rate limits" (https://example.com/pr/12): branch rate-limits into main.
+  | 
+  | Your folder is on branch trix/triage-12-fix, which starts at the PR's branch as origin has it. These are the must-fix findings, each proven and checked again (evidence); `by` says who raised it, and `also` how the other reviewer put the same defect:
+  | 
+  | [
+  |   {
+  |     "id": "F1",
+  |     "file": "src/limit.rs",
+  |     "line": 1,
+  |     "severity": "important",
+  |     "summary": "the window never resets",
+  |     "failure": "after 60s a client is still refused",
+  |     "proof": {
+  |       "test": "limit_resets_after_60s",
+  |       "observed": "refused at t=61",
+  |       "expected": "allowed at t=61"
+  |     },
+  |     "evidence": "limit_resets_after_60s fails: refused at t=61",
+  |     "by": [
+  |       "reviewer F1"
+  |     ]
+  |   }
+  | ]
+  | 
+  | Keep the PR's work: fix or complete it in place, no rewrite. For each finding, start from its proof: apply proof.patch if it has one (git apply), and see the test or repro fail. Fix it, run the proof again and see it pass, and commit the test with the fix (one that fails without it). If it isn't a bug, say why. If a fix is too risky or too large to do safely, or is a design choice, don't guess: mark it needs_you and say why, and the user decides. Commit, then push to the PR's branch with: git push origin HEAD:rate-limits (never force). Don't merge the PR.
+  | 
+  | Then hand in what you did. Hand it in by piping the JSON on stdin, with a heredoc, so no file lands in the checkout:
+  | trix case submit triage-12 fixer <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-fixer.json in your folder, and run: trix case submit triage-12 fixer --file .trix-fixer.json. trix deletes the file once it takes the report; never commit it.
+  | 
+  | The JSON: {"commits": ["<sha>"], "tests": "what you ran, and how it went", "findings": [{"id": "F1", "outcome": "fixed", "test": "the test's name", "proof": {"ran": "the finding's test or repro, run again", "output": "what it shows now", "passes": true}}, {"id": "F2", "outcome": "not_a_bug", "note": "why"}]}. outcome is fixed, not_a_bug, wont_fix or needs_you; each finding gets one, and a note for any that isn't fixed. A fixed finding that has a proof needs proof, run again and passing. trix checks the commits are on origin before it takes the report.
+  | 
+  | Follow the repository's own rules (CLAUDE.md, AGENTS.md). If the submit command says the report is wrong, fix it and submit again.
+  print started the fixer (claude, triage-12-fix) in <tmp>/repo/.trix/worktrees/triage-12-fix
+  say Working: triage-12 · fixing
+  => changed stage=Fixing round=1 ask=-
+agent fixer pushed 6f147b8aad037a33f63fd8a41b8d3ee1859de58b to rate-limits
+submit fixer -> ok: fixer report taken for case triage-12
+tick 5 @+0
+  agents
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: 6f147b8aad037a33f63fd8a41b8d3ee1859de58b
+  git [repo] merge-base --is-ancestor 6f147b8aad037a33f63fd8a41b8d3ee1859de58b 6f147b8aad037a33f63fd8a41b8d3ee1859de58b -> ok
+  print the fixer fixed 1 of 1 (1 commit)
+  say Working: triage-12 · verifying
+  => changed stage=Verifying round=1 ask=-
+tick 6 @+0
+  agents
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: 6f147b8aad037a33f63fd8a41b8d3ee1859de58b
+  git [repo] worktree add --quiet --detach <tmp>/repo/.trix/worktrees/triage-12-gate-1 6f147b8aad037a33f63fd8a41b8d3ee1859de58b -> ok
+  git [repo/.trix/worktrees/triage-12-gate-1] rev-parse HEAD -> ok: 6f147b8aad037a33f63fd8a41b8d3ee1859de58b
+  spawn triage-12-gate-1 agent=claude args=[] cwd=<tmp>/repo/.trix/worktrees/triage-12-gate-1
+  | You're the gatekeeper in trix triage case triage-12, for pull request #12 "Add rate limits" (https://example.com/pr/12): branch rate-limits into main.
+  | 
+  | Your folder is a fresh checkout of the PR's branch after the Fixer's work (6f147b8aad037a33f63fd8a41b8d3ee1859de58b). You check that work on your own: you haven't seen the Fixer's reasoning, and you don't need it.
+  | 
+  | The must-fix findings, each with its proof and the reviewer's evidence; `by` says who raised it:
+  | [
+  |   {
+  |     "id": "F1",
+  |     "file": "src/limit.rs",
+  |     "line": 1,
+  |     "severity": "important",
+  |     "summary": "the window never resets",
+  |     "failure": "after 60s a client is still refused",
+  |     "proof": {
+  |       "test": "limit_resets_after_60s",
+  |       "observed": "refused at t=61",
+  |       "expected": "allowed at t=61"
+  |     },
+  |     "evidence": "limit_resets_after_60s fails: refused at t=61",
+  |     "by": [
+  |       "reviewer F1"
+  |     ]
+  |   }
+  | ]
+  | 
+  | What the Fixer says it did:
+  | {
+  |   "commits": [
+  |     "6f147b8aad037a33f63fd8a41b8d3ee1859de58b"
+  |   ],
+  |   "tests": "cargo test: 12 passed",
+  |   "findings": [
+  |     {
+  |       "id": "F1",
+  |       "outcome": "fixed",
+  |       "note": null,
+  |       "test": "limit_resets_after_60s",
+  |       "proof": {
+  |         "ran": "limit_resets_after_60s",
+  |         "output": "ok",
+  |         "passes": true
+  |       }
+  |     }
+  |   ],
+  |   "notes": null
+  | }
+  | 
+  | For each finding, is it really fixed? Run its proof again (apply proof.patch if the fix didn't commit it), read the code and the test, run the tests. For one called not_a_bug or wont_fix, is that right? For one called needs_you, is it right to leave it to the user (they're told at the merge gate)? Then judge the fix's own diff (the fixer's commits) for new must-fix defects. Check CI with: gh pr checks 12. Don't edit, commit or push anything.
+  | 
+  | Ask for changes only for must-fix defects you've shown, the reviewers' rule: a real defect (wrong behaviour, a crash, security, lost data, a broken build or tests, or the issue not solved), proved by a failing test or a command or repro you ran. Style, naming, refactors, nice-to-haves and guesses aren't. A finding that isn't ok needs its proof (its test or repro run again, still failing, or your own); a new finding needs file, line, summary, failure and proof, and a new id. Anything else goes in optional, which never holds the PR back.
+  | 
+  | Hand it in by piping the JSON on stdin, with a heredoc, so no file lands in the checkout:
+  | trix case submit triage-12 gatekeeper <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-gatekeeper.json in your folder, and run: trix case submit triage-12 gatekeeper --file .trix-gatekeeper.json. trix deletes the file once it takes the report; never commit it.
+  | 
+  | The JSON: {"verdict": "pass", "findings": [{"id": "F1", "ok": true}, {"id": "F2", "ok": false, "reason": "why, and what to change", "proof": {"repro": "…", "observed": "…", "expected": "…"}}], "new": [], "optional": [], "ci": "green"}. verdict is pass or changes; ci is green, red, pending or none. Pass only when every finding is ok, nothing must-fix is new, CI isn't red.
+  | 
+  | Follow the repository's own rules (CLAUDE.md, AGENTS.md). If the submit command says the report is wrong, fix it and submit again.
+  print started the gatekeeper (claude, triage-12-gate-1) in <tmp>/repo/.trix/worktrees/triage-12-gate-1
+  say Working: triage-12 · verifying
+  => changed stage=Verifying round=1 ask=-
+submit gatekeeper -> ok: gatekeeper report taken for case triage-12
+tick 7 @+0
+  agents
+  print the gatekeeper says pass
+  => changed stage=Gate round=1 ask=-
+# CI fails with a round left: a finding for the fixer
+tick 8 @+0
+  agents
+  gh pr view 12 --json mergeable,mergeStateStatus -> ok
+  gh api repos/{owner}/{repo}/commits/6f147b8aad037a33f63fd8a41b8d3ee1859de58b/check-runs?per_page=100 -> ok
+  print CI fails on the PR: test
+  print round 2: back to the fixer
+  agents
+  send triage-12-fix
+  | Round 2 of case triage-12. CI fails on the PR: test. See gh pr checks 12.
+  | 
+  | Answer these findings: CI1. Fix, commit, push with git push origin HEAD:rate-limits (never force), and hand in a new report the same way:
+  | trix case submit triage-12 fixer <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-fixer.json in your folder, and run: trix case submit triage-12 fixer --file .trix-fixer.json. trix deletes the file once it takes the report; never commit it.
+  say Working: triage-12 · fixing · round 2
+  => changed stage=Fixing round=2 ask=-
+agent fixer pushed 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002 to rate-limits
+submit fixer -> ok: fixer report taken for case triage-12
+tick 9 @+0
+  agents
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+  git [repo] merge-base --is-ancestor 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002 -> ok
+  print the fixer fixed 1 of 1 (1 commit)
+  say Working: triage-12 · verifying · round 2
+  => changed stage=Verifying round=2 ask=-
+tick 10 @+0
+  agents
+  git [repo] fetch --quiet origin +refs/heads/rate-limits:refs/remotes/origin/rate-limits -> ok
+  git [repo] rev-parse refs/remotes/origin/rate-limits -> ok: 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+  git [repo] worktree add --quiet --detach <tmp>/repo/.trix/worktrees/triage-12-gate-2 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002 -> ok
+  git [repo/.trix/worktrees/triage-12-gate-2] rev-parse HEAD -> ok: 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+  spawn triage-12-gate-2 agent=claude args=[] cwd=<tmp>/repo/.trix/worktrees/triage-12-gate-2
+  | You're the gatekeeper in trix triage case triage-12, for pull request #12 "Add rate limits" (https://example.com/pr/12): branch rate-limits into main.
+  | 
+  | Your folder is a fresh checkout of the PR's branch after the Fixer's work (9ee91270546fd3dfdc470940f0ef6bd7d8fd3002). You check that work on your own: you haven't seen the Fixer's reasoning, and you don't need it.
+  | 
+  | The must-fix findings, each with its proof and the reviewer's evidence; `by` says who raised it:
+  | [
+  |   {
+  |     "id": "CI1",
+  |     "file": "CI",
+  |     "line": null,
+  |     "severity": "important",
+  |     "summary": "CI fails on the PR: test",
+  |     "failure": "gh pr checks 12 shows them failing"
+  |   }
+  | ]
+  | 
+  | What the Fixer says it did:
+  | {
+  |   "commits": [
+  |     "9ee91270546fd3dfdc470940f0ef6bd7d8fd3002"
+  |   ],
+  |   "tests": "cargo test: 12 passed",
+  |   "findings": [
+  |     {
+  |       "id": "CI1",
+  |       "outcome": "fixed",
+  |       "note": null,
+  |       "test": null,
+  |       "proof": null
+  |     }
+  |   ],
+  |   "notes": null
+  | }
+  | 
+  | For each finding, is it really fixed? Run its proof again (apply proof.patch if the fix didn't commit it), read the code and the test, run the tests. For one called not_a_bug or wont_fix, is that right? For one called needs_you, is it right to leave it to the user (they're told at the merge gate)? Then judge the fix's own diff (the fixer's commits) for new must-fix defects. Check CI with: gh pr checks 12. Don't edit, commit or push anything.
+  | 
+  | Ask for changes only for must-fix defects you've shown, the reviewers' rule: a real defect (wrong behaviour, a crash, security, lost data, a broken build or tests, or the issue not solved), proved by a failing test or a command or repro you ran. Style, naming, refactors, nice-to-haves and guesses aren't. A finding that isn't ok needs its proof (its test or repro run again, still failing, or your own); a new finding needs file, line, summary, failure and proof, and a new id. Anything else goes in optional, which never holds the PR back.
+  | 
+  | Hand it in by piping the JSON on stdin, with a heredoc, so no file lands in the checkout:
+  | trix case submit triage-12 gatekeeper <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-gatekeeper.json in your folder, and run: trix case submit triage-12 gatekeeper --file .trix-gatekeeper.json. trix deletes the file once it takes the report; never commit it.
+  | 
+  | The JSON: {"verdict": "pass", "findings": [{"id": "F1", "ok": true}, {"id": "F2", "ok": false, "reason": "why, and what to change", "proof": {"repro": "…", "observed": "…", "expected": "…"}}], "new": [], "optional": [], "ci": "green"}. verdict is pass or changes; ci is green, red, pending or none. Pass only when every finding is ok, nothing must-fix is new, CI isn't red.
+  | 
+  | Follow the repository's own rules (CLAUDE.md, AGENTS.md). If the submit command says the report is wrong, fix it and submit again.
+  print started the gatekeeper (claude, triage-12-gate-2) in <tmp>/repo/.trix/worktrees/triage-12-gate-2
+  say Working: triage-12 · verifying · round 2
+  => changed stage=Verifying round=2 ask=-
+submit gatekeeper -> ok: gatekeeper report taken for case triage-12
+tick 11 @+0
+  agents
+  print the gatekeeper says pass
+  => changed stage=Gate round=2 ask=-
+# and again, with the rounds used up: it asks
+tick 12 @+0
+  agents
+  gh pr view 12 --json mergeable,mergeStateStatus -> ok
+  gh api repos/{owner}/{repo}/commits/9ee91270546fd3dfdc470940f0ef6bd7d8fd3002/check-runs?per_page=100 -> ok
+  print CI fails on the PR: test
+  print needs you: CI failed (test) and the rounds are used up  [r: one more round · a: abort]
+  say Question: triage-12 · CI failed (test) and the rounds are used up
+  => changed stage=Gate round=2 ask=CiFailed
+you type r
+tick 13 @+0
+  agents
+  answer -> Some('r')
+  print round 3: back to the fixer
+  agents
+  send triage-12-fix
+  | Round 3 of case triage-12. CI fails on the PR: see gh pr checks 12.
+  | 
+  | Answer these findings: CI2. Fix, commit, push with git push origin HEAD:rate-limits (never force), and hand in a new report the same way:
+  | trix case submit triage-12 fixer <<'EOF'
+  | <the JSON>
+  | EOF
+  | 
+  | If your permissions refuse that command (some refuse any heredoc), write the JSON with your file tool to .trix-fixer.json in your folder, and run: trix case submit triage-12 fixer --file .trix-fixer.json. trix deletes the file once it takes the report; never commit it.
+  => changed stage=Fixing round=3 ask=-
+
+== case folder ==
+--- case.json
+{
+  "id": "triage-12",
+  "pr": {
+    "number": 12,
+    "title": "Add rate limits",
+    "url": "https://example.com/pr/12",
+    "head": "rate-limits",
+    "base": "main",
+    "sha": "f8f3dfda243f1a7c17b22a635f7eca026642019f"
+  },
+  "issue": null,
+  "choices": [],
+  "trusted": false,
+  "reviews": [
+    {
+      "findings": [
+        {
+          "id": "F1",
+          "file": "src/limit.rs",
+          "line": 1,
+          "severity": "important",
+          "summary": "the window never resets",
+          "failure": "after 60s a client is still refused",
+          "proof": {
+            "test": "limit_resets_after_60s",
+            "observed": "refused at t=61",
+            "expected": "allowed at t=61"
+          },
+          "evidence": "limit_resets_after_60s fails: refused at t=61"
+        }
+      ],
+      "optional": [],
+      "solves": null,
+      "retracted": [],
+      "verifying": false,
+      "done": true,
+      "agent": null,
+      "nudged": false,
+      "given": 1795000000,
+      "worked": false,
+      "stopped_at": null
+    }
+  ],
+  "optional": [],
+  "about": null,
+  "retracted": [],
+  "solves": null,
+  "needs_you": [],
+  "repo": "<tmp>/repo",
+  "stage": "fixing",
+  "round": 3,
+  "max_rounds": 3,
+  "budget": 10.0,
+  "budget_step": 10.0,
+  "builder": {
+    "agent": "claude",
+    "args": []
+  },
+  "reviewer": {
+    "agent": "claude",
+    "args": []
+  },
+  "reviewer2": null,
+  "fixer": {
+    "agent": "claude",
+    "args": []
+  },
+  "gatekeeper": {
+    "agent": "claude",
+    "args": []
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "file": "src/limit.rs",
+      "line": 1,
+      "severity": "important",
+      "summary": "the window never resets",
+      "failure": "after 60s a client is still refused",
+      "proof": {
+        "test": "limit_resets_after_60s",
+        "observed": "refused at t=61",
+        "expected": "allowed at t=61"
+      },
+      "evidence": "limit_resets_after_60s fails: refused at t=61",
+      "by": [
+        "reviewer F1"
+      ]
+    },
+    {
+      "id": "CI1",
+      "file": "CI",
+      "line": null,
+      "severity": "important",
+      "summary": "CI fails on the PR: test",
+      "failure": "gh pr checks 12 shows them failing"
+    },
+    {
+      "id": "CI2",
+      "file": "CI",
+      "line": null,
+      "severity": "important",
+      "summary": "CI fails on the PR: test",
+      "failure": "gh pr checks 12 shows them failing"
+    }
+  ],
+  "open": [
+    "CI2"
+  ],
+  "build": null,
+  "fix": null,
+  "verdict": {
+    "verdict": "pass",
+    "findings": [
+      {
+        "id": "CI1",
+        "ok": true,
+        "reason": null,
+        "proof": null
+      }
+    ],
+    "new": [],
+    "optional": [],
+    "ci": "green",
+    "solves": null,
+    "notes": null
+  },
+  "checked": "9ee91270546fd3dfdc470940f0ef6bd7d8fd3002",
+  "ci_expected": true,
+  "merge_when_ready": false,
+  "merge_tries": 0,
+  "merge_how": "now",
+  "blocked": null,
+  "review_solves": null,
+  "agent": "triage-12-fix",
+  "nudged": false,
+  "given": 1795000000,
+  "worked": false,
+  "stopped_at": null,
+  "closing": [
+    "triage-12-gate-1",
+    "triage-12-gate-2"
+  ],
+  "spent_closed": 1.0,
+  "ask": null,
+  "why": "",
+  "log": [
+    [
+      1795000000,
+      "started the reviewer (claude, triage-12-review) in <tmp>/repo/.trix/worktrees/triage-12-review"
+    ],
+    [
+      1795000000,
+      "the reviewer found 1 must-fix finding: it checks them now"
+    ],
+    [
+      1795000000,
+      "the reviewer confirmed 1"
+    ],
+    [
+      1795000000,
+      "started the fixer (claude, triage-12-fix) in <tmp>/repo/.trix/worktrees/triage-12-fix"
+    ],
+    [
+      1795000000,
+      "the fixer fixed 1 of 1 (1 commit)"
+    ],
+    [
+      1795000000,
+      "started the gatekeeper (claude, triage-12-gate-1) in <tmp>/repo/.trix/worktrees/triage-12-gate-1"
+    ],
+    [
+      1795000000,
+      "the gatekeeper says pass"
+    ],
+    [
+      1795000000,
+      "CI fails on the PR: test"
+    ],
+    [
+      1795000000,
+      "round 2: back to the fixer"
+    ],
+    [
+      1795000000,
+      "the fixer fixed 1 of 1 (1 commit)"
+    ],
+    [
+      1795000000,
+      "started the gatekeeper (claude, triage-12-gate-2) in <tmp>/repo/.trix/worktrees/triage-12-gate-2"
+    ],
+    [
+      1795000000,
+      "the gatekeeper says pass"
+    ],
+    [
+      1795000000,
+      "CI fails on the PR: test"
+    ],
+    [
+      1795000000,
+      "needs you: CI failed (test) and the rounds are used up  [r: one more round · a: abort]"
+    ],
+    [
+      1795000000,
+      "round 3: back to the fixer"
+    ]
+  ],
+  "created": 1795000000
+}
+--- fixer-1.json
+{
+  "commits": [
+    "6f147b8aad037a33f63fd8a41b8d3ee1859de58b"
+  ],
+  "tests": "cargo test: 12 passed",
+  "findings": [
+    {
+      "id": "F1",
+      "outcome": "fixed",
+      "note": null,
+      "test": "limit_resets_after_60s",
+      "proof": {
+        "ran": "limit_resets_after_60s",
+        "output": "ok",
+        "passes": true
+      }
+    }
+  ],
+  "notes": null
+}
+--- fixer-2.json
+{
+  "commits": [
+    "9ee91270546fd3dfdc470940f0ef6bd7d8fd3002"
+  ],
+  "tests": "cargo test: 12 passed",
+  "findings": [
+    {
+      "id": "CI1",
+      "outcome": "fixed",
+      "note": null,
+      "test": null,
+      "proof": null
+    }
+  ],
+  "notes": null
+}
+--- gatekeeper-1.json
+{
+  "verdict": "pass",
+  "findings": [
+    {
+      "id": "F1",
+      "ok": true,
+      "reason": null,
+      "proof": null
+    }
+  ],
+  "new": [],
+  "optional": [],
+  "ci": "green",
+  "solves": null,
+  "notes": null
+}
+--- gatekeeper-2.json
+{
+  "verdict": "pass",
+  "findings": [
+    {
+      "id": "CI1",
+      "ok": true,
+      "reason": null,
+      "proof": null
+    }
+  ],
+  "new": [],
+  "optional": [],
+  "ci": "green",
+  "solves": null,
+  "notes": null
+}
+--- reviewer-1-verify.json
+{
+  "findings": [
+    {
+      "id": "F1",
+      "confirmed": true,
+      "evidence": "limit_resets_after_60s fails: refused at t=61",
+      "why": null
+    }
+  ],
+  "optional": [],
+  "solves": null,
+  "notes": null
+}
+--- reviewer-1.json
+{
+  "findings": [
+    {
+      "id": "F1",
+      "file": "src/limit.rs",
+      "line": 1,
+      "severity": "important",
+      "summary": "the window never resets",
+      "failure": "after 60s a client is still refused",
+      "proof": {
+        "test": "limit_resets_after_60s",
+        "observed": "refused at t=61",
+        "expected": "allowed at t=61"
+      }
+    }
+  ],
+  "optional": [],
+  "solves": null,
+  "notes": null
+}
+
+== repository ==
+worktree <tmp>/repo
+HEAD 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+branch refs/heads/main
+
+worktree <tmp>/repo/.trix/worktrees/triage-12-fix
+HEAD 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+branch refs/heads/trix/triage-12-fix
+
+worktree <tmp>/repo/.trix/worktrees/triage-12-gate-1
+HEAD 6f147b8aad037a33f63fd8a41b8d3ee1859de58b
+detached
+
+worktree <tmp>/repo/.trix/worktrees/triage-12-gate-2
+HEAD 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+detached
+
+worktree <tmp>/repo/.trix/worktrees/triage-12-review
+HEAD f8f3dfda243f1a7c17b22a635f7eca026642019f
+detached
+-- refs
+refs/heads/main 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+refs/heads/trix/triage-12-fix 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+refs/remotes/origin/main 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+refs/remotes/origin/rate-limits 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
+
+== origin ==
+refs/heads/main 89ce2aa1655e2a16874dcd538c54b6210dea32e1
+refs/heads/rate-limits 9ee91270546fd3dfdc470940f0ef6bd7d8fd3002
