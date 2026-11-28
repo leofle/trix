@@ -30,6 +30,8 @@ pub struct Config {
     pub worktree: WorktreeOpts,
     pub session: SessionOpts,
     pub triage: TriageOpts,
+    /// `[workflows]`, `[approvals]`, `[capabilities]` (`workflow/settings.rs`).
+    pub workflows: crate::workflow::settings::Settings,
 }
 
 /// `trix triage`: what a case may spend, how many fix rounds it gets, and
@@ -382,6 +384,12 @@ struct File {
     session: FileSession,
     #[serde(default)]
     triage: FileTriage,
+    #[serde(default)]
+    workflows: crate::workflow::settings::FileWorkflows,
+    #[serde(default)]
+    approvals: crate::workflow::settings::FileApprovals,
+    #[serde(default)]
+    capabilities: toml::Table,
 }
 
 #[derive(Deserialize, Default)]
@@ -431,6 +439,8 @@ struct FileCost {
     prices: BTreeMap<String, FilePrice>,
     live_prices: Option<bool>,
     prices_url: Option<String>,
+    /// A workflow whose estimate is over this asks before it launches.
+    confirm_over: Option<f64>,
 }
 
 /// USD per million tokens.
@@ -584,6 +594,7 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         Some(n) => return Err(format!("ui.scrollback: {n} is not a number of lines from 0 to {MAX_SCROLLBACK}")),
     };
     let ui = Ui { nerd_font: f.ui.nerd_font.unwrap_or(false), scrollback };
+    let confirm_over = f.cost.confirm_over;
     let cost = cost_opts(f.cost)?;
     let worktree = worktree_opts(f.worktree)?;
     let session = match f.session.idle_after.as_deref() {
@@ -591,7 +602,8 @@ pub fn parse(text: &str, dir: &Path) -> Result<Config, String> {
         Some(s) => SessionOpts { idle_after: crate::idle::parse_after(s).map_err(|e| format!("session.idle_after: {e}"))? },
     };
     let triage = triage_opts(f.triage)?;
-    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree, session, triage })
+    let workflows = crate::workflow::settings::settings(f.workflows, f.approvals, f.capabilities, confirm_over)?;
+    Ok(Config { keys: Keys::from_file(f.keys)?, notify, sound, strip, new, theme, ui, workspace: Workspace { restore }, cost, worktree, session, triage, workflows })
 }
 
 fn triage_opts(f: FileTriage) -> Result<TriageOpts, String> {
@@ -753,12 +765,14 @@ pub enum Action {
     Detach,
     Help,
     Spend,
+    /// The workflow builder, or the run view when a run is going.
+    Workflows,
     Settings,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -779,6 +793,7 @@ impl Action {
         Action::Detach,
         Action::Help,
         Action::Spend,
+        Action::Workflows,
         Action::Settings,
         Action::Quit,
     ];
@@ -805,6 +820,7 @@ impl Action {
             Action::Detach => "detach",
             Action::Help => "help",
             Action::Spend => "spend",
+            Action::Workflows => "workflows",
             Action::Settings => "settings",
             Action::Quit => "quit",
         }
@@ -832,6 +848,7 @@ impl Action {
             Action::Detach => &["alt+d"],
             Action::Help => &["alt+?", "alt+/"],
             Action::Spend => &["alt+$"],
+            Action::Workflows => &["alt+p"],
             Action::Settings => &["alt+,"],
             Action::Quit => &["alt+q"],
         }

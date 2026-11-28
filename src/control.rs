@@ -75,6 +75,16 @@ pub enum Request {
     Events { targets: Vec<String> },
     /// A triage case: a report handed in, or your approval (`case.rs`).
     Case { id: String, op: crate::case::Op },
+    /// A workflow run: a report handed in, a question, or your word on it
+    /// (`workflow/engine.rs`). `run`: none when an agent's pane says which.
+    Wf { run: Option<String>, op: crate::workflow::engine::Op },
+    /// Start an agent with the guard on its pane (`workflow/guard.rs`): a
+    /// run's agent under `push: guarded` or `gate_only`. A server that
+    /// doesn't know the guard hangs up, so it's never silently left off.
+    SpawnGuarded { kind: String, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String> },
+    /// A run's pane says this process is one of its checks: nothing that
+    /// runs under it can drive trix.
+    CheckPid { pid: u32 },
     /// Whose pane is the process `pid` in? Another session's server asks,
     /// to tell an agent of this session from you (`ask_elsewhere`).
     Whose { pid: u32 },
@@ -89,6 +99,8 @@ pub enum Pane {
     Shell,
     /// In none of this session's panes.
     Outside,
+    /// Under a check a run registered: the run's name.
+    Check(String),
 }
 
 /// What the other sessions said of a process in none of this session's
@@ -112,13 +124,16 @@ pub enum Asker {
     /// A pane no server shows (`held_pane`): what runs in it, agent or
     /// shell, nobody can say. How to say which one.
     Held(String),
+    /// A check's process (or one it started): code the agents wrote, run by
+    /// a run's pane. It's nobody: it can't drive trix. What it is.
+    Check(String),
 }
 
 impl Asker {
     /// Its name, to hold against a role's agent's, or say it isn't.
     pub fn name(&self) -> &str {
         match self {
-            Asker::Agent(n) | Asker::Held(n) => n,
+            Asker::Agent(n) | Asker::Held(n) | Asker::Check(n) => n,
         }
     }
 
@@ -127,7 +142,7 @@ impl Asker {
     pub fn said(&self) -> String {
         match self {
             Asker::Agent(n) => format!("an agent ({n})"),
-            Asker::Held(how) => how.clone(),
+            Asker::Held(how) | Asker::Check(how) => how.clone(),
         }
     }
 }
@@ -306,7 +321,7 @@ pub fn run(req: Request) -> ! {
     let wait = match &req {
         Request::Wait { timeout_secs, .. } => Some(*timeout_secs),
         // Making a worktree in a big repo can take a while.
-        Request::Spawn { .. } => Some(50),
+        Request::Spawn { .. } | Request::SpawnGuarded { .. } => Some(50),
         // Asks every session and git before it removes anything.
         Request::Close { clean: true, .. } => Some(50),
         _ => None,
@@ -339,6 +354,10 @@ pub fn reply(stream: &mut UnixStream, r: &Reply) {
 }
 
 pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Request, sandboxed: bool) {
+    // `[approvals] allow_sandboxed = true` lets a sandboxed agent start and
+    // stop runs, as `[workflows.agents]` allows any agent. Never approve.
+    let run_ops = matches!(&req, Request::Wf { op: crate::workflow::engine::Op::Start | crate::workflow::engine::Op::Abort | crate::workflow::engine::Op::Pause | crate::workflow::engine::Op::Resume, .. });
+    let sandboxed = sandboxed && !(run_ops && app.config.workflows.approvals.allow_sandboxed);
     if sandboxed && let Some(what) = outside_the_sandbox(&req) {
         let err = format!("a command in a sandbox can't {what}: that would run outside the sandbox. Ask the user to do it, or run it outside the sandbox");
         return reply(&mut stream, &Reply::fail(err));
@@ -362,12 +381,15 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
     if matches!(req, Request::Send { .. } | Request::Spawn { .. }) {
         app.clock.active(std::time::SystemTime::now());
     }
-    if matches!(req, Request::Send { .. } | Request::Case { .. }) {
+    if matches!(req, Request::Send { .. } | Request::Case { .. } | Request::Wf { .. }) {
         // The kernel's word for who's asking, or the pane's own if it names
         // one: either way an agent is never taken for you. In none of this
         // session's panes, it may be in another session's agent's.
         let peer = crate::platform::peer_pid(&stream);
         let asker = match who_asks(app, peer, from) {
+            // A check, or something it started: code the agents wrote. It's
+            // found before any pane is, so it's never taken for the run's.
+            Pane::Check(run) => Some(Asker::Check(format!("a check of {run}"))),
             Pane::Agent(name) => Some(Asker::Agent(name)),
             Pane::Outside if needs_everyone(app, &req) && let Some(pid) = peer => return ask_elsewhere(app, stream, from, req, pid),
             Pane::Shell | Pane::Outside => None,
@@ -379,7 +401,19 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::List { json: true } => Reply::ok(listing_json(app, from)),
         Request::List { json: false } => Reply::ok(app.listing()),
         Request::Read { target, lines } => read(app, &target, lines),
-        Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree),
+        Request::Spawn { kind, name, cwd, command, prompt, worktree } => spawn(app, from, &kind, name, cwd, command, prompt, worktree, false),
+        Request::SpawnGuarded { kind, name, cwd, command, prompt } => spawn(app, from, &kind, name, cwd, command, prompt, false, true),
+        Request::CheckPid { pid } => {
+            // Only a run's own pane registers its checks.
+            match caller_name(app, from).filter(|n| app.agents.iter().any(|a| a.name == *n && is_case_pane(app, a))) {
+                Some(run) => {
+                    app.checks.retain(|(p, _)| crate::platform::parent_of(*p).is_some());
+                    app.checks.push((pid, run));
+                    Reply::ok("")
+                }
+                None => Reply::fail("only a run's pane registers a check"),
+            }
+        }
         Request::Close { target, force, clean } => match close(app, from, &target, force, clean) {
             Ok(Closed::Said(r)) => r,
             Ok(Closed::Later(name, left)) => return after_close(stream, name, left, clean),
@@ -389,7 +423,7 @@ pub fn handle(app: &mut App, mut stream: UnixStream, from: Option<u32>, req: Req
         Request::Layout => Reply::ok(serde_json::to_string(&app.open_agents()).unwrap_or_default()),
         Request::Open { name, agents, resume } => crate::layout::open(app, from, &name, agents, resume),
         Request::Whose { pid } => Reply::ok(serde_json::to_string(&pane_of(app, Some(pid))).unwrap_or_default()),
-        Request::Wait { .. } | Request::Events { .. } | Request::Send { .. } | Request::Case { .. } => unreachable!(),
+        Request::Wait { .. } | Request::Events { .. } | Request::Send { .. } | Request::Case { .. } | Request::Wf { .. } => unreachable!(),
     };
     reply(&mut stream, &r);
 }
@@ -399,6 +433,7 @@ fn as_asker(app: &mut App, from: Option<u32>, asker: Option<&Asker>, req: Reques
     match req {
         Request::Send { target, text, force } => send(app, from, asker.map(Asker::name), &target, &text, force),
         Request::Case { id, op } => case_request(app, asker, &id, op),
+        Request::Wf { run, op } => wf_request(app, asker, run.as_deref(), op),
         _ => unreachable!(),
     }
 }
@@ -407,6 +442,7 @@ fn as_asker(app: &mut App, from: Option<u32>, asker: Option<&Asker>, req: Reques
 /// pane it says it's in (`from`) is one.
 fn who_asks(app: &App, peer: Option<u32>, from: Option<u32>) -> Pane {
     match pane_of(app, peer) {
+        Pane::Check(run) => Pane::Check(run),
         Pane::Agent(name) => Pane::Agent(name),
         here => match caller_name(app, from).filter(|n| app.agents.iter().any(|a| a.name == *n && a.kind != Kind::Shell)) {
             Some(name) => Pane::Agent(name),
@@ -419,7 +455,7 @@ fn who_asks(app: &App, peer: Option<u32>, from: Option<u32>) -> Pane {
 /// another session's agent? For a case, and for a send into a case's pane.
 fn needs_everyone(app: &App, req: &Request) -> bool {
     match req {
-        Request::Case { .. } => true,
+        Request::Case { .. } | Request::Wf { .. } => true,
         Request::Send { target, .. } => find(app, target).is_ok_and(|i| is_case_pane(app, &app.agents[i])),
         _ => false,
     }
@@ -578,6 +614,8 @@ fn asker_elsewhere(elsewhere: &Elsewhere, req: &Request) -> Result<Option<Asker>
     let what = match req {
         Request::Case { op: crate::case::Op::Submit { .. }, .. } => return Ok(None),
         Request::Case { .. } => "approve, abort or answer a case",
+        Request::Wf { op: crate::workflow::engine::Op::Submit { .. } | crate::workflow::engine::Op::Ask { .. }, .. } => return Ok(None),
+        Request::Wf { .. } => "approve, stop, resume or answer a workflow run",
         _ => "type into a triage case's pane",
     };
     match elsewhere.silent.as_slice() {
@@ -614,6 +652,11 @@ fn pane_of(app: &App, pid: Option<u32>) -> Pane {
     let mut pid = peer;
     let mut found = None;
     for _ in 0..64 {
+        // A registered check comes before the pane that runs it: what it
+        // starts is the check's, not the run's.
+        if let Some((_, run)) = app.checks.iter().find(|(p, _)| *p == pid) {
+            return Pane::Check(run.clone());
+        }
         if let Some(a) = pane(pid) {
             found = Some(a);
             break;
@@ -634,7 +677,8 @@ fn pane_of(app: &App, pid: Option<u32>) -> Pane {
 /// it takes stdin lines as your answers, so no agent may type into it.
 pub(crate) fn is_case_pane(app: &App, a: &crate::agent::Agent) -> bool {
     let words = app.specs.get(&a.id).and_then(|s| s.command.as_deref()).and_then(|c| shell_words::split(c).ok()).unwrap_or_default();
-    a.kind == Kind::Custom && (matches!(words.as_slice(), [.., c, r, _] if c == "case" && r == "run") || a.command_line.contains(" case run "))
+    let runs = |c: &str, r: &str| (c == "case" && r == "run") || (c == "workflow" && r == "pane");
+    a.kind == Kind::Custom && (matches!(words.as_slice(), [.., c, r, _] if runs(c, r)) || a.command_line.contains(" case run ") || a.command_line.contains(" workflow pane "))
 }
 
 /// `trix case …` in the server. An approve or abort is typed into the
@@ -650,6 +694,26 @@ fn case_request(app: &mut App, agent: Option<&Asker>, id: &str, op: crate::case:
             }
             None => Reply::fail(format!("case {id}'s pane isn't running: it comes back when the workspace is restored")),
         },
+    }
+}
+
+/// `trix wf …` and `trix workflow approve / abort / …` in the server. An
+/// answer is typed into the run's pane, where the runner takes it.
+fn wf_request(app: &mut App, asker: Option<&Asker>, run: Option<&str>, op: crate::workflow::engine::Op) -> Reply {
+    let policy = app.config.workflows.agents.clone();
+    match crate::workflow::engine::handle(&crate::workflow::store::runs_root(), asker, run, op, &policy) {
+        Err(e) => Reply::fail(e),
+        Ok((out, None)) => Reply::ok(out),
+        Ok((out, Some(key))) => {
+            let id = run.unwrap_or_default();
+            match app.agents.iter_mut().find(|a| a.name == id && a.state != State::Exited) {
+                Some(pane) => {
+                    pane.submit(vec![key as u8]);
+                    Reply::ok(out)
+                }
+                None => Reply::fail(format!("run {id}'s pane isn't running: it comes back when the workspace is restored")),
+            }
+        }
     }
 }
 
@@ -853,8 +917,12 @@ pub(crate) fn hung_up(s: &UnixStream) -> bool {
 fn outside_the_sandbox(req: &Request) -> Option<&'static str> {
     match req {
         Request::Send { force: true, .. } => Some("send --force (it could answer another agent's permission prompt)"),
-        Request::Spawn { kind, .. } if matches!(kind_of(kind), Some(Kind::Shell | Kind::Custom)) => Some("start a shell or a custom command"),
-        Request::Spawn { command: Some(c), .. } if !c.trim().is_empty() => Some("start an agent with --args"),
+        Request::Spawn { kind, .. } | Request::SpawnGuarded { kind, .. } if matches!(kind_of(kind), Some(Kind::Shell | Kind::Custom)) => Some("start a shell or a custom command"),
+        Request::Spawn { command: Some(c), .. } | Request::SpawnGuarded { command: Some(c), .. } if !c.trim().is_empty() => Some("start an agent with --args"),
+        // A sandboxed agent hands in and asks; it never runs a run.
+        Request::Wf { op: crate::workflow::engine::Op::Submit { .. } | crate::workflow::engine::Op::Ask { .. }, .. } => None,
+        Request::Wf { .. } => Some("approve, stop, resume or answer a workflow run"),
+        Request::CheckPid { .. } => Some("register a check"),
         Request::Close { force: true, .. } => Some("close --force"),
         Request::Close { clean: true, .. } => Some("close --clean (it removes a worktree and its branch)"),
         Request::Args { set, clear, .. } if set.is_some() || *clear => Some("change the arguments an agent starts with"),
@@ -874,7 +942,7 @@ fn kind_of(label: &str) -> Option<Kind> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool) -> Reply {
+fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd: PathBuf, command: Option<String>, prompt: Option<String>, worktree: bool, guard: bool) -> Reply {
     let Some(kind) = kind_of(kind) else {
         return Reply::fail(format!("unknown agent kind '{kind}' (claude, codex, grok, opencode, cursor, copilot, muse, gemini, antigravity, amp, shell or custom)"));
     };
@@ -938,6 +1006,7 @@ fn spawn(app: &mut App, from: Option<u32>, kind: &str, name: Option<String>, cwd
             Err(e) => return Reply::fail(e.to_string()),
         }
     }
+    runtime.guard = guard;
     let by = caller_name(app, from);
     let spec = Spawn { kind, name: name.clone(), cwd: cwd.clone(), command, prompt, branch_note: note, resume: None, fork: false, runtime };
     match app.spawn_quiet(spec) {
@@ -1351,6 +1420,46 @@ mod tests {
     }
 
     #[test]
+    fn a_check_and_what_it_starts_are_nobodys_whatever_pane_runs_them() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
+        // The run's pane is this process's own parent, as the kernel has it:
+        // without the registry, a process under here would be the run's.
+        let me = std::process::id();
+        let mut pane = crate::agent::test_agent(Kind::Custom);
+        pane.name = "issue-to-pr-42".into();
+        pane.pid = crate::platform::parent_of(me).unwrap();
+        app.agents.push(pane);
+        let mut child = std::process::Command::new("sh").args(["-c", "sleep 5"]).spawn().unwrap();
+        assert_eq!(pane_of(&app, Some(child.id())), Pane::Agent("issue-to-pr-42".into()));
+        // The run registers this process as one of its checks: now anything
+        // under it is found as the check first, before the pane.
+        app.checks.push((me, "issue-to-pr-42".into()));
+        assert_eq!(pane_of(&app, Some(child.id())), Pane::Check("issue-to-pr-42".into()));
+        assert_eq!(pane_of(&app, Some(me)), Pane::Check("issue-to-pr-42".into()));
+        assert_eq!(who_asks(&app, Some(child.id()), None), Pane::Check("issue-to-pr-42".into()));
+        // Naming a pane in the request doesn't make it that pane's.
+        assert_eq!(who_asks(&app, Some(child.id()), Some(app.agents[0].id)), Pane::Check("issue-to-pr-42".into()));
+        // And a check can't drive a run: every request there is is refused.
+        let check = Asker::Check("a check of issue-to-pr-42".into());
+        let root = std::env::temp_dir().join(format!("trix-control-check-{me}"));
+        for op in [crate::workflow::engine::Op::Approve, crate::workflow::engine::Op::Start, crate::workflow::engine::Op::Submit { node: "judge".into(), report: "{}".into() }] {
+            let e = crate::workflow::engine::handle(&root, Some(&check), Some("issue-to-pr-42"), op, &app.config.workflows.agents).unwrap_err();
+            assert!(e.contains("a check runs code the agents wrote"), "{e}");
+        }
+        // A sandboxed agent hands in and asks, and runs nothing.
+        let wf = |op| Request::Wf { run: Some("issue-to-pr-42".into()), op };
+        assert!(outside_the_sandbox(&wf(crate::workflow::engine::Op::Submit { node: "judge".into(), report: "{}".into() })).is_none());
+        assert!(outside_the_sandbox(&wf(crate::workflow::engine::Op::Ask { text: "?".into() })).is_none());
+        for op in [crate::workflow::engine::Op::Approve, crate::workflow::engine::Op::Start, crate::workflow::engine::Op::Abort, crate::workflow::engine::Op::Revoke] {
+            assert!(outside_the_sandbox(&wf(op)).is_some());
+        }
+        assert!(outside_the_sandbox(&Request::CheckPid { pid: 1 }).is_some());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
     fn no_agent_types_into_a_cases_pane() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
@@ -1626,7 +1735,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(tx, "/nonexistent.sock".into(), Default::default(), "/bin/true".into(), crate::session::Out::default());
         app.pending_restore = None;
-        let r = spawn(&mut app, None, "custom", Some("w".into()), dir.clone(), Some("exec sleep 60".into()), None, true);
+        let r = spawn(&mut app, None, "custom", Some("w".into()), dir.clone(), Some("exec sleep 60".into()), None, true, false);
         assert!(r.err.contains("isn't trusted"), "{}", r.err);
         assert!(app.agents[0].installing.is_none(), "no setup is held in front of it");
         assert!(!dir.join(".trix/worktrees/w/.env").exists());

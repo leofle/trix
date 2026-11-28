@@ -294,7 +294,7 @@ trix case answer triage-123 n  # answer any other question it asks, as in its pa
   ```
 
   `Bash(cargo test:*)` stands for your project's own test command (`Bash(npm test:*)`, `Bash(pytest:*)`, …): add yours, per project, or the agents can't run the tests. With `dontAsk`, anything not allowed is refused rather than asked, so a refused command can make an agent hand in less (a report that says it couldn't run the tests, say). `Bash(git:*)` lets an agent run any git command; narrow it (`Bash(git diff:*)`, `Bash(git commit:*)`, `Bash(git push origin HEAD:*)`, …) if you want.
-- **What it costs** is the case's agents' spend, against `[triage] budget` ($10 by default), both reviewers' included; each reviewer and the gatekeeper close as soon as their report is in.
+- **What it costs** is the case's agents' spend, against `[triage] budget` ($10 by default), both reviewers' included; each reviewer and the gatekeeper close as soon as their report is in. trix prices Claude and Codex agents. A case with an agent of any other kind says `spent $1.20 + unknown of $10.00`: what that agent spends is unknown, not $0, and the budget can't count it.
 - Each case is a folder in `~/.local/state/trix/cases/` (`$XDG_STATE_HOME` if set). Its pane is restored like any agent, and picks the case up where it was.
 - For now, a case takes a PR whose branch is in the same repository (not a fork), on GitHub, with `gh` signed in.
 
@@ -306,6 +306,104 @@ With an issue, the review also asks whether the PR solves it (yes, partly or no,
 - **trix closes the issue after the merge** only if both reviewers' and the gatekeeper's last word was yes: `gh issue close 12 --comment "Solved by #20, merged by trix triage case <id>."`, noted in the log. A close that fails is logged and said in the pane, and never fails the merge. The PR's description is never edited.
 - **When the PR closes the issue itself**, trix does nothing more.
 - **When a reviewer or the gatekeeper didn't say yes**, the issue stays open, and the gate's question says so.
+
+### Workflows
+
+A **workflow** is triage's idea, for any job: agents with one task each, the checks that judge their work, and the edges between them, run by trix itself. It prompts the agents, sends work back when a check or a reviewer says so, and stops when the goal is met or a limit is hit. You don't relay anything. Triage is the first workflow, and it still runs exactly as before.
+
+```sh
+trix workflow new                      # the wizard: a template, the goal, a backend for each role
+trix workflow edit issue-to-pr         # the builder (alt+p in the workspace)
+trix workflow check issue-to-pr        # what would go wrong, before anything runs
+trix workflow dry-run issue-to-pr      # simulate it: the path, every prompt, what would stop it
+trix workflow run issue-to-pr --input issue=42
+```
+
+Four templates ship in the binary. They're read-only: the wizard and the builder save your copy under another name. Triage is the exception: its stages are its own and run only as a triage case, so there's no copy of it to make. Its agents, rounds and budget are [`[triage]`](#config).
+
+| template | what it does |
+| --- | --- |
+| `triage` | Today's [triage](#triage), as a workflow: a pull request or an issue, from findings to a merge you approve |
+| `issue-to-pr` | An issue to a merged PR: an implementer, the tests, a reviewer, and a judge that can approve the merge |
+| `bug-repro` | A bug report to a failing test that shows it. No push and no PR: the test is the result |
+| `nightly-deps` | Outdated dependencies, overnight: one upgrader per package, landed into one PR |
+
+**What a workflow is made of**
+
+- **Nodes.** An *agent* node runs one agent in a pane, with a **brief**: what it owns (path globs), what it must not touch, and what done means. A *check* runs a command and its exit code decides. The *gate* pushes, opens the PR, waits for CI and merges. `for_each` fans an agent out over a list, `join` waits for several nodes, and a `workflow` node runs another workflow.
+- **Edges** say what comes next for each verdict (`pass`, `changes`, `fail`, …). An edge that leads back is a **cycle**, and a cycle is a cost: nothing rewards more of them.
+- **A goal** with `done_when`: the checks that must pass and the nodes that must say so, on the same commit. A check pins the commit it ran on, and everything after it judges that commit. With no check before the gate, the checked commit is the one every judge in `done_when` passed.
+- **Limits.** Every workflow has a `wall_clock` (only time agents spend working counts: a run waiting for you at a gate uses none). A workflow with a cycle needs `max_iterations`. `budget_usd` and `no_progress` (stop at the first cycle that changed nothing) are optional. What happens at a limit is `on_limit`: ask you, or park.
+- **Workspaces.** Writers that the edges put in order share the run's worktree, on `trix/wf-<run>`. Writers that can run at the same time each get their own, and their commits land on the run's branch in the order they finish; a conflict goes back to its author. Nothing is removed before it has landed. A reviewer or a judge gets a fresh, detached checkout of the commit it's judging, and never the author's.
+
+A workflow is a TOML file: `.trix/workflows/<name>.toml` in the main checkout is the team's, `~/.config/trix/workflows/<name>.toml` is yours, and the team's wins. A run works from a copy taken when it starts, so editing the file never changes a run that's going.
+
+**The builder** (`trix workflow edit <name>`, or `alt+p`) draws the workflow as boxes and edges and runs the checker on every edit: each node shows what its backend can and can't do in that role, and each problem comes with its fixes (`f` applies the first). `B` picks a backend and says how well each one fits, `v` adds a verifier for the selected writer, `A` is the approvals. `r` stays off while an error remains. Keys do everything; the mouse selects and moves nodes.
+
+**Any backend, honestly.** Every node can run on any [supported agent](#supported-agents). What each can do is in a capability matrix that ships with trix, and `trix workflow capabilities` shows it. Each entry says how well trix knows it:
+
+- **verified**: a probe passed on the version you have installed (`trix workflow capabilities --verify` runs the probes; it's opt-in and spends a little quota);
+- **documented**: from trix's source and the vendor's docs, not probed;
+- **unverified**: counts as no.
+
+Out of the box, Claude Code is verified for the version it was probed on and documented on any other, and every other backend is documented. The checker uses the matrix to tell you before a run, not during it, that a Codex agent on a read-only sandbox can't hand in its report, or that a rule you wrote can never fire.
+
+**One checker.** `trix workflow check`, the builder, a dry run, an import and the start of a run all use the same checker and say the same thing. An error keeps a workflow from running. `check --fix` applies the fixes that are safe to apply.
+
+**Dry run and rehearsal.** `trix workflow dry-run <name>` drives the real engine with stub agents: no agent, no git, no GitHub. It shows the path, every prompt each node would get, how the run ends, the cycles, the cost estimate, and every approval that would be made without you. (For `triage` it follows the template's edges and says so: triage's own prompts and questions aren't simulated.) `--scenario` picks what the stubs say (`failures`, `worst`, `conflict`, `stall=<node>`, `quota=<node>`, or verdicts you script). `trix workflow rehearse <name>` runs real agents in a throwaway clone whose only remote is a local mirror, with the guard on every pane and check, and trix's own push, PR and merge stubbed.
+
+**While it runs.** The run has a pane, like a triage case, and asks you there. `trix workflow overview <run>` is the run at a glance: done, blocked, what needs you, cycles and wasted cycles, spend. `trix workflow ls` lists runs, `show` is one run, `pause`, `resume` and `abort` do what they say. A stopped agent is nudged once and then it's yours; an agent out of quota is retried with a backoff that doesn't use the wall clock.
+
+**The log stays on your machine.** `trix workflow log <run>` has every prompt, report, question, edge and nudge. Each line carries the hash of the one before, and `--verify` reports a line that was edited, deleted or cut off. What leaves the machine is an outcome summary only (nodes, verdicts, cycles, check results, who approved): that's the PR's body. Prompts and reports never go there.
+
+**Schedules.** `trix workflow schedule <name> --cron '0 2 * * *'` (with `--deadline HH:MM` to park and `--kill-at HH:MM` to abort) and `trix workflow scheduler`, which starts what's due and what triggers fire, from a pane or from a unit: `trix workflow units systemd|launchd` shows one and writes it only with `--yes`. `[workflows] on_finish` runs a command when a run ends.
+
+**Sharing.** `trix workflow export <name> > wf.yaml` writes one self-contained YAML file. `trix workflow import <file>` runs the checker on it, saves it as native TOML among your workflows, and asks whether you trust it. An imported file is never trusted by being imported, a file with errors imports as a draft that can't run, and an import never replaces a workflow you already have.
+
+<a id="workflow-safety"></a>
+
+#### What a workflow may do without you
+
+By default, nothing: you approve every merge, and trix never answers an agent's permission prompt. Everything below is opt-in, and each part says exactly how strong it is.
+
+**Push protection** is the workflow's `[policy] push`, and each agent node is labelled with what it really gets:
+
+| label | what it means |
+| --- | --- |
+| **enforced** | The agent cannot push, whatever it tries: a Claude Code profile that names its tools, every one of them on trix's safe list (`Read`, `Glob`, `Grep`, `Edit`, `Write`, `git add`, `commit`, `diff`, `status`, `log`, `show`, and trix's own hand-in commands), and refuses the rest. Nothing else is ever labelled enforced: a profile that can run your tests can run anything |
+| **guarded** | The pane's environment sends every `git push` nowhere, turns the repository's git hooks off and gives `gh` no login. This stops an agent that pushes by habit or by mistake. **It does not stop code that sets out to undo it**: the agent runs as you and can change its own environment |
+| **none** | `push = "allow"`: the agent pushes its own commits, as triage's builder and fixer do today |
+
+`push = "gate_only"` is an error unless every agent node can be enforced, so it never claims more than it delivers. `guarded` is a warning on the workflow, by name.
+
+**Checks and test commands run code the agents wrote, as you**, with your files and your credentials in reach. trix is not a sandbox. What it does: a check runs in a process of its own with the guard on, in a clean checkout of the commit being judged; trix's server refuses every request from a check and from anything it starts, so a test can't approve its own merge; and trix compares the repository's hooks and the git settings that run commands (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, `credential.helper`) with what they were when the run began, before its own push, land and merge, and parks the run if they changed. A check is always labelled guarded, never enforced.
+
+**Floors** bind what trix itself does, are on by default and can't be removed, by a workflow, a rule or an approver:
+
+- trix's push is a plain push of the checked commit. It never forces.
+- No merge into a protected branch without green CI on the checked commit, whoever approved. "No checks yet" isn't green, and a branch whose protection trix can't read counts as protected.
+- No push of a change to CI configuration (`.github/workflows/**`, `.github/actions/**` and your `[workflows] ci_paths`) without you: only `trix workflow approve`, from you, releases it, for that run.
+
+`[approvals] floors` can add `push_without_you` and `merge_without_you`. A floor covers trix's own actions; what an agent does in its pane is covered by its push protection, above.
+
+**Approvals.** Two things must both be true before trix approves anything for you: the workflow has an `[approvals]` block, and its name is in `[approvals] allow` in *your* config while its file is the one you trusted (`trix workflow trust <name>`, pinned to a SHA-256 of its content). A file can't switch approvals on by itself, and editing it takes the trust away.
+
+- **A merge approver** is a node (a judge, a verifier) that voted pass on the exact commit being merged and didn't write it. It never overrides a floor.
+- **A permission rule** lets trix answer one agent's permission prompt for one tool and command, through that backend's own hook. It needs the hook's decision to be *verified* for the installed version; today that's Claude Code only, and only after the probe passes on your version. On every other backend, and on any failure (no rule, a timeout, a revoked run, no server), trix says nothing and the prompt is yours, as before. Nothing is ever typed into a pane. A push or a merge is never a rule's.
+- **The audit**: `trix workflow audit <run>` lists every approval with who gave it, by which rule, and the exact command, branch and commit. `trix workflow revoke <run>` drops every approval in a run back to asking, at once.
+- **Autopilot** (`trix workflow autopilot <name>`) shows what each node will do unattended, and with `--yes` switches the workflow to limits that park instead of asking, a merge approver that isn't the author, and a catch-all rule that asks. It writes no rule that allows a tool: those are yours to add.
+- **Agents and workflows.** An agent pane can start, pause or resume a run only as `[workflows.agents]` says (ask you, by default; its own runs only; two levels deep). Approving a gate, trusting a file and importing one are yours alone.
+
+**Coming from triage alone.** Nothing changes for triage: `trix triage`, every `trix case` command and every `[triage]` setting work as before, and cases in flight go on. One thing reads differently: an agent trix can't price (anything but Claude and Codex) counts as **unknown, not $0**, in a triage case's spend and in a workflow's. A session started before this version must be restarted before it can run a workflow.
+
+**Known limits**
+
+- The scheduler is a command (`trix workflow scheduler`), not part of the server, and it needs a trix session to open panes in.
+- The builder connects nodes from the keyboard (`c`); dragging an edge with the mouse isn't wired. The run view is the text overview, not the canvas.
+- A run started by a `workflow` node works on its own branch and opens its own PR; the parent takes its outcome and doesn't merge its branch. A dry run doesn't start those runs.
+- **Triage can't be copied or changed as a workflow yet.** Its stages (`triage.review`, `triage.fix`, …) run only in the built-in triage, and the checker refuses them anywhere else rather than let a copy start and fail. So triage has no approver node: you approve its merges, as before. It also can't be scheduled, rehearsed or used as a node.
+- Triage's 12 hour wall clock is declared in its template but not enforced: triage has no time limit, as before.
+- Codex's hook decision isn't verified, so no permission rule fires on Codex.
 
 ### Layouts
 
@@ -399,6 +497,7 @@ budget = 25                       # USD for the whole workspace (none by default
 agent_budget = 5                  # USD for each agent (none by default)
 monthly_budget = 300              # USD for a calendar month, every session's agents together (none by default)
 warn_at = 80                      # warn this far into a budget, in percent (80 by default)
+confirm_over = 10                 # a workflow whose estimated cost is over this is an expensive topology (its budget, or $10, by default)
 live_prices = false               # don't fetch the live price list: config.toml's prices and trix's own only (on by default)
 prices_url = "https://example.com/prices.json"  # fetch the list from here instead, in LiteLLM's format
 
@@ -426,11 +525,31 @@ port_base = 20000                 # where blocks start (1024 to 65535)
 port_count = 10                   # ports per block, unless the repo's .trix.toml says (1 to 100)
 on_close = "ask"                  # closing a worktree's last agent offers to remove it if safe; "keep" never offers
 
+[workflows]
+ci_paths = ["ci/**"]              # more paths that count as CI configuration (.github/workflows and .github/actions always do)
+on_finish = ["notify-run", "{{run.id}}", "{{run.state}}"]   # a command run when a run ends, as an argv (none by default)
+digest = "08:00"                  # when the scheduler sends the daily digest (none by default)
+[workflows.agents]                # what an agent pane may do with runs: "allow", "ask" (default) or "deny"
+run = "ask"
+stop = "ask"                      # pause and abort
+resume = "ask"
+scope = "own"                     # only runs that agent started (default), or "any"
+max_depth = 2                     # how deep a run started by a run may go (2 by default)
+
+[approvals]                       # off unless a workflow is named here: see "What a workflow may do without you"
+allow = ["issue-to-pr"]           # workflows that may approve for you, each pinned to the file you trusted
+allow_sandboxed = false           # let a sandboxed agent start and stop runs (false by default)
+notify = "each"                   # tell you of each approval as it's made (default), or "summary"
+floors = ["merge_without_you"]    # floors to add; the three built in can't be removed
+
+[capabilities.gemini]             # correct the shipped matrix for one backend; shown as overridden
+quota_signal = "none"
+
 [session]
 idle_after = "8h"                 # when `trix ls` flags a session left alone: like 30m, 8h or 1d (default), or "off"
 ```
 
-- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `compact`, `search`, `broadcast`, `review`, `clone`, `rename`, `close`, `menu`, `select`, `detach`, `help`, `settings` and `quit`. Naming an action replaces its keys; the actions you leave out keep theirs.
+- **Keys.** The actions are `new`, `jump`, `next`, `prev`, `attention`, `grid`, `sidebar`, `mini_sidebar`, `compact`, `search`, `broadcast`, `review`, `clone`, `rename`, `close`, `menu`, `select`, `detach`, `help`, `settings`, `workflows` and `quit`. Naming an action replaces its keys; the actions you leave out keep theirs.
   - A key is `alt`, `ctrl` and/or `shift` plus a letter, a symbol, a named key (`up`, `pgdn`, `enter`, `space`, `plus`…) or `f1`–`f12`. It needs `alt` or `ctrl`, so it can't swallow what you type into agents; only an F-key may stand alone. `super`/`cmd` is refused, because terminals don't pass it on.
   - A key you bind is yours: an action that has it only by default goes without it (with `new = "alt+l"`, clone has no key), so a default trix adds later never breaks your file. Two of your own bindings on one key are an error, and so is a key in jump's range.
   - The footer, the help (`alt+?`) and the other hints show the keys you chose.
@@ -444,6 +563,7 @@ idle_after = "8h"                 # when `trix ls` flags a session left alone: l
 - **`[workspace] restore`** answers the question a fresh trix asks about the saved workspace (see [Restore](#restore)).
 - **`[cost]`** sets the budgets and prices in [Cost and tokens](#cost-and-tokens). A price under `[cost.prices]` applies to the model of that name, or to models whose name starts with it (`"gpt-6"` covers `gpt-6-luna`), ahead of the live list and trix's own. `live_prices` and `prices_url` are for the [live list](#cost-and-tokens).
 - **`[worktree]`** sets the ports of [runnable worktrees](#runnable-worktrees). The default base sits below the ports Linux and macOS hand out on their own. What a repository's worktrees run and copy lives in its `.trix.toml`, not here. `on_close` is `"ask"` (the default: the close dialog's `r` and the kept-worktree toast, see [Review](#review)) or `"keep"` (neither). There's no `"remove"`: a worktree goes only when you say so.
+- **`[workflows]`, `[workflows.agents]`, `[approvals]` and `[capabilities.<kind>]`** are the settings of [Workflows](#workflows). Approvals are off until you name a workflow in `[approvals] allow`.
 - **`[session] idle_after`** is how long a session can go with nobody attached and nothing happening before `trix ls` flags it, and how long an agent can need you before it's flagged more strongly (see [Sessions](#sessions)). A trix from before this key was added can't reload a config that has it.
 - **What you tell every agent** (who does what, who reports to whom) goes in `~/.config/trix/instructions.md`, not here: see [Your instructions](#your-instructions).
 
@@ -626,6 +746,7 @@ The sidebar size you pick with `alt+m`, and what `alt+c` chose, are kept separat
 | `alt+c` | compact sidebar: one-line cards instead of full ones that scroll (remembered) |
 | `shift+pgup/pgdn`, wheel | scrollback |
 | drag | select & copy (OSC 52, plus wl-copy or pbcopy) |
+| `alt+p` | workflows: the run view when a workflow is running, else the builder ([Workflows](#workflows)) |
 | `alt+,` | settings: theme, sidebar, notifications, sounds |
 | `alt+$` | spend: this month (or earlier ones) by model |
 | `alt+?` | all keys |
@@ -807,7 +928,9 @@ Codex shows a startup warning that `-c` overrides run it "without the shared bac
 
 trix runs agents as you, with your permissions. It doesn't sandbox them; it keeps itself from widening what they can do:
 
-- **It never answers a prompt for you.** trix's hooks and plugins only watch: none decides whether a tool runs. Cursor gets none of its permission hooks, Copilot's and Muse's hooks run as `trix hook … || true`, Gemini's never blocks, and Antigravity's answers `allow`, which hands the call on to Antigravity's own permissions. `trix send` (without `--force`), a broadcast and the review's notes are never typed into an agent that needs you, so none of them can answer its prompt ([guard rails](#agent-control)).
+- **It never answers a prompt for you, unless you opt in.** By default trix's hooks and plugins only watch: none decides whether a tool runs. The one exception is a [workflow](#workflow-safety) permission rule, which you switch on twice (in the workflow, and by naming it in `[approvals] allow` after trusting its file): then trix answers the one prompt the rule covers, through the backend's own hook, and only on a backend whose hook decision a probe has verified for your installed version (Claude Code today). It answers `allow` or nothing; on any doubt the prompt is yours. It never types an answer into a pane. Cursor gets none of its permission hooks, Copilot's and Muse's hooks run as `trix hook … || true`, Gemini's never blocks, and Antigravity's answers `allow`, which hands the call on to Antigravity's own permissions. `trix send` (without `--force`), a broadcast and the review's notes are never typed into an agent that needs you, so none of them can answer its prompt ([guard rails](#agent-control)).
+- **Checks and test commands run code agents wrote, as you.** A workflow's check (`npm test`, `cargo test`, a script) runs whatever the agents committed, with your files and credentials in reach. trix guards that process (pushes go nowhere, git hooks are off, `gh` has no login, and trix's server refuses anything it asks), but the guard can be undone by code that sets out to, and trix says so wherever it labels it: `guarded`, never `enforced`. Only a Claude Code profile limited to trix's safe list is `enforced` ([What a workflow may do without you](#workflow-safety)). If you wouldn't run a repository's tests yourself, don't run a workflow on it.
+- **A workflow can't widen itself.** Three floors bind trix's own push and merge and can't be removed: no force push, no merge into a protected branch without green CI on the checked commit, no push of a CI-configuration change without you. A workflow file is run only as you trusted it, an imported one is never trusted by being imported, and approving a gate is yours alone: the server refuses it from every agent pane and every check.
 - **Sandboxed agents stay sandboxed.** A command running inside an agent's sandbox (such as Codex's) can't use trix to do anything outside it: no shells, custom commands, `--force`, layouts or `trix kill`. trix asks the kernel which process is on the other end of its socket and checks its sandbox ([guard rails](#agent-control)).
 - **A repository's setup runs only once you trust it.** Nothing in a `.trix.toml` runs or is copied until you accept it in the new-agent form, which shows exactly what would run, and any change to it asks again ([Trust](#runnable-worktrees)). That guards against surprises; it isn't a sandbox.
 - **Your agent configs stay yours.** Everything trix hands an agent is passed to that one process and lives in trix's runtime folder until the server stops. trix makes that folder `0700` and refuses to start if it isn't private to you; sockets whose path would be too long go in `/tmp/trix-<uid>`, which trix makes `0700` and won't use if it isn't yours or others can open it.

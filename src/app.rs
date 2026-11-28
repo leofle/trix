@@ -613,6 +613,9 @@ pub struct App {
     pub published: HashMap<u32, crate::events::Published>,
     /// `~/.config/trix/config.toml`, and the write it was read from.
     pub config: crate::config::Config,
+    /// The checks runs' panes registered, each with its run: a process
+    /// under one is nobody's, and can't drive trix (`control.rs`).
+    pub checks: Vec<(u32, String)>,
     config_stamp: Option<crate::config::Stamp>,
     /// The file had a mistake when it was last read.
     config_failed: bool,
@@ -724,6 +727,7 @@ impl App {
             subscribers: Vec::new(),
             published: HashMap::new(),
             config,
+            checks: Vec::new(),
             config_stamp,
             config_failed: config_error.is_some(),
             last_needs_you_sound: None,
@@ -1943,7 +1947,7 @@ impl App {
             // A setup that hadn't finished comes back with what it was for.
             let setup = meta.pending_setup().cloned();
             let prompt = setup.as_ref().and(meta.first_prompt.clone());
-            let runtime = crate::worktree::Runtime { ports: None, setup };
+            let runtime = crate::worktree::Runtime { ports: None, setup, guard: false };
             let spec = Spawn { kind, name: agent.name.clone(), cwd: meta.cwd.clone(), command: meta.command.clone(), prompt, branch_note: None, resume: None, fork: false, runtime };
             if meta.parked && agent.state == State::Exited {
                 self.parked.insert(id);
@@ -2824,6 +2828,17 @@ impl App {
             Action::Detach => self.detach = true,
             Action::Help => self.modal = Some(Modal::Help),
             Action::Spend => self.modal = Some(Modal::Spend(crate::ledger::Ym::now())),
+            // The builder, or the run view when a run is going: a pane of its
+            // own, in the focused agent's folder.
+            Action::Workflows => {
+                let cwd = self.focused().map(|a| a.cwd.clone()).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+                let exe = crate::platform::trix_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "trix".into());
+                let name = self.unique_name("workflows");
+                let spec = Spawn { kind: Kind::Custom, name, cwd, command: Some(shell_words::join([exe.as_str(), "workflow", "open"])), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
+                if let Err(e) = self.spawn_quiet(spec) {
+                    self.toast(format!("couldn't open workflows: {e}"), ToastKind::Bad);
+                }
+            }
             Action::Settings => self.open_settings(),
             Action::Quit => {
                 if self.agents.iter().any(|a| a.state != State::Exited) {
@@ -6717,7 +6732,7 @@ mod tests {
     fn enter_on_a_failed_setup_runs_it_again_with_the_prompt() {
         let mut app = test_app();
         let setup = crate::worktree::Setup { script: "false".into(), root: std::env::temp_dir(), done: None };
-        let spec = Spawn { kind: Kind::Custom, name: "s".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 60".into()), prompt: Some("first".into()), branch_note: None, resume: None, fork: false, runtime: crate::worktree::Runtime { ports: None, setup: Some(setup.clone()) } };
+        let spec = Spawn { kind: Kind::Custom, name: "s".into(), cwd: std::env::temp_dir(), command: Some("exec sleep 60".into()), prompt: Some("first".into()), branch_note: None, resume: None, fork: false, runtime: crate::worktree::Runtime { ports: None, setup: Some(setup.clone()), guard: false } };
         let id = app.spawn_quiet(spec).unwrap();
         assert!(app.agents[0].installing.is_some(), "held in starting");
         app.agents[0].set_state(State::Exited, false);

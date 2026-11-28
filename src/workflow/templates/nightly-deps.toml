@@ -1,0 +1,164 @@
+schema = 1
+name = "nightly-deps"
+description = "Upgrade outdated dependencies overnight: one upgrader per package, landed into one PR."
+
+[goal]
+text = "Every outdated dependency that upgrades cleanly is upgraded in one PR with green tests."
+
+[goal.done_when]
+mechanical = [{ check = "tests" }, { ci = "green" }]
+attested = [{ judge = "verifier" }]
+
+[limits]
+wall_clock = "4h"
+max_iterations = 3
+no_progress = 1
+budget_usd = 20.0
+on_limit = "park"
+# Stop new work and park before morning.
+deadline = "06:00"
+
+[policy]
+push = "guarded"
+open_pr = "gate_only"
+merge = "you"
+
+[nodes.scan]
+kind = "agent"
+role = "reviewer"
+agent = "claude"
+profile = "read-only"
+revisit = "fresh"
+verdicts = ["found", "none"]
+output = { packages = "list<string>" }
+brief = { owns = [], done = "The outdated direct dependencies, by name, or none." }
+prompt = """
+List this repository's outdated direct dependencies, read from its manifests
+and lockfiles. Hand in with trix wf submit scan:
+{"verdict": "found", "packages": ["<name>"]} or {"verdict": "none"}.
+"""
+
+# One upgrader per package. They can run at the same time, so each gets a
+# worktree of its own, and the land step puts their commits together.
+[nodes.upgrade]
+kind = "for_each"
+role = "worker"
+over = "scan.packages"
+parallel = 3
+agent = "codex"
+profile = "edit-and-test"
+workspace = "isolated"
+revisit = "fresh"
+max_visits = 2
+verdicts = ["upgraded", "skipped"]
+prompt = """
+Upgrade the dependency {{item}} to its newest release that keeps the tests
+green, and nothing else. Commit. Do not push. If it can't be done cleanly,
+hand in skipped and say why. Hand in with trix wf submit {{node}}.
+"""
+
+[nodes.upgrade.brief]
+owns = ["package.json", "package-lock.json", "Cargo.toml", "Cargo.lock"]
+must_not_touch = [".github/**"]
+done = "The one dependency is upgraded and committed, or skipped with a reason."
+
+# Partial failure is fine: what upgraded goes on, what didn't is reported.
+[nodes.collect]
+kind = "join"
+wait = "all"
+verdicts = ["some", "none"]
+
+[nodes.land]
+kind = "land"
+on_conflict = "author"
+
+[nodes.tests]
+kind = "check"
+run = ["npm", "test"]
+commit = "land.head"
+outputs = ["exit_code", "log_tail"]
+
+[nodes.verifier]
+kind = "agent"
+preset = "verifier"
+agent = "claude"
+profile = "read-only"
+revisit = "fresh"
+verdicts = ["pass", "changes"]
+output = { findings = "string" }
+brief = { owns = [], done = "Every upgrade is the one named, and nothing else changed." }
+worktree = { checkout = "tests.commit", detached = true }
+prompt = """
+Commit {{tests.commit}} lands dependency upgrades. The tests passed:
+{{tests.log_tail}}
+Is each change an upgrade of a named dependency and nothing else? Hand in pass
+or changes with trix wf submit verifier.
+"""
+
+[nodes.gate]
+kind = "gh.gate"
+merge = "squash"
+
+[[edges]]
+from = "scan"
+to = "upgrade"
+on = "found"
+
+[[edges]]
+from = "scan"
+to = "@done"
+on = "none"
+
+[[edges]]
+from = "upgrade"
+to = "collect"
+on = ["upgraded", "skipped"]
+
+[[edges]]
+from = "collect"
+to = "land"
+on = "some"
+
+[[edges]]
+from = "collect"
+to = "@done"
+on = "none"
+
+[[edges]]
+from = "land"
+to = "tests"
+on = "landed"
+
+[[edges]]
+from = "tests"
+to = "verifier"
+on = "pass"
+
+[[edges]]
+from = "tests"
+to = "@fail"
+on = "fail"
+
+[[edges]]
+from = "verifier"
+to = "gate"
+on = "pass"
+
+[[edges]]
+from = "verifier"
+to = "@fail"
+on = "changes"
+
+[[edges]]
+from = "*"
+to = "@fail"
+on = ["error", "timeout", "exited"]
+
+[layout]
+scan = [2, 1]
+upgrade = [26, 1]
+collect = [50, 1]
+land = [50, 7]
+tests = [50, 13]
+verifier = [26, 13]
+gate = [2, 13]

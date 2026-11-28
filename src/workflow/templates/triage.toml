@@ -1,0 +1,143 @@
+# Triage, as a workflow: today's `trix triage`, unchanged for its users.
+# Built in and read-only. Its stages are triage's own and run only as a case:
+# a copy of this file can't run. Its agents, rounds and budget are [triage] in
+# your config.
+schema = 1
+name = "triage"
+builtin = true
+description = "Take a pull request, or an issue, from findings to a merge you approve."
+notes = """
+The built-in kinds keep triage's own prompts, reports and pane lifetimes. \
+Their briefs are for the checker and the overview only: no scope check runs \
+on a built-in, so nothing triage accepts today is ever sent back."""
+
+[inputs.target]
+type = "pr_or_issue"
+required = true
+resolve = "gh.resolve_target"
+
+[goal]
+text = "The pull request is merged, with every must-fix finding fixed and checked."
+
+[goal.done_when]
+mechanical = [{ ci = "green" }]
+attested = [{ judge = "gatekeep" }]
+
+[limits]
+# In-flight time only: gates, parking and CI waits never count.
+wall_clock = "12h"
+# Then RoundLimit asks, as today.
+max_iterations = "{{config.triage.max_rounds}}"
+budget_usd = "{{config.triage.budget}}"
+# Today's triage just goes another round on repeat findings.
+no_progress = "off"
+on_limit = "ask"
+
+[policy]
+# Today's builder and fixer push their own commits
+# (git push origin HEAD:<branch>, never force, by instruction).
+push = "allow"
+# You approve the merge, as today.
+merge = "you"
+
+[nodes.target]
+kind = "gh.resolve_target"
+verdicts = ["pr", "issue"]
+
+[nodes.build]
+kind = "triage.build"
+agent = "{{config.triage.builder.agent}}"
+args = "{{config.triage.builder.args}}"
+revisit = "fresh"
+verdicts = ["pushed"]
+brief = { owns = ["**"], done = "A pushed branch that answers the issue; trix opens its PR." }
+
+[nodes.review]
+kind = "triage.review"
+agent = "{{config.triage.reviewer.agent}}"
+args = "{{config.triage.reviewer.args}}"
+reviewers = "{{config.triage.reviewers}}"
+second = { agent = "{{config.triage.reviewer2.agent}}", args = "{{config.triage.reviewer2.args}}" }
+revisit = "fresh"
+verdicts = ["findings", "nothing_found", "unsolved"]
+brief = { owns = [], done = "Must-fix findings with proofs, or none." }
+
+[nodes.fix]
+kind = "triage.fix"
+agent = "{{config.triage.fixer.agent}}"
+args = "{{config.triage.fixer.args}}"
+# Keeps its pane between rounds: each new round is sent to it.
+revisit = "reuse"
+verdicts = ["pushed"]
+brief = { owns = ["**"], done = "Every open finding fixed and pushed, or answered." }
+
+[nodes.gatekeep]
+kind = "triage.gatekeep"
+agent = "{{config.triage.gatekeeper.agent}}"
+args = "{{config.triage.gatekeeper.args}}"
+# A fresh checkout every round.
+revisit = "fresh"
+verdicts = ["pass", "changes"]
+brief = { owns = [], done = "Pass, or the findings still open." }
+
+[nodes.gate]
+kind = "gh.gate"
+merge = "squash"
+verdicts = ["merged", "ci_failed", "conflict"]
+
+[[edges]]
+from = "target"
+to = "review"
+on = "pr"
+
+[[edges]]
+from = "target"
+to = "build"
+on = "issue"
+
+[[edges]]
+from = "build"
+to = "review"
+on = "pushed"
+
+[[edges]]
+from = "review"
+to = "fix"
+on = "findings"
+
+[[edges]]
+from = "review"
+to = "gate"
+on = "nothing_found"
+ask = "NothingFound"
+
+[[edges]]
+from = "review"
+to = "fix"
+on = "unsolved"
+ask = "Unsolved"
+
+[[edges]]
+from = "fix"
+to = "gatekeep"
+on = "pushed"
+
+[[edges]]
+from = "gatekeep"
+to = "fix"
+on = "changes"
+
+[[edges]]
+from = "gatekeep"
+to = "gate"
+on = "pass"
+
+[[edges]]
+from = "gate"
+to = "fix"
+on = ["ci_failed", "conflict"]
+
+[[edges]]
+from = "gate"
+to = "@done"
+on = "merged"

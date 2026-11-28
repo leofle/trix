@@ -997,6 +997,14 @@ pub fn run_client(source: &str, arg_payload: Option<String>) {
     if let Some(context) = workspace_hook_context(source, &v, std::env::var("MUSE_SESSION_ID").ok().as_deref()) {
         println!("{context}");
     }
+    // A permission request from a workflow run's agent: a rule of the run
+    // may answer this one request, through the server, inside the hook's
+    // timeout. Anything but allow prints nothing, and the prompt is yours
+    // as it always was. Off unless you switched approvals on for the
+    // workflow (`workflow/policy.rs`).
+    if let Some(allow) = crate::workflow::policy::hook_decision(source, &v) {
+        println!("{allow}");
+    }
     if source == "amp"
         && let Some(answer) = amp_answer(&v)
     {

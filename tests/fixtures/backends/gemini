@@ -1,0 +1,17 @@
+#!/bin/sh
+# A stand-in for Gemini CLI, for tests: `gemini -p <prompt>`. It has no
+# hook that can decide and no tool list trix can hold it to: it runs what
+# the prompt names, so read-only is by instruction and a push is stopped
+# only by the guard.
+[ "$1" = "--version" ] && { echo "${FAKE_VERSION:-0.30.1}"; exit 0; }
+prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in -p) prompt="$2"; shift 2 ;; *) shift ;; esac
+done
+if [ "$FAKE_MODE" = "quota" ]; then
+  echo "Quota exceeded for quota metric 'Generate Content API requests per minute'."
+  exit 1
+fi
+cmd=$(printf '%s\n' "$prompt" | sed -n '/^RUN:$/,/^END$/p' | sed '1d;$d')
+[ -z "$cmd" ] && exit 0
+sh -c "$cmd" 2>&1
