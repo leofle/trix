@@ -21,7 +21,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 2 | Seeded replay and goldens of today's triage | a39b7a0 | pass |
 | 3 | Generic runner extracted, the triage tests ported (three green commits) | 1d928ee, aba1465, 8277530 | pass |
 | 4 | Built-ins and the triage template (**hard parity gate**) | f590813 | **pass** |
-| 5 | Workflow model and native TOML | (this) | pass |
+| 5 | Workflow model and native TOML | 75e1cbc | pass |
+| 6 | Capability matrix and the shared checker | (this) | pass |
 
 ## Step 1: baseline
 
@@ -270,6 +271,92 @@ goldens freeze, so it's kept in the run's own folder, which step 13 adds.
   `1h30m`). The content hash that trust is pinned to is FNV-1a over the
   workflow's canonical JSON: it detects edits, it isn't a signature.
 - Tests added: 4. Suite: 735 passed. Deferred: nothing.
+
+## Step 6: the capability matrix and the shared checker
+
+**Built**
+
+- `src/workflow/capabilities.toml`, shipped in the binary: one entry per
+  backend (claude, codex, opencode, copilot, muse, grok, gemini, cursor,
+  antigravity, amp, custom) with its **level** (`verified`, `documented`,
+  `unverified`), version range, hand-in, read-only, best push protection,
+  state source, resume, `quota_signal`, `permission_decision`, merge
+  approver, priced and hook timeout. **Every entry ships as `documented`**;
+  nothing is `verified` until a probe passes (step 7).
+- `src/workflow/caps.rs`: the matrix, `[capabilities.<kind>]` overrides
+  (labelled), local probe results, version detection (`<program>
+  --version`) and the rule that a version outside the entry's range drops
+  it to `documented`. Also the **safe list** (13 commands, exactly the
+  PRD's), the five shipped profiles, and `Profile::protection`: a Claude
+  profile is `enforced` only if it names its tools, every one is on the safe
+  list, and it refuses the rest; anything else is `guarded`.
+- `src/workflow/check.rs`: **`check(workflow, matrix, ctx)`, the only
+  checker.** Each problem has a level (error, blocks-run, warning, info),
+  a stable code, where it is (workflow, node, edge, rule, approvals) and
+  its fixes; `apply` makes a fix, `fix_all` is `check --fix`. It also gives
+  each agent node its badges (`Label`: hand-in, push protection,
+  read-only enforced or by instruction, decision level, priced) and the
+  cost estimate (peak parallel agents, cycles, priced cost, and whether
+  some of it is unknown).
+- `src/workflow/settings.rs` and `src/config.rs`: `[workflows]`
+  (`ci_paths`, `on_finish`, `digest`), `[workflows.agents]`, `[approvals]`
+  (`allow`, `allow_sandboxed`, `notify`, `floors`), `[capabilities.<kind>]`
+  and `[cost] confirm_over`, with the PRD's defaults: agents ask, own runs
+  only, depth 2; approvals off; the three floors on and not removable.
+- `trix workflow check <name> [--fix]` and `trix workflow capabilities
+  [--kind k]`.
+
+**Accept**
+
+- One test per row of the predictions and graph-check tables
+  (`src/workflow/check_tests.rs`, 25 tests): Codex read-only hand-in;
+  gate_only with Codex, Claude with `Bash(npm test:*)`, with `git:*`, with
+  bare `Bash`, with `git push`, and a kind with no enforced profile; the
+  workflow-level push-guarded warning; rules on unverified kinds (error) and
+  on documented-only kinds (warning, suspended); an agent approver on a
+  permission rule; a missing or invalid approver and the default order
+  (judge, verifier, gatekeeper, you); dead rules; overlapping scopes on
+  writers that can run at the same time; a missing brief on an agent node
+  and none needed on a check; a verifier that is the author; a missing or
+  unreachable land step; an expensive topology; a kind with no quota
+  signal; an upgraded backend version; a writer whose scope covers CI
+  configuration; plus every graph rule.
+- **issue-to-pr checks to exactly 0 errors and 2 warnings** on a machine
+  with its three backends installed in range and Codex's hooks trusted:
+  the workflow-level push-guarded warning (implementer, judge, tests) and
+  the judge's read-only by instruction.
+- Every template passes check with 0 errors, triage bound to `[triage]`
+  included.
+- **Identical output on every fixture:** `every_way_in_gives_the_same_report`
+  holds each way in against the API's text. At this step the ways in are
+  the API and `trix workflow check`; import, dry run, the builder and run
+  start are added to that same test as they're built (steps 8, 12, 14, 15),
+  and its `SURFACES` count ends at 5.
+
+**Decisions**
+
+- A run starts where `entry` says, or at the nodes no edge leads to.
+  issue-to-pr and bug-repro name theirs, because their first node is also
+  the target of their back edges.
+- "Can run at the same time" is: neither reaches the other going forward
+  (an edge that leads back orders nothing).
+- Path-glob overlap is decided segment by segment (`**` any folders, `*`
+  within one). It can say "overlap" for two globs that share no real file
+  when both have a `*` in the same segment; it's used for warnings and for
+  the must-not-touch error, where erring that way is the safe side.
+- The cost estimate before there's history is $0.50 per priced agent visit,
+  doubled for a node on a loop. It's labelled an estimate, and unpriced
+  kinds make the total `+ ?`.
+- An info line says approvals stay off until the workflow's name is in
+  `[approvals] allow`. It's info, not a warning, so it doesn't change the
+  counts above.
+- Codex's version range was set from the build machine (0.167.2 installed).
+- Codex hook trust can't be read from Codex, so the checker counts the
+  hooks as trusted once trix has seen a Codex hook event (step 8 records
+  it); until then the warning shows.
+
+Tests added: 31 (25 checker, 4 matrix, 2 settings). Suite: 766 passed.
+Deferred: nothing.
 
 ## Decisions to review
 

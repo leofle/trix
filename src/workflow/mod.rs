@@ -5,13 +5,32 @@
 // docs step, once every step is in.
 #![allow(dead_code)]
 
+pub mod caps;
+pub mod check;
 pub mod cli;
 pub mod env;
 pub mod model;
 pub mod runner;
+pub mod settings;
 pub mod store;
 pub mod triage;
 pub mod view;
 
 #[cfg(test)]
+mod check_tests;
+#[cfg(test)]
 pub mod replay;
+
+/// How many ways a workflow gets checked, each through the one checker.
+#[cfg(test)]
+pub const SURFACES: usize = 1;
+
+/// What each of those ways says of a workflow: its name, and the text.
+#[cfg(test)]
+pub fn surfaces(
+    w: &model::Workflow,
+    m: &caps::Matrix,
+    ctx: &check::Ctx,
+) -> Vec<(&'static str, String)> {
+    vec![("trix workflow check", cli::check_text(w, m, ctx))]
+}

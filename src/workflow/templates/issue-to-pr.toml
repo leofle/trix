@@ -2,6 +2,8 @@ schema = 1
 name = "issue-to-pr"
 description = "Take a GitHub issue to a merged PR. The judge approves the merge within floors."
 
+entry = ["implementer"]
+
 [inputs.issue]
 type = "int"
 required = true

@@ -1,0 +1,171 @@
+# What each backend can do, shipped in the binary and never downloaded.
+#
+# Every entry has a level:
+#   verified    a real probe passed, on the versions `verified_with` names,
+#               in the trix release `verified_at` names
+#   documented  from trix's source and README and the vendor's docs; not probed
+#   unverified  counts as no
+# The checker counts verified and documented as yes. Rule approvals (trix
+# answering a permission prompt for you) need permission_decision to be
+# verified for the installed version. `trix workflow capabilities --verify`
+# runs real probes and raises your local entries.
+#
+# versions: the releases this entry was written against. An installed
+# backend outside it drops to documented, with a warning.
+
+[claude]
+level = "documented"
+verified_with = ""
+verified_at = ""
+versions = { min = "2.0.0", max = "2.99.99" }
+hand_in = true
+read_only_enforced = true            # with a profile whose commands are all on the safe list
+push = "enforced"                    # with a safe-list profile; guarded with anything else
+state = "hooks"
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "documented"   # PermissionRequest can return a decision; verified by the probe
+merge_approver = true
+priced = true
+hook_timeout_s = 5
+
+[codex]
+level = "documented"
+verified_with = ""
+verified_at = ""
+versions = { min = "0.100.0", max = "0.999.999" }
+hand_in = { "workspace-write" = true, "read-only" = false }  # read-only: no socket
+read_only_enforced = false           # read-only exists but can't hand in
+push = "guarded"                     # workspace-write needs network for trix
+state = "hooks"                      # after /hooks trust; else notify only
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "unverified"   # PermissionRequest hook seen; can it decide? the probe says
+merge_approver = true
+priced = true
+hook_timeout_s = 3
+
+[opencode]
+level = "documented"
+versions = { min = "0.1.0", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "plugin"
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "none"         # no confirmed decision API
+merge_approver = true
+priced = false
+hook_timeout_s = 5
+
+[copilot]
+level = "documented"
+versions = { min = "0.1.0", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "plugin hooks"
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "none"         # gets no PermissionRequest hook, only a Notification
+merge_approver = true
+priced = false
+hook_timeout_s = 5
+
+[muse]
+level = "documented"
+versions = { min = "0.1.0", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "managed hooks"
+resume = "yes"                       # with no prompt
+quota_signal = "screen"
+permission_decision = "none"
+merge_approver = true
+priced = false
+hook_timeout_s = 5
+
+[grok]
+level = "documented"
+versions = { min = "0.1.0", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "title, screen"
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "none"         # screen-detected: no structured request to match
+merge_approver = true
+priced = false
+hook_timeout_s = 0
+
+[gemini]
+level = "documented"
+versions = { min = "0.1.0", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "title, screen"
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "none"
+merge_approver = true
+priced = false
+hook_timeout_s = 0
+
+[cursor]
+level = "documented"
+versions = { min = "0.1.0", max = "9999.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "cadence, screen"
+resume = "yes"
+quota_signal = "screen"
+permission_decision = "none"
+merge_approver = true
+priced = false
+hook_timeout_s = 0
+
+[antigravity]
+level = "documented"
+versions = { min = "0.1.0", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "cadence, screen"
+resume = "after_id"                  # once it has reported its session id
+quota_signal = "screen"
+permission_decision = "none"
+merge_approver = true
+priced = false
+hook_timeout_s = 0
+
+[amp]
+level = "documented"
+versions = { min = "0.0.1", max = "99.0.0" }
+hand_in = true
+read_only_enforced = false
+push = "guarded"
+state = "cadence, screen"
+resume = "after_id"
+quota_signal = "screen"
+permission_decision = "none"
+merge_approver = true
+priced = false
+hook_timeout_s = 0
+
+[custom]
+level = "documented"
+hand_in = true                       # if what it runs can run commands
+read_only_enforced = false
+push = "guarded"                     # always guarded at best
+state = "cadence"
+resume = "no"
+quota_signal = "none"                # a quota stop looks like an idle agent
+permission_decision = "none"
+merge_approver = true
+priced = false
+hook_timeout_s = 0

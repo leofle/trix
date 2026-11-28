@@ -2,6 +2,8 @@ schema = 1
 name = "bug-repro"
 description = "Turn a bug report into a failing test that shows it. No push, no PR: the test is the result."
 
+entry = ["reproducer"]
+
 [inputs.issue]
 type = "int"
 required = true

@@ -52,6 +52,9 @@ pub struct Workflow {
     pub profiles: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Notify::is_empty")]
     pub notify: Notify,
+    /// Where a run starts. Unset: the nodes no edge leads to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry: Vec<String>,
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
@@ -543,8 +546,10 @@ pub const BUILTIN_KINDS: [&str; 7] = [
 ];
 
 impl Node {
+    /// It runs an agent in a pane: an agent kind, or a fan-out of agents.
     pub fn is_agent(&self) -> bool {
         AGENT_KINDS.contains(&self.kind.as_str())
+            || (self.kind == "for_each" && self.workflow.is_none())
     }
     pub fn is_builtin(&self) -> bool {
         BUILTIN_KINDS.contains(&self.kind.as_str())
@@ -679,8 +684,11 @@ impl Workflow {
             .map(|(id, n)| (id.as_str(), n))
     }
 
-    /// Nodes no edge leads to: where a run starts.
+    /// Where a run starts: the nodes named, or those no edge leads to.
     pub fn entries(&self) -> Vec<&str> {
+        if !self.entry.is_empty() {
+            return self.entry.iter().map(String::as_str).collect();
+        }
         self.nodes
             .keys()
             .map(String::as_str)
