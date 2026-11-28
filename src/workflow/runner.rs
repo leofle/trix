@@ -120,6 +120,12 @@ pub fn run_pane<R: Run>(root: &Path, id: &str) -> i32 {
         }
     };
     let mut env = Live::in_pane(R::SOURCE);
+    drive(&mut run, root, &mut env, || {})
+}
+
+/// Drive a run in its pane, through `env`, for good. `over`: called once,
+/// when the run is over and its panes are closed.
+pub fn drive<R: Run>(run: &mut R, root: &Path, env: &mut dyn Env, mut over: impl FnMut()) -> ! {
     print!("{}", run.banner());
     if let Some(q) = run.question() {
         env.say("Question", &q);
@@ -131,7 +137,7 @@ pub fn run_pane<R: Run>(root: &Path, id: &str) -> i32 {
     }
     let mut said_over = false;
     loop {
-        if step(&mut run, root, &mut env) {
+        if step(run, root, env) {
             if let Err(e) = run.store(root) {
                 eprintln!("trix: {e}");
             }
@@ -144,6 +150,7 @@ pub fn run_pane<R: Run>(root: &Path, id: &str) -> i32 {
             let (line, what) = run.ended();
             println!("{line}");
             env.say("Finished", &what);
+            over();
         }
         std::thread::sleep(LOOK);
     }

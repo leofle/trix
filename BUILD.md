@@ -27,7 +27,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 8 | Generic nodes and prompting | 77e9fd5 (with 7) | pass |
 | 9 | Workspaces and landing | 871528d | pass |
 | 10 | Composition | a899ab0 | pass |
-| 11 | Policy, approvals and autopilot | (this) | pass |
+| 11 | Policy, approvals and autopilot | 7e1cc86 | pass |
+| 12 | Dry run and rehearsal | (this) | pass |
 
 ## Step 1: baseline
 
@@ -735,6 +736,56 @@ live server and a real `trix` binary in a check.
   is one a user adds): a rule trix invents would be an approval nobody chose.
 
 Tests added: 10. Suite: 807 passed. Deferred: nothing.
+
+## Step 12: dry run and rehearsal
+
+**Built** (`src/workflow/dryrun.rs`)
+
+- **Dry run** (`trix workflow dry-run <name> [--scenario s] [--prompts]`):
+  the one checker first (a refusal is its text), then the **real engine**
+  driven through a stub `Env`: no agent, no git, no GitHub. Stub agents hand
+  in canned verdicts by scenario: `happy`, `failures` (each failure edge
+  once), `worst`, `conflict`, `stall=<node>`, `quota=<node>`, or verdicts
+  you script per visit (`<node>=<v>,<v>`). It reports the path, every
+  prompt each node would get per visit with its inbox filled in, how the
+  run ends and why, cycles and waste, peak parallelism, the cost estimate
+  (unknown for unpriced kinds) and every ⚡ approval that would be made
+  without you.
+- **Rehearsal** (`trix workflow rehearse <name>`): `prepare` makes a bare
+  mirror of the repository and a clone of the mirror, so a push can only
+  reach the mirror and `gh` finds no GitHub remote. The run's pane wraps
+  its `Env` in `Rehearse`: the guard on every pane and check whatever the
+  push policy, and trix's own push, PR and merge stubbed. The clone and
+  mirror are deleted when the run is over.
+
+**Accept** (`workflow::dryrun_tests`, 3 tests)
+
+- **Seeded defects are reported**
+  (`seeded_defects_are_reported_before_any_agent_runs`): a checker error
+  (not simulated, said why); the worst case (what stops it); a defect only
+  a run shows (`done_when` names a node that never votes pass: the checker
+  passes it, the simulation fails it); a node that goes quiet; a quota
+  stop; a land conflict; and autopilot parking where supervised asks.
+- **Prompts match the goldens**: `tests/goldens/dryrun/issue-to-pr-happy.golden`
+  and `issue-to-pr-failures.golden` hold every prompt of those two dry
+  runs; `a_dry_run_shows_every_prompt_and_what_would_be_approved_without_you`
+  compares them.
+- **In rehearsal** an agent's `git push`, `gh pr create`, `gh pr merge` and
+  `gh api` all fail (with a `gh` that works whenever it finds a login), the
+  fixture's remote is unchanged, trix's own push and PR never reach git or
+  gh, and after cleanup nothing is left behind:
+  `in_a_rehearsal_nothing_an_agent_does_reaches_the_real_remote`.
+- The "same report" test now covers three ways in (check, run start, dry
+  run and rehearsal).
+
+**Decisions**
+
+- A dry run doesn't start the runs its workflow nodes name: it says so at
+  that node. Dry-run each workflow on its own.
+- The stub's check passes unless the scenario says otherwise; it can't know
+  what your tests would say.
+
+Tests added: 3. Suite: 810 passed. Deferred: nothing.
 
 ## Decisions to review
 

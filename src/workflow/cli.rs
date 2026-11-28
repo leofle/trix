@@ -19,6 +19,14 @@ usage:
   trix workflow show <run> [--json]         one run: its nodes, its log
   trix workflow check <name> [--fix]        the one checker: the builder, import, dry run and
                                             run start use it too. --fix applies what it can
+  trix workflow dry-run <name> [--scenario s] [--prompts]
+                                            simulate a run with stub agents: the path, every
+                                            prompt, what would stop it, what's approved without
+                                            you. s: happy, failures, worst, conflict,
+                                            stall=<node>, quota=<node>, <node>=<verdict>,…
+  trix workflow rehearse <name> [--input k=v]…
+                                            real agents in a throwaway clone whose origin is a
+                                            local mirror, the guard on every pane and check
   trix workflow capabilities [--kind k] [--verify]
                                             what each backend can do, and how well trix knows
                                             it. --verify runs real probes (opt-in: it spends a
@@ -54,6 +62,15 @@ pub enum Cmd {
     Check {
         name: String,
         fix: bool,
+    },
+    DryRun {
+        name: String,
+        scenario: String,
+        prompts: bool,
+    },
+    Rehearse {
+        name: String,
+        inputs: BTreeMap<String, String>,
     },
     Capabilities {
         kind: Option<String>,
@@ -107,6 +124,38 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 name: name.to_string(),
                 inputs,
             })
+        }
+        ["dry-run", name, rest @ ..] => {
+            let (mut scenario, mut prompts) = ("happy".to_string(), false);
+            let mut rest = rest.iter();
+            while let Some(flag) = rest.next() {
+                match *flag {
+                    "--prompts" => prompts = true,
+                    "--scenario" => {
+                        scenario = rest.next().ok_or("--scenario takes one")?.to_string()
+                    }
+                    f => {
+                        return Err(format!(
+                            "dry-run: '{f}' isn't an option (--scenario s, --prompts)"
+                        ));
+                    }
+                }
+            }
+            Ok(Cmd::DryRun {
+                name: name.to_string(),
+                scenario,
+                prompts,
+            })
+        }
+        ["rehearse", rest @ ..] => {
+            let as_run: Vec<String> = std::iter::once("run")
+                .chain(rest.iter().copied())
+                .map(String::from)
+                .collect();
+            match parse(&as_run)? {
+                Cmd::Run { name, inputs } => Ok(Cmd::Rehearse { name, inputs }),
+                _ => Err(HELP.to_string()),
+            }
         }
         ["pane", x] => Ok(Cmd::Pane(id(x))),
         ["ls"] => Ok(Cmd::Ls { json }),
@@ -322,6 +371,20 @@ pub fn trusted(stores: &Stores, w: &Workflow, builtin: bool) -> Result<bool, Str
     ))
 }
 
+/// Stand-in values for a workflow's inputs, for a dry run.
+pub fn sample_inputs(w: &Workflow) -> BTreeMap<String, serde_json::Value> {
+    w.inputs
+        .iter()
+        .map(|(name, i)| {
+            let v = match i.resolve.as_deref() {
+                Some(_) => serde_json::json!({"number": 1, "title": "(a sample issue)", "body": "(the issue's text)", "url": "(its URL)", "outsiders": []}),
+                None => serde_json::json!("(sample)"),
+            };
+            (name.clone(), v)
+        })
+        .collect()
+}
+
 fn fail(e: impl std::fmt::Display) -> i32 {
     eprintln!("trix: workflow: {e}");
     1
@@ -466,7 +529,64 @@ pub fn run(args: &[String]) -> i32 {
                 Err(e) => fail(e),
             }
         }
-        Cmd::Pane(id) => super::runner::run_pane::<WfRun>(&root, &id),
+        Cmd::Pane(id) => match engine::load(&root, &id) {
+            // A rehearsal: the guard on everything, trix's own push, PR and
+            // merge stubbed, and the clone and mirror deleted once it's over.
+            Ok(mut run) if run.rehearsal.is_some() => {
+                let base = run.rehearsal.clone().unwrap_or_default();
+                let mut live = Live::in_pane("workflow");
+                let mut env = super::dryrun::Rehearse {
+                    inner: &mut live,
+                    pr: false,
+                };
+                super::runner::drive(&mut run, &root, &mut env, || {
+                    let _ = std::fs::remove_dir_all(&base);
+                    println!(
+                        "the rehearsal's clone and mirror are deleted: nothing was pushed, opened or merged"
+                    );
+                })
+            }
+            _ => super::runner::run_pane::<WfRun>(&root, &id),
+        },
+        Cmd::DryRun {
+            name,
+            scenario,
+            prompts,
+        } => {
+            let stores = Stores::of(main_checkout().as_deref());
+            say(stores.load(&name).and_then(|(w, _)| {
+                let (m, ctx, settings) = live()?;
+                let scenario = super::dryrun::Scenario::parse(&scenario)?;
+                Ok(
+                    super::dryrun::dry_run(&w, &m, &ctx, &settings, scenario, sample_inputs(&w))
+                        .render(prompts),
+                )
+            }))
+        }
+        Cmd::Rehearse { name, inputs } => {
+            let Some(repo) = main_checkout() else {
+                return fail("not in a git repository");
+            };
+            let stores = Stores::of(Some(&repo));
+            say(stores.load(&name).and_then(|(w, _)| {
+                let (m, ctx, settings) = live()?;
+                let r = super::dryrun::prepare(&repo, |dir, args| super::env::run_cmd("git", dir, args))?;
+                let mut env = Live::looking("workflow");
+                let l = super::launch::Launch { stores: &stores, repo: &r.clone, m: &m, ctx: &ctx, settings: &settings, trusted: false };
+                let started = super::launch::start(&mut env, &root, &l, &w, &inputs).and_then(|mut run| {
+                    run.rehearsal = Some(r.base.clone());
+                    engine::store(&root, &run)?;
+                    env.open_run(&run.id, &r.clone).map(|_| run.id)
+                });
+                match started {
+                    Ok(id) => Ok(format!("{id}\nrehearsing in {}: its origin is a local mirror, and it's deleted afterwards\n", crate::app::tilde(&r.clone))),
+                    Err(e) => {
+                        r.cleanup();
+                        Err(e)
+                    }
+                }
+            }))
+        }
         Cmd::Ls { json } => {
             let seen = Live::looking("workflow").agents().unwrap_or_default();
             let mut runs: Vec<_> = crate::case::all(&cases)

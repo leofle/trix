@@ -9,6 +9,7 @@ pub mod caps;
 pub mod check;
 pub mod cli;
 pub mod compose;
+pub mod dryrun;
 pub mod engine;
 pub mod env;
 pub mod guard;
@@ -30,6 +31,8 @@ pub mod view;
 #[cfg(test)]
 mod check_tests;
 #[cfg(test)]
+mod dryrun_tests;
+#[cfg(test)]
 pub mod engine_tests;
 #[cfg(test)]
 mod policy_tests;
@@ -38,7 +41,7 @@ pub mod replay;
 
 /// How many ways a workflow gets checked, each through the one checker.
 #[cfg(test)]
-pub const SURFACES: usize = 2;
+pub const SURFACES: usize = 3;
 
 /// What each of those ways says of a workflow: its name, and the text.
 #[cfg(test)]
@@ -51,8 +54,17 @@ pub fn surfaces(
         Ok(report) => report.render(),
         Err(refused) => refused,
     };
+    let dry = dryrun::dry_run(
+        w,
+        m,
+        ctx,
+        &Default::default(),
+        dryrun::Scenario::Happy,
+        Default::default(),
+    );
     vec![
         ("trix workflow check", cli::check_text(w, m, ctx)),
         ("run start", start),
+        ("dry run and rehearsal", dry.check),
     ]
 }

@@ -352,6 +352,10 @@ pub struct WfRun {
     /// the run began (`policy::fingerprint`).
     #[serde(default)]
     pub fingerprint: Option<BTreeMap<String, String>>,
+    /// A rehearsal: the folder its throwaway clone and mirror are in,
+    /// deleted when it's over.
+    #[serde(default)]
+    pub rehearsal: Option<PathBuf>,
     /// The blackboard: what nodes wrote for the rest of the run to read.
     #[serde(default)]
     pub board: BTreeMap<String, serde_json::Value>,
@@ -508,6 +512,7 @@ impl WfRun {
             depth: 0,
             started_by: None,
             fingerprint: None,
+            rehearsal: None,
             board: BTreeMap::new(),
             finished: Vec::new(),
             log: Vec::new(),

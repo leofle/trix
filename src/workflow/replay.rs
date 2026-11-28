@@ -634,8 +634,20 @@ fn golden_path(name: &str) -> PathBuf {
 /// The golden for `name` says exactly `got`. A golden that isn't there yet
 /// is written under `TRIX_BLESS=1`, and never overwritten.
 pub fn compare(name: &str, got: &str) {
-    let path = golden_path(name);
-    match std::fs::read_to_string(&path) {
+    compare_at(&golden_path(name), name, got)
+}
+
+/// The same, for a golden anywhere under `tests/goldens/`.
+pub fn compare_in(dir: &str, name: &str, got: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/goldens")
+        .join(dir)
+        .join(format!("{name}.golden"));
+    compare_at(&path, name, got)
+}
+
+fn compare_at(path: &Path, name: &str, got: &str) {
+    match std::fs::read_to_string(path) {
         Ok(want) if want == got => {}
         Ok(want) => {
             let line = want
@@ -659,7 +671,7 @@ pub fn compare(name: &str, got: &str) {
         }
         Err(_) if std::env::var_os("TRIX_BLESS").is_some() => {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, got).unwrap();
+            std::fs::write(path, got).unwrap();
         }
         Err(_) => panic!(
             "no golden for '{name}' at {}: goldens are recorded once, with TRIX_BLESS=1",
