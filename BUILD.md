@@ -29,7 +29,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 10 | Composition | a899ab0 | pass |
 | 11 | Policy, approvals and autopilot | 7e1cc86 | pass |
 | 12 | Dry run and rehearsal | 4d823e5 | pass |
-| 13 | Run log, overview, scheduling and notifications | (this) | pass |
+| 13 | Run log, overview, scheduling and notifications | 73cfaf3 | pass |
+| 14 | Terminal builder | (this) | pass |
 
 ## Step 1: baseline
 
@@ -854,6 +855,84 @@ Tests added: 3. Suite: 810 passed. Deferred: nothing.
 - The digest is sent by the scheduler, so there's none without it.
 
 Tests added: 9. Suite: 819 passed.
+
+## Step 14: the terminal builder
+
+**Built**
+
+- `src/workflow/canvas.rs`: the canvas, **on rataflow 0.1.0** (pinned
+  `=0.1.0`), and the only file that names it: nodes as boxes with their
+  marks, edges, click to select, drag to move, and its Sugiyama layout for
+  `L`. Swapping or vendoring the widget touches this file only.
+- `src/workflow/builder.rs`: the builder's state and screen. The one
+  checker runs on every edit, so:
+  - each node's **badges** (`hand-in ✗`, `push guarded|enforced|none`,
+    `approve —|⚡`, `$ ?`, error and warning counts) and its mark on the
+    canvas are live;
+  - the **inspector's needs-and-has panel** has a row per capability the
+    role needs and what the backend and profile provide, with the matrix
+    level, then each problem with `f` (first fix) and `F` (the others);
+  - the **backend picker** (`B`) lists every installed kind with its fit
+    for the role (✓ fits, ⚠ fits with limits, ✗ can't) and why, those that
+    fit first;
+  - adding an agent node asks for its **brief** first (owns, must not
+    touch, done), with a suggestion from its role; write scopes show on
+    the node;
+  - `v` adds a **verifier** for the selected writer: fresh, read-only, on
+    another backend, wired so its changes go back to the author;
+  - the **Approvals tab** (`A`) shows the merge approver and the rules, ⚡
+    on every auto-approval, and `m` offers only nodes that didn't write
+    the change;
+  - the header's **cost badge** (peak parallel agents, estimated cost,
+    yellow on an expensive topology), the **launch warning**, and the
+    **problems bar**; `r` stays off while any error remains.
+  - undo and redo, autosave on `s` with trust for your own edits.
+- The **wizard** (`trix workflow new`): template, name, goal, a backend per
+  role with each kind's fit, supervised or autopilot.
+- `trix workflow edit <name>`, and **`alt+p`** (rebindable as `[keys]
+  workflows`), which opens a pane running `trix workflow open`: the run
+  view when a run is going, else the builder.
+
+**Accept** (`workflow::builder_tests`, 4 tests, on ratatui's test backend)
+
+- Every check shows live on its node or edge
+  (`every_check_shows_live_on_its_node_as_you_build`: the PRD's Codex
+  reviewer on read-only, fixed with `f`; a new agent's brief; an unwired
+  node; connecting it).
+- Every action works from keys (`every_action_works_from_the_keys`), and
+  the mouse is tested with crossterm events (a click selects, a drag moves
+  and is kept, `u` puts it back).
+- The wizard yields a valid workflow for every template, supervised and
+  autopilot (`the_wizard_yields_a_valid_workflow_for_every_template`).
+- The layout works at 100 columns (inspector as a panel) and 80 (inspector
+  as an overlay on enter).
+- trix-probe UI tests: there is no trix-probe in this repository at
+  `fe0cbe3`, so none were used; the builder is tested on ratatui's
+  `TestBackend`.
+- The "same report" test now covers four ways in.
+
+**Dependencies added**: `rataflow = "=0.1.0"` (the PRD names it). It
+brings `rust-sugiyama`, `petgraph`, `fixedbitset`, `hashbrown`, `foldhash`
+and `thiserror` into `Cargo.lock`.
+
+**Limits, said plainly**
+
+- **Drag-to-connect isn't wired.** Connecting is `c` from the keyboard
+  (pick the target, name the verdict). rataflow can do it; reading its
+  connection event and turning it into an edge with a trigger is left.
+- **The builder is its own terminal UI**, run in a pane (`trix workflow
+  edit`, or `alt+p`), not drawn by the workspace's own renderer.
+- **The run view is the overview** (text, refreshed), not the canvas in
+  run mode.
+- Write-scope overlaps between writers are shown as a problem on the node
+  and in the bar, not drawn as a line between the two nodes. Scopes show as
+  text on the node, not as tinted paths.
+- The prompt is edited in the file or `$EDITOR`, not inline with a `{{`
+  picker; the builder edits briefs, backends, checks' commands, edges and
+  approvals.
+- Pan and zoom are rataflow's defaults; there's no minimap.
+
+Tests added: 4. Suite: 823 passed.
 
 ## Decisions to review
 

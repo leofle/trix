@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const HELP: &str = "\
-usage:
+usage:  trix workflow new                         the wizard: a template, the goal, a backend per role
+  trix workflow edit <name>                 the builder (alt+p in the workspace)
+
   trix workflow run <name> [--input k=v]…   start a run of a workflow
                                             (triage: --input target=<PR or issue>)
   trix workflow ls [--json]                 every run and where it is
@@ -60,6 +62,10 @@ pub enum Cmd {
         name: String,
         inputs: BTreeMap<String, String>,
     },
+    New,
+    Edit(String),
+    /// alt+p: the run view when a run is going, else the builder.
+    Open,
     /// The run's pane: what a saved layout starts again.
     Pane(String),
     Ls {
@@ -249,6 +255,9 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
             kind: kind.to_string(),
             yes: true,
         }),
+        ["new"] => Ok(Cmd::New),
+        ["edit", x] => Ok(Cmd::Edit(id(x))),
+        ["open"] => Ok(Cmd::Open),
         ["pane", x] => Ok(Cmd::Pane(id(x))),
         ["ls"] => Ok(Cmd::Ls { json }),
         ["show", x] => Ok(Cmd::Show { id: id(x), json }),
@@ -663,6 +672,210 @@ fn scheduler() -> i32 {
     }
 }
 
+/// A line you type.
+fn ask(what: &str) -> Result<String, String> {
+    use std::io::Write;
+    print!("{what}: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    Ok(line.trim().to_string())
+}
+
+/// The run view: the overview, drawn again every couple of seconds. A key
+/// then enter: n the next item that needs you, y approve, p pause, a
+/// abort, R revoke, q leave.
+fn watch(root: &Path, id: &str) -> i32 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        while std::io::stdin().read_line(&mut line).is_ok_and(|n| n > 0) {
+            let _ = tx.send(line.trim().to_string());
+            line.clear();
+        }
+    });
+    let mut at = None;
+    loop {
+        let Ok(run) = engine::load(root, id) else {
+            return fail(format!("no run named '{id}'"));
+        };
+        let seen = Live::looking("workflow").agents().unwrap_or_default();
+        let needs = super::overview::needs(&run, &seen);
+        let width = crossterm::terminal::size().map_or(100, |(w, _)| w as usize);
+        print!(
+            "\x1b[2J\x1b[H{}",
+            super::overview::render(&run, &seen, at, width)
+        );
+        if let Ok(key) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            let op = match key.as_str() {
+                "n" => {
+                    at = super::overview::next(&needs, at);
+                    None
+                }
+                "y" => Some(Op::Approve),
+                "p" => Some(Op::Pause),
+                "a" => Some(Op::Abort),
+                "R" => Some(Op::Revoke),
+                "l" => {
+                    print!("{}", super::runlog::render(&engine::dir_of(root, id)));
+                    let _ = rx.recv();
+                    None
+                }
+                "q" => return 0,
+                _ => None,
+            };
+            if let Some(op) = op
+                && let Err(e) = control(Request::Wf {
+                    run: Some(id.to_string()),
+                    op,
+                })
+            {
+                println!("{e}");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+/// `trix workflow new`: the wizard. It asks, then opens what it made in
+/// the builder.
+fn new_workflow() -> Result<String, String> {
+    let (m, ctx, _) = live()?;
+    let template =
+        ask("template (triage, issue-to-pr, bug-repro, nightly-deps, blank) [issue-to-pr]")?;
+    let template = if template.is_empty() {
+        "issue-to-pr".to_string()
+    } else {
+        template
+    };
+    let name = ask("its name")?;
+    let goal = ask("the goal, in a sentence (enter keeps the template's)")?;
+    let mut answers = super::builder::Answers {
+        template: template.clone(),
+        name,
+        goal: Some(goal),
+        ..Default::default()
+    };
+    // A backend per role, with each kind's fit for it.
+    if let Some(w) = super::store::builtin(&template) {
+        let b = super::builder::Builder::new(w.clone(), m.clone(), ctx.clone());
+        for (id, n) in w
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.is_agent() && n.agent.as_ref().is_some_and(|a| !a.starts_with("{{")))
+        {
+            let fits: Vec<String> = b
+                .backends(id)
+                .into_iter()
+                .map(|(k, fit, _)| format!("{} {k}", fit.mark()))
+                .collect();
+            let kind = ask(&format!(
+                "{id} ({}): {} [{}]",
+                n.role().map_or("agent", |r| r.name()),
+                fits.join("  "),
+                n.agent.clone().unwrap_or_default()
+            ))?;
+            if !kind.is_empty() {
+                answers.backends.insert(id.clone(), kind);
+            }
+        }
+    }
+    answers.autopilot = ask("supervised or autopilot [supervised]")?.starts_with("auto");
+    let w = super::builder::wizard(&answers, &m, &ctx)?;
+    let stores = Stores::of(main_checkout().as_deref());
+    stores.save(&w, super::store::Origin::Personal)?;
+    edit(&w.name)
+}
+
+/// `trix workflow edit`: the builder, in this terminal.
+fn edit(name: &str) -> Result<String, String> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+    let repo = main_checkout();
+    let stores = Stores::of(repo.as_deref());
+    let (mut w, mut origin) = stores.load(name)?;
+    // A built-in is read-only: what's edited is a copy under a name of its own.
+    if origin == super::store::Origin::Builtin {
+        w.name = format!("my-{}", w.name);
+        w.builtin = false;
+        origin = super::store::Origin::Personal;
+    }
+    let (m, ctx, _) = live()?;
+    let mut b = super::builder::Builder::new(w, m, ctx);
+    crossterm::terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    let _ = crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+            .map_err(|e| e.to_string())?;
+    let save = |b: &mut super::builder::Builder| -> Result<String, String> {
+        let path = stores.save(&b.w, origin)?;
+        // Your own edits are trusted as you make them.
+        let hash = super::policy::content_hash(&b.w, &subs(&stores, &b.w)?);
+        let trusted = control(Request::Wf {
+            run: None,
+            op: Op::Trust {
+                name: b.w.name.clone(),
+                hash,
+            },
+        });
+        b.dirty = false;
+        Ok(format!(
+            "saved {}{}",
+            crate::app::tilde(&path),
+            if trusted.is_ok() {
+                ""
+            } else {
+                " (not trusted yet: trix workflow trust)"
+            }
+        ))
+    };
+    let out = loop {
+        let _ = term.draw(|f| b.draw(f));
+        match crossterm::event::read() {
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => match b.key(k) {
+                super::builder::Outcome::Stay => {}
+                super::builder::Outcome::Quit => break Ok(String::new()),
+                super::builder::Outcome::Save => b.message = save(&mut b).unwrap_or_else(|e| e),
+                super::builder::Outcome::DryRun => break Ok("dry-run".to_string()),
+                super::builder::Outcome::Run => break save(&mut b).map(|_| "run".to_string()),
+            },
+            Ok(Event::Mouse(ev)) => b.mouse(ev),
+            Ok(_) => {}
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = crossterm::terminal::disable_raw_mode();
+    match out?.as_str() {
+        "dry-run" => {
+            let (m, ctx, settings) = live()?;
+            let dry = super::dryrun::dry_run(
+                &b.w,
+                &m,
+                &ctx,
+                &settings,
+                super::dryrun::Scenario::Happy,
+                sample_inputs(&b.w),
+            );
+            Ok(dry.render(false))
+        }
+        "run" => {
+            println!("{}", b.launch_text());
+            let repo = repo.ok_or("not in a git repository")?;
+            let inputs: BTreeMap<String, String> =
+                b.w.inputs
+                    .iter()
+                    .filter(|(_, i)| i.required)
+                    .map(|(k, i)| ask(&format!("input {k} ({})", i.kind)).map(|v| (k.clone(), v)))
+                    .collect::<Result<_, _>>()?;
+            start_named(&repo, &b.w.name, &inputs, None, None)
+        }
+        _ => Ok(String::new()),
+    }
+}
+
 fn fail(e: impl std::fmt::Display) -> i32 {
     eprintln!("trix: workflow: {e}");
     1
@@ -998,6 +1211,26 @@ pub fn run(args: &[String]) -> i32 {
             let exe = crate::platform::trix_exe().map_err(|e| e.to_string())?;
             unit.install(&home, &exe, yes)
         })),
+        Cmd::Edit(name) => say(edit(&name)),
+        Cmd::New => say(new_workflow()),
+        Cmd::Open => {
+            // A run that's going: its overview, refreshed. Else the builder.
+            let going = engine::all(&root).into_iter().find(|r| !r.state.over());
+            match going {
+                Some(run) => watch(&root, &run.id),
+                None => {
+                    let stores = Stores::of(main_checkout().as_deref());
+                    let names: Vec<String> = stores
+                        .list()
+                        .into_iter()
+                        .map(|(n, o)| format!("{n} ({})", o.label()))
+                        .collect();
+                    println!("no run is going. Workflows: {}", names.join(", "));
+                    say(ask("which one to open in the builder")
+                        .and_then(|name| edit(name.split_whitespace().next().unwrap_or_default())))
+                }
+            }
+        }
         Cmd::Approve(id) => wf(id, Op::Approve),
         Cmd::Abort(id) => wf(id, Op::Abort),
         Cmd::Pause(id) => wf(id, Op::Pause),

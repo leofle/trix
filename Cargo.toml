@@ -11,6 +11,7 @@ alacritty_terminal = "0.26.0"
 anyhow = "1.0.104"
 crossterm = { version = "0.29.0", features = ["serde"] }
 libc = "0.2.191"
+rataflow = "=0.1.0"
 ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"

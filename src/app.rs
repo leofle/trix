@@ -2828,6 +2828,17 @@ impl App {
             Action::Detach => self.detach = true,
             Action::Help => self.modal = Some(Modal::Help),
             Action::Spend => self.modal = Some(Modal::Spend(crate::ledger::Ym::now())),
+            // The builder, or the run view when a run is going: a pane of its
+            // own, in the focused agent's folder.
+            Action::Workflows => {
+                let cwd = self.focused().map(|a| a.cwd.clone()).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+                let exe = crate::platform::trix_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "trix".into());
+                let name = self.unique_name("workflows");
+                let spec = Spawn { kind: Kind::Custom, name, cwd, command: Some(shell_words::join([exe.as_str(), "workflow", "open"])), prompt: None, branch_note: None, resume: None, fork: false, runtime: Default::default() };
+                if let Err(e) = self.spawn_quiet(spec) {
+                    self.toast(format!("couldn't open workflows: {e}"), ToastKind::Bad);
+                }
+            }
             Action::Settings => self.open_settings(),
             Action::Quit => {
                 if self.agents.iter().any(|a| a.state != State::Exited) {

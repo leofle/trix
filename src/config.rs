@@ -765,12 +765,14 @@ pub enum Action {
     Detach,
     Help,
     Spend,
+    /// The workflow builder, or the run view when a run is going.
+    Workflows,
     Settings,
     Quit,
 }
 
 impl Action {
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Action::New,
         Action::Jump,
         Action::Next,
@@ -791,6 +793,7 @@ impl Action {
         Action::Detach,
         Action::Help,
         Action::Spend,
+        Action::Workflows,
         Action::Settings,
         Action::Quit,
     ];
@@ -817,6 +820,7 @@ impl Action {
             Action::Detach => "detach",
             Action::Help => "help",
             Action::Spend => "spend",
+            Action::Workflows => "workflows",
             Action::Settings => "settings",
             Action::Quit => "quit",
         }
@@ -844,6 +848,7 @@ impl Action {
             Action::Detach => &["alt+d"],
             Action::Help => &["alt+?", "alt+/"],
             Action::Spend => &["alt+$"],
+            Action::Workflows => &["alt+p"],
             Action::Settings => &["alt+,"],
             Action::Quit => &["alt+q"],
         }

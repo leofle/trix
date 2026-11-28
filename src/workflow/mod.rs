@@ -5,6 +5,8 @@
 // docs step, once every step is in.
 #![allow(dead_code)]
 
+pub mod builder;
+pub mod canvas;
 pub mod caps;
 pub mod check;
 pub mod cli;
@@ -31,6 +33,8 @@ pub mod trigger;
 pub mod view;
 
 #[cfg(test)]
+mod builder_tests;
+#[cfg(test)]
 mod check_tests;
 #[cfg(test)]
 mod dryrun_tests;
@@ -45,7 +49,7 @@ pub mod replay;
 
 /// How many ways a workflow gets checked, each through the one checker.
 #[cfg(test)]
-pub const SURFACES: usize = 3;
+pub const SURFACES: usize = 4;
 
 /// What each of those ways says of a workflow: its name, and the text.
 #[cfg(test)]
@@ -70,5 +74,11 @@ pub fn surfaces(
         ("trix workflow check", cli::check_text(w, m, ctx)),
         ("run start", start),
         ("dry run and rehearsal", dry.check),
+        (
+            "the builder",
+            builder::Builder::new(w.clone(), m.clone(), ctx.clone())
+                .problems()
+                .render(),
+        ),
     ]
 }
