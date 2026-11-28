@@ -16,9 +16,11 @@ pub mod guard;
 pub mod land;
 pub mod launch;
 pub mod model;
+pub mod overview;
 pub mod policy;
 pub mod probe;
 pub mod prompt;
+pub mod runlog;
 pub mod runner;
 pub mod sched;
 pub mod settings;
@@ -34,6 +36,8 @@ mod check_tests;
 mod dryrun_tests;
 #[cfg(test)]
 pub mod engine_tests;
+#[cfg(test)]
+mod ops_tests;
 #[cfg(test)]
 mod policy_tests;
 #[cfg(test)]

@@ -11,7 +11,12 @@ pub fn outcome(r: &WfRun) -> String {
         "**trix workflow `{}`**, run `{}`: {}.\n\nCycles: {} ({} wasted), of at most {}.\n\n| node | kind | backend | visits | result |\n|---|---|---|---|---|\n",
         r.workflow.name,
         r.id,
-        r.state.label(),
+        // At the gate, approved and about to merge: that's what it is.
+        if r.gate.approved.is_some() && !r.state.over() {
+            "ready to merge"
+        } else {
+            r.state.label()
+        },
         r.cycles,
         r.wasted,
         r.ceiling

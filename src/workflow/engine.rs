@@ -356,6 +356,13 @@ pub struct WfRun {
     /// deleted when it's over.
     #[serde(default)]
     pub rehearsal: Option<PathBuf>,
+    /// What the run did since it was last stored: written to the run log,
+    /// hash-chained, when it is (`runlog.rs`).
+    #[serde(default)]
+    pub journal: Vec<super::runlog::Pending>,
+    /// The deadline passed, and it was said: you resumed past it.
+    #[serde(default)]
+    pub past_deadline: bool,
     /// The blackboard: what nodes wrote for the rest of the run to read.
     #[serde(default)]
     pub board: BTreeMap<String, serde_json::Value>,
@@ -513,11 +520,37 @@ impl WfRun {
             started_by: None,
             fingerprint: None,
             rehearsal: None,
+            journal: Vec::new(),
+            past_deadline: false,
             board: BTreeMap::new(),
             finished: Vec::new(),
             log: Vec::new(),
             created: now,
         }
+    }
+
+    /// A line for the run log.
+    pub(super) fn record(&mut self, env: &mut dyn Env, kind: &str, data: serde_json::Value) {
+        self.journal.push(super::runlog::Pending {
+            at: env.now(),
+            kind: kind.into(),
+            data,
+        });
+    }
+
+    /// The run ended: your `on_finish` command runs, with the run's id and state.
+    fn ended_hook(&mut self, env: &mut dyn Env) {
+        if self.opts.on_finish.is_empty() {
+            return;
+        }
+        let vars = self.vars("");
+        let argv: Vec<String> = self
+            .opts
+            .on_finish
+            .iter()
+            .map(|a| prompt::render(a, &vars))
+            .collect();
+        env.on_finish(&argv);
     }
 
     fn autopilot(&self) -> bool {
@@ -546,6 +579,11 @@ impl WfRun {
         let at = env.now();
         let (_, _, secs) = crate::ledger::local(at);
         env.print(&format!("{:02}:{:02}  {text}", secs / 3600, secs / 60 % 60));
+        self.journal.push(super::runlog::Pending {
+            at,
+            kind: "note".into(),
+            data: text.clone().into(),
+        });
         self.log.push((at, text));
     }
 
@@ -587,6 +625,7 @@ impl WfRun {
         self.note(env, format!("failed: {}", self.why));
         self.close_all(env, false);
         env.say("Finished", &format!("{} · failed: {}", self.id, self.why));
+        self.ended_hook(env);
         env.notify(&format!("{} failed", self.id), &self.why.clone());
     }
 
@@ -600,6 +639,7 @@ impl WfRun {
         self.close_all(env, true);
         self.remove_checkouts(env);
         env.say("Finished", &format!("{} · {what}", self.id));
+        self.ended_hook(env);
         env.notify(&format!("{} succeeded", self.id), &what);
     }
 
@@ -1009,9 +1049,23 @@ impl WfRun {
         let kept = n.revisit() == Revisit::Reuse
             && seen.iter().any(|a| a.name == name && a.state != "exited");
         let sent = if kept {
-            env.send(&name, &prompt::again_prompt(id, &n, visit, &inbox))
+            {
+                let text = prompt::again_prompt(id, &n, visit, &inbox);
+                self.record(
+                    env,
+                    "assign",
+                    serde_json::json!({"node": id, "visit": visit, "prompt": text}),
+                );
+                env.send(&name, &text)
+            }
         } else {
             let text = prompt::node_prompt(id, &n, &self.vars(id));
+            let brief = n.brief.clone();
+            self.record(
+                env,
+                "assign",
+                serde_json::json!({"node": id, "visit": visit, "prompt": text, "brief": brief}),
+            );
             let args = check::profile_of(&self.workflow, &n)
                 .map(|p| p.args)
                 .unwrap_or_default();
@@ -1189,8 +1243,18 @@ impl WfRun {
                 env,
                 format!("{id} handed in {verdict}: {}", plural(files.len(), "file")),
             );
+            self.record(
+                env,
+                "report",
+                serde_json::json!({"node": id, "verdict": verdict, "files": files}),
+            );
         } else {
             self.note(env, format!("{id} handed in {verdict}"));
+            self.record(
+                env,
+                "report",
+                serde_json::json!({"node": id, "verdict": verdict}),
+            );
         }
         // A wasted cycle: a writer that came back and left the head where it was;
         // a reader that says the same of the same commit.
@@ -1558,6 +1622,7 @@ impl WfRun {
                 out.exit_code
             ),
         );
+        self.record(env, "check", serde_json::json!({"node": id, "commit": sha, "exit_code": out.exit_code, "verdict": verdict}));
         if same && self.wasted(env, id, "failed the same way on the same commit") {
             return;
         }
@@ -1610,6 +1675,7 @@ impl WfRun {
                     ..Watch::default()
                 };
                 self.note(env, format!("answered {to}'s question"));
+                self.record(env, "answer", serde_json::json!({"to": to, "text": text}));
             }
             // Its pane is gone: the answer waits in its inbox.
             None => self.nodes.get_mut(to).unwrap().inbox.push(text.to_string()),
@@ -1629,6 +1695,11 @@ impl WfRun {
                 self.note(
                     env,
                     format!("{from} mentioned {name}: queued for its next visit"),
+                );
+                self.record(
+                    env,
+                    "mention",
+                    serde_json::json!({"from": from, "to": name, "text": text}),
                 );
             }
         }
@@ -1681,6 +1752,11 @@ impl WfRun {
             let _ = std::fs::remove_file(&f);
             self.queue_mentions(env, &q.text, &q.from);
             self.questions.push(q.clone());
+            self.record(
+                env,
+                "question",
+                serde_json::json!({"from": q.from, "text": q.text}),
+            );
             if self.workflow.of_kind("supervisor").is_some() {
                 self.ask_supervisor(env);
             } else if self.ask.is_none() {
@@ -1820,6 +1896,7 @@ impl WfRun {
         e["at"] = env.now().into();
         e["run"] = self.id.clone().into();
         e["branch"] = self.branch.clone().into();
+        self.record(env, "approval", e.clone());
         let path = dir_of(root, &self.id).join("approvals.jsonl");
         let line = format!("{}\n", serde_json::to_string(&e).unwrap_or_default());
         let _ = std::fs::OpenOptions::new()
@@ -1978,6 +2055,13 @@ impl WfRun {
                 },
             );
         }
+        // The PR's body is the outcome summary as it stands now, approval
+        // included. Never a prompt, an inbox, issue text, a path or a log.
+        let body = super::summary::outcome(self);
+        let _ = env.gh(
+            &self.repo,
+            &["pr", "edit", &number.to_string(), "--body", &body],
+        );
         let num = number.to_string();
         let method = format!("--{}", n.merge.as_deref().unwrap_or("squash"));
         match env.gh(
@@ -2019,7 +2103,7 @@ impl WfRun {
     /// A floor stopped trix: for you, whatever the approvals say.
     fn floor(&mut self, env: &mut dyn Env, stop: super::policy::Stop) {
         match stop {
-            super::policy::Stop::Park(why) => self.park(env, why),
+            super::policy::Stop::Park(why) | super::policy::Stop::Kill(why) => self.park(env, why),
             super::policy::Stop::You(floor, why) => {
                 self.limit = Some(floor);
                 self.ask(env, Ask::Floor, None, why);
@@ -2081,7 +2165,10 @@ impl Run for WfRun {
     fn load(root: &Path, id: &str) -> Result<WfRun, String> {
         load(root, id)
     }
-    fn store(&self, root: &Path) -> Result<(), String> {
+    fn store(&mut self, root: &Path) -> Result<(), String> {
+        // What it did since the last look goes into the run log, chained.
+        super::runlog::append(&dir_of(root, &self.id), &self.journal)?;
+        self.journal.clear();
         store(root, self)
     }
     fn over(&self) -> bool {
@@ -2274,6 +2361,7 @@ impl Run for WfRun {
         );
         self.close_all(env, false);
         env.say("Finished", &format!("{} · aborted", self.id));
+        self.ended_hook(env);
     }
 
     fn limited(&mut self, env: &mut dyn Env, seen: &[Seen]) -> bool {
@@ -2312,6 +2400,10 @@ impl Run for WfRun {
             match stop {
                 super::policy::Stop::Park(why) => self.park(env, why),
                 super::policy::Stop::You(_, why) => self.fail(env, why),
+                super::policy::Stop::Kill(why) => {
+                    self.note(env, why);
+                    Run::abort(self, env, seen);
+                }
             }
             return true;
         }

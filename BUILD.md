@@ -28,7 +28,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 9 | Workspaces and landing | 871528d | pass |
 | 10 | Composition | a899ab0 | pass |
 | 11 | Policy, approvals and autopilot | 7e1cc86 | pass |
-| 12 | Dry run and rehearsal | (this) | pass |
+| 12 | Dry run and rehearsal | 4d823e5 | pass |
+| 13 | Run log, overview, scheduling and notifications | (this) | pass |
 
 ## Step 1: baseline
 
@@ -786,6 +787,73 @@ Tests added: 10. Suite: 807 passed. Deferred: nothing.
   what your tests would say.
 
 Tests added: 3. Suite: 810 passed. Deferred: nothing.
+
+## Step 13: run log, overview, scheduling and notifications
+
+**Built**
+
+- `src/workflow/runlog.rs`: `runs/<id>/log.jsonl`, in order: every
+  assignment (the prompt as rendered, and the brief), question, answer and
+  queued mention, a diff summary per hand-in (the files), check results,
+  landings, approvals, and every note the run made (verdicts, edges,
+  nudges, quota). Each line carries the SHA-256 of the line before; a head
+  file beside the log keeps its length and last hash. `trix workflow log
+  <run> --verify` reports a line that was edited, deleted or cut off.
+  SHA-256 is implemented in the file (FIPS 180-4 test vectors pass), so the
+  chain is real without a dependency.
+- **What leaves the machine** (`summary.rs`): the outcome summary only
+  (nodes, declared verdicts, cycles, check exit codes, landings, who
+  approved and by which rule). It's the PR's body, refreshed just before
+  the merge, and the end-of-run report.
+- `src/workflow/overview.rs` and `trix workflow overview <run>`: the goal,
+  N of M done, blocked, how many need you, cycles and waste, spend
+  (unknown for unpriced kinds), a row per node, and `n` over everything
+  that needs you: the gate, an escalation, a parked run, an agent at a
+  prompt no rule answered.
+- `src/workflow/sched.rs`: five-field cron, `trix workflow schedule <name>
+  --cron … [--deadline HH:MM] [--kill-at HH:MM]`, `schedule ls|rm`, and
+  `trix workflow scheduler`, which starts what's due (once per minute a
+  cron names) and what triggers fire, and sends the daily digest. A
+  deadline parks the run; a kill time aborts it. `trix workflow units
+  systemd|launchd` shows the unit and where it would go, and writes it only
+  with `--yes`; trix never starts it.
+- `on_finish` (argv, with `{{run.id}}` and `{{run.state}}`) runs when a
+  run ends; a desktop notification on succeeded, failed and parked.
+
+**Accept** (`workflow::ops_tests` 5, `runlog` 2, `sched` 2)
+
+- `log --verify` reports an edited, a deleted and a truncated line
+  (`verify_reports_an_edited_a_deleted_and_a_truncated_line`).
+- The log records every assignment, question, mention, diff summary, test
+  result, land and approval
+  (`the_log_records_everything_and_a_canary_never_leaves_the_machine`,
+  `a_landing_is_in_the_log_too`).
+- **A canary string** in the issue body, repeated by agents in their
+  reports and in a question, is in the local log and never in the PR body,
+  the run report, the summary or a notification.
+- The overview's counts match the run's state, and `n` visits every item
+  that needs you (`the_overview_counts_match_the_run_and_n_visits_…`), at
+  100 and 80 columns.
+- Tests run on a mocked clock, and a run at a gate for 20 hours doesn't
+  use up a 3 hour wall clock; the wall clock, a deadline and a kill time
+  each do what they say (`on_a_mocked_clock_only_work_counts_and_a_deadline_parks`).
+- Units aren't installed without confirmation
+  (`units_arent_installed_without_confirmation`).
+
+**Decisions and limits**
+
+- **The scheduler is a command, not part of the server**: `trix workflow
+  scheduler` runs in a pane or under the unit and starts runs through the
+  same path as `trix workflow run`. It needs a trix session to open the
+  runs' panes in; the unit doesn't start one. Putting the scheduler inside
+  the server process is the PRD's wording and is left for a follow-up.
+- Triggers are polled for the repository the scheduler runs in.
+- **Triage's `wall_clock = "12h"` is declared, not enforced** (deferred
+  from step 4). Today's triage has no time limit, so nothing changes for
+  it; enforcing it needs clock state outside `case.json`.
+- The digest is sent by the scheduler, so there's none without it.
+
+Tests added: 9. Suite: 819 passed.
 
 ## Decisions to review
 

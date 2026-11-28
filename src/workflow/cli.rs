@@ -17,6 +17,16 @@ usage:
                                             (triage: --input target=<PR or issue>)
   trix workflow ls [--json]                 every run and where it is
   trix workflow show <run> [--json]         one run: its nodes, its log
+  trix workflow overview <run>              the run at a glance, and what in it needs you
+  trix workflow log <run> [--verify]        every prompt, report, edge and nudge; --verify
+                                            reports a line that was edited, deleted or cut off
+  trix workflow audit <run>                 every approval: who, by which rule, what exactly
+  trix workflow schedule <name> --cron '0 2 * * *' [--deadline HH:MM] [--kill-at HH:MM]
+  trix workflow schedule ls | rm <name>
+  trix workflow scheduler                   start what's scheduled and triggered, until stopped
+  trix workflow units systemd|launchd [--yes]
+                                            a unit that runs the scheduler with no terminal:
+                                            shown, and written only with --yes
   trix workflow check <name> [--fix]        the one checker: the builder, import, dry run and
                                             run start use it too. --fix applies what it can
   trix workflow dry-run <name> [--scenario s] [--prompts]
@@ -58,6 +68,26 @@ pub enum Cmd {
     Show {
         id: String,
         json: bool,
+    },
+    Overview(String),
+    Log {
+        id: String,
+        verify: bool,
+    },
+    Audit(String),
+    Schedule {
+        name: String,
+        cron: String,
+        deadline: Option<String>,
+        kill_at: Option<String>,
+        inputs: BTreeMap<String, String>,
+    },
+    ScheduleLs,
+    ScheduleRm(String),
+    Scheduler,
+    Units {
+        kind: String,
+        yes: bool,
     },
     Check {
         name: String,
@@ -157,6 +187,68 @@ pub fn parse(args: &[String]) -> Result<Cmd, String> {
                 _ => Err(HELP.to_string()),
             }
         }
+        ["overview", x] => Ok(Cmd::Overview(id(x))),
+        ["log", x] => Ok(Cmd::Log {
+            id: id(x),
+            verify: false,
+        }),
+        ["log", x, "--verify"] | ["log", "--verify", x] => Ok(Cmd::Log {
+            id: id(x),
+            verify: true,
+        }),
+        ["audit", x] => Ok(Cmd::Audit(id(x))),
+        ["schedule", "ls"] => Ok(Cmd::ScheduleLs),
+        ["schedule", "rm", x] => Ok(Cmd::ScheduleRm(id(x))),
+        ["schedule", name, rest @ ..] => {
+            let (mut cron, mut deadline, mut kill_at, mut inputs) =
+                (None, None, None, BTreeMap::new());
+            let mut rest = rest.iter();
+            while let Some(flag) = rest.next() {
+                let mut value = || {
+                    rest.next()
+                        .map(|v| v.to_string())
+                        .ok_or(format!("{flag} takes a value"))
+                };
+                match *flag {
+                    "--cron" => cron = Some(value()?),
+                    "--deadline" => deadline = Some(value()?),
+                    "--kill-at" => kill_at = Some(value()?),
+                    "--input" => {
+                        let pair = value()?;
+                        let (k, v) = pair
+                            .split_once('=')
+                            .ok_or_else(|| format!("--input {pair}: name=value"))?;
+                        inputs.insert(k.to_string(), v.to_string());
+                    }
+                    f => {
+                        return Err(format!(
+                            "schedule: '{f}' isn't an option (--cron, --deadline, --kill-at, --input)"
+                        ));
+                    }
+                }
+            }
+            let cron = cron.ok_or("schedule needs --cron \"minute hour day month weekday\"")?;
+            super::sched::matches(&cron, super::sched::Moment::local(0))?;
+            for t in deadline.iter().chain(&kill_at) {
+                super::settings::clock(t)?;
+            }
+            Ok(Cmd::Schedule {
+                name: name.to_string(),
+                cron,
+                deadline,
+                kill_at,
+                inputs,
+            })
+        }
+        ["scheduler"] => Ok(Cmd::Scheduler),
+        ["units", kind] => Ok(Cmd::Units {
+            kind: kind.to_string(),
+            yes: false,
+        }),
+        ["units", kind, "--yes"] => Ok(Cmd::Units {
+            kind: kind.to_string(),
+            yes: true,
+        }),
         ["pane", x] => Ok(Cmd::Pane(id(x))),
         ["ls"] => Ok(Cmd::Ls { json }),
         ["show", x] => Ok(Cmd::Show { id: id(x), json }),
@@ -385,6 +477,192 @@ pub fn sample_inputs(w: &Workflow) -> BTreeMap<String, serde_json::Value> {
         .collect()
 }
 
+/// Start a run of the workflow named `name` in `repo`: checked, trusted as
+/// it is, its pane opened as the server allows. `deadline` and `kill_at`:
+/// a schedule's, over the workflow's own.
+pub fn start_named(
+    repo: &Path,
+    name: &str,
+    inputs: &BTreeMap<String, String>,
+    deadline: Option<&str>,
+    kill_at: Option<&str>,
+) -> Result<String, String> {
+    let root = runs_root();
+    let stores = Stores::of(Some(repo));
+    let (mut w, origin) = stores.load(name)?;
+    let (m, mut ctx, settings) = live()?;
+    // A file runs only as you trusted it: a change since then needs your trust again.
+    let trusted = trusted(&stores, &w, origin == super::store::Origin::Builtin)?;
+    ctx.trusted = Some(trusted);
+    if let Some(d) = deadline {
+        w.limits.deadline = Some(d.to_string());
+    }
+    if let Some(k) = kill_at {
+        w.limits.kill_at = Some(k.to_string());
+    }
+    let mut env = Live::looking("workflow");
+    let l = super::launch::Launch {
+        stores: &stores,
+        repo,
+        m: &m,
+        ctx: &ctx,
+        settings: &settings,
+        trusted,
+    };
+    let run = super::launch::start(&mut env, &root, &l, &w, inputs)?;
+    // The server says whether this pane may start it: an agent's only as
+    // [workflows.agents] allows.
+    let allowed = control(Request::Wf {
+        run: Some(run.id.clone()),
+        op: Op::Start,
+    });
+    if let Err(e) = allowed.and_then(|_| env.open_run(&run.id, repo)) {
+        let _ = std::fs::remove_dir_all(engine::dir_of(&root, &run.id));
+        return Err(e);
+    }
+    Ok(format!("{}\n", run.id))
+}
+
+/// `trix workflow scheduler`: start what's scheduled and what's triggered,
+/// looking every half minute, until it's stopped. It needs a trix session
+/// to open the runs' panes in.
+fn scheduler() -> i32 {
+    println!("trix workflow scheduler: looking every 30 s (ctrl+c stops it)");
+    let fired_file = crate::worktree::state_dir().join("triggers-fired.json");
+    let mut digest_day = 0u32;
+    loop {
+        let now = crate::prices::now();
+        let at = super::sched::Moment::local(now);
+        // Cron.
+        let file = super::sched::file();
+        let mut all = super::sched::load(&file);
+        let due = super::sched::due(&mut all, now, at);
+        if !due.is_empty() {
+            let _ = super::sched::save(&file, &all);
+        }
+        for s in due {
+            match start_named(
+                &s.repo,
+                &s.workflow,
+                &s.inputs,
+                s.deadline.as_deref(),
+                s.kill_at.as_deref(),
+            ) {
+                Ok(id) => println!(
+                    "started {} ({}, scheduled {})",
+                    id.trim(),
+                    s.workflow,
+                    s.cron
+                ),
+                Err(e) => println!(
+                    "couldn't start {}: {}",
+                    s.workflow,
+                    e.lines().next().unwrap_or_default()
+                ),
+            }
+        }
+        // Triggers, for the repository this runs in.
+        if let Some(repo) = main_checkout() {
+            let stores = Stores::of(Some(&repo));
+            let flows: Vec<(String, Vec<super::model::Trigger>)> = stores
+                .list()
+                .iter()
+                .filter_map(|(n, _)| stores.load(n).ok())
+                .map(|(w, _)| (w.name, w.triggers))
+                .filter(|(_, t)| !t.is_empty())
+                .collect();
+            if !flows.is_empty() {
+                let mut facts: Vec<super::trigger::Fact> = engine::all(&runs_root())
+                    .iter()
+                    .filter(|r| r.state.over())
+                    .map(|r| super::trigger::Fact::RunEnded {
+                        run: r.id.clone(),
+                        workflow: r.workflow.name.clone(),
+                        state: r.state.label().into(),
+                    })
+                    .collect();
+                for t in flows
+                    .iter()
+                    .flat_map(|(_, t)| t)
+                    .filter(|t| t.on == "github")
+                {
+                    let kind = t.kind.as_deref().unwrap_or("issue");
+                    let mut args = vec![
+                        kind,
+                        "list",
+                        "--state",
+                        "open",
+                        "--json",
+                        "number,labels",
+                        "--limit",
+                        "50",
+                    ];
+                    if let Some(l) = &t.label {
+                        args.extend(["--label", l.as_str()]);
+                    }
+                    if let Ok(json) = super::env::run_cmd("gh", &repo, &args) {
+                        facts.extend(super::trigger::github_facts(kind, &json));
+                    }
+                }
+                let head = [
+                    "log",
+                    "-1",
+                    "--format=%H",
+                    "--name-only",
+                    "refs/remotes/origin/HEAD",
+                ];
+                if let Ok(out) = super::env::run_cmd("git", &repo, &head) {
+                    let mut lines = out.lines().filter(|l| !l.is_empty());
+                    if let Some(sha) = lines.next() {
+                        facts.push(super::trigger::Fact::Files {
+                            sha: sha.to_string(),
+                            paths: lines.map(String::from).collect(),
+                        });
+                    }
+                }
+                let mut fired = super::trigger::Fired::load(&fired_file);
+                for s in super::trigger::due(&flows, &facts, &mut fired) {
+                    match start_named(&repo, &s.workflow, &s.inputs, None, None) {
+                        Ok(id) => println!(
+                            "started {} ({}, because {})",
+                            id.trim(),
+                            s.workflow,
+                            s.because
+                        ),
+                        Err(e) => println!(
+                            "couldn't start {}: {}",
+                            s.workflow,
+                            e.lines().next().unwrap_or_default()
+                        ),
+                    }
+                }
+                let _ = fired.save(&fired_file);
+            }
+        }
+        // The digest, once a day at its time.
+        if let Ok(settings) = crate::config::load().map(|c| c.workflows)
+            && let Some(when) = settings
+                .digest
+                .as_deref()
+                .and_then(|t| super::settings::clock(t).ok())
+            && at.hour * 60 + at.minute == when
+            && digest_day != at.day
+        {
+            digest_day = at.day;
+            let runs = engine::all(&runs_root());
+            let ended: BTreeMap<String, u64> = runs
+                .iter()
+                .map(|r| (r.id.clone(), r.log.last().map_or(r.created, |l| l.0)))
+                .collect();
+            let views: Vec<_> = runs.iter().map(|r| r.view(&[])).collect();
+            if let Some(text) = super::sched::digest(&views, &ended, now.saturating_sub(86_400)) {
+                crate::platform::notify("trix workflows: the last day", &text, false);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
 fn fail(e: impl std::fmt::Display) -> i32 {
     eprintln!("trix: workflow: {e}");
     1
@@ -491,37 +769,9 @@ pub fn run(args: &[String]) -> i32 {
             let Some(repo) = main_checkout() else {
                 return fail("not in a git repository");
             };
-            let stores = Stores::of(Some(&repo));
-            let started = stores.load(&name).and_then(|(w, origin)| {
-                let (m, mut ctx, settings) = live()?;
-                // A file runs only as you trusted it: a change since then needs your trust again.
-                let trusted = trusted(&stores, &w, origin == super::store::Origin::Builtin)?;
-                ctx.trusted = Some(trusted);
-                let mut env = Live::looking("workflow");
-                let l = super::launch::Launch {
-                    stores: &stores,
-                    repo: &repo,
-                    m: &m,
-                    ctx: &ctx,
-                    settings: &settings,
-                    trusted,
-                };
-                let run = super::launch::start(&mut env, &root, &l, &w, &inputs)?;
-                // The server says whether this pane may start it: an agent's only as
-                // [workflows.agents] allows.
-                let allowed = control(Request::Wf {
-                    run: Some(run.id.clone()),
-                    op: Op::Start,
-                });
-                if let Err(e) = allowed.and_then(|_| env.open_run(&run.id, &repo)) {
-                    let _ = std::fs::remove_dir_all(engine::dir_of(&root, &run.id));
-                    return Err(e);
-                }
-                Ok(format!("{}\n", run.id))
-            });
-            // A refusal is the checker's own text: nothing to put before it.
-            match started {
+            match start_named(&repo, &name, &inputs, None, None) {
                 Ok(out) => say(Ok(out)),
+                // A refusal is the checker's own text: nothing to put before it.
                 Err(e) if e.contains(" error") && e.contains(" warning") => {
                     eprint!("{e}");
                     1
@@ -668,6 +918,86 @@ pub fn run(args: &[String]) -> i32 {
         },
         Cmd::Capabilities { kind, verify: true } => say(live()
             .and_then(|(m, ctx, _)| super::probe::verify(&m, &ctx.installed, kind.as_deref()))),
+        Cmd::Overview(id) => say(engine::load(&root, &id).map(|r| {
+            let seen = Live::looking("workflow").agents().unwrap_or_default();
+            let at = super::overview::next(&super::overview::needs(&r, &seen), None);
+            super::overview::render(&r, &seen, at, 100)
+        })),
+        Cmd::Log { id, verify } => {
+            let dir = engine::dir_of(&root, &id);
+            if !verify {
+                return say(engine::load(&root, &id).map(|_| super::runlog::render(&dir)));
+            }
+            match super::runlog::verify(&dir) {
+                Ok(n) => say(Ok(format!("{id}: {n} lines, each as it was written\n"))),
+                Err(wrong) => fail(format!("{id}'s log was changed:\n  {}", wrong.join("\n  "))),
+            }
+        }
+        Cmd::Audit(id) => say(engine::load(&root, &id).map(|_| {
+            let text = std::fs::read_to_string(engine::dir_of(&root, &id).join("approvals.jsonl"))
+                .unwrap_or_default();
+            if text.is_empty() {
+                "no approval was made in this run\n".to_string()
+            } else {
+                text
+            }
+        })),
+        Cmd::Schedule {
+            name,
+            cron,
+            deadline,
+            kill_at,
+            inputs,
+        } => {
+            let Some(repo) = main_checkout() else {
+                return fail("not in a git repository");
+            };
+            say(Stores::of(Some(&repo)).load(&name).and_then(|_| {
+                let file = super::sched::file();
+                let mut all = super::sched::load(&file);
+                all.retain(|s| !(s.workflow == name && s.repo == repo));
+                all.push(super::sched::Schedule { workflow: name.clone(), cron: cron.clone(), deadline, kill_at, inputs, repo, last: 0 });
+                super::sched::save(&file, &all)?;
+                Ok(format!("{name} is scheduled: {cron}. It starts while trix workflow scheduler runs (trix workflow units writes a unit for that)\n"))
+            }))
+        }
+        Cmd::ScheduleLs => {
+            let all = super::sched::load(&super::sched::file());
+            for s in &all {
+                println!(
+                    "{:<16} {:<14} {}{}",
+                    s.workflow,
+                    s.cron,
+                    crate::app::tilde(&s.repo),
+                    s.deadline
+                        .as_ref()
+                        .map_or(String::new(), |d| format!("  deadline {d}"))
+                );
+            }
+            if all.is_empty() {
+                println!(
+                    "nothing is scheduled: trix workflow schedule <name> --cron \"0 2 * * *\""
+                );
+            }
+            0
+        }
+        Cmd::ScheduleRm(name) => {
+            let file = super::sched::file();
+            let mut all = super::sched::load(&file);
+            let before = all.len();
+            all.retain(|s| s.workflow != name);
+            if all.len() == before {
+                return fail(format!("{name} isn't scheduled"));
+            }
+            say(super::sched::save(&file, &all).map(|_| format!("{name} is no longer scheduled\n")))
+        }
+        Cmd::Scheduler => scheduler(),
+        Cmd::Units { kind, yes } => say(super::sched::Unit::parse(&kind).and_then(|unit| {
+            let home =
+                std::path::PathBuf::from(std::env::var("HOME").map_err(|_| "no home folder")?);
+            let exe = crate::platform::trix_exe().map_err(|e| e.to_string())?;
+            unit.install(&home, &exe, yes)
+        })),
         Cmd::Approve(id) => wf(id, Op::Approve),
         Cmd::Abort(id) => wf(id, Op::Abort),
         Cmd::Pause(id) => wf(id, Op::Pause),

@@ -72,7 +72,7 @@ pub fn start(w: &mut World, wf: Workflow, o: Opts) -> WfRun {
 pub fn tick(w: &mut World, r: &mut WfRun) {
     let root = root(w);
     if runner::step(r, &root, w) {
-        engine::store(&root, r).unwrap();
+        Run::store(r, &root).unwrap();
     }
 }
 

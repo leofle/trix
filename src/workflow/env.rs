@@ -76,6 +76,10 @@ pub trait Env {
     fn notify(&mut self, title: &str, body: &str) {
         let _ = (title, body);
     }
+    /// Run your `on_finish` command: a run ended.
+    fn on_finish(&mut self, argv: &[String]) {
+        let _ = argv;
+    }
     /// Store nothing, start a run's pane: the run is already in its folder.
     fn open_run(&mut self, id: &str, repo: &Path) -> Result<(), String> {
         let _ = (id, repo);
@@ -316,6 +320,17 @@ impl Env for Live {
     }
     fn notify(&mut self, title: &str, body: &str) {
         crate::platform::notify(title, body, false);
+    }
+    fn on_finish(&mut self, argv: &[String]) {
+        if let Some((program, rest)) = argv.split_first() {
+            let program = crate::app::expand(program);
+            let _ = std::process::Command::new(program)
+                .args(rest)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     }
     fn open_run(&mut self, id: &str, repo: &Path) -> Result<(), String> {
         let exe = crate::platform::trix_exe().map_err(|e| e.to_string())?;

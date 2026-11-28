@@ -2811,7 +2811,7 @@ impl Run for Case {
     fn load(root: &Path, id: &str) -> Result<Case, String> {
         load(root, id)
     }
-    fn store(&self, root: &Path) -> Result<(), String> {
+    fn store(&mut self, root: &Path) -> Result<(), String> {
         store(root, self)
     }
     fn over(&self) -> bool {

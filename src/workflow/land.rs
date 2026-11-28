@@ -200,6 +200,11 @@ pub fn land_node(run: &mut WfRun, env: &mut dyn Env, id: &str) {
                         run.branch
                     ),
                 );
+                run.record(
+                    env,
+                    "land",
+                    serde_json::json!({"node": w, "commits": commits, "onto": run.branch}),
+                );
             }
             Err(files) => {
                 let what = if files.is_empty() {

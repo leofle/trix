@@ -89,6 +89,8 @@ pub struct World {
     /// Every check run: where, what, and whether the guard was on.
     pub checks: Vec<(PathBuf, Vec<String>, bool)>,
     pub opened: Vec<String>,
+    /// Every `on_finish` command run.
+    pub finished: Vec<Vec<String>>,
     guard_next: bool,
     trace: Vec<String>,
     commits: u32,
@@ -179,6 +181,7 @@ impl World {
             notified: Vec::new(),
             checks: Vec::new(),
             opened: Vec::new(),
+            finished: Vec::new(),
             guard_next: false,
             trace: Vec::new(),
             commits: 0,
@@ -549,6 +552,10 @@ impl World {
                 });
                 Ok(format!("https://example.com/pr/{n}\n"))
             }
+            ["pr", "edit", _, "--body", body] => {
+                self.hub.pr_bodies.push(body.to_string());
+                Ok(String::new())
+            }
             ["pr", "list", "--head", head, ..] => {
                 let found: Vec<HubPr> = self
                     .hub
@@ -871,6 +878,9 @@ impl Env for World {
     }
     fn notify(&mut self, title: &str, body: &str) {
         self.notified.push((title.into(), body.into()));
+    }
+    fn on_finish(&mut self, argv: &[String]) {
+        self.finished.push(argv.to_vec());
     }
     fn open_run(&mut self, id: &str, _repo: &Path) -> Result<(), String> {
         self.opened.push(id.into());

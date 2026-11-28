@@ -21,6 +21,8 @@ pub enum Stop {
     Park(String),
     /// A floor: for you to let through, for this run only. The floor, then why.
     You(String, String),
+    /// The kill time came: the run is aborted.
+    Kill(String),
 }
 
 pub fn op_name(op: &Op) -> &'static str {

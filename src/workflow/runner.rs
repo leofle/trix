@@ -16,7 +16,8 @@ pub trait Run: Clone + PartialEq + Sized {
     const SOURCE: &'static str;
 
     fn load(root: &Path, id: &str) -> Result<Self, String>;
-    fn store(&self, root: &Path) -> Result<(), String>;
+    /// Store the run, and write what it did since to its log.
+    fn store(&mut self, root: &Path) -> Result<(), String>;
 
     /// Finished, failed or aborted: nothing more is started.
     fn over(&self) -> bool;
