@@ -3392,6 +3392,8 @@ fn show(c: &Case) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The generic runner drives the case in every test here.
+    use crate::workflow::runner::step;
 
     #[derive(Default)]
     struct Fake {
