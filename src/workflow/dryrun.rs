@@ -292,6 +292,8 @@ pub struct DryRun {
     pub auto: Vec<String>,
     pub estimate: check::Estimate,
     pub looks: u32,
+    /// What this simulation leaves out, said before the path.
+    pub note: Option<String>,
 }
 
 /// The most looks a simulated run gets: past this it's stuck.
@@ -319,6 +321,7 @@ pub fn dry_run(
         auto: Vec::new(),
         estimate: report.estimate.clone(),
         looks: 0,
+        note: None,
     };
     if !report.runnable() {
         return out;
@@ -370,6 +373,10 @@ pub fn dry_run(
         let _ = engine::store(&root, &run);
     }
     out.ran = true;
+    if w.is_triage() {
+        // Triage runs as a case, on its own stages: this is its template's path.
+        out.note = Some("triage's stages are its own: this follows the template's edges with stub verdicts. Its prompts aren't shown here, and what a case asks you on the way (nothing found, the round limit, a conflict, …) isn't simulated.".into());
+    }
     out.state = run.state;
     out.why = if out.looks >= LOOKS {
         format!("still going after {LOOKS} looks")
@@ -380,6 +387,14 @@ pub fn dry_run(
     out.wasted = run.wasted;
     out.prompts = env.prompts;
     out.log = run.log.iter().map(|(_, l)| l.clone()).collect();
+    if w.is_triage() {
+        // The prompts are triage's own, written by the case: none to show.
+        out.prompts.clear();
+        // A stage with no agent is trix's own step.
+        for l in &mut out.log {
+            *l = l.replace(" (, ", " (trix, ");
+        }
+    }
     out.auto = out
         .log
         .iter()
@@ -397,6 +412,9 @@ impl DryRun {
         if !self.ran {
             s.push_str("\nnot simulated: the checker found errors\n");
             return s;
+        }
+        if let Some(note) = &self.note {
+            s.push_str(&format!("\n{note}\n"));
         }
         s.push_str("\nsimulated path:\n");
         for l in &self.log {

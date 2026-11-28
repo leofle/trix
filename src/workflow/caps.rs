@@ -85,8 +85,8 @@ pub struct Entry {
 pub struct Installed(pub BTreeMap<String, String>);
 
 impl Installed {
-    /// Every kind, in a version inside its entry's range: for tests and
-    /// for checking a workflow as its author's machine would.
+    /// Every kind, in a version inside its entry's range: for tests.
+    #[cfg(test)]
     pub fn all(m: &Matrix) -> Installed {
         Installed(
             m.0.iter()

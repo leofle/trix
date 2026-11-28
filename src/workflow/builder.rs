@@ -142,7 +142,9 @@ impl Builder {
         b
     }
 
-    /// The problems, as the builder's API hands them out: the checker's.
+    /// The problems the builder shows: the checker's report, which is what
+    /// it draws from.
+    #[cfg(test)]
     pub fn problems(&self) -> &Report {
         &self.report
     }
@@ -1398,9 +1400,12 @@ pub fn wizard(a: &Answers, m: &Matrix, ctx: &Ctx) -> Result<Workflow, String> {
                 ..Default::default()
             },
             ..Workflow::default()
-        },
+        }, // Triage's stages are its own: a copy of it couldn't run.
+        "triage" => {
+            return Err("triage isn't a template to copy: its stages run only as a triage case. Set its agents, rounds and budget under [triage] in your config, or start from issue-to-pr".into());
+        }
         t => super::store::builtin(t).ok_or_else(|| {
-            format!("'{t}' isn't a template (triage, issue-to-pr, bug-repro, nightly-deps, blank)")
+            format!("'{t}' isn't a template (issue-to-pr, bug-repro, nightly-deps, blank)")
         })?,
     };
     w.name = a.name.clone();

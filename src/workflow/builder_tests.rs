@@ -410,8 +410,22 @@ fn the_mouse_selects_and_drags_and_the_layout_fits_100_and_80_columns() {
 
 #[test]
 fn the_wizard_yields_a_valid_workflow_for_every_template() {
-    let (m, ctx) = ideal();
-    for template in ["triage", "issue-to-pr", "bug-repro", "nightly-deps"] {
+    let (m, ctx) = ideal(); // Triage isn't one to copy: its stages run only as a triage case.
+    let e = wizard(
+        &Answers {
+            template: "triage".into(),
+            name: "my-triage".into(),
+            ..Answers::default()
+        },
+        &m,
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(
+        e.contains("triage isn't a template to copy") && e.contains("[triage]"),
+        "{e}"
+    );
+    for template in ["issue-to-pr", "bug-repro", "nightly-deps"] {
         for autopilot in [false, true] {
             let a = Answers {
                 template: template.into(),
@@ -420,13 +434,6 @@ fn the_wizard_yields_a_valid_workflow_for_every_template() {
                 ..Answers::default()
             };
             let w = wizard(&a, &m, &ctx).unwrap();
-            let w = if template == "triage" {
-                w.bind(&serde_json::json!({"triage": {"budget": 10.0, "max_rounds": 2, "reviewers": 2,
-                "builder": {"agent": "claude", "args": []}, "reviewer": {"agent": "claude", "args": []}, "reviewer2": {"agent": "claude", "args": []},
-                "fixer": {"agent": "claude", "args": []}, "gatekeeper": {"agent": "claude", "args": []}}})).unwrap()
-            } else {
-                w
-            };
             let r = check(&w, &m, &ctx);
             assert_eq!(
                 r.errors(),

@@ -175,6 +175,10 @@ pub fn start(
     w: &Workflow,
     given: &BTreeMap<String, String>,
 ) -> Result<WfRun, String> {
+    // Triage's stages are triage's own: it runs as a case.
+    if w.is_triage() {
+        return Err("triage runs as a case: trix triage <PR or issue> (or trix workflow run triage --input target=<PR or issue>). It can't be scheduled, rehearsed or run as a node".into());
+    }
     preflight(w, l.m, l.ctx)?;
     let inputs = resolve(env, l.repo, w, given)?;
     // The default branch, and the repository's name, as GitHub has them.

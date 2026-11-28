@@ -3356,7 +3356,7 @@ impl Case {
             cycles: self.round,
             wasted: 0,
             spent_usd: self.spent_closed,
-            unpriced: false,
+            unpriced: !unpriced(self).is_empty(),
             why: self.why.clone(),
         }
     }
@@ -3381,12 +3381,29 @@ fn listing(cases: &[Case]) -> String {
     cases.iter().zip(&what).map(|(c, s)| format!("{:<w$}  {s:<v$}  {}  ·  {}\n", c.id, c.status(), c.title())).collect()
 }
 
-/// `spent $1.20 of $10.00`, and of that what agents still open spend.
+/// The kinds among the case's agents that trix can't price. What they
+/// spend is unknown, never $0: the budget counts what's priced, and the
+/// case says which agents it can't count.
+fn unpriced(c: &Case) -> Vec<String> {
+    let m = crate::workflow::caps::Matrix::shipped();
+    let mut roles = vec![&c.reviewer, &c.fixer, &c.gatekeeper];
+    roles.extend(&c.reviewer2);
+    if c.build.is_some() || (c.pr.is_none() && c.issue.is_some()) { roles.push(&c.builder); }
+    let mut kinds: Vec<String> = roles.iter().map(|r| r.agent.clone()).filter(|k| !m.0.get(k).is_some_and(|e| e.priced)).collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+/// `spent $1.20 of $10.00`, and of that what agents still open spend. With
+/// an agent trix can't price, `spent $1.20 + unknown of $10.00`.
 fn spent_line(c: &Case, live: &[Seen]) -> String {
     let total = cost_of(c, live);
     let open = total - c.spent_closed;
     let open = if open > 0.0 { format!(" ({} by agents still open)", crate::cost::usd(open)) } else { String::new() };
-    format!("spent {} of {}{open}", crate::cost::usd(total), crate::cost::usd(c.budget))
+    let kinds = unpriced(c);
+    if kinds.is_empty() { return format!("spent {} of {}{open}", crate::cost::usd(total), crate::cost::usd(c.budget)); }
+    format!("spent {} + unknown of {}{open} · trix can't price {}: what it spends is unknown, not $0, and the budget can't count it", crate::cost::usd(total), crate::cost::usd(c.budget), kinds.join(", "))
 }
 
 fn show(c: &Case) -> String {
@@ -3770,6 +3787,29 @@ mod tests {
         assert!(submit(&root, &mut c, Role::Gatekeeper, lenient).err.contains("pass needs every finding ok"));
         let red = r#"{"verdict": "pass", "findings": [{"id": "F1", "ok": true}, {"id": "F2", "ok": true}], "ci": "red"}"#;
         assert!(submit(&root, &mut c, Role::Gatekeeper, red).err.contains("CI not red"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn an_agent_trix_cant_price_counts_as_unknown_not_zero() {
+        // Claude and Codex are priced: the line is as it always was.
+        let (root, mut c) = fixture("unpriced");
+        assert_eq!(unpriced(&c), Vec::<String>::new());
+        assert_eq!(spent_line(&c, &[]), "spent $0.00 of $10.00");
+        assert!(!c.view().unpriced);
+        // A gatekeeper trix can't price: its spend is unknown, and said to be.
+        c.gatekeeper.agent = "gemini".into();
+        assert_eq!(unpriced(&c), vec!["gemini".to_string()]);
+        c.spent_closed = 1.5;
+        assert_eq!(spent_line(&c, &[]), "spent $1.50 + unknown of $10.00 · trix can't price gemini: what it spends is unknown, not $0, and the budget can't count it");
+        assert!(c.view().unpriced);
+        // A kind trix has never heard of is unknown too.
+        c.gatekeeper.agent = "my-agent".into();
+        assert_eq!(unpriced(&c), vec!["my-agent".to_string()]);
+        // The builder counts only in a case that has one.
+        c.gatekeeper.agent = "claude".into();
+        c.builder.agent = "gemini".into();
+        assert_eq!(unpriced(&c), Vec::<String>::new(), "a PR case has no builder");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

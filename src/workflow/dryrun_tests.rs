@@ -102,13 +102,15 @@ fn a_dry_run_shows_every_prompt_and_what_would_be_approved_without_you() {
         "{}",
         again.2
     );
-    compare_in("dryrun", "issue-to-pr-failures", &d.prompts_text());
-    // Every template dry-runs, and none is left unfinished by the simulation.
-    for name in super::store::builtin_names()
-        .into_iter()
-        .filter(|n| *n != "triage")
-    {
-        let d = sim(&builtin(name).unwrap(), Scenario::Happy);
+    compare_in("dryrun", "issue-to-pr-failures", &d.prompts_text()); // Every template dry-runs, and none is left unfinished by the simulation.
+    for name in super::store::builtin_names() {
+        // Triage as a case runs it: bound to [triage].
+        let w = if name == "triage" {
+            super::triage::bound(&crate::config::TriageOpts::default())
+        } else {
+            builtin(name).unwrap()
+        };
+        let d = sim(&w, Scenario::Happy);
         let ended = matches!(d.state, RunState::NeedsYou | RunState::Succeeded);
         assert!(
             d.ran && d.looks < 400 && ended,

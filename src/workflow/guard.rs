@@ -80,18 +80,6 @@ pub fn apply(cmd: &mut std::process::Command, empty: &Path) {
     }
 }
 
-/// The guard as a shell prefix, for a pane's command line:
-/// `env -u GH_TOKEN … GIT_CONFIG_COUNT=9 … <program>`.
-pub fn prefix(empty: &Path) -> Vec<String> {
-    let mut words = vec!["env".to_string()];
-    for k in GH_TOKENS {
-        words.push("-u".into());
-        words.push(k.into());
-    }
-    words.extend(env(empty).into_iter().map(|(k, v)| format!("{k}={v}")));
-    words
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -220,13 +208,6 @@ pub mod tests {
         assert_eq!(
             String::from_utf8_lossy(&o.stdout).trim(),
             format!("none/none/{}", empty.display())
-        );
-        // The same guard as a pane's command prefix.
-        let p = prefix(&empty);
-        assert_eq!(p[0], "env");
-        assert!(
-            p.windows(2).any(|w| w == ["-u", "GH_TOKEN"])
-                && p.iter().any(|w| w.starts_with("GIT_CONFIG_COUNT="))
         );
         // Without the guard the same push goes through: it's the guard that stops it.
         git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/allowed"]).unwrap();

@@ -2266,3 +2266,100 @@ fn what_a_node_writes_on_the_blackboard_every_later_node_can_read() {
     );
     done(w);
 }
+
+const JUDGED: &str = r#"
+schema = 1
+name = "judged"
+entry = ["writer"]
+[goal]
+text = "The file is there, and a judge says so."
+[goal.done_when]
+mechanical = [{ ci = "green" }]
+attested = [{ judge = "judge" }]
+[limits]
+wall_clock = "1h"
+max_iterations = 2
+[policy]
+push = "guarded"
+merge = "you"
+[nodes.writer]
+kind = "agent"
+agent = "claude"
+profile = "edit-only"
+revisit = "reuse"
+verdicts = ["ready"]
+brief = { owns = ["src/**"], done = "The file is committed." }
+[nodes.judge]
+kind = "judge"
+agent = "claude"
+profile = "read-only"
+revisit = "fresh"
+verdicts = ["pass", "changes"]
+brief = { owns = [], done = "The file is right." }
+[nodes.gate]
+kind = "gh.gate"
+verdicts = ["merged"]
+[[edges]]
+from = "writer"
+to = "judge"
+on = "ready"
+[[edges]]
+from = "judge"
+to = "writer"
+on = "changes"
+[[edges]]
+from = "judge"
+to = "gate"
+on = "pass"
+[[edges]]
+from = "gate"
+to = "@done"
+on = "merged"
+"#;
+
+#[test]
+fn with_no_check_the_gate_merges_the_commit_the_judge_passed() {
+    let wf = Workflow::from_toml(JUDGED).unwrap();
+    let m = super::caps::Matrix::shipped();
+    let report = super::check::check(&wf, &m, &super::check::Ctx::ideal(&m));
+    assert_eq!(report.errors(), 0, "{}", report.render());
+    let mut w = World::new("wf-judged");
+    w.hub.ci = green();
+    let mut r = start(&mut w, wf, opts());
+    tick(&mut w, &mut r);
+    edit(&mut w, &r, "writer", "src/file", "x\n");
+    submit(&mut w, &r, "writer", r#"{"verdict": "ready"}"#).unwrap();
+    ticks(&mut w, &mut r, 2);
+    // Nothing is checked until the judge has passed a commit.
+    assert_eq!(r.pinned, None);
+    let judged = r.nodes["writer"].outputs["head"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    submit(&mut w, &r, "judge", r#"{"verdict": "pass"}"#).unwrap();
+    ticks(&mut w, &mut r, 3);
+    // The gate took the commit the judge passed, and asks you for the merge.
+    assert_eq!(
+        (r.state, r.ask),
+        (RunState::NeedsYou, Some(Ask::Merge)),
+        "{:?}",
+        r.log
+    );
+    assert_eq!(r.pinned.as_deref(), Some(judged.as_str()));
+    assert_eq!(
+        r.nodes["judge"].outputs["commit"].as_str(),
+        Some(judged.as_str())
+    );
+    op(&mut w, None, Some(&r.id), Op::Approve).unwrap();
+    ticks(&mut w, &mut r, 2);
+    assert_eq!(r.state, RunState::Succeeded, "{:?}", r.log);
+    assert_eq!(w.hub.prs.last().unwrap().state, "MERGED");
+    let audit =
+        std::fs::read_to_string(engine::dir_of(&root(&w), &r.id).join("approvals.jsonl")).unwrap();
+    // What you approved is the commit the judge passed.
+    assert!(
+        audit.contains(&format!("\"sha\":\"{judged}\"")) && audit.contains("\"approver\":\"you\""),
+        "{audit}"
+    );
+    done(w);
+}

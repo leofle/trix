@@ -1,5 +1,7 @@
 # Triage, as a workflow: today's `trix triage`, unchanged for its users.
-# Built in and read-only: `trix workflow export triage` to fork your own.
+# Built in and read-only. Its stages are triage's own and run only as a case:
+# a copy of this file can't run. Its agents, rounds and budget are [triage] in
+# your config.
 schema = 1
 name = "triage"
 builtin = true

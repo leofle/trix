@@ -31,7 +31,8 @@ rustfmt --check --edition 2024 src/workflow/mod.rs   # all new code, see D2
 | 12 | Dry run and rehearsal | 4d823e5 | pass |
 | 13 | Run log, overview, scheduling and notifications | 73cfaf3 | pass |
 | 14 | Terminal builder | 999de55 | pass |
-| 15 | YAML import and export | (this) | pass |
+| 15 | YAML import and export | 4b01abf | pass |
+| 16 | Docs, and the last honesty fixes | (this) | pass |
 
 ## Step 1: baseline
 
@@ -277,8 +278,10 @@ goldens freeze, so it's kept in the run's own folder, which step 13 adds.
 - **Decisions:** `{{config.…}}` settings (triage's round ceiling, budget and
   agents) are kept as text in the file and bound when a run starts, so the
   shipped template round-trips unchanged. Durations are text (`3h`,
-  `1h30m`). The content hash that trust is pinned to is FNV-1a over the
-  workflow's canonical JSON: it detects edits, it isn't a signature.
+  `1h30m`). The content hash that trust is pinned to was FNV-1a over the
+  workflow's canonical JSON at this step; **step 16 changed it to SHA-256**
+  (a 64-bit hash can be collided on purpose, and trust is what stands
+  between an edited file and a run).
 - Tests added: 4. Suite: 735 passed. Deferred: nothing.
 
 ## Step 6: the capability matrix and the shared checker
@@ -976,6 +979,87 @@ what isn't a workflow; an import lands in your own workflows and replaces
 nothing). Suite: 827 passed. Tried by hand against a throwaway home
 directory: export, rename, import, check.
 
+## Step 16: docs
+
+**Docs**
+
+- `README.md`: a **Workflows** section (what a workflow is made of, the
+  templates, the builder, the matrix and its three levels, the one checker,
+  dry run and rehearsal, the run view, the log, schedules, sharing), and
+  under it **"What a workflow may do without you"**: push protection as
+  enforced, guarded or none with what each really does and doesn't stop;
+  that checks and test commands run code the agents wrote, as you; the
+  three floors and the two opt-in ones; approvals and their two switches;
+  the audit, revoke and autopilot; what agent panes may do. Then migration
+  notes and the known limits. Also the `alt+p` key, the new config tables
+  and `[cost] confirm_over`.
+- **The Security promise is rewritten**: "never answers a prompt for you"
+  is now "never, unless you opt in", with exactly when (a rule you switch
+  on twice, through the backend's hook, only where the decision is verified
+  for the installed version) and that it never types into a pane. Two new
+  bullets: checks run agent-written code as you and the guard can be
+  undone by code that sets out to; a workflow can't widen itself (floors,
+  trust, approve is yours).
+- `CHANGELOG.md` (new: the repository had none, D10): what's new, what
+  changed, and migrating, including **$0 to unknown**.
+
+**Fixes made while writing the docs down honestly**
+
+- **The documented break, built.** An agent trix can't price counted as $0
+  in a triage case. Now `trix case show` says `spent $1.20 + unknown of
+  $10.00` and names the kinds, and the case's view carries `unpriced`. The
+  budget still asks on what's priced. The 45 ported triage tests keep every
+  assertion; one test was added
+  (`an_agent_trix_cant_price_counts_as_unknown_not_zero`).
+- **Trust and the hooks fingerprint are SHA-256** (were 64-bit FNV-1a). A
+  hash trust is pinned to must not be collidable on purpose.
+- **`#![allow(dead_code)]` is gone** from `src/workflow/`; what was unused
+  was removed (`guard::prefix`, `WfRun::land_unbuilt`, `BUILTIN_KINDS`,
+  `Node::is_builtin`, `Workflow::content_hash`, `policy::brief`) or marked
+  as the tests' (`Ctx::ideal`, `Installed::all`, `builtin_names`,
+  `Builder::problems`). `trix workflow check` and the same-report test now
+  call one function.
+- **A copy of triage passed the checker and couldn't run.** Step 16's
+  accept ("every template passes check and dry run") showed the dry-run
+  test had skipped triage, and that a renamed copy of the template checked
+  clean while its stages have no prompts outside triage and its gate had no
+  checked commit. Now (D9):
+  - the checker refuses triage's stages (`builtin-kind`) anywhere but the
+    built-in triage, refuses triage as a `workflow` node
+    (`triage-as-node`), and refuses a kind it doesn't know
+    (`unknown-kind`, which used to run as an agent);
+  - "built in" is where the store found the workflow: a file is loaded
+    with `builtin = false` whatever it says;
+  - the wizard doesn't offer triage, and says why; `launch::start` refuses
+    it (triage starts as a case);
+  - `trix workflow check triage` and `dry-run triage` use the template as
+    `[triage]` binds it. The dry run follows its edges to "ready to merge",
+    and says that triage's own prompts and questions aren't simulated.
+- **A gate with no check before it.** The gate failed at run time with "no
+  checked commit" when `done_when` had a judge and CI but no check. Now
+  the checked commit is the one every judge in `done_when` passed (as in
+  triage, where it's the gatekeeper's), and a gate with nothing in
+  `done_when` that checks a commit is a checker error
+  (`gate-nothing-checked`) instead of a run that fails at the end.
+
+**Accept**
+
+- Every template passes check with 0 errors
+  (`every_template_passes_check…` in `check_tests`, triage bound to
+  `[triage]` included) and dry-runs to an end that isn't a failure, triage
+  included now (`a_dry_run_shows_every_prompt…` in `dryrun_tests`: the
+  filter that skipped triage is gone).
+- Full suite: **831 passed**, 0 failed, 1 ignored (the same one as on
+  `origin/main`). `cargo clippy --all-targets -- -D warnings` clean, with
+  no dead-code allowance. New code rustfmt-clean. Triage goldens untouched
+  since `a39b7a0`.
+
+Tests added: 5 (the unpriced break; triage's stages only in the built-in
+triage, with unknown kinds and triage as a node; a gate needs something
+checked; with no check the gate merges what the judge passed; plus
+triage in the every-template dry run). The wizard's test no longer makes a
+copy of triage: it asserts the refusal instead.
+
 ## Decisions to review
 
 - **D1. BUILD.md is at the repository root.** The PRD says
@@ -1018,3 +1102,51 @@ directory: export, rename, import, check.
   says import "runs the checker and asks for trust" and is silent on a name
   that's taken. Replacing a file you had trusted with one from elsewhere is
   the less safe reading, so the import is refused and says to rename it.
+- **D9. Triage can't be copied or changed as a workflow in this build.**
+  The PRD has triage's stages as built-in kinds any workflow can use, and
+  mentions "an approver node in a fork of it". Here they stay inside
+  `case.rs` (D6) and run only as a triage case. Rather than let a copy
+  pass the checker and fail in a run, the checker refuses those kinds
+  outside the built-in triage, and the wizard, scheduler, rehearsal and
+  `workflow` nodes refuse triage. **This is the largest gap against the
+  PRD**: making the stages usable from any workflow means moving their
+  prompts, report validators and GitHub steps out of `Case`, which wasn't
+  attempted because it puts the parity gate at risk.
+- **D10. `CHANGELOG.md` is new.** The PRD asks for "the CHANGELOG"; the
+  repository had none (releases are tags). It was created with an
+  Unreleased section.
+- **D11. Trust is pinned to SHA-256, not FNV.** The PRD says "content
+  hash". The first build used a 64-bit FNV; step 16 moved trust and the
+  hooks fingerprint to the SHA-256 the run log already has.
+- **D12. With no check before the gate, the checked commit is the one the
+  `done_when` judges passed.** The PRD pins verdicts to the commit a check
+  ran on and doesn't say what a gate does in a workflow whose only
+  mechanical condition is CI. Triage answers it (the gatekeeper's commit),
+  so the generic gate does the same, and a gate with neither a check nor a
+  judge in `done_when` is a checker error.
+
+## Known limits
+
+- **Triage as a workflow**: not copyable, no approver node, not
+  schedulable, not rehearsable, not usable as a node (D9). Its
+  `wall_clock = "12h"` is declared and not enforced; triage has no time
+  limit, as before.
+- **Codex**: its hook decision is unverified (the probe was inconclusive
+  on the build machine because of a managed policy), so no permission rule
+  fires on Codex. Only Claude Code 2.1.332 ships as verified; every other
+  backend is documented, and gemini wasn't installed to probe.
+- **The scheduler** is a command (`trix workflow scheduler`), not part of
+  the server, and needs a session to open panes in.
+- **The builder**: drag-to-connect isn't wired (connect with `c`); it's
+  its own terminal UI in a pane; the run view is the text overview, not
+  the canvas; prompts are edited in the file; scope overlaps are a problem
+  line, not drawn.
+- **Nested runs** work on their own branch and open their own PR; the
+  parent takes the outcome only. A dry run doesn't start them.
+- **The check refusal** is proven on the server's code and on real process
+  ancestry in separate tests; there is no single end-to-end test with a
+  live server and a real `trix` inside a check.
+- **The guard is guarded, not enforced**: it stops pushes by habit or
+  mistake, not code that sets out to undo it. Only a Claude profile limited
+  to the safe list is labelled enforced.
+- **`cargo fmt --check`** passes for the new code only (D2).

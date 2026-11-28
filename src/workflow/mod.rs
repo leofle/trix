@@ -1,10 +1,6 @@
 //! Trix Workflows: a workflow prompts the agents, re-prompts them and
 //! checks their work, so you don't. Triage (`case.rs`) is the first one.
 
-// Parts are built ahead of the steps that use them: this comes off in the
-// docs step, once every step is in.
-#![allow(dead_code)]
-
 pub mod builder;
 pub mod canvas;
 pub mod caps;
@@ -72,7 +68,7 @@ pub fn surfaces(
         Default::default(),
     );
     vec![
-        ("trix workflow check", cli::check_text(w, m, ctx)),
+        ("trix workflow check", cli::check_text(w, m, ctx).0),
         ("run start", start),
         ("dry run and rehearsal", dry.check),
         (

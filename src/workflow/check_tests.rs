@@ -21,14 +21,6 @@ fn run(w: &Workflow) -> Report {
     check(w, &m, &ctx)
 }
 
-fn codes(r: &Report, level: Severity) -> Vec<&'static str> {
-    r.problems
-        .iter()
-        .filter(|p| p.level == level)
-        .map(|p| p.code)
-        .collect()
-}
-
 /// Claude's hook decision probed and passed on the installed version.
 fn verified() -> (Matrix, Ctx) {
     let local = BTreeMap::from([(
@@ -1325,9 +1317,107 @@ fn every_way_in_gives_the_same_report() {
     fixtures.push(warned);
     for w in &fixtures {
         let api = check(w, &m, &ctx).render();
+        // An import makes a file of your own, and says what the checker
+        // says of that file. Only for triage is that another report: its
+        // stages run built in, so its copy can't run.
+        let mut file = w.clone();
+        file.builtin = false;
+        let of_the_file = check(&file, &m, &ctx).render();
+        assert_eq!(of_the_file == api, !w.is_triage(), "{}", w.name);
         for (way, text) in super::surfaces(w, &m, &ctx) {
-            assert_eq!(text, api, "{} via {way}", w.name);
+            let expect = if way == "import" { &of_the_file } else { &api };
+            assert_eq!(&text, expect, "{} via {way}", w.name);
         }
     }
     assert_eq!(super::surfaces(&wf(), &m, &ctx).len(), super::SURFACES);
+}
+
+#[test]
+fn triages_stages_run_only_in_the_built_in_triage() {
+    let (m, ctx) = ideal();
+    let opts = crate::config::TriageOpts::default();
+    // The built-in, as a case runs it: nothing to say.
+    let triage = super::triage::bound(&opts);
+    assert!(triage.is_triage());
+    let r = check(&triage, &m, &ctx);
+    assert_eq!(r.errors(), 0, "{}", r.render());
+    // A copy of it under another name can't run: each of its stages says so.
+    let mut copy = triage.clone();
+    copy.name = "my-triage".into();
+    copy.builtin = false;
+    let r = check(&copy, &m, &ctx);
+    assert!(!r.runnable() && r.has("builtin-kind"), "{}", r.render());
+    let said = r.render();
+    for stage in [
+        "triage.build",
+        "triage.review",
+        "triage.fix",
+        "triage.gatekeep",
+        "gh.resolve_target",
+    ] {
+        assert!(
+            said.contains(&format!(
+                "{stage} is one of triage's own stages: it runs only in the built-in triage"
+            )),
+            "{stage}:\n{said}"
+        );
+    }
+    // A file that calls itself triage and built in is still a file: the store says which it is.
+    let dir = std::env::temp_dir().join(format!("trix-check-triage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("workflows")).unwrap();
+    std::fs::write(dir.join("workflows/triage.toml"), triage.to_toml().unwrap()).unwrap();
+    let stores = super::store::Stores {
+        team: None,
+        personal: dir.join("workflows"),
+    };
+    let (mine, origin) = stores.load("triage").unwrap();
+    assert_eq!(
+        (mine.builtin, origin),
+        (false, super::store::Origin::Personal)
+    );
+    assert!(check(&mine, &m, &ctx).has("builtin-kind"));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Triage isn't a node of another workflow either.
+    let mut w = wf();
+    w.nodes.insert(
+        "sub".into(),
+        Node {
+            kind: "workflow".into(),
+            workflow: Some("triage".into()),
+            ..Node::default()
+        },
+    );
+    assert!(run(&w).has("triage-as-node"));
+    // And a kind trix has never heard of is an error, not an agent.
+    let mut w = wf();
+    w.nodes.get_mut("judge").unwrap().kind = "oracle".into();
+    let r = run(&w);
+    assert!(r.has("unknown-kind"), "{}", r.render());
+    assert!(r.render().contains("'oracle' isn't a kind of node: agent, judge, supervisor, check, gh.gate, land, for_each, join, workflow"));
+}
+
+#[test]
+fn a_gate_needs_something_in_done_when_to_check_a_commit() {
+    // issue-to-pr names a check and a judge: fine.
+    assert!(!run(&wf()).has("gate-nothing-checked"));
+    // A judge alone is enough for the gate (CI is the mechanical part).
+    let mut w = wf();
+    w.goal.done_when.mechanical = vec![Cond {
+        check: None,
+        ci: Some("green".into()),
+        judge: None,
+    }];
+    assert!(!run(&w).has("gate-nothing-checked"));
+    // CI alone checks nothing trix can pin: the gate would have no commit.
+    w.goal.done_when.attested.clear();
+    let r = run(&w);
+    assert!(
+        !r.runnable() && r.has("gate-nothing-checked"),
+        "{}",
+        r.render()
+    );
+    assert!(r.render().contains(
+        "the gate pushes and merges the checked commit, and nothing in done_when checks one"
+    ));
 }

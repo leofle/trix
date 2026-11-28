@@ -7,7 +7,7 @@
 
 use super::caps::{Level, Matrix};
 use super::check::{self, Ctx, ci_globs, overlap};
-use super::engine::{self, Op, WfRun, first_line, short};
+use super::engine::{self, Op, WfRun, short};
 use super::env::Env;
 use super::model::{Allow, MergeApproval, Mode, Notify, OnLimit, PermRule, Push, Workflow};
 use super::settings::{AgentPolicy, May};
@@ -250,12 +250,9 @@ pub fn fingerprint(env: &mut dyn Env, repo: &Path) -> BTreeMap<String, String> {
         if name.ends_with(".sample") {
             continue;
         }
+        // SHA-256: a hook an agent rewrote can't be made to look the same.
         let bytes = std::fs::read(&file).unwrap_or_default();
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in &bytes {
-            h = (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        f.insert(format!("hook {name}"), format!("{h:016x}"));
+        f.insert(format!("hook {name}"), super::runlog::sha256(&bytes));
     }
     f
 }
@@ -568,12 +565,9 @@ pub fn content_hash(w: &Workflow, subs: &[Workflow]) -> String {
         .iter()
         .map(|(id, n)| (id, check::profile_of(w, n).map(|p| p.args)))
         .collect();
+    // SHA-256: what you trusted can't be swapped for a file made to hash the same.
     let text = serde_json::to_string(&(w, subs, profiles)).unwrap_or_default();
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
-        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    super::runlog::sha256(text.as_bytes())
 }
 
 /// Whether the workflow is trusted as it is now. One from the binary is
@@ -747,9 +741,4 @@ pub fn preview_text(w: &Workflow, nodes: &[(String, Unattended)]) -> String {
         "  a limit, a stall, a floor or a prompt outside the rules parks the run and tells you\n",
     );
     s
-}
-
-/// The first line of an error, for a note.
-pub fn brief(e: &str) -> &str {
-    first_line(e)
 }

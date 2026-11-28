@@ -815,6 +815,26 @@ impl WfRun {
         }
         v
     }
+    /// The commit every judge in done_when voted pass on, when they agree
+    /// on one: what's checked in a workflow with no check node.
+    fn attested_commit(&self) -> Option<String> {
+        let mut commits = self
+            .workflow
+            .goal
+            .done_when
+            .attested
+            .iter()
+            .filter_map(|c| c.judge.as_ref())
+            .map(|name| {
+                let st = self.nodes.get(name)?;
+                let sha = st.outputs.get("commit")?.as_str()?;
+                (st.verdict.as_deref() == Some("pass") && !sha.is_empty()).then(|| sha.to_string())
+            });
+        let first = commits.next()??;
+        commits
+            .all(|c| c.as_deref() == Some(first.as_str()))
+            .then_some(first)
+    }
 
     /// Whether a mechanical or attested condition holds on the pinned commit.
     /// CI is the gate's to ask GitHub about: not looked at here.
@@ -1771,17 +1791,6 @@ impl WfRun {
     }
 }
 
-impl WfRun {
-    /// A kind this trix doesn't run yet.
-    pub fn land_unbuilt(&mut self, env: &mut dyn Env, id: &str) {
-        let kind = self.workflow.nodes[id].kind.clone();
-        self.fail(
-            env,
-            format!("{id} is a {kind} node, which this trix doesn't run yet"),
-        );
-    }
-}
-
 // ───────────────────────────── the gate ─────────────────────────────
 
 /// CI on a commit, as GitHub has it.
@@ -1921,12 +1930,15 @@ impl WfRun {
     /// merge exactly that commit after a fresh look at CI.
     fn gate_node(&mut self, root: &Path, env: &mut dyn Env, id: &str) {
         let n = self.workflow.nodes[id].clone();
-        let Some(sha) = self.pinned.clone() else {
+        // The checked commit: the one a check ran on, or with no check
+        // before the gate, the one every judge in done_when passed.
+        let Some(sha) = self.pinned.clone().or_else(|| self.attested_commit()) else {
             return self.fail(
                 env,
-                "the gate has no checked commit: no check ran before it",
+                "the gate has no checked commit: no check ran before it, and no judge in done_when passed one",
             );
         };
+        self.pinned = Some(sha.clone());
         if let Err(why) = self.done_when() {
             return self.park(env, format!("done_when isn't met: {why}"));
         }

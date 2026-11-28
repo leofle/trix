@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const HELP: &str = "\
-usage:  trix workflow new                         the wizard: a template, the goal, a backend per role
+usage:
+  trix workflow new                         the wizard: a template, the goal, a backend per role
   trix workflow edit <name>                 the builder (alt+p in the workspace)
 
   trix workflow run <name> [--input k=v]…   start a run of a workflow
@@ -341,9 +342,21 @@ pub fn parse_wf(args: &[String]) -> Result<WfCmd, String> {
     }
 }
 
-/// `trix workflow check`: what the one checker says, as text.
-pub fn check_text(w: &Workflow, m: &Matrix, ctx: &Ctx) -> String {
-    check::check(w, m, ctx).render()
+/// `trix workflow check`: what the one checker says, as text, and
+/// whether the workflow can run.
+pub fn check_text(w: &Workflow, m: &Matrix, ctx: &Ctx) -> (String, bool) {
+    let report = check::check(w, m, ctx);
+    (report.render(), report.runnable())
+}
+
+/// The workflow as a run would have it: triage is bound to `[triage]`,
+/// which is how a case runs it. Any other is as its file has it.
+fn as_it_runs(w: Workflow) -> Result<Workflow, String> {
+    if w.is_triage() {
+        Ok(super::triage::bound(&crate::config::load()?.triage))
+    } else {
+        Ok(w)
+    }
 }
 
 /// The main checkout of the repository this runs in, if it's in one.
@@ -749,8 +762,7 @@ fn watch(root: &Path, id: &str) -> i32 {
 /// the builder.
 fn new_workflow() -> Result<String, String> {
     let (m, ctx, _) = live()?;
-    let template =
-        ask("template (triage, issue-to-pr, bug-repro, nightly-deps, blank) [issue-to-pr]")?;
+    let template = ask("template (issue-to-pr, bug-repro, nightly-deps, blank) [issue-to-pr]")?;
     let template = if template.is_empty() {
         "issue-to-pr".to_string()
     } else {
@@ -1025,6 +1037,7 @@ pub fn run(args: &[String]) -> i32 {
             let stores = Stores::of(main_checkout().as_deref());
             say(stores.load(&name).and_then(|(w, _)| {
                 let (m, ctx, settings) = live()?;
+                let w = as_it_runs(w)?;
                 let scenario = super::dryrun::Scenario::parse(&scenario)?;
                 Ok(
                     super::dryrun::dry_run(&w, &m, &ctx, &settings, scenario, sample_inputs(&w))
@@ -1102,9 +1115,10 @@ pub fn run(args: &[String]) -> i32 {
         })),
         Cmd::Check { name, fix } => {
             let stores = Stores::of(main_checkout().as_deref());
-            let found = stores
-                .load(&name)
-                .and_then(|(w, origin)| live().map(|(m, ctx, _)| (w, origin, m, ctx)));
+            let found = stores.load(&name).and_then(|(w, origin)| {
+                let w = as_it_runs(w)?;
+                live().map(|(m, ctx, _)| (w, origin, m, ctx))
+            });
             let (mut w, origin, m, ctx) = match found {
                 Ok(x) => x,
                 Err(e) => return fail(e),
@@ -1121,9 +1135,9 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            let report = check::check(&w, &m, &ctx);
-            print!("{}", report.render());
-            i32::from(!report.runnable())
+            let (text, runnable) = check_text(&w, &m, &ctx);
+            print!("{text}");
+            i32::from(!runnable)
         }
         Cmd::Capabilities {
             kind,

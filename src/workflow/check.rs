@@ -30,7 +30,8 @@ pub struct Ctx {
 
 impl Ctx {
     /// A machine with every backend installed in range and Codex's hooks
-    /// trusted: how a workflow checks for its author.
+    /// trusted: for tests.
+    #[cfg(test)]
     pub fn ideal(m: &Matrix) -> Ctx {
         Ctx {
             installed: Installed::all(m),
@@ -597,6 +598,50 @@ pub fn check(w: &Workflow, m: &Matrix, ctx: &Ctx) -> Report {
 
     if ctx.trusted == Some(false) {
         add(Blocks, "untrusted", At::Workflow, "untrusted, or changed since trust was given: it can't run until you trust it (trix workflow trust)".into(), vec![]);
+    } // ── kinds ──
+    // Triage's stages are triage's own: they run as a case, nowhere else.
+    for (id, n) in &w.nodes {
+        let kind = n.kind.as_str();
+        if super::model::TRIAGE_KINDS.contains(&kind) {
+            if !w.is_triage() {
+                add(
+                    Error,
+                    "builtin-kind",
+                    node(id),
+                    format!(
+                        "{kind} is one of triage's own stages: it runs only in the built-in triage (trix triage), not in a workflow of your own. Set triage's agents, rounds and budget under [triage], or use an agent node with its own prompt here"
+                    ),
+                    vec![],
+                );
+            }
+        } else if !super::model::KINDS.contains(&kind) {
+            add(
+                Error,
+                "unknown-kind",
+                node(id),
+                format!(
+                    "'{kind}' isn't a kind of node: {}",
+                    super::model::KINDS.join(", ")
+                ),
+                vec![],
+            );
+        }
+        if kind == "workflow" && n.workflow.as_deref() == Some("triage") {
+            add(Error, "triage-as-node", node(id), "triage runs as a case of its own (trix triage <PR or issue>), not as a node of another workflow".into(), vec![]);
+        }
+    }
+    // The gate merges the checked commit: something has to check one.
+    let checks_a_commit = w
+        .goal
+        .done_when
+        .mechanical
+        .iter()
+        .any(|c| c.check.is_some())
+        || w.goal.done_when.attested.iter().any(|c| c.judge.is_some());
+    if !w.is_triage() && !checks_a_commit {
+        for (id, _) in w.nodes.iter().filter(|(_, n)| n.kind == "gh.gate") {
+            add(Error, "gate-nothing-checked", node(id), "the gate pushes and merges the checked commit, and nothing in done_when checks one: name a check or a judge there".into(), vec![fix("add a check node, and name it in done_when.mechanical", FixOp::Manual)]);
+        }
     }
 
     // ── backends ──

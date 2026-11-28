@@ -537,15 +537,28 @@ pub const AGENT_KINDS: [&str; 7] = [
     "triage.gatekeep",
 ];
 
-/// Built-in kinds that keep their own prompts, reports and checks.
-pub const BUILTIN_KINDS: [&str; 7] = [
+/// Triage's own stages: they keep their prompts, reports and checks in
+/// triage itself, and run only as a triage case.
+pub const TRIAGE_KINDS: [&str; 6] = [
     "triage.build",
     "triage.review",
     "triage.fix",
     "triage.gatekeep",
     "gh.resolve_target",
-    "gh.gate",
     "gh.merge",
+];
+
+/// The kinds a workflow of your own is built from.
+pub const KINDS: [&str; 9] = [
+    "agent",
+    "judge",
+    "supervisor",
+    "check",
+    "gh.gate",
+    "land",
+    "for_each",
+    "join",
+    "workflow",
 ];
 
 impl Node {
@@ -553,9 +566,6 @@ impl Node {
     pub fn is_agent(&self) -> bool {
         AGENT_KINDS.contains(&self.kind.as_str())
             || (self.kind == "for_each" && self.workflow.is_none())
-    }
-    pub fn is_builtin(&self) -> bool {
-        BUILTIN_KINDS.contains(&self.kind.as_str())
     }
     /// The role it plays: named, or what its kind and preset imply.
     pub fn role(&self) -> Option<Role> {
@@ -751,15 +761,14 @@ impl Workflow {
         bind_value(&mut v, config)?;
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
+}
 
-    /// A hash of everything a run would act on: what trust is pinned to.
-    pub fn content_hash(&self) -> String {
-        let text = serde_json::to_string(self).unwrap_or_default();
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in text.bytes() {
-            h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        format!("{h:016x}")
+impl Workflow {
+    /// The built-in triage: the one workflow that runs as a triage case,
+    /// on triage's own stages. Whether it's built in is where it was
+    /// found, which the store sets: never what a file says of itself.
+    pub fn is_triage(&self) -> bool {
+        self.builtin && self.name == "triage"
     }
 }
 

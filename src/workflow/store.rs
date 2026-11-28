@@ -72,7 +72,10 @@ impl Stores {
             };
             let text =
                 std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let w = Workflow::from_toml(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            let mut w =
+                Workflow::from_toml(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            // A file is a file, whatever it says of itself.
+            w.builtin = false;
             if w.name != name {
                 return Err(format!(
                     "{}: it names itself '{}', not '{name}'",
@@ -148,6 +151,7 @@ pub fn builtin(name: &str) -> Option<Workflow> {
     Some(Workflow::from_toml(text).unwrap_or_else(|e| panic!("the built-in {name} template: {e}")))
 }
 
+#[cfg(test)]
 pub fn builtin_names() -> Vec<&'static str> {
     BUILTIN.iter().map(|(n, _)| *n).collect()
 }
@@ -334,11 +338,11 @@ mod tests {
         assert_eq!(s.load("repro").unwrap().0, edited);
         // The run still has the workflow it started with.
         assert_eq!(snapshot_of(&run).unwrap(), w);
-        assert_ne!(
-            snapshot_of(&run).unwrap().content_hash(),
-            edited.content_hash()
-        );
-        assert_eq!(snapshot_of(&run).unwrap().content_hash(), w.content_hash());
+        let hash = |w: &Workflow| crate::workflow::policy::content_hash(w, &[]);
+        assert_ne!(hash(&snapshot_of(&run).unwrap()), hash(&edited));
+        assert_eq!(hash(&snapshot_of(&run).unwrap()), hash(&w));
+        // SHA-256, in hex: what trust is pinned to.
+        assert_eq!(hash(&w).len(), 64);
         let _ = std::fs::remove_dir_all(base);
     }
 }
